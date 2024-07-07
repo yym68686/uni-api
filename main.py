@@ -1,3 +1,4 @@
+import os
 import httpx
 import yaml
 from contextlib import asynccontextmanager
@@ -82,56 +83,94 @@ async def fetch_response(client, url, headers, payload):
     # print(response.text)
     return response.json()
 
-@app.post("/v1/chat/completions")
-async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
-    model_name = request.model
+async def process_request(request: RequestModel, provider: Dict):
+    print("provider: ", provider['provider'])
+    url = provider['base_url']
+    headers = {
+        'Authorization': f"Bearer {provider['api']}",
+        'Content-Type': 'application/json'
+    }
 
-    for provider in config:
-        if model_name in provider['model']:
-            print("provider: ", provider['provider'])
-            url = provider['base_url']
-            headers = {
-                'Authorization': f"Bearer {provider['api']}",
-                'Content-Type': 'application/json'
-            }
+    # 转换消息格式
+    messages = []
+    for msg in request.messages:
+        if isinstance(msg.content, list):
+            content = " ".join([item.text for item in msg.content if item.type == "text"])
+        else:
+            content = msg.content
+        messages.append({"role": msg.role, "content": content})
 
-            # 转换消息格式
-            messages = []
-            for msg in request.messages:
-                if isinstance(msg.content, list):
-                    content = " ".join([item.text for item in msg.content if item.type == "text"])
-                else:
-                    content = msg.content
-                messages.append({"role": msg.role, "content": content})
+    payload = {
+        "model": request.model,
+        "messages": messages
+    }
 
-            payload = {
-                "model": model_name,
-                "messages": messages
-            }
+    # 只有当相应参数存在且不为None时，才添加到payload中
+    if request.stream is not None:
+        payload["stream"] = request.stream
+    if request.include_usage is not None:
+        payload["include_usage"] = request.include_usage
 
-            # 只有当相应参数存在且不为None时，才添加到payload中
-            if request.stream is not None:
-                payload["stream"] = request.stream
-            if request.include_usage is not None:
-                payload["include_usage"] = request.include_usage
+    if provider['provider'] == 'anthropic':
+        payload["max_tokens"] = 1000  # 您可能想让这个可配置
+    else:
+        if request.logprobs is not None:
+            payload["logprobs"] = request.logprobs
+        if request.top_logprobs is not None:
+            payload["top_logprobs"] = request.top_logprobs
 
-            if provider['provider'] == 'anthropic':
-                payload["max_tokens"] = 1000  # 您可能想让这个可配置
-            else:
-                if request.logprobs is not None:
-                    payload["logprobs"] = request.logprobs
-                if request.top_logprobs is not None:
-                    payload["top_logprobs"] = request.top_logprobs
+    if request.stream:
+        return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload), media_type="text/event-stream")
+    else:
+        return await fetch_response(app.state.client, url, headers, payload)
 
+class ModelRequestHandler:
+    def __init__(self):
+        self.last_provider_index = -1
+
+    def get_matching_providers(self, model_name):
+        return [provider for provider in config if model_name in provider['model']]
+
+    async def request_model(self, request: RequestModel, token: str):
+        model_name = request.model
+        matching_providers = self.get_matching_providers(model_name)
+        print("matching_providers", matching_providers)
+
+        if not matching_providers:
+            raise HTTPException(status_code=404, detail="No matching model found")
+
+        # 检查是否启用轮询
+        use_round_robin = os.environ.get('USE_ROUND_ROBIN', 'false').lower() == 'true'
+
+        if use_round_robin:
+            return await self.round_robin_request(request, matching_providers)
+        else:
+            # 使用第一个匹配的提供者
+            provider = matching_providers[0]
             try:
-                if request.stream:
-                    return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload), media_type="text/event-stream")
-                else:
-                    return await fetch_response(app.state.client, url, headers, payload)
+                return await process_request(request, provider)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error calling API: {str(e)}")
 
-        raise HTTPException(status_code=404, detail="No matching model found")
+    async def round_robin_request(self, request: RequestModel, providers: List[Dict]):
+        num_providers = len(providers)
+        for i in range(num_providers):
+            self.last_provider_index = (self.last_provider_index + 1) % num_providers
+            # print(f"Trying provider {self.last_provider_index}")
+            provider = providers[self.last_provider_index]
+            try:
+                response = await process_request(request, provider)
+                return response
+            except Exception as e:
+                print(f"Error with provider {provider['provider']}: {str(e)}")
+                continue
+        raise HTTPException(status_code=500, detail="All providers failed")
+
+model_handler = ModelRequestHandler()
+
+@app.post("/v1/chat/completions")
+async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
+    return await model_handler.request_model(request, token)
 
 if __name__ == '__main__':
     import uvicorn
