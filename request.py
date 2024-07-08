@@ -149,8 +149,102 @@ async def get_gpt_payload(request, engine, provider):
 
     return url, headers, payload
 
+async def gpt2claude_tools_json(json_dict):
+    import copy
+    json_dict = copy.deepcopy(json_dict)
+    keys_to_change = {
+        "parameters": "input_schema",
+    }
+    for old_key, new_key in keys_to_change.items():
+        if old_key in json_dict:
+            if new_key:
+                json_dict[new_key] = json_dict.pop(old_key)
+            else:
+                json_dict.pop(old_key)
+    # if "tools" in json_dict.keys():
+    #     json_dict["tool_choice"] = {
+    #         "type": "auto"
+    #     }
+    return json_dict
+
 async def get_claude_payload(request, engine, provider):
-    pass
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": f"{provider['api']}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "tools-2024-05-16"
+    }
+    url = provider['base_url']
+
+    messages = []
+    for msg in request.messages:
+        if isinstance(msg.content, list):
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    text_message = await get_text_message(msg.role, item.text, engine)
+                    content.append(text_message)
+                elif item.type == "image_url":
+                    image_message = await get_image_message(item.image_url.url, engine)
+                    content.append(image_message)
+        else:
+            content = msg.content
+            name = msg.name
+        if name:
+            messages.append({"role": msg.role, "name": name, "content": content})
+        elif msg.role != "system":
+            messages.append({"role": msg.role, "content": content})
+        elif msg.role == "system":
+            system_prompt = content
+
+    payload = {
+        "model": request.model,
+        "messages": messages,
+        "system": system_prompt,
+    }
+    # json_post = {
+    #     "model": model or self.engine,
+    #     "messages": self.conversation[convo_id] if pass_history else [{
+    #         "role": "user",
+    #         "content": prompt
+    #     }],
+    #     "temperature": kwargs.get("temperature", self.temperature),
+    #     "top_p": kwargs.get("top_p", self.top_p),
+    #     "max_tokens": model_max_tokens,
+    #     "stream": True,
+    # }
+
+    miss_fields = [
+        'model',
+        'messages',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            payload[field] = value
+
+    tools = []
+    for tool in request.tools:
+        print("tool", type(tool), tool)
+
+        json_tool = await gpt2claude_tools_json(tool.dict()["function"])
+        tools.append(json_tool)
+    payload["tools"] = tools
+        # del payload["type"]
+        # del payload["function"]
+    if "tool_choice" in payload:
+        payload["tool_choice"] = {
+            "type": "auto"
+        }
+    import json
+    print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
+
+    return url, headers, payload
 
 async def get_payload(request: RequestModel, engine, provider):
     if engine == "gemini":

@@ -64,12 +64,12 @@ async def process_request(request: RequestModel, provider: Dict):
 
     url, headers, payload = await get_payload(request, engine, provider)
 
-    # request_info = {
-    #     "url": url,
-    #     "headers": headers,
-    #     "payload": payload
-    # }
-    # print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
+    request_info = {
+        "url": url,
+        "headers": headers,
+        "payload": payload
+    }
+    print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
 
     if request.stream:
         return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload, engine, request.model), media_type="text/event-stream")
