@@ -51,12 +51,34 @@ def load_config():
 config = load_config()
 # print(config)
 
+# 定义 Function 参数模型
+class FunctionParameter(BaseModel):
+    type: str
+    properties: Dict[str, Dict[str, str]]
+    required: List[str]
+
+# 定义 Function 模型
+class Function(BaseModel):
+    name: str
+    description: str
+    parameters: FunctionParameter
+
+# 定义 Tool 模型
+class Tool(BaseModel):
+    type: str
+    function: Function
+
+class ImageUrl(BaseModel):
+    url: str
+
 class ContentItem(BaseModel):
     type: str
-    text: str
+    text: Optional[str] = None
+    image_url: Optional[ImageUrl] = None
 
 class Message(BaseModel):
     role: str
+    name: Optional[str] = None
     content: Union[str, List[ContentItem]]
 
 class RequestModel(BaseModel):
@@ -66,10 +88,20 @@ class RequestModel(BaseModel):
     top_logprobs: Optional[int] = None
     stream: Optional[bool] = None
     include_usage: Optional[bool] = None
+    temperature: Optional[float] = 0.5
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[int] = None
+    presence_penalty: Optional[float] = 0.0
+    frequency_penalty: Optional[float] = 0.0
+    n: Optional[int] = 1
+    user: Optional[str] = None
+    tool_choice: Optional[str] = None
+    tools: Optional[List[Tool]] = None
 
 async def fetch_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         async for chunk in response.aiter_bytes():
+            print(chunk.decode('utf-8'))
             yield chunk
 
 async def fetch_response(client, url, headers, payload):
@@ -88,37 +120,36 @@ async def process_request(request: RequestModel, provider: Dict):
     messages = []
     for msg in request.messages:
         if isinstance(msg.content, list):
-            content = " ".join([item.text for item in msg.content if item.type == "text"])
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    content.append({"type": "text", "text": item.text})
+                elif item.type == "image_url":
+                    content.append({"type": "image_url", "image_url": item.image_url.dict()})
         else:
             content = msg.content
-        messages.append({"role": msg.role, "content": content})
+            name = msg.name
+        if name:
+            messages.append({"role": msg.role, "name": name, "content": content})
+        else:
+            messages.append({"role": msg.role, "content": content})
+
 
     payload = {
         "model": request.model,
         "messages": messages
     }
 
-    # 只有当相应参数存在且不为None时，才添加到payload中
-    # print("request: ", request)
-    if request.stream is not None:
-        payload["stream"] = request.stream
-    if request.include_usage is not None:
-        payload["include_usage"] = request.include_usage
+    for field, value in request.dict(exclude_unset=True).items():
+        if field not in ['model', 'messages'] and value is not None:
+            payload[field] = value
 
-    if provider['provider'] == 'anthropic':
-        payload["max_tokens"] = 1000  # 您可能想让这个可配置
-    else:
-        if request.logprobs is not None:
-            payload["logprobs"] = request.logprobs
-        if request.top_logprobs is not None:
-            payload["top_logprobs"] = request.top_logprobs
-
-    # request_info = {
-    #     "url": url,
-    #     "headers": headers,
-    #     "payload": payload
-    # }
-    # print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
+    request_info = {
+        "url": url,
+        "headers": headers,
+        "payload": payload
+    }
+    print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
     if request.stream:
         return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload), media_type="text/event-stream")
     else:
@@ -134,7 +165,7 @@ class ModelRequestHandler:
     async def request_model(self, request: RequestModel, token: str):
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name)
-        print("matching_providers", json.dumps(matching_providers, indent=2, ensure_ascii=False))
+        # print("matching_providers", json.dumps(matching_providers, indent=2, ensure_ascii=False))
 
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
