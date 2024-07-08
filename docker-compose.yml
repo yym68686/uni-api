@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   uni-api:
     container_name: uni-api
