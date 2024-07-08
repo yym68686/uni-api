@@ -142,21 +142,18 @@ class ModelRequestHandler:
         # 检查是否启用轮询
         use_round_robin = os.environ.get('USE_ROUND_ROBIN', 'false').lower() == 'true'
 
-        if use_round_robin:
-            return await self.round_robin_request(request, matching_providers)
-        else:
-            # 使用第一个匹配的提供者
-            provider = matching_providers[0]
-            try:
-                return await process_request(request, provider)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Error calling API: {str(e)}")
+        return await self.try_all_providers(request, matching_providers, use_round_robin)
 
-    async def round_robin_request(self, request: RequestModel, providers: List[Dict]):
+    async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool):
         num_providers = len(providers)
+        start_index = self.last_provider_index if use_round_robin else 0
+
         for i in range(num_providers):
-            self.last_provider_index = (self.last_provider_index + 1) % num_providers
-            # print(f"Trying provider {self.last_provider_index}")
+            if use_round_robin:
+                self.last_provider_index = (start_index + i) % num_providers
+            else:
+                self.last_provider_index = i
+
             provider = providers[self.last_provider_index]
             try:
                 response = await process_request(request, provider)
@@ -164,6 +161,7 @@ class ModelRequestHandler:
             except Exception as e:
                 print(f"Error with provider {provider['provider']}: {str(e)}")
                 continue
+
         raise HTTPException(status_code=500, detail="All providers failed")
 
 model_handler = ModelRequestHandler()
