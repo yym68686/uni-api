@@ -1,3 +1,4 @@
 api.json
 api.yaml
 .env
+__pycache__
