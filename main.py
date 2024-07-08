@@ -99,7 +99,7 @@ async def process_request(request: RequestModel, provider: Dict):
     }
 
     # 只有当相应参数存在且不为None时，才添加到payload中
-    print("request: ", request)
+    # print("request: ", request)
     if request.stream is not None:
         payload["stream"] = request.stream
     if request.include_usage is not None:
@@ -134,7 +134,7 @@ class ModelRequestHandler:
     async def request_model(self, request: RequestModel, token: str):
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name)
-        print("matching_providers", matching_providers)
+        print("matching_providers", json.dumps(matching_providers, indent=2, ensure_ascii=False))
 
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
@@ -146,12 +146,13 @@ class ModelRequestHandler:
 
     async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool):
         num_providers = len(providers)
-        start_index = self.last_provider_index if use_round_robin else 0
 
         for i in range(num_providers):
             if use_round_robin:
-                self.last_provider_index = (start_index + i) % num_providers
+                # 始终从第一个提供者开始轮询
+                self.last_provider_index = i % num_providers
             else:
+                # 非轮询模式，按顺序尝试
                 self.last_provider_index = i
 
             provider = providers[self.last_provider_index]
