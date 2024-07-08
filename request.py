@@ -191,7 +191,32 @@ async def get_claude_payload(request, engine, provider):
             content = msg.content
             name = msg.name
         if name:
-            messages.append({"role": msg.role, "name": name, "content": content})
+            # messages.append({"role": "assistant", "name": name, "content": content})
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
+                            "name": name,
+                            "input": {"text": messages[-1]["content"][0]["text"]},
+                        }
+                    ]
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
+                            "content": content
+                        }
+                    ]
+                }
+            )
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
@@ -228,19 +253,18 @@ async def get_claude_payload(request, engine, provider):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
-    tools = []
-    for tool in request.tools:
-        print("tool", type(tool), tool)
+    if request.tools:
+        tools = []
+        for tool in request.tools:
+            print("tool", type(tool), tool)
 
-        json_tool = await gpt2claude_tools_json(tool.dict()["function"])
-        tools.append(json_tool)
-    payload["tools"] = tools
-        # del payload["type"]
-        # del payload["function"]
-    if "tool_choice" in payload:
-        payload["tool_choice"] = {
-            "type": "auto"
-        }
+            json_tool = await gpt2claude_tools_json(tool.dict()["function"])
+            tools.append(json_tool)
+        payload["tools"] = tools
+        if "tool_choice" in payload:
+            payload["tool_choice"] = {
+                "type": "auto"
+            }
     import json
     print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
 

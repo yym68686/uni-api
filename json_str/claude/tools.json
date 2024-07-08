@@ -1,0 +1,95 @@
+{
+    "model": "claude-3-5-sonnet-20240620",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "搜索今天的新闻"
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
+                    "name": "get_search_results",
+                    "input": {
+                        "prompt": "latest news today"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
+                    "content": "latest news today"
+                }
+            ]
+        }
+    ],
+    "temperature": 0.5,
+    "top_p": 0.7,
+    "max_tokens": 4096,
+    "stream": true,
+    "system": "You are Claude, a large language model trained by Anthropic. Use simple characters to represent mathematical symbols. Do not use LaTeX commands. Respond conversationally in English.",
+    "tools": [
+        {
+            "name": "get_search_results",
+            "description": "Search Google to enhance knowledge.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt to search."
+                    }
+                },
+                "required": [
+                    "prompt"
+                ]
+            }
+        },
+        {
+            "name": "get_url_content",
+            "description": "Get the webpage content of a URL",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "the URL to request"
+                    }
+                },
+                "required": [
+                    "url"
+                ]
+            }
+        },
+        {
+            "name": "download_read_arxiv_pdf",
+            "description": "Get the content of the paper corresponding to the arXiv ID",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "the arXiv ID of the paper"
+                    }
+                },
+                "required": [
+                    "prompt"
+                ]
+            }
+        }
+    ],
+    "tool_choice": {
+        "type": "auto"
+    }
+}

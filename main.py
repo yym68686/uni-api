@@ -69,7 +69,7 @@ async def process_request(request: RequestModel, provider: Dict):
         "headers": headers,
         "payload": payload
     }
-    print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
+    print(f"Request details: {json.dumps(request_info, indent=4, ensure_ascii=False)}")
 
     if request.stream:
         return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload, engine, request.model), media_type="text/event-stream")
@@ -86,7 +86,7 @@ class ModelRequestHandler:
     async def request_model(self, request: RequestModel, token: str):
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name)
-        # print("matching_providers", json.dumps(matching_providers, indent=2, ensure_ascii=False))
+        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
 
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")

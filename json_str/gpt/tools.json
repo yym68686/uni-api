@@ -1,0 +1,91 @@
+{
+    "model": "gpt-4o",
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are ChatGPT, a large language model trained by OpenAI. Respond conversationally in English. Use simple characters to represent mathematical symbols. Do not use LaTeX commands. Knowledge cutoff: 2023-12. Current date: [ 2024-07-09 ]"
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "搜索今天的新闻"
+                }
+            ]
+        },
+        {
+            "role": "function",
+            "name": "get_search_results",
+            "content": "latest news today"
+        }
+    ],
+    "max_tokens": 4096,
+    "stream": true,
+    "temperature": 0.5,
+    "top_p": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "n": 1,
+    "user": "function",
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_search_results",
+                "description": "Search Google to enhance knowledge.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "The prompt to search."
+                        }
+                    },
+                    "required": [
+                        "prompt"
+                    ]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_url_content",
+                "description": "Get the webpage content of a URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "the URL to request"
+                        }
+                    },
+                    "required": [
+                        "url"
+                    ]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "download_read_arxiv_pdf",
+                "description": "Get the content of the paper corresponding to the arXiv ID",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "the arXiv ID of the paper"
+                        }
+                    },
+                    "required": [
+                        "prompt"
+                    ]
+                }
+            }
+        }
+    ],
+    "tool_choice": "auto"
+}

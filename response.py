@@ -2,7 +2,7 @@ from datetime import datetime
 import json
 import httpx
 
-async def generate_sse_response(timestamp, model, content):
+async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None):
     sample_data = {
         "id": "chatcmpl-9ijPeRHa0wtyA2G8wq5z8FC3wGMzc",
         "object": "chat.completion.chunk",
@@ -19,6 +19,11 @@ async def generate_sse_response(timestamp, model, content):
         ],
         "usage": None
     }
+    if function_call_content:
+        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"arguments": function_call_content}}]}
+    if tools_id and function_call_name:
+        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"id":tools_id,"type":"function","function":{"name":function_call_name,"arguments":""}}]}
+        # sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"id": tools_id, "name": function_call_name}}]}
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
@@ -81,7 +86,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                 for chunk in chunk_line:
                     if chunk.startswith("data:"):
                         line = chunk[6:]
-                        # print(line)
+                        print(line)
                         resp: dict = json.loads(line)
                         message = resp.get("message")
                         if message:
@@ -89,24 +94,29 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                             if tokens_use:
                                 total_tokens = tokens_use["input_tokens"] + tokens_use["output_tokens"]
                                 # print("\n\rtotal_tokens", total_tokens)
-                        # tool_use = resp.get("content_block")
-                        # if tool_use and "tool_use" == tool_use['type']:
-                        #     # print("tool_use", tool_use)
-                        #     tools_id = tool_use["id"]
-                        #     need_function_call = True
-                        #     if "name" in tool_use:
-                        #         function_call_name = tool_use["name"]
+                        tool_use = resp.get("content_block")
+                        tools_id = None
+                        function_call_name = None
+                        if tool_use and "tool_use" == tool_use['type']:
+                            # print("tool_use", tool_use)
+                            tools_id = tool_use["id"]
+                            if "name" in tool_use:
+                                function_call_name = tool_use["name"]
+                                sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
+                                yield sse_string
                         delta = resp.get("delta")
                         # print("delta", delta)
                         if not delta:
                             continue
                         if "text" in delta:
                             content = delta["text"]
-                            sse_string = await generate_sse_response(timestamp, model, content)
-                            print(sse_string)
+                            sse_string = await generate_sse_response(timestamp, model, content, None, None)
                             yield sse_string
-                        # if "partial_json" in delta:
-                        #     function_call_content = delta["partial_json"]
+                        if "partial_json" in delta:
+                            # {"type":"input_json_delta","partial_json":""}
+                            function_call_content = delta["partial_json"]
+                            sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
+                            yield sse_string
             yield "data: [DONE]\n\n"
     except httpx.ConnectError as e:
         print(f"连接错误： {e}")
