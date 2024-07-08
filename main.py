@@ -1,4 +1,5 @@
 import os
+import json
 import httpx
 import yaml
 from contextlib import asynccontextmanager
@@ -61,10 +62,10 @@ class Message(BaseModel):
 class RequestModel(BaseModel):
     model: str
     messages: List[Message]
-    logprobs: Optional[bool] = False
+    logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
-    stream: Optional[bool] = False
-    include_usage: Optional[bool] = False
+    stream: Optional[bool] = None
+    include_usage: Optional[bool] = None
 
 async def fetch_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
@@ -72,15 +73,7 @@ async def fetch_response_stream(client, url, headers, payload):
             yield chunk
 
 async def fetch_response(client, url, headers, payload):
-    # request_info = {
-    #     "url": url,
-    #     "headers": headers,
-    #     "payload": payload
-    # }
-    # print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
-
     response = await client.post(url, headers=headers, json=payload)
-    # print(response.text)
     return response.json()
 
 async def process_request(request: RequestModel, provider: Dict):
@@ -106,6 +99,7 @@ async def process_request(request: RequestModel, provider: Dict):
     }
 
     # 只有当相应参数存在且不为None时，才添加到payload中
+    print("request: ", request)
     if request.stream is not None:
         payload["stream"] = request.stream
     if request.include_usage is not None:
@@ -119,6 +113,12 @@ async def process_request(request: RequestModel, provider: Dict):
         if request.top_logprobs is not None:
             payload["top_logprobs"] = request.top_logprobs
 
+    # request_info = {
+    #     "url": url,
+    #     "headers": headers,
+    #     "payload": payload
+    # }
+    # print(f"Request details: {json.dumps(request_info, indent=2, ensure_ascii=False)}")
     if request.stream:
         return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload), media_type="text/event-stream")
     else:
