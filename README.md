@@ -21,7 +21,7 @@ yym68686/uni-api:latest
 Or if you want to use Docker Compose, here is a docker-compose.yml example:
 
 ```yaml
-version: "3.5"
+version: "3.8"
 services:
   uni-api:
     container_name: uni-api
