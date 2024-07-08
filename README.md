@@ -12,10 +12,10 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 Start the container
 
 ```bash
-docker run -p 8001:8000 --name uni-api -dit \
-    -v ./api.yaml:/home/api.yaml \
-    -e USE_ROUND_ROBIN=True \
-    yym68686/uni-api:latest
+docker run --user root -p 8001:8000 --name uni-api -dit \
+-v ./api.yaml:/home/api.yaml \
+-e USE_ROUND_ROBIN=True \
+yym68686/uni-api:latest
 ```
 
 Or if you want to use Docker Compose, here is a docker-compose.yml example:
@@ -37,6 +37,7 @@ services:
 Run Docker Compose container in the background
 
 ```bash
+docker-compose pull
 docker-compose up -d
 ```
 
@@ -46,4 +47,17 @@ Docker build
 docker build --no-cache -t uni-api:latest -f Dockerfile --platform linux/amd64 .
 docker tag uni-api:latest yym68686/uni-api:latest
 docker push yym68686/uni-api:latest
+```
+
+One-Click Restart Docker Image
+
+```bash
+set -eu
+docker pull yym68686/uni-api:latest
+docker rm -f uni-api
+docker run --user root -p 8001:8000 -dit --name uni-api \
+-v ./api.yaml:/home/api.yaml \
+-e USE_ROUND_ROBIN=True \
+yym68686/uni-api:latest
+docker logs -f uni-api
 ```
