@@ -3,6 +3,7 @@ import json
 import httpx
 import logging
 import yaml
+import secrets
 import traceback
 from contextlib import asynccontextmanager
 
@@ -95,17 +96,17 @@ class ModelRequestHandler:
         #     if model_name in provider['model'].keys():
         #         print("provider", provider)
         api_index = api_list.index(token)
-        provider_rules = {}
+        provider_rules = []
 
         for model in config['api_keys'][api_index]['model']:
             if "/" in model:
                 provider_name = model.split("/")[0]
                 model = model.split("/")[1]
-                if model_name == model:
-                    provider_rules[provider_name] = model
+                if (model and model_name == model) or (model == "*"):
+                    provider_rules.append(provider_name)
         provider_list = []
         for provider in config['providers']:
-            if model_name in provider['model'].keys() and ((provider_rules != {} and provider['provider'] in provider_rules.keys()) or provider_rules == {}):
+            if model_name in provider['model'].keys() and ((provider_rules and provider['provider'] in provider_rules) or provider_rules == []):
                 provider_list.append(provider)
         return provider_list
 
@@ -179,6 +180,39 @@ def get_all_models(token):
     api_index = api_list.index(token)
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
+            if "/" in model:
+                provider = model.split("/")[0]
+                model = model.split("/")[1]
+                if model == "*":
+                    for provider_item in config["providers"]:
+                        if provider_item['provider'] != provider:
+                            continue
+                        for model_item in provider_item['model'].keys():
+                            if model_item not in unique_models:
+                                unique_models.add(model_item)
+                                model_info = {
+                                    "id": model_item,
+                                    "object": "model",
+                                    "created": 1720524448858,
+                                    "owned_by": provider_item['provider']
+                                }
+                                all_models.append(model_info)
+                else:
+                    for provider_item in config["providers"]:
+                        if provider_item['provider'] != provider:
+                            continue
+                        if model_item in provider_item['model'].keys() :
+                            if model_item not in unique_models and model_item != model:
+                                unique_models.add(model_item)
+                                model_info = {
+                                    "id": model_item,
+                                    "object": "model",
+                                    "created": 1720524448858,
+                                    "owned_by": provider_item['provider']
+                                }
+                                all_models.append(model_info)
+                continue
+
             if model not in unique_models:
                 unique_models.add(model)
                 model_info = {
@@ -210,6 +244,12 @@ async def list_models(token: str = Depends(verify_api_key)):
         "object": "list",
         "data": models
     }
+
+@app.get("/generate-api-key")
+def generate_api_key():
+    api_key = "sk-" + secrets.token_urlsafe(32)
+    return {"api_key": api_key}
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run("__main__:app", host="0.0.0.0", port=8000, reload=True)
