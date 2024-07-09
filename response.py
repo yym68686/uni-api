@@ -136,14 +136,20 @@ async def fetch_response(client, url, headers, payload):
     return response.json()
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
-    if engine == "gemini":
-        async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
-            yield chunk
-    elif engine == "claude":
-        async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
-            yield chunk
-    elif engine == "gpt":
-        async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-            yield chunk
-    else:
-        raise ValueError("Unknown response")
+    for _ in range(2):
+        try:
+            if engine == "gemini":
+                async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
+                    yield chunk
+            elif engine == "claude":
+                async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
+                    yield chunk
+            elif engine == "gpt":
+                async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+                    yield chunk
+            else:
+                raise ValueError("Unknown response")
+            break
+        except httpx.ConnectError as e:
+            print(f"连接错误： {e}")
+            continue

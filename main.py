@@ -27,12 +27,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 模拟存储API Key的数据库
-api_keys_db = {
-    "sk-KjjI60Yf0JFcsvgRmXqFwgGmWUd9GZnmi3KlvowmRWpWpQRo": "user1",
-    # 可以添加更多的API Key
-}
-
 # 安全性依赖
 security = HTTPBearer()
 
@@ -49,7 +43,7 @@ def load_config():
         return []
 
 config = load_config()
-for index, provider in enumerate(config):
+for index, provider in enumerate(config['providers']):
     model_dict = {}
     for model in provider['model']:
         if type(model) == str:
@@ -57,8 +51,10 @@ for index, provider in enumerate(config):
         if type(model) == dict:
             model_dict.update({value: key for key, value in model.items()})
     provider['model'] = model_dict
-    config[index] = provider
-# print(json.dumps(config, indent=4, ensure_ascii=False))
+    config['providers'][index] = provider
+api_keys_db = config['api_keys']
+api_list = [item["api"] for item in api_keys_db]
+print(json.dumps(config, indent=4, ensure_ascii=False))
 
 async def process_request(request: RequestModel, provider: Dict):
     print("provider: ", provider['provider'])
@@ -93,17 +89,30 @@ class ModelRequestHandler:
     def __init__(self):
         self.last_provider_index = -1
 
-    def get_matching_providers(self, model_name):
+    def get_matching_providers(self, model_name, token):
         # for provider in config:
         #     print("provider", model_name, list(provider['model'].keys()))
         #     if model_name in provider['model'].keys():
         #         print("provider", provider)
-        return [provider for provider in config if model_name in provider['model'].keys()]
+        api_index = api_list.index(token)
+        provider_rules = {}
+
+        for model in config['api_keys'][api_index]['model']:
+            if "/" in model:
+                provider_name = model.split("/")[0]
+                model = model.split("/")[1]
+                if model_name == model:
+                    provider_rules[provider_name] = model
+        provider_list = []
+        for provider in config['providers']:
+            if model_name in provider['model'].keys() and ((provider_rules != {} and provider['provider'] in provider_rules.keys()) or provider_rules == {}):
+                provider_list.append(provider)
+        return provider_list
 
     async def request_model(self, request: RequestModel, token: str):
         model_name = request.model
-        matching_providers = self.get_matching_providers(model_name)
-        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
+        matching_providers = self.get_matching_providers(model_name, token)
+        print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
 
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
@@ -153,7 +162,7 @@ async def log_requests(request: Request, call_next):
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
-    if token not in api_keys_db:
+    if token not in api_list:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     return token
 
@@ -161,27 +170,42 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
 
-def get_all_models():
+def get_all_models(token):
     all_models = []
     unique_models = set()
 
-    for provider in config:
-        for model in provider['model'].keys():
+    if token not in api_list:
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+    api_index = api_list.index(token)
+    if config['api_keys'][api_index]['model']:
+        for model in config['api_keys'][api_index]['model']:
             if model not in unique_models:
                 unique_models.add(model)
                 model_info = {
                     "id": model,
                     "object": "model",
                     "created": 1720524448858,
-                    "owned_by": provider['provider']
+                    "owned_by": model
                 }
                 all_models.append(model_info)
+    else:
+        for provider in config["providers"]:
+            for model in provider['model'].keys():
+                if model not in unique_models:
+                    unique_models.add(model)
+                    model_info = {
+                        "id": model,
+                        "object": "model",
+                        "created": 1720524448858,
+                        "owned_by": provider['provider']
+                    }
+                    all_models.append(model_info)
 
     return all_models
 
-@app.get("/v1/models")
-async def list_models():
-    models = get_all_models()
+@app.post("/v1/models")
+async def list_models(token: str = Depends(verify_api_key)):
+    models = get_all_models(token)
     return {
         "object": "list",
         "data": models
