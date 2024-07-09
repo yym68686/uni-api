@@ -135,16 +135,19 @@ async def request_model(request: RequestModel, token: str = Depends(verify_api_k
 def get_all_models():
     config = load_config()
     all_models = []
+    unique_models = set()
 
     for provider in config:
         for model in provider['model']:
-            model_info = {
-                "id": model,
-                "object": "model",
-                "created": 1720524448858,
-                "owned_by": provider['provider']
-            }
-            all_models.append(model_info)
+            if model not in unique_models:
+                unique_models.add(model)
+                model_info = {
+                    "id": model,
+                    "object": "model",
+                    "created": 1720524448858,
+                    "owned_by": provider['provider']
+                }
+                all_models.append(model_info)
 
     return all_models
 
