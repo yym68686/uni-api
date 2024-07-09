@@ -2,7 +2,7 @@ from datetime import datetime
 import json
 import httpx
 
-async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None):
+async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, tokens_use=None, total_tokens=None):
     sample_data = {
         "id": "chatcmpl-9ijPeRHa0wtyA2G8wq5z8FC3wGMzc",
         "object": "chat.completion.chunk",
@@ -24,6 +24,8 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     if tools_id and function_call_name:
         sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"id":tools_id,"type":"function","function":{"name":function_call_name,"arguments":""}}]}
         # sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"id": tools_id, "name": function_call_name}}]}
+    if role:
+        sample_data["choices"][0]["delta"] = {"role": role, "content": ""}
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
@@ -91,6 +93,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         message = resp.get("message")
                         if message:
                             tokens_use = resp.get("usage")
+                            role = message.get("role")
+                            if role:
+                                sse_string = await generate_sse_response(timestamp, model, None, None, None, None, role)
+                                yield sse_string
                             if tokens_use:
                                 total_tokens = tokens_use["input_tokens"] + tokens_use["output_tokens"]
                                 # print("\n\rtotal_tokens", total_tokens)

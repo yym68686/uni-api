@@ -1,11 +1,12 @@
 import os
 import json
 import httpx
+import logging
 import yaml
 import traceback
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -48,7 +49,16 @@ def load_config():
         return []
 
 config = load_config()
-# print(config)
+for index, provider in enumerate(config):
+    model_dict = {}
+    for model in provider['model']:
+        if type(model) == str:
+            model_dict[model] = model
+        if type(model) == dict:
+            model_dict.update({value: key for key, value in model.items()})
+    provider['model'] = model_dict
+    config[index] = provider
+# print(json.dumps(config, indent=4, ensure_ascii=False))
 
 async def process_request(request: RequestModel, provider: Dict):
     print("provider: ", provider['provider'])
@@ -64,15 +74,16 @@ async def process_request(request: RequestModel, provider: Dict):
 
     url, headers, payload = await get_payload(request, engine, provider)
 
-    request_info = {
-        "url": url,
-        "headers": headers,
-        "payload": payload
-    }
-    print(f"Request details: {json.dumps(request_info, indent=4, ensure_ascii=False)}")
+    # request_info = {
+    #     "url": url,
+    #     "headers": headers,
+    #     "payload": payload
+    # }
+    # print(f"Request details: {json.dumps(request_info, indent=4, ensure_ascii=False)}")
 
     if request.stream:
-        return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload, engine, request.model), media_type="text/event-stream")
+        model = provider['model'][request.model]
+        return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload, engine, model), media_type="text/event-stream")
     else:
         return await fetch_response(app.state.client, url, headers, payload)
 
@@ -81,7 +92,11 @@ class ModelRequestHandler:
         self.last_provider_index = -1
 
     def get_matching_providers(self, model_name):
-        return [provider for provider in config if model_name in provider['model']]
+        # for provider in config:
+        #     print("provider", model_name, list(provider['model'].keys()))
+        #     if model_name in provider['model'].keys():
+        #         print("provider", provider)
+        return [provider for provider in config if model_name in provider['model'].keys()]
 
     async def request_model(self, request: RequestModel, token: str):
         model_name = request.model
@@ -122,6 +137,18 @@ class ModelRequestHandler:
 
 model_handler = ModelRequestHandler()
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # 打印请求信息
+    logging.info(f"Request: {request.method} {request.url}")
+    # 打印请求体（如果有）
+    if request.method in ["POST", "PUT", "PATCH"]:
+        body = await request.body()
+        logging.info(f"Request Body: {body.decode('utf-8')}")
+
+    response = await call_next(request)
+    return response
+
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     if token not in api_keys_db:
@@ -137,7 +164,7 @@ def get_all_models():
     unique_models = set()
 
     for provider in config:
-        for model in provider['model']:
+        for model in provider['model'].keys():
             if model not in unique_models:
                 unique_models.add(model)
                 model_info = {

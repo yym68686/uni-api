@@ -38,9 +38,10 @@ async def get_gemini_payload(request, engine, provider):
         'Content-Type': 'application/json'
     }
     url = provider['base_url']
+    model = provider['model'][request.model]
     if request.stream:
         gemini_stream = "streamGenerateContent"
-    url = url.format(model=request.model, stream=gemini_stream, api_key=provider['api'])
+    url = url.format(model=model, stream=gemini_stream, api_key=provider['api'])
 
     messages = []
     for msg in request.messages:
@@ -112,7 +113,6 @@ async def get_gpt_payload(request, engine, provider):
         'Content-Type': 'application/json'
     }
     url = provider['base_url']
-    url = url.format(model=request.model, stream=request.stream, api_key=provider['api'])
 
     messages = []
     for msg in request.messages:
@@ -133,8 +133,9 @@ async def get_gpt_payload(request, engine, provider):
         else:
             messages.append({"role": msg.role, "content": content})
 
+    model = provider['model'][request.model]
     payload = {
-        "model": request.model,
+        "model": model,
         "messages": messages,
     }
 
@@ -222,8 +223,9 @@ async def get_claude_payload(request, engine, provider):
         elif msg.role == "system":
             system_prompt = content
 
+    model = provider['model'][request.model]
     payload = {
-        "model": request.model,
+        "model": model,
         "messages": messages,
         "system": system_prompt,
     }
