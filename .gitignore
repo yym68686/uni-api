@@ -2,3 +2,4 @@ api.json
 api.yaml
 .env
 __pycache__
+.vscode

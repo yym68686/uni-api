@@ -64,13 +64,15 @@ async def process_request(request: RequestModel, provider: Dict):
     print("provider: ", provider['provider'])
     url = provider['base_url']
     parsed_url = urlparse(url)
+    # print(parsed_url)
     engine = None
     if parsed_url.netloc == 'generativelanguage.googleapis.com':
         engine = "gemini"
-    elif parsed_url.netloc == 'api.anthropic.com':
+    elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/message"):
         engine = "claude"
     else:
         engine = "gpt"
+    print(engine)
 
     url, headers, payload = await get_payload(request, engine, provider)
 

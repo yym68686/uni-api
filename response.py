@@ -83,12 +83,16 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
     try:
         timestamp = datetime.timestamp(datetime.now())
         async with client.stream('POST', url, headers=headers, json=payload) as response:
+            buffer = ""
             async for chunk in response.aiter_bytes():
-                chunk_line = chunk.decode('utf-8').split("\n")
-                for chunk in chunk_line:
-                    if chunk.startswith("data:"):
-                        line = chunk[6:]
+                buffer += chunk.decode('utf-8')
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    print(line)
+
+                    if line.startswith("data:"):
                         print(line)
+                        line = line[6:]
                         resp: dict = json.loads(line)
                         message = resp.get("message")
                         if message:
