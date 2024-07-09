@@ -132,6 +132,29 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
 
+def get_all_models():
+    config = load_config()
+    all_models = []
+
+    for provider in config:
+        for model in provider['model']:
+            model_info = {
+                "id": model,
+                "object": "model",
+                "created": 1720524448858,
+                "owned_by": provider['provider']
+            }
+            all_models.append(model_info)
+
+    return all_models
+
+@app.get("/v1/models")
+async def list_models():
+    models = get_all_models()
+    return {
+        "object": "list",
+        "data": models
+    }
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run("__main__:app", host="0.0.0.0", port=8000, reload=True)
