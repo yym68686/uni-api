@@ -133,7 +133,6 @@ async def request_model(request: RequestModel, token: str = Depends(verify_api_k
     return await model_handler.request_model(request, token)
 
 def get_all_models():
-    config = load_config()
     all_models = []
     unique_models = set()
 
