@@ -1,10 +1,70 @@
 # uni-api
 
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
--H "Content-Type: application/json" \
--H "Authorization: Bearer sk-KjjI60Yf0JFcsvgRmXqFwgGmWUd9GZnmi3KlvowmRWpWpQRo" \
--d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
+<p align="center">
+  <a href="https://t.me/uni_api">
+    <img src="https://img.shields.io/badge/Join Telegram Group-blue?&logo=telegram">
+  </a>
+   <a href="https://hub.docker.com/repository/docker/yym68686/uni-api">
+    <img src="https://img.shields.io/docker/pulls/yym68686/uni-api?color=blue" alt="docker pull">
+  </a>
+</p>
+
+
+## Introduction
+
+这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、DeepBricks、OpenRouter、Gemini等。
+
+## Features
+
+- 统一管理多个后端服务
+- 支持负载均衡
+- 支持多个模型
+- 支持多个API Key
+
+## Configuration
+
+使用api.yaml配置文件，可以配置多个模型，每个模型可以配置多个后端服务，支持负载均衡。下面是 api.yaml 配置文件的示例：
+
+```yaml
+providers:
+  - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
+    base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
+    api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
+    model:
+      - gpt-4o # 可以使用的模型名称，必填
+      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+    tools: true # 是否支持工具，如生成代码、生成文档等，选填
+    url: https://openai.com/ # 服务商的网址，选填
+
+  - provider: anthropic
+    base_url: https://api.anthropic.com/v1/messages
+    api: sk-ant-api03-bNnAOJyA-xQw_twAA
+    model:
+      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+    tools: true
+
+  - provider: gemini
+    base_url: https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key} # base_url 支持变量替换，{model} 会被替换为模型名称，{stream} 会被替换为 stream 参数，{api_key} 会被替换为 api_key 参数, 仅供 Gemini 模型使用，必填
+    api: AIzaSyAN2k6IRdgw
+    model:
+      - gemini-1.5-pro
+      - gemini-1.5-flash
+    tools: false
+
+api_keys:
+  - api: sk-KjjI60Yf0JFWtfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
+    model: # 该 API Key 可以使用的模型，必填
+      - gpt-4o # 可以使用的模型名称，可以使用所有提供商提供的 gpt-4o 模型
+      - claude-3-5-sonnet # 可以使用的模型名称，可以使用所有提供商提供的 claude-3-5-sonnet 模型
+      - gemini/* # 可以使用的模型名称，仅可以使用名为 gemini 提供商提供的所有模型，其中 gemini 是 provider 名称，* 代表所有模型
+    role: admin
+
+  - api: sk-pkhf60Yf0JGyJygRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
+    model:
+      - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。
+
+preferences:
+  USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true
 ```
 
 ## Docker Local Deployment
@@ -21,7 +81,6 @@ yym68686/uni-api:latest
 Or if you want to use Docker Compose, here is a docker-compose.yml example:
 
 ```yaml
-version: "3.8"
 services:
   uni-api:
     container_name: uni-api
@@ -61,3 +120,18 @@ docker run --user root -p 8001:8000 -dit --name uni-api \
 yym68686/uni-api:latest
 docker logs -f uni-api
 ```
+
+RESTful curl test
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer ${API}" \
+-d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
+```
+
+## Star History
+
+<a href="https://github.com/yym68686/uni-api/stargazers">
+        <img width="500" alt="Star History Chart" src="https://api.star-history.com/svg?repos=yym68686/uni-api&type=Date">
+</a>

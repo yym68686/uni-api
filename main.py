@@ -124,7 +124,7 @@ class ModelRequestHandler:
             raise HTTPException(status_code=404, detail="No matching model found")
 
         # 检查是否启用轮询
-        use_round_robin = os.environ.get('USE_ROUND_ROBIN', 'false').lower() == 'true'
+        use_round_robin = config["preferences"].get("USE_ROUND_ROBIN")
 
         return await self.try_all_providers(request, matching_providers, use_round_robin)
 
