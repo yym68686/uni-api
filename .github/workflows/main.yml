@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - main
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - main.py
+      - models.py
+      - request.py
+      - response.py
+      - docker-compose.yml
 
 jobs:
   build-and-push:

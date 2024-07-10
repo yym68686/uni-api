@@ -4,3 +4,4 @@ api.yaml
 __pycache__
 .vscode
 node_modules
+.wrangler
