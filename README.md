@@ -74,7 +74,6 @@ Start the container
 ```bash
 docker run --user root -p 8001:8000 --name uni-api -dit \
 -v ./api.yaml:/home/api.yaml \
--e USE_ROUND_ROBIN=True \
 yym68686/uni-api:latest
 ```
 
@@ -85,8 +84,6 @@ services:
   uni-api:
     container_name: uni-api
     image: yym68686/uni-api:latest
-    environment:
-      - USE_ROUND_ROBIN=True
     ports:
       - 8001:8000
     volumes:
@@ -116,7 +113,6 @@ docker pull yym68686/uni-api:latest
 docker rm -f uni-api
 docker run --user root -p 8001:8000 -dit --name uni-api \
 -v ./api.yaml:/home/api.yaml \
--e USE_ROUND_ROBIN=True \
 yym68686/uni-api:latest
 docker logs -f uni-api
 ```
