@@ -3,3 +3,4 @@ api.yaml
 .env
 __pycache__
 .vscode
+node_modules
