@@ -28,6 +28,7 @@ class ContentItem(BaseModel):
 class Message(BaseModel):
     role: str
     name: Optional[str] = None
+    arguments: Optional[str] = None
     content: Union[str, List[ContentItem]]
 
 class RequestModel(BaseModel):

@@ -1,10 +1,10 @@
-import os
 import json
 import httpx
 import logging
 import yaml
 import secrets
 import traceback
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
-    timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+    timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=30.0)
     app.state.client = httpx.AsyncClient(timeout=timeout)
     yield
     # 关闭时的代码
@@ -48,7 +48,7 @@ def load_config():
                 conf['providers'][index] = provider
             api_keys_db = conf['api_keys']
             api_list = [item["api"] for item in api_keys_db]
-            print(json.dumps(conf, indent=4, ensure_ascii=False))
+            # print(json.dumps(conf, indent=4, ensure_ascii=False))
             return conf, api_keys_db, api_list
     except FileNotFoundError:
         print("配置文件 'config.yaml' 未找到。请确保文件存在于正确的位置。")
@@ -58,6 +58,24 @@ def load_config():
         return []
 
 config, api_keys_db, api_list = load_config()
+
+async def error_handling_wrapper(generator, status_code=200):
+    try:
+        first_item = await generator.__anext__()
+        if isinstance(first_item, dict) and "error" in first_item:
+            # 如果第一个 yield 的项是错误信息，抛出 HTTPException
+            raise HTTPException(status_code=status_code, detail=first_item)
+
+        # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
+        async def new_generator():
+            yield first_item
+            async for item in generator:
+                yield item
+
+        return new_generator()
+    except StopAsyncIteration:
+        # 处理生成器为空的情况
+        return []
 
 async def process_request(request: RequestModel, provider: Dict):
     print("provider: ", provider['provider'])
@@ -84,7 +102,15 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if request.stream:
         model = provider['model'][request.model]
-        return StreamingResponse(fetch_response_stream(app.state.client, url, headers, payload, engine, model), media_type="text/event-stream")
+        try:
+            generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
+            wrapped_generator = await error_handling_wrapper(generator, status_code=500)
+            return StreamingResponse(wrapped_generator, media_type="text/event-stream")
+        except HTTPException as e:
+            return JSONResponse(status_code=e.status_code, content={"error": str(e.detail)})
+        except Exception as e:
+            # 处理其他异常
+            return JSONResponse(status_code=500, content={"error": str(e)})
     else:
         return await fetch_response(app.state.client, url, headers, payload)
 

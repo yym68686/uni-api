@@ -1,3 +1,4 @@
+import json
 from models import RequestModel
 
 async def get_image_message(base64_image, engine = None):
@@ -191,6 +192,9 @@ async def get_claude_payload(request, engine, provider):
         else:
             content = msg.content
             name = msg.name
+            arguments = msg.arguments
+            if arguments:
+                arguments = json.loads(arguments)
         if name:
             # messages.append({"role": "assistant", "name": name, "content": content})
             messages.append(
@@ -201,7 +205,7 @@ async def get_claude_payload(request, engine, provider):
                             "type": "tool_use",
                             "id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
                             "name": name,
-                            "input": {"text": messages[-1]["content"][0]["text"]},
+                            "input": arguments,
                         }
                     ]
                 }
@@ -223,23 +227,30 @@ async def get_claude_payload(request, engine, provider):
         elif msg.role == "system":
             system_prompt = content
 
+    conversation_len = len(messages) - 1
+    message_index = 0
+    while message_index < conversation_len:
+        if messages[message_index]["role"] == messages[message_index + 1]["role"]:
+            if messages[message_index].get("content"):
+                if isinstance(messages[message_index]["content"], list):
+                    messages[message_index]["content"].extend(messages[message_index + 1]["content"])
+                elif isinstance(messages[message_index]["content"], str) and isinstance(messages[message_index + 1]["content"], list):
+                    content_list = [{"type": "text", "text": messages[message_index]["content"]}]
+                    content_list.extend(messages[message_index + 1]["content"])
+                    messages[message_index]["content"] = content_list
+                else:
+                    messages[message_index]["content"] += messages[message_index + 1]["content"]
+            messages.pop(message_index + 1)
+            conversation_len = conversation_len - 1
+        else:
+            message_index = message_index + 1
+
     model = provider['model'][request.model]
     payload = {
         "model": model,
         "messages": messages,
         "system": system_prompt,
     }
-    # json_post = {
-    #     "model": model or self.engine,
-    #     "messages": self.conversation[convo_id] if pass_history else [{
-    #         "role": "user",
-    #         "content": prompt
-    #     }],
-    #     "temperature": kwargs.get("temperature", self.temperature),
-    #     "top_p": kwargs.get("top_p", self.top_p),
-    #     "max_tokens": model_max_tokens,
-    #     "stream": True,
-    # }
 
     miss_fields = [
         'model',
@@ -258,7 +269,7 @@ async def get_claude_payload(request, engine, provider):
     if request.tools:
         tools = []
         for tool in request.tools:
-            print("tool", type(tool), tool)
+            # print("tool", type(tool), tool)
 
             json_tool = await gpt2claude_tools_json(tool.dict()["function"])
             tools.append(json_tool)
@@ -267,7 +278,6 @@ async def get_claude_payload(request, engine, provider):
             payload["tool_choice"] = {
                 "type": "auto"
             }
-    import json
     print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
 
     return url, headers, payload
