@@ -206,8 +206,8 @@ def get_all_models(token):
                     for provider_item in config["providers"]:
                         if provider_item['provider'] != provider:
                             continue
-                        if model_item in provider_item['model'].keys() :
-                            if model_item not in unique_models and model_item != model:
+                        for model_item in provider_item['model'].keys() :
+                            if model_item not in unique_models and model_item == model:
                                 unique_models.add(model_item)
                                 model_info = {
                                     "id": model_item,
