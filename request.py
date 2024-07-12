@@ -149,6 +149,10 @@ async def get_gpt_payload(request, engine, provider):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
+    if provider.get("tools") == False:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
     return url, headers, payload
 
 async def get_openrouter_payload(request, engine, provider):
@@ -329,11 +333,10 @@ async def get_claude_payload(request, engine, provider):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
-    if request.tools:
+    if request.tools and provider.get("tools"):
         tools = []
         for tool in request.tools:
             # print("tool", type(tool), tool)
-
             json_tool = await gpt2claude_tools_json(tool.dict()["function"])
             tools.append(json_tool)
         payload["tools"] = tools
@@ -341,7 +344,12 @@ async def get_claude_payload(request, engine, provider):
             payload["tool_choice"] = {
                 "type": "auto"
             }
-    print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
+
+    if provider.get("tools") == False:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
+    # print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
 
     return url, headers, payload
 
