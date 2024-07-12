@@ -87,9 +87,11 @@ async def process_request(request: RequestModel, provider: Dict):
         engine = "gemini"
     elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/message"):
         engine = "claude"
+    elif parsed_url.netloc == 'openrouter.ai':
+        engine = "openrouter"
     else:
         engine = "gpt"
-    print(engine)
+    print("engine", engine)
 
     url, headers, payload = await get_payload(request, engine, provider)
 
@@ -281,10 +283,10 @@ def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(32)
     return {"api_key": api_key}
 
-async def on_fetch(request, env):
-    import asgi
+# async def on_fetch(request, env):
+#     import asgi
 
-    return await asgi.fetch(app, request, env)
+#     return await asgi.fetch(app, request, env)
 
 if __name__ == '__main__':
     import uvicorn

@@ -154,6 +154,9 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
             elif engine == "gpt":
                 async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
                     yield chunk
+            elif engine == "openrouter":
+                async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+                    yield chunk
             else:
                 raise ValueError("Unknown response")
             break
