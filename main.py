@@ -91,6 +91,14 @@ async def process_request(request: RequestModel, provider: Dict):
         engine = "openrouter"
     else:
         engine = "gpt"
+
+    if "claude" not in provider['model'][request.model] \
+        and "gpt" not in provider['model'][request.model] \
+        and "gemini" not in provider['model'][request.model]:
+        engine = "openrouter"
+
+    if provider.get("engine"):
+        engine = provider["engine"]
     print("engine", engine)
 
     url, headers, payload = await get_payload(request, engine, provider)

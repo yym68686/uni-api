@@ -33,7 +33,7 @@ providers:
     model:
       - gpt-4o # 可以使用的模型名称，必填
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
-    tools: true # 是否支持工具，如生成代码、生成文档等，选填
+    tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
     url: https://openai.com/ # 服务商的网址，选填
 
   - provider: anthropic
@@ -50,6 +50,14 @@ providers:
       - gemini-1.5-pro
       - gemini-1.5-flash
     tools: false
+
+  - provider: other-provider
+    base_url: https://api.xxx.com/v1/messages
+    api: sk-bNnAOJyA-xQw_twAA
+    model:
+      - causallm-35b-beta2ep-q6k: causallm-35b
+    tools: false
+    engine: openrouter # 强制使用某个消息格式，目前支持 gpt，claude，gemini，openrouter 原生格式，选填
 
 api_keys:
   - api: sk-KjjI60Yf0JFWtfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
