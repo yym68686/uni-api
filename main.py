@@ -85,7 +85,7 @@ async def process_request(request: RequestModel, provider: Dict):
     engine = None
     if parsed_url.netloc == 'generativelanguage.googleapis.com':
         engine = "gemini"
-    elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/message"):
+    elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
         engine = "claude"
     elif parsed_url.netloc == 'openrouter.ai':
         engine = "openrouter"
