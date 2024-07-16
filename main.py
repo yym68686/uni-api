@@ -35,7 +35,7 @@ security = HTTPBearer()
 # 读取YAML配置文件
 def load_config():
     try:
-        with open('api.yaml', 'r') as f:
+        with open('./api.yaml', 'r') as f:
             conf = yaml.safe_load(f)
             for index, provider in enumerate(conf['providers']):
                 model_dict = {}
@@ -51,11 +51,11 @@ def load_config():
             # print(json.dumps(conf, indent=4, ensure_ascii=False))
             return conf, api_keys_db, api_list
     except FileNotFoundError:
-        print("配置文件 'config.yaml' 未找到。请确保文件存在于正确的位置。")
-        return []
+        print("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
+        return [], [], []
     except yaml.YAMLError:
-        print("配置文件 'config.yaml' 格式不正确。请检查YAML格式。")
-        return []
+        print("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。")
+        return [], [], []
 
 config, api_keys_db, api_list = load_config()
 
