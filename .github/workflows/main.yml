@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - Dockerfile
+      - .dockerignore
       - requirements.txt
       - main.py
       - models.py
