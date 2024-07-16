@@ -93,8 +93,8 @@ async def process_request(request: RequestModel, provider: Dict):
         engine = "gpt"
 
     if "claude" not in provider['model'][request.model] \
-        and "gpt" not in provider['model'][request.model] \
-        and "gemini" not in provider['model'][request.model]:
+    and "gpt" not in provider['model'][request.model] \
+    and "gemini" not in provider['model'][request.model]:
         engine = "openrouter"
 
     if provider.get("engine"):
@@ -160,7 +160,10 @@ class ModelRequestHandler:
             raise HTTPException(status_code=404, detail="No matching model found")
 
         # 检查是否启用轮询
-        use_round_robin = config["preferences"].get("USE_ROUND_ROBIN")
+        api_index = api_list.index(token)
+        use_round_robin = False
+        if config['api_keys'][api_index].get("preferences"):
+            use_round_robin = config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN")
 
         return await self.try_all_providers(request, matching_providers, use_round_robin)
 
