@@ -62,6 +62,10 @@ config, api_keys_db, api_list = load_config()
 async def error_handling_wrapper(generator, status_code=200):
     try:
         first_item = await generator.__anext__()
+        if isinstance(first_item, (bytes, bytearray)):
+            first_item = first_item.decode("utf-8")
+        if isinstance(first_item, str):
+            first_item = json.loads(first_item)
         if isinstance(first_item, dict) and "error" in first_item:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             raise HTTPException(status_code=status_code, detail=first_item)
@@ -112,15 +116,15 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if request.stream:
         model = provider['model'][request.model]
-        try:
-            generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-            wrapped_generator = await error_handling_wrapper(generator, status_code=500)
-            return StreamingResponse(wrapped_generator, media_type="text/event-stream")
-        except HTTPException as e:
-            return JSONResponse(status_code=e.status_code, content={"error": str(e.detail)})
-        except Exception as e:
-            # 处理其他异常
-            return JSONResponse(status_code=500, content={"error": str(e)})
+        # try:
+        generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
+        wrapped_generator = await error_handling_wrapper(generator, status_code=500)
+        return StreamingResponse(wrapped_generator, media_type="text/event-stream")
+        # except HTTPException as e:
+        #     return JSONResponse(status_code=e.status_code, content={"error": str(e.detail)})
+        # except Exception as e:
+        #     # 处理其他异常
+        #     return JSONResponse(status_code=500, content={"error": str(e)})
     else:
         return await fetch_response(app.state.client, url, headers, payload)
 
@@ -170,14 +174,8 @@ class ModelRequestHandler:
     async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool):
         num_providers = len(providers)
 
-        for i in range(num_providers):
-            if use_round_robin:
-                # 始终从第一个提供者开始轮询
-                self.last_provider_index = i % num_providers
-            else:
-                # 非轮询模式，按顺序尝试
-                self.last_provider_index = i
-
+        for i in range(num_providers + 1):
+            self.last_provider_index = i % num_providers
             provider = providers[self.last_provider_index]
             try:
                 response = await process_request(request, provider)
@@ -185,9 +183,11 @@ class ModelRequestHandler:
             except Exception as e:
                 print('\033[31m')
                 print(f"Error with provider {provider['provider']}: {str(e)}")
-                traceback.print_exc()
                 print('\033[0m')
-                continue
+                if use_round_robin:
+                    continue
+                else:
+                    raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
 
         raise HTTPException(status_code=500, detail="All providers failed")
 
