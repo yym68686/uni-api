@@ -62,13 +62,18 @@ config, api_keys_db, api_list = load_config()
 async def error_handling_wrapper(generator, status_code=200):
     try:
         first_item = await generator.__anext__()
-        if isinstance(first_item, (bytes, bytearray)):
-            first_item = first_item.decode("utf-8")
-        if isinstance(first_item, str):
-            first_item = json.loads(first_item)
-        if isinstance(first_item, dict) and "error" in first_item:
+        first_item_str = first_item
+        if isinstance(first_item_str, (bytes, bytearray)):
+            first_item_str = first_item_str.decode("utf-8")
+        if isinstance(first_item_str, str):
+            if first_item_str.startswith("data: "):
+                first_item_str = first_item_str[6:]
+            elif first_item_str.startswith("data:"):
+                first_item_str = first_item_str[5:]
+            first_item_str = json.loads(first_item_str)
+        if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
-            raise HTTPException(status_code=status_code, detail=first_item)
+            raise HTTPException(status_code=status_code, detail=first_item_str)
 
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
         async def new_generator():
@@ -183,6 +188,7 @@ class ModelRequestHandler:
             except Exception as e:
                 print('\033[31m')
                 print(f"Error with provider {provider['provider']}: {str(e)}")
+                traceback.print_exc()
                 print('\033[0m')
                 if use_round_robin:
                     continue

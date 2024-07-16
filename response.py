@@ -53,34 +53,42 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                     except json.JSONDecodeError:
                         print(f"无法解析JSON: {line}")
 
-        # 处理缓冲区中剩余的内容
-        if buffer:
-            # print(buffer)
-            if '\"text\": \"' in buffer:
-                try:
-                    json_data = json.loads(buffer)
-                    content = json_data.get('text', '')
-                    content = "\n".join(content.split("\\n"))
-                    sse_string = await generate_sse_response(timestamp, model, content)
-                    yield sse_string
-                except json.JSONDecodeError:
-                    print(f"无法解析JSON: {buffer}")
-
-        # yield "data: [DONE]\n\n"
+        # # 处理缓冲区中剩余的内容
+        # if buffer:
+        #     # print(buffer)
+        #     if '\"text\": \"' in buffer:
+        #         try:
+        #             json_data = json.loads(buffer)
+        #             content = json_data.get('text', '')
+        #             content = "\n".join(content.split("\\n"))
+        #             sse_string = await generate_sse_response(timestamp, model, content)
+        #             yield sse_string
+        #         except json.JSONDecodeError:
+        #             print(f"无法解析JSON: {buffer}")
 
 async def fetch_gpt_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
+        # print("response.status_code", response.status_code)
+        if response.status_code != 200:
+            print("请求失败，状态码是", response.status_code)
+            error_message = await response.aread()
+            error_str = error_message.decode('utf-8', errors='replace')
+            error_json = json.loads(error_str)
+            print(json.dumps(error_json, indent=4, ensure_ascii=False))
+            yield {"error": f"HTTP Error {response.status_code}", "details": error_json}
+        buffer = ""
         async for chunk in response.aiter_bytes():
-            print(chunk.decode('utf-8'))
-            yield chunk
+            # print("chunk.decode('utf-8')", chunk.decode('utf-8'))
+            buffer += chunk.decode('utf-8')
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                print(line)
+                yield line + "\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
     async with client.stream('POST', url, headers=headers, json=payload) as response:
-        # response.raise_for_status()
-        if response.status_code == 200:
-            print("请求成功，状态码是200")
-        else:
+        if response.status_code != 200:
             print('\033[31m')
             print(f"请求失败，状态码是{response.status_code}，错误信息：")
             error_message = await response.aread()
@@ -89,8 +97,6 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
             print(json.dumps(error_json, indent=4, ensure_ascii=False))
             print('\033[0m')
             yield {"error": f"HTTP Error {response.status_code}", "details": error_json}
-            # raise HTTPStatusError(f"HTTP Error {response.status_code}", request=response.request, response=response)
-            # raise HTTPException(status_code=response.status_code, detail=error_json)
         buffer = ""
         async for chunk in response.aiter_bytes():
             buffer += chunk.decode('utf-8')
@@ -135,8 +141,6 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         function_call_content = delta["partial_json"]
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
                         yield sse_string
-
-        # yield "data: [DONE]\n\n"
 
 async def fetch_response(client, url, headers, payload):
     response = await client.post(url, headers=headers, json=payload)
