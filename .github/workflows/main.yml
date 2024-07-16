@@ -12,6 +12,7 @@ on:
       - models.py
       - request.py
       - response.py
+      - .github/workflows/main.yml
       - docker-compose.yml
 
 jobs:
