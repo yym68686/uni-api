@@ -42,7 +42,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                print(line)
+                # print(line)
                 if line and '\"text\": \"' in line:
                     try:
                         json_data = json.loads( "{" + line + "}")
@@ -82,7 +82,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
             buffer += chunk.decode('utf-8')
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                print(line)
+                # print(line)
                 yield line + "\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
@@ -102,7 +102,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
             buffer += chunk.decode('utf-8')
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                print(line)
+                # print(line)
 
                 if line.startswith("data:"):
                     print(line)

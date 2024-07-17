@@ -72,6 +72,9 @@ async def error_handling_wrapper(generator, status_code=200):
                 first_item_str = first_item_str[5:]
             first_item_str = json.loads(first_item_str)
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
+            print('\033[31m')
+            print(f"first_item_str: {first_item_str}")
+            print('\033[0m')
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             raise HTTPException(status_code=status_code, detail=first_item_str)
 
