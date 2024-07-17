@@ -1,10 +1,9 @@
 import json
+import yaml
 import httpx
 import logging
-import yaml
 import secrets
 import traceback
-from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException, Depends

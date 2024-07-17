@@ -77,12 +77,11 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
             print(json.dumps(error_json, indent=4, ensure_ascii=False))
             yield {"error": f"HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
-        async for chunk in response.aiter_bytes():
-            # print("chunk.decode('utf-8')", chunk.decode('utf-8'))
-            buffer += chunk.decode('utf-8')
+        async for chunk in response.aiter_text():
+            # print(chunk)
+            buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                # print(line)
                 yield line + "\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
@@ -98,14 +97,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
             print('\033[0m')
             yield {"error": f"HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
-        async for chunk in response.aiter_bytes():
-            buffer += chunk.decode('utf-8')
+        async for chunk in response.aiter_text():
+            buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 # print(line)
 
                 if line.startswith("data:"):
-                    print(line)
                     line = line[6:]
                     resp: dict = json.loads(line)
                     message = resp.get("message")
@@ -166,4 +164,7 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
             break
         except httpx.ConnectError as e:
             print(f"连接错误： {e}")
+            continue
+        except httpx.ReadTimeout as e:
+            print(f"读取响应超时： {e}")
             continue
