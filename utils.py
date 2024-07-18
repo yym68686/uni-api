@@ -61,7 +61,7 @@ async def error_handling_wrapper(generator, status_code=200):
         # 处理生成器为空的情况
         return []
 
-def get_all_models(token):
+def post_all_models(token):
     all_models = []
     unique_models = set()
 
@@ -84,7 +84,8 @@ def get_all_models(token):
                                     "id": model_item,
                                     "object": "model",
                                     "created": 1720524448858,
-                                    "owned_by": provider_item['provider']
+                                    "owned_by": "uni-api"
+                                    # "owned_by": provider_item['provider']
                                 }
                                 all_models.append(model_info)
                 else:
@@ -98,7 +99,7 @@ def get_all_models(token):
                                     "id": model_item,
                                     "object": "model",
                                     "created": 1720524448858,
-                                    "owned_by": provider_item['provider']
+                                    "owned_by": "uni-api"
                                 }
                                 all_models.append(model_info)
                 continue
@@ -112,18 +113,24 @@ def get_all_models(token):
                     "owned_by": model
                 }
                 all_models.append(model_info)
-    else:
-        for provider in config["providers"]:
-            for model in provider['model'].keys():
-                if model not in unique_models:
-                    unique_models.add(model)
-                    model_info = {
-                        "id": model,
-                        "object": "model",
-                        "created": 1720524448858,
-                        "owned_by": provider['provider']
-                    }
-                    all_models.append(model_info)
+
+    return all_models
+
+def get_all_models():
+    all_models = []
+    unique_models = set()
+
+    for provider in config["providers"]:
+        for model in provider['model'].keys():
+            if model not in unique_models:
+                unique_models.add(model)
+                model_info = {
+                    "id": model,
+                    "object": "model",
+                    "created": 1720524448858,
+                    "owned_by": "uni-api"
+                }
+                all_models.append(model_info)
 
     return all_models
 

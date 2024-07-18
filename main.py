@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends
 
 from models import RequestModel
-from utils import config, api_keys_db, api_list, error_handling_wrapper, get_all_models, verify_api_key
+from utils import config, api_keys_db, api_list, error_handling_wrapper, get_all_models, verify_api_key, post_all_models
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 
@@ -160,7 +160,15 @@ async def options_handler():
 
 @app.post("/v1/models")
 async def list_models(token: str = Depends(verify_api_key)):
-    models = get_all_models(token)
+    models = post_all_models(token)
+    return {
+        "object": "list",
+        "data": models
+    }
+
+@app.get("/v1/models")
+async def list_models():
+    models = get_all_models()
     return {
         "object": "list",
         "data": models
