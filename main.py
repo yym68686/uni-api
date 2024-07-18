@@ -92,12 +92,12 @@ class ModelRequestHandler:
                 model = model.split("/")[1]
                 for provider in config['providers']:
                     if provider['provider'] == provider_name:
-                        models_list = list(provider['model'].keys()) + list(provider['model'].values())
+                        models_list = provider['model'].keys()
                 if (model and model_name in models_list) or (model == "*" and model_name in models_list):
                     provider_rules.append(provider_name)
         provider_list = []
         for provider in config['providers']:
-            if model_name in list(provider['model'].keys()) + list(provider['model'].values()) and ((provider_rules and provider['provider'] in provider_rules) or provider_rules == []):
+            if model_name in provider['model'].keys() and ((provider_rules and provider['provider'] in provider_rules) or provider_rules == []):
                 provider_list.append(provider)
         return provider_list
 
