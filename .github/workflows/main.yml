@@ -5,15 +5,16 @@ on:
     branches:
       - main
     paths:
-      - Dockerfile
-      - .dockerignore
-      - requirements.txt
       - main.py
+      - utils.py
       - models.py
       - request.py
+      - Dockerfile
       - response.py
-      - .github/workflows/main.yml
+      - .dockerignore
+      - requirements.txt
       - docker-compose.yml
+      - .github/workflows/main.yml
 
 jobs:
   build-and-push:

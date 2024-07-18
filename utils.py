@@ -14,7 +14,8 @@ def load_config():
                     if type(model) == str:
                         model_dict[model] = model
                     if type(model) == dict:
-                        model_dict.update({value: key for key, value in model.items()})
+                        model_dict.update({new: old for old, new in model.items()})
+                        model_dict.update({old: old for old, new in model.items()})
                 provider['model'] = model_dict
                 conf['providers'][index] = provider
             api_keys_db = conf['api_keys']
