@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
-    timeout = httpx.Timeout(connect=15.0, read=5.0, write=30.0, pool=30.0)
+    timeout = httpx.Timeout(connect=15.0, read=10.0, write=30.0, pool=30.0)
     app.state.client = httpx.AsyncClient(timeout=timeout)
     yield
     # 关闭时的代码
@@ -114,7 +114,7 @@ class ModelRequestHandler:
     async def request_model(self, request: RequestModel, token: str):
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name, token)
-        print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
+        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
 
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
