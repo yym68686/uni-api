@@ -46,6 +46,7 @@ async def get_gemini_payload(request, engine, provider):
 
     messages = []
     for msg in request.messages:
+        name = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -117,6 +118,7 @@ async def get_gpt_payload(request, engine, provider):
 
     messages = []
     for msg in request.messages:
+        name = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -164,6 +166,7 @@ async def get_openrouter_payload(request, engine, provider):
 
     messages = []
     for msg in request.messages:
+        name = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -247,6 +250,7 @@ async def get_claude_payload(request, engine, provider):
 
     messages = []
     for msg in request.messages:
+        name = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:

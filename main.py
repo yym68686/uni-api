@@ -14,7 +14,8 @@ from response import fetch_response, fetch_response_stream
 
 from typing import List, Dict
 from urllib.parse import urlparse
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -26,6 +27,15 @@ async def lifespan(app: FastAPI):
     await app.state.client.aclose()
 
 app = FastAPI(lifespan=lifespan)
+
+# 配置 CORS 中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有 HTTP 方法
+    allow_headers=["*"],  # 允许所有头部字段
+)
 
 async def process_request(request: RequestModel, provider: Dict):
     print("provider: ", provider['provider'])
@@ -143,6 +153,10 @@ model_handler = ModelRequestHandler()
 @app.post("/v1/chat/completions")
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
+
+@app.options("/v1/chat/completions")
+async def options_handler():
+    return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
 @app.post("/v1/models")
 async def list_models(token: str = Depends(verify_api_key)):
