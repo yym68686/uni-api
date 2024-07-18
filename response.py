@@ -72,10 +72,10 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
         if response.status_code != 200:
             print("请求失败，状态码是", response.status_code)
             error_message = await response.aread()
-            error_str = error_message.decode('utf-8', errors='replace')
-            error_json = json.loads(error_str)
-            print(json.dumps(error_json, indent=4, ensure_ascii=False))
-            yield {"error": f"HTTP Error {response.status_code}", "details": error_json}
+            # error_str = error_message.decode('utf-8', errors='replace')
+            # error_json = json.loads(error_str)
+            # print(json.dumps(error_json, indent=4, ensure_ascii=False))
+            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_message.decode('utf-8', errors='replace')}
         buffer = ""
         async for chunk in response.aiter_text():
             # print(chunk)
