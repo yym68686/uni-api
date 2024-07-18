@@ -141,8 +141,16 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         yield sse_string
 
 async def fetch_response(client, url, headers, payload):
-    response = await client.post(url, headers=headers, json=payload)
-    return response.json()
+    for _ in range(2):
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            return response.json()
+        except httpx.ConnectError as e:
+            print(f"fetch_response 连接错误： {e}")
+            continue
+        except httpx.ReadTimeout as e:
+            print(f"fetch_response 读取响应超时： {e}")
+            continue
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     for _ in range(2):
@@ -163,8 +171,8 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                 raise ValueError("Unknown response")
             break
         except httpx.ConnectError as e:
-            print(f"连接错误： {e}")
+            print(f"fetch_response_stream 连接错误： {e}")
             continue
         except httpx.ReadTimeout as e:
-            print(f"读取响应超时： {e}")
+            print(f"fetch_response_stream 读取响应超时： {e}")
             continue
