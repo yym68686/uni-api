@@ -240,11 +240,13 @@ async def gpt2claude_tools_json(json_dict):
     return json_dict
 
 async def get_claude_payload(request, engine, provider):
+    model = provider['model'][request.model]
     headers = {
         "content-type": "application/json",
         "x-api-key": f"{provider['api']}",
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": "tools-2024-05-16"
+        "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15" if "claude-3-5-sonnet" in model else "tools-2024-05-16",
+
     }
     url = provider['base_url']
 
