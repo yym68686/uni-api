@@ -14,7 +14,7 @@ def test_client():
 def api_key():
     return os.environ.get("API")
 
-def test_request_model(test_client, api_key, model="gpt-4o"):
+def test_request_model(test_client, api_key, model="claude-3-5-sonnet-20240620"):
     request_data = {
         "model": model,
         "messages": [
@@ -79,4 +79,4 @@ def test_request_model(test_client, api_key, model="gpt-4o"):
     assert response.status_code == 200
 
 if __name__ == "__main__":
-    pytest.main(["-s", "test/test.py"])
+    pytest.main(["-s", "test/provider_test.py"])

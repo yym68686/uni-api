@@ -251,6 +251,7 @@ async def get_claude_payload(request, engine, provider):
     url = provider['base_url']
 
     messages = []
+    system_prompt = None
     for msg in request.messages:
         name = None
         if isinstance(msg.content, list):
@@ -322,7 +323,7 @@ async def get_claude_payload(request, engine, provider):
     payload = {
         "model": model,
         "messages": messages,
-        "system": system_prompt,
+        "system": system_prompt or "You are Claude, a large language model trained by Anthropic.",
     }
 
     miss_fields = [
