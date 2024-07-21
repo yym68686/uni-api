@@ -136,6 +136,15 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request, provider)
                 return response
+            except HTTPException as e:
+                print('\033[31m')
+                print(f"Error with provider {provider['provider']}: {str(e)}")
+                traceback.print_exc()
+                print('\033[0m')
+                if use_round_robin:
+                    continue
+                else:
+                    raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
             except Exception as e:
                 print('\033[31m')
                 print(f"Error with provider {provider['provider']}: {str(e)}")
