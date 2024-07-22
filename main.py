@@ -108,12 +108,19 @@ class ModelRequestHandler:
             else:
                 for provider in config['providers']:
                     if model in provider['model'].keys():
-                        provider_rules.append(provider['provider'])
+                        provider_rules.append(provider['provider'] + "/" + model)
 
         provider_list = []
+        # print("provider_rules", provider_rules)
         for provider in config['providers']:
-            if model_name in provider['model'].keys() and (provider_rules and provider['provider'] in provider_rules):
-                provider_list.append(provider)
+            for item in provider_rules:
+                if provider['provider'] in item:
+                    if "/" in item:
+                        if item.split("/")[1] == model_name:
+                            provider_list.append(provider)
+                    else:
+                        if model_name in provider['model'].keys():
+                            provider_list.append(provider)
         return provider_list
 
     async def request_model(self, request: RequestModel, token: str):
