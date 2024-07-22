@@ -105,9 +105,14 @@ class ModelRequestHandler:
                         models_list = provider['model'].keys()
                 if (model and model_name in models_list) or (model == "*" and model_name in models_list):
                     provider_rules.append(provider_name)
+            else:
+                for provider in config['providers']:
+                    if model in provider['model'].keys():
+                        provider_rules.append(provider['provider'])
+
         provider_list = []
         for provider in config['providers']:
-            if model_name in provider['model'].keys() and ((provider_rules and provider['provider'] in provider_rules) or provider_rules == []):
+            if model_name in provider['model'].keys() and (provider_rules and provider['provider'] in provider_rules):
                 provider_list.append(provider)
         return provider_list
 
@@ -115,7 +120,6 @@ class ModelRequestHandler:
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name, token)
         # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
-
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
 
@@ -136,19 +140,10 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request, provider)
                 return response
-            except HTTPException as e:
+            except (Exception, HTTPException) as e:
                 print('\033[31m')
                 print(f"Error with provider {provider['provider']}: {str(e)}")
-                traceback.print_exc()
-                print('\033[0m')
-                if use_round_robin:
-                    continue
-                else:
-                    raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
-            except Exception as e:
-                print('\033[31m')
-                print(f"Error with provider {provider['provider']}: {str(e)}")
-                traceback.print_exc()
+                # traceback.print_exc()
                 print('\033[0m')
                 if use_round_robin:
                     continue

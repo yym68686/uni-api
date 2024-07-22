@@ -70,7 +70,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         # print("response.status_code", response.status_code)
         if response.status_code != 200:
-            print("请求失败，状态码是", response.status_code)
+            # print("请求失败，状态码是", response.status_code)
             error_message = await response.aread()
             # error_str = error_message.decode('utf-8', errors='replace')
             # error_json = json.loads(error_str)
@@ -89,13 +89,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         if response.status_code != 200:
             print('\033[31m')
-            print(f"请求失败，状态码是{response.status_code}，错误信息：")
+            # print(f"请求失败，状态码是{response.status_code}，错误信息：")
             error_message = await response.aread()
             error_str = error_message.decode('utf-8', errors='replace')
             error_json = json.loads(error_str)
-            print(json.dumps(error_json, indent=4, ensure_ascii=False))
+            # print(json.dumps(error_json, indent=4, ensure_ascii=False))
             print('\033[0m')
-            yield {"error": f"HTTP Error {response.status_code}", "details": error_json}
+            yield {"error": f"fetch_claude_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
         async for chunk in response.aiter_text():
             buffer += chunk
