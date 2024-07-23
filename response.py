@@ -104,7 +104,9 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                 # print(line)
 
                 if line.startswith("data:"):
-                    line = line[6:]
+                    line = line[5:]
+                    if line.startswith(" "):
+                        line = line[1:]
                     resp: dict = json.loads(line)
                     message = resp.get("message")
                     if message:
