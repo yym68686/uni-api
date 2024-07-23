@@ -140,9 +140,10 @@ class ModelRequestHandler:
 
     async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool):
         num_providers = len(providers)
+        start_index = self.last_provider_index + 1 if use_round_robin else 0
 
         for i in range(num_providers + 1):
-            self.last_provider_index = i % num_providers
+            self.last_provider_index = (start_index + i) % num_providers
             provider = providers[self.last_provider_index]
             try:
                 response = await process_request(request, provider)
