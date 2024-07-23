@@ -155,26 +155,28 @@ async def fetch_response(client, url, headers, payload):
             continue
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
-    for _ in range(2):
-        try:
-            if engine == "gemini":
-                async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
-                    yield chunk
-            elif engine == "claude":
-                async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
-                    yield chunk
-            elif engine == "gpt":
-                async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-                    yield chunk
-            elif engine == "openrouter":
-                async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-                    yield chunk
-            else:
-                raise ValueError("Unknown response")
-            break
-        except httpx.ConnectError as e:
-            print(f"fetch_response_stream 连接错误： {e}")
-            continue
-        except httpx.ReadTimeout as e:
-            print(f"fetch_response_stream 读取响应超时： {e}")
-            continue
+    # for _ in range(2):
+    try:
+        if engine == "gemini":
+            async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
+                yield chunk
+        elif engine == "claude":
+            async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
+                yield chunk
+        elif engine == "gpt":
+            async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+                yield chunk
+        elif engine == "openrouter":
+            async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+                yield chunk
+        else:
+            raise ValueError("Unknown response")
+        # break
+    except httpx.ConnectError as e:
+        # print(f"fetch_response_stream 连接错误： {e}")
+        yield {"error": f"500", "details": "fetch_response_stream Connect Error"}
+        # continue
+    except httpx.ReadTimeout as e:
+        # print(f"fetch_response_stream 读取响应超时 {e}")
+        yield {"error": f"500", "details": "fetch_response_stream Read Response Timeout"}
+        # continue

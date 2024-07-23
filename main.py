@@ -133,12 +133,14 @@ class ModelRequestHandler:
         # 检查是否启用轮询
         api_index = api_list.index(token)
         use_round_robin = False
+        auto_retry = False
         if config['api_keys'][api_index].get("preferences"):
             use_round_robin = config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN")
+            auto_retry = config['api_keys'][api_index]["preferences"].get("AUTO_RETRY")
 
-        return await self.try_all_providers(request, matching_providers, use_round_robin)
+        return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry)
 
-    async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool):
+    async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool, auto_retry: bool):
         num_providers = len(providers)
         start_index = self.last_provider_index + 1 if use_round_robin else 0
 
@@ -153,7 +155,7 @@ class ModelRequestHandler:
                 print(f"Error with provider {provider['provider']}: {str(e)}")
                 # traceback.print_exc()
                 print('\033[0m')
-                if use_round_robin:
+                if auto_retry:
                     continue
                 else:
                     raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
