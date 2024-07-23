@@ -38,7 +38,6 @@ app.add_middleware(
 )
 
 async def process_request(request: RequestModel, provider: Dict):
-    print("provider: ", provider['provider'])
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print(parsed_url)
@@ -59,7 +58,7 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if provider.get("engine"):
         engine = provider["engine"]
-    print("engine", engine)
+    print("provider: ", provider['provider'], "engine: ", engine)
 
     url, headers, payload = await get_payload(request, engine, provider)
 
