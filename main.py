@@ -174,23 +174,23 @@ async def options_handler():
 @app.post("/v1/models")
 async def list_models(token: str = Depends(verify_api_key)):
     models = post_all_models(token)
-    return {
+    return JSONResponse(content={
         "object": "list",
         "data": models
-    }
+    })
 
 @app.get("/v1/models")
 async def list_models():
     models = get_all_models()
-    return {
+    return JSONResponse(content={
         "object": "list",
         "data": models
-    }
+    })
 
 @app.get("/generate-api-key")
 def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(32)
-    return {"api_key": api_key}
+    return JSONResponse(content={"api_key": api_key})
 
 # async def on_fetch(request, env):
 #     import asgi
