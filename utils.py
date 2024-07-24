@@ -3,6 +3,8 @@ import json
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
+from log_config import logger
+
 # 读取YAML配置文件
 def load_config():
     try:
@@ -20,13 +22,13 @@ def load_config():
                 conf['providers'][index] = provider
             api_keys_db = conf['api_keys']
             api_list = [item["api"] for item in api_keys_db]
-            # print(json.dumps(conf, indent=4, ensure_ascii=False))
+            # logger.info(json.dumps(conf, indent=4, ensure_ascii=False))
             return conf, api_keys_db, api_list
     except FileNotFoundError:
-        print("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
+        logger.error("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
         return [], [], []
     except yaml.YAMLError:
-        print("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。")
+        logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。")
         return [], [], []
 
 config, api_keys_db, api_list = load_config()
@@ -59,7 +61,7 @@ async def error_handling_wrapper(generator, status_code=200):
             try:
                 first_item_str = json.loads(first_item_str)
             except json.JSONDecodeError:
-                print("error_handling_wrapper JSONDecodeError!", first_item_str)
+                logger.error("error_handling_wrapper JSONDecodeError!", first_item_str)
                 pass  # 如果不是有效的JSON，保持原样
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException

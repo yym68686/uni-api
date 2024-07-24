@@ -1,5 +1,4 @@
-import json
-import traceback
+from log_config import logger
 
 import httpx
 import secrets
@@ -58,7 +57,7 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if provider.get("engine"):
         engine = provider["engine"]
-    print("provider:", provider['provider'], "engine:", engine)
+    logger.info(f"provider: {provider['provider']:<10} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
 
@@ -71,15 +70,9 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if request.stream:
         model = provider['model'][request.model]
-        # try:
         generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
         wrapped_generator = await error_handling_wrapper(generator, status_code=500)
         return StreamingResponse(wrapped_generator, media_type="text/event-stream")
-        # except HTTPException as e:
-        #     return JSONResponse(status_code=e.status_code, content={"error": str(e.detail)})
-        # except Exception as e:
-        #     # 处理其他异常
-        #     return JSONResponse(status_code=500, content={"error": str(e)})
     else:
         return await fetch_response(app.state.client, url, headers, payload)
 
@@ -88,10 +81,6 @@ class ModelRequestHandler:
         self.last_provider_index = -1
 
     def get_matching_providers(self, model_name, token):
-        # for provider in config:
-        #     print("provider", model_name, list(provider['model'].keys()))
-        #     if model_name in provider['model'].keys():
-        #         print("provider", provider)
         api_index = api_list.index(token)
         provider_rules = []
 
@@ -150,9 +139,7 @@ class ModelRequestHandler:
                 response = await process_request(request, provider)
                 return response
             except (Exception, HTTPException) as e:
-                print('\033[31m')
-                print(f"Error with provider {provider['provider']}: {str(e)}")
-                print('\033[0m')
+                logger.error(f"Error with provider {provider['provider']}: {str(e)}")
                 if auto_retry:
                     continue
                 else:
@@ -164,13 +151,7 @@ model_handler = ModelRequestHandler()
 
 @app.post("/v1/chat/completions")
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
-    # try:
     return await model_handler.request_model(request, token)
-    # except Exception as e:
-    #     print('\033[31m')
-    #     print(f"request_model Error: {str(e)}")
-    #     traceback.print_exc()
-    #     print('\033[0m')
 
 @app.options("/v1/chat/completions")
 async def options_handler():

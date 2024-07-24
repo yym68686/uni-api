@@ -2,6 +2,8 @@ import json
 import httpx
 from datetime import datetime
 
+from log_config import logger
+
 
 async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, tokens_use=None, total_tokens=None):
     sample_data = {
@@ -51,7 +53,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                         sse_string = await generate_sse_response(timestamp, model, content)
                         yield sse_string
                     except json.JSONDecodeError:
-                        print(f"无法解析JSON: {line}")
+                        logger.error(f"无法解析JSON: {line}")
 
         # # 处理缓冲区中剩余的内容
         # if buffer:
@@ -88,13 +90,9 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         if response.status_code != 200:
-            print('\033[31m')
-            # print(f"请求失败，状态码是{response.status_code}，错误信息：")
             error_message = await response.aread()
             error_str = error_message.decode('utf-8', errors='replace')
             error_json = json.loads(error_str)
-            # print(json.dumps(error_json, indent=4, ensure_ascii=False))
-            print('\033[0m')
             yield {"error": f"fetch_claude_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
         async for chunk in response.aiter_text():
@@ -143,19 +141,15 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         yield sse_string
 
 async def fetch_response(client, url, headers, payload):
-    for _ in range(2):
-        try:
-            response = await client.post(url, headers=headers, json=payload)
-            return response.json()
-        except httpx.ConnectError as e:
-            print(f"fetch_response 连接错误： {e}")
-            continue
-        except httpx.ReadTimeout as e:
-            print(f"fetch_response 读取响应超时： {e}")
-            continue
+    try:
+        response = await client.post(url, headers=headers, json=payload)
+        return response.json()
+    except httpx.ConnectError as e:
+        return {"error": f"500", "details": "fetch_response Connect Error"}
+    except httpx.ReadTimeout as e:
+        return {"error": f"500", "details": "fetch_response Read Response Timeout"}
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
-    # for _ in range(2):
     try:
         if engine == "gemini":
             async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
@@ -171,12 +165,7 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                 yield chunk
         else:
             raise ValueError("Unknown response")
-        # break
     except httpx.ConnectError as e:
-        # print(f"fetch_response_stream 连接错误： {e}")
         yield {"error": f"500", "details": "fetch_response_stream Connect Error"}
-        # continue
     except httpx.ReadTimeout as e:
-        # print(f"fetch_response_stream 读取响应超时 {e}")
         yield {"error": f"500", "details": "fetch_response_stream Read Response Timeout"}
-        # continue
