@@ -165,13 +165,13 @@ model_handler = ModelRequestHandler()
 
 @app.post("/v1/chat/completions")
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
-    try:
-        return await model_handler.request_model(request, token)
-    except Exception as e:
-        print('\033[31m')
-        print(f"request_model Error: {str(e)}")
-        traceback.print_exc()
-        print('\033[0m')
+    # try:
+    return await model_handler.request_model(request, token)
+    # except Exception as e:
+    #     print('\033[31m')
+    #     print(f"request_model Error: {str(e)}")
+    #     traceback.print_exc()
+    #     print('\033[0m')
 
 @app.options("/v1/chat/completions")
 async def options_handler():
