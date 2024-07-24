@@ -58,7 +58,7 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if provider.get("engine"):
         engine = provider["engine"]
-    print("provider: ", provider['provider'], "engine: ", engine)
+    print("provider:", provider['provider'], "engine:", engine)
 
     url, headers, payload = await get_payload(request, engine, provider)
 
@@ -165,7 +165,13 @@ model_handler = ModelRequestHandler()
 
 @app.post("/v1/chat/completions")
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
-    return await model_handler.request_model(request, token)
+    try:
+        return await model_handler.request_model(request, token)
+    except Exception as e:
+        print('\033[31m')
+        print(f"request_model Error: {str(e)}")
+        traceback.print_exc()
+        print('\033[0m')
 
 @app.options("/v1/chat/completions")
 async def options_handler():
