@@ -31,6 +31,20 @@ def load_config():
 
 config, api_keys_db, api_list = load_config()
 
+def ensure_string(item):
+    if isinstance(item, (bytes, bytearray)):
+        return item.decode("utf-8")
+    elif isinstance(item, str):
+        return item
+    elif isinstance(item, dict):
+        return f"data: {json.dumps(item)}\n\n"
+    else:
+        return str(item)
+
+async def async_generator(items):
+    for item in items:
+        yield item
+
 async def error_handling_wrapper(generator, status_code=200):
     try:
         first_item = await generator.__anext__()
@@ -42,21 +56,25 @@ async def error_handling_wrapper(generator, status_code=200):
                 first_item_str = first_item_str[6:]
             elif first_item_str.startswith("data:"):
                 first_item_str = first_item_str[5:]
-            first_item_str = json.loads(first_item_str)
+            try:
+                first_item_str = json.loads(first_item_str)
+            except json.JSONDecodeError:
+                print("error_handling_wrapper JSONDecodeError!")
+                pass  # 如果不是有效的JSON，保持原样
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             raise HTTPException(status_code=status_code, detail=f"{first_item_str}"[:300])
 
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
         async def new_generator():
-            yield first_item
+            yield ensure_string(first_item)
             async for item in generator:
-                yield item
+                yield ensure_string(item)
 
         return new_generator()
     except StopAsyncIteration:
         # 处理生成器为空的情况
-        return "data: {'error': 'No data returned'}\n\n"
+        return async_generator(["data: {'error': 'No data returned'}\n\n"])
 
 def post_all_models(token):
     all_models = []
