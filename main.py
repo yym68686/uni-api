@@ -152,7 +152,6 @@ class ModelRequestHandler:
             except (Exception, HTTPException) as e:
                 print('\033[31m')
                 print(f"Error with provider {provider['provider']}: {str(e)}")
-                # traceback.print_exc()
                 print('\033[0m')
                 if auto_retry:
                     continue
@@ -205,4 +204,10 @@ def generate_api_key():
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run("__main__:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "__main__:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        ws="none"
+    )
