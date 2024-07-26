@@ -22,14 +22,14 @@ async def lifespan(app: FastAPI):
     timeout = httpx.Timeout(connect=15.0, read=10.0, write=30.0, pool=30.0)
     app.state.client = httpx.AsyncClient(timeout=timeout)
     import os
-    import json
+    import yaml
     # 新增： 从环境变量获取配置URL并拉取配置
     config_url = os.environ.get('CONFIG_URL')
     if config_url:
         try:
             response = await app.state.client.get(config_url)
             response.raise_for_status()
-            config_data = json.loads(response.text)
+            config_data = yaml.safe_load(response.text)
             # 更新配置
             global config, api_keys_db, api_list
             config, api_keys_db, api_list = update_config(config_data)
