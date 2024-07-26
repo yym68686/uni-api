@@ -29,6 +29,9 @@ def load_config():
             if f.readable():
                 conf = yaml.safe_load(f)
                 return update_config(conf)
+            else:
+                logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
+                return [], [], []
     except FileNotFoundError:
         logger.error("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
         return [], [], []
