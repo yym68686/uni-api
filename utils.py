@@ -26,8 +26,8 @@ def load_config():
     try:
         with open('./api.yaml', 'r') as f:
             # 判断是否为空文件
-            if f.readable():
-                conf = yaml.safe_load(f)
+            conf = yaml.safe_load(f)
+            if conf:
                 return update_config(conf)
             else:
                 logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
