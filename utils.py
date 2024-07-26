@@ -25,8 +25,10 @@ def update_config(config_data):
 def load_config():
     try:
         with open('./api.yaml', 'r') as f:
-            conf = yaml.safe_load(f)
-            return update_config(conf)
+            # 判断是否为空文件
+            if f.readable():
+                conf = yaml.safe_load(f)
+                return update_config(conf)
     except FileNotFoundError:
         logger.error("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
         return [], [], []
