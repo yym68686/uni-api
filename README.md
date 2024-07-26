@@ -92,6 +92,8 @@ services:
   uni-api:
     container_name: uni-api
     image: yym68686/uni-api:latest
+    environment:
+      - CONFIG_URL=http://file_url/api.yaml
     ports:
       - 8001:8000
     volumes:
@@ -120,6 +122,7 @@ set -eu
 docker pull yym68686/uni-api:latest
 docker rm -f uni-api
 docker run --user root -p 8001:8000 -dit --name uni-api \
+-e CONFIG_URL=http://file_url/api.yaml \
 -v ./api.yaml:/home/api.yaml \
 yym68686/uni-api:latest
 docker logs -f uni-api

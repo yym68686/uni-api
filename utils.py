@@ -5,25 +5,28 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from log_config import logger
 
+def update_config(config_data):
+    for index, provider in enumerate(config_data['providers']):
+        model_dict = {}
+        for model in provider['model']:
+            if type(model) == str:
+                model_dict[model] = model
+            if type(model) == dict:
+                model_dict.update({new: old for old, new in model.items()})
+                model_dict.update({old: old for old, new in model.items()})
+        provider['model'] = model_dict
+        config_data['providers'][index] = provider
+    api_keys_db = config_data['api_keys']
+    api_list = [item["api"] for item in api_keys_db]
+    # logger.info(json.dumps(conf, indent=4, ensure_ascii=False))
+    return config_data, api_keys_db, api_list
+
 # 读取YAML配置文件
 def load_config():
     try:
         with open('./api.yaml', 'r') as f:
             conf = yaml.safe_load(f)
-            for index, provider in enumerate(conf['providers']):
-                model_dict = {}
-                for model in provider['model']:
-                    if type(model) == str:
-                        model_dict[model] = model
-                    if type(model) == dict:
-                        model_dict.update({new: old for old, new in model.items()})
-                        model_dict.update({old: old for old, new in model.items()})
-                provider['model'] = model_dict
-                conf['providers'][index] = provider
-            api_keys_db = conf['api_keys']
-            api_list = [item["api"] for item in api_keys_db]
-            # logger.info(json.dumps(conf, indent=4, ensure_ascii=False))
-            return conf, api_keys_db, api_list
+            return update_config(conf)
     except FileNotFoundError:
         logger.error("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
         return [], [], []

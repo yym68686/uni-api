@@ -2,6 +2,8 @@ services:
   uni-api:
     container_name: uni-api
     image: yym68686/uni-api:latest
+    environment:
+      - CONFIG_URL=http://file_url/api.yaml
     ports:
       - 8001:8000
     volumes:

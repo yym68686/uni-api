@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends
 
 from models import RequestModel
-from utils import config, api_keys_db, api_list, error_handling_wrapper, get_all_models, verify_api_key, post_all_models
+from utils import config, api_keys_db, api_list, error_handling_wrapper, get_all_models, verify_api_key, post_all_models, update_config
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 
@@ -21,6 +21,21 @@ async def lifespan(app: FastAPI):
     # 启动时的代码
     timeout = httpx.Timeout(connect=15.0, read=10.0, write=30.0, pool=30.0)
     app.state.client = httpx.AsyncClient(timeout=timeout)
+    import os
+    import json
+    # 新增： 从环境变量获取配置URL并拉取配置
+    config_url = os.environ.get('CONFIG_URL')
+    if config_url:
+        try:
+            response = await app.state.client.get(config_url)
+            response.raise_for_status()
+            config_data = json.loads(response.text)
+            # 更新配置
+            global config, api_keys_db, api_list
+            config, api_keys_db, api_list = update_config(config_data)
+        except Exception as e:
+            logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
+
     yield
     # 关闭时的代码
     await app.state.client.aclose()
