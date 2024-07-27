@@ -4,38 +4,25 @@ import httpx
 import secrets
 from contextlib import asynccontextmanager
 
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from models import RequestModel
-from utils import config, api_keys_db, api_list, error_handling_wrapper, get_all_models, verify_api_key, post_all_models, update_config
+from utils import error_handling_wrapper, get_all_models, post_all_models, load_config
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 
 from typing import List, Dict
 from urllib.parse import urlparse
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
     timeout = httpx.Timeout(connect=15.0, read=10.0, write=30.0, pool=30.0)
     app.state.client = httpx.AsyncClient(timeout=timeout)
-    import os
-    import yaml
-    # 新增： 从环境变量获取配置URL并拉取配置
-    config_url = os.environ.get('CONFIG_URL')
-    if config_url:
-        try:
-            response = await app.state.client.get(config_url)
-            response.raise_for_status()
-            config_data = yaml.safe_load(response.text)
-            # 更新配置
-            global config, api_keys_db, api_list
-            config, api_keys_db, api_list = update_config(config_data)
-        except Exception as e:
-            logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
-
+    app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
     yield
     # 关闭时的代码
     await app.state.client.aclose()
@@ -96,6 +83,10 @@ class ModelRequestHandler:
         self.last_provider_index = -1
 
     def get_matching_providers(self, model_name, token):
+        config = app.state.config
+        # api_keys_db = app.state.api_keys_db
+        api_list = app.state.api_list
+
         api_index = api_list.index(token)
         provider_rules = []
 
@@ -127,6 +118,10 @@ class ModelRequestHandler:
         return provider_list
 
     async def request_model(self, request: RequestModel, token: str):
+        config = app.state.config
+        # api_keys_db = app.state.api_keys_db
+        api_list = app.state.api_list
+
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name, token)
         # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
@@ -164,6 +159,16 @@ class ModelRequestHandler:
 
 model_handler = ModelRequestHandler()
 
+# 安全性依赖
+security = HTTPBearer()
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    api_list = app.state.api_list
+    token = credentials.credentials
+    if token not in api_list:
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+    return token
+
 @app.post("/v1/chat/completions")
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
@@ -174,7 +179,7 @@ async def options_handler():
 
 @app.post("/v1/models")
 async def list_models(token: str = Depends(verify_api_key)):
-    models = post_all_models(token)
+    models = post_all_models(token, app.state.config, app.state.api_list)
     return JSONResponse(content={
         "object": "list",
         "data": models
@@ -182,7 +187,7 @@ async def list_models(token: str = Depends(verify_api_key)):
 
 @app.get("/v1/models")
 async def list_models():
-    models = get_all_models()
+    models = get_all_models(config=app.state.config)
     return JSONResponse(content={
         "object": "list",
         "data": models

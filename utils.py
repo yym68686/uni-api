@@ -1,4 +1,3 @@
-import yaml
 import json
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -22,24 +21,48 @@ def update_config(config_data):
     return config_data, api_keys_db, api_list
 
 # 读取YAML配置文件
-def load_config():
+async def load_config(app):
+    import yaml
     try:
         with open('./api.yaml', 'r') as f:
             # 判断是否为空文件
             conf = yaml.safe_load(f)
+            # conf = None
             if conf:
-                return update_config(conf)
+                config, api_keys_db, api_list = update_config(conf)
             else:
-                logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
-                return [], [], []
+                # logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
+                config, api_keys_db, api_list = [], [], []
     except FileNotFoundError:
         logger.error("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
-        return [], [], []
+        config, api_keys_db, api_list = [], [], []
     except yaml.YAMLError:
         logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。")
-        return [], [], []
+        config, api_keys_db, api_list = [], [], []
 
-config, api_keys_db, api_list = load_config()
+    if config != []:
+        return config, api_keys_db, api_list
+
+    import os
+    # 新增： 从环境变量获取配置URL并拉取配置
+    config_url = os.environ.get('CONFIG_URL')
+    if config_url:
+        try:
+            response = await app.state.client.get(config_url)
+            # logger.info(f"Fetching config from {response.text}")
+            response.raise_for_status()
+            config_data = yaml.safe_load(response.text)
+            # 更新配置
+            # logger.info(config_data)
+            if config_data:
+                config, api_keys_db, api_list = update_config(config_data)
+            else:
+                logger.error(f"Error fetching or parsing config from {config_url}")
+                config, api_keys_db, api_list = [], [], []
+        except Exception as e:
+            logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
+            config, api_keys_db, api_list = [], [], []
+    return config, api_keys_db, api_list
 
 def ensure_string(item):
     if isinstance(item, (bytes, bytearray)):
@@ -86,7 +109,7 @@ async def error_handling_wrapper(generator, status_code=200):
         # 处理生成器为空的情况
         return async_generator(["data: {'error': 'No data returned'}\n\n"])
 
-def post_all_models(token):
+def post_all_models(token, config, api_list):
     all_models = []
     unique_models = set()
 
@@ -141,7 +164,7 @@ def post_all_models(token):
 
     return all_models
 
-def get_all_models():
+def get_all_models(config):
     all_models = []
     unique_models = set()
 
@@ -158,12 +181,3 @@ def get_all_models():
                 all_models.append(model_info)
 
     return all_models
-
-# 安全性依赖
-security = HTTPBearer()
-
-def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    if token not in api_list:
-        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-    return token
