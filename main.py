@@ -94,9 +94,13 @@ class ModelRequestHandler:
             if "/" in model:
                 provider_name = model.split("/")[0]
                 model = model.split("/")[1]
+                models_list = []
                 for provider in config['providers']:
                     if provider['provider'] == provider_name:
-                        models_list = provider['model'].keys()
+                        models_list.extend(list(provider['model'].keys()))
+                # print("models_list", models_list)
+                # print("model_name", model_name)
+                # print("model", model)
                 if (model and model_name in models_list) or (model == "*" and model_name in models_list):
                     provider_rules.append(provider_name)
             else:

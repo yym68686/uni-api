@@ -17,7 +17,7 @@ def update_config(config_data):
         config_data['providers'][index] = provider
     api_keys_db = config_data['api_keys']
     api_list = [item["api"] for item in api_keys_db]
-    # logger.info(json.dumps(conf, indent=4, ensure_ascii=False))
+    # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
     return config_data, api_keys_db, api_list
 
 # 读取YAML配置文件
