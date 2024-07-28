@@ -80,11 +80,13 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
             yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_message.decode('utf-8', errors='replace')}
         buffer = ""
         async for chunk in response.aiter_text():
-            # print(chunk)
+            # print("chunk", repr(chunk))
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                yield line + "\n"
+                # print("line", repr(line))
+                if line and line != "data: " and line != "data:":
+                    yield line + "\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
