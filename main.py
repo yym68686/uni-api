@@ -59,7 +59,7 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if provider.get("engine"):
         engine = provider["engine"]
-    logger.info(f"provider: {provider['provider']:<10} provider: {request.model:<10} engine: {engine}")
+    logger.info(f"provider: {provider['provider']:<10} model: {request.model:<10} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
 
