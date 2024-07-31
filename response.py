@@ -70,14 +70,14 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
 
 async def fetch_gpt_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
-        # print("response.status_code", response.status_code)
         if response.status_code != 200:
-            # print("请求失败，状态码是", response.status_code)
             error_message = await response.aread()
-            # error_str = error_message.decode('utf-8', errors='replace')
-            # error_json = json.loads(error_str)
-            # print(json.dumps(error_json, indent=4, ensure_ascii=False))
-            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_message.decode('utf-8', errors='replace')}
+            error_str = error_message.decode('utf-8', errors='replace')
+            try:
+                error_json = json.loads(error_str)
+            except json.JSONDecodeError:
+                error_json = error_str
+            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
         async for chunk in response.aiter_text():
             # print("chunk", repr(chunk))
@@ -94,14 +94,18 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
         if response.status_code != 200:
             error_message = await response.aread()
             error_str = error_message.decode('utf-8', errors='replace')
-            error_json = json.loads(error_str)
+            try:
+                error_json = json.loads(error_str)
+            except json.JSONDecodeError:
+                error_json = error_str
             yield {"error": f"fetch_claude_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
         async for chunk in response.aiter_text():
+            logger.info(f"chunk: {repr(chunk)}")
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                # print(line)
+                # logger.info(line)
 
                 if line.startswith("data:"):
                     line = line[5:]
