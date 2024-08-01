@@ -46,6 +46,7 @@ async def get_gemini_payload(request, engine, provider):
     url = url.format(model=model, stream=gemini_stream, api_key=provider['api'])
 
     messages = []
+    systemInstruction = None
     for msg in request.messages:
         if msg.role == "assistant":
             msg.role = "model"
@@ -63,6 +64,8 @@ async def get_gemini_payload(request, engine, provider):
             content = [{"text": msg.content}]
         if msg.role != "system":
             messages.append({"role": msg.role, "parts": content})
+        if msg.role == "system":
+            systemInstruction = {"parts": content}
 
 
     payload = {
@@ -86,6 +89,8 @@ async def get_gemini_payload(request, engine, provider):
             }
         ]
     }
+    if systemInstruction:
+        payload["systemInstruction"] = systemInstruction
 
     miss_fields = [
         'model',
