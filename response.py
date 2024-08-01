@@ -101,7 +101,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
             yield {"error": f"fetch_claude_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
         async for chunk in response.aiter_text():
-            logger.info(f"chunk: {repr(chunk)}")
+            # logger.info(f"chunk: {repr(chunk)}")
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
