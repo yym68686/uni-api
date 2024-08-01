@@ -39,6 +39,14 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
 async def fetch_gemini_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
     async with client.stream('POST', url, headers=headers, json=payload) as response:
+        if response.status_code != 200:
+            error_message = await response.aread()
+            error_str = error_message.decode('utf-8', errors='replace')
+            try:
+                error_json = json.loads(error_str)
+            except json.JSONDecodeError:
+                error_json = error_str
+            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
         async for chunk in response.aiter_text():
             buffer += chunk

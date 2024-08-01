@@ -47,7 +47,8 @@ async def get_gemini_payload(request, engine, provider):
 
     messages = []
     for msg in request.messages:
-        name = None
+        if msg.role == "assistant":
+            msg.role = "model"
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -59,7 +60,7 @@ async def get_gemini_payload(request, engine, provider):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
-            content = msg.content
+            content = [{"text": msg.content}]
         if msg.role != "system":
             messages.append({"role": msg.role, "parts": content})
 

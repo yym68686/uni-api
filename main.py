@@ -68,7 +68,8 @@ async def process_request(request: RequestModel, provider: Dict):
     #     "headers": headers,
     #     "payload": payload
     # }
-    # print(f"Request details: {json.dumps(request_info, indent=4, ensure_ascii=False)}")
+    # import json
+    # logger.info(f"Request details: {json.dumps(request_info, indent=4, ensure_ascii=False)}")
 
     if request.stream:
         model = provider['model'][request.model]
