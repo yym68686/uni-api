@@ -93,7 +93,6 @@ async def error_handling_wrapper(generator, status_code=200):
                 first_item_str = json.loads(first_item_str)
             except json.JSONDecodeError:
                 logger.error("error_handling_wrapper JSONDecodeError!" + repr(first_item_str))
-                pass  # 如果不是有效的JSON，保持原样
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             raise HTTPException(status_code=status_code, detail=f"{first_item_str}"[:300])

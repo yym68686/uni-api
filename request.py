@@ -1,5 +1,6 @@
 import json
 from models import RequestModel
+from log_config import logger
 
 async def get_image_message(base64_image, engine = None):
     if "gpt" == engine:
@@ -159,9 +160,11 @@ async def get_gpt_payload(request, engine, provider):
 
 async def get_openrouter_payload(request, engine, provider):
     headers = {
-        'Authorization': f"Bearer {provider['api']}",
         'Content-Type': 'application/json'
     }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api']}"
+
     url = provider['base_url']
 
     messages = []
@@ -246,7 +249,6 @@ async def get_claude_payload(request, engine, provider):
         "x-api-key": f"{provider['api']}",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15" if "claude-3-5-sonnet" in model else "tools-2024-05-16",
-
     }
     url = provider['base_url']
 
