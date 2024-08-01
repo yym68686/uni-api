@@ -105,8 +105,7 @@ async def error_handling_wrapper(generator, status_code=200):
 
         return new_generator()
     except StopAsyncIteration:
-        # 处理生成器为空的情况
-        return async_generator(["data: {'error': 'No data returned'}\n\n"])
+        raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
 
 def post_all_models(token, config, api_list):
     all_models = []
