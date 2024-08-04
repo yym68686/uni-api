@@ -1,4 +1,5 @@
 httpx
+yaml
 pytest
 uvicorn
 fastapi
