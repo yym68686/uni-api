@@ -89,10 +89,14 @@ async def error_handling_wrapper(generator, status_code=200):
                 first_item_str = first_item_str[6:]
             elif first_item_str.startswith("data:"):
                 first_item_str = first_item_str[5:]
+            if first_item_str == "[DONE]":
+                logger.error("error_handling_wrapper [DONE]!")
+                raise StopAsyncIteration
             try:
                 first_item_str = json.loads(first_item_str)
             except json.JSONDecodeError:
                 logger.error("error_handling_wrapper JSONDecodeError!" + repr(first_item_str))
+                raise StopAsyncIteration
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             raise HTTPException(status_code=status_code, detail=f"{first_item_str}"[:300])

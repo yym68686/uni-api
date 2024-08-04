@@ -76,25 +76,57 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
         #         except json.JSONDecodeError:
         #             print(f"无法解析JSON: {buffer}")
 
-async def fetch_gpt_response_stream(client, url, headers, payload):
-    async with client.stream('POST', url, headers=headers, json=payload) as response:
-        if response.status_code != 200:
-            error_message = await response.aread()
-            error_str = error_message.decode('utf-8', errors='replace')
-            try:
-                error_json = json.loads(error_str)
-            except json.JSONDecodeError:
-                error_json = error_str
-            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
-        buffer = ""
-        async for chunk in response.aiter_text():
-            # logger.info(f"chunk: {repr(chunk)}")
-            buffer += chunk
+async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
+    redirect_count = 0
+    while redirect_count < max_redirects:
+        # logger.info(f"fetch_gpt_response_stream: {url}")
+        async with client.stream('POST', url, headers=headers, json=payload) as response:
+            if response.status_code != 200:
+                error_message = await response.aread()
+                error_str = error_message.decode('utf-8', errors='replace')
+                try:
+                    error_json = json.loads(error_str)
+                except json.JSONDecodeError:
+                    error_json = error_str
+                yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
+                return
+
+            # 检查是否存在重定向脚本
+            content = await response.aread()
+            content_str = content.decode('utf-8', errors='replace')
+            # logger.info(f"chunk: {repr(content_str)}")
+            import re
+            redirect_match = re.search(r"window\.location\.href\s*=\s*'([^']+)'", content_str)
+            if redirect_match:
+                new_url = redirect_match.group(1)
+                # logger.info(f"new_url: {new_url}")
+                if not new_url.startswith('http'):
+                    # 如果是相对路径，构造完整URL
+                    # logger.info(url.split('/'))
+                    base_url = '/'.join(url.split('/')[:3])  # 提取协议和域名
+                    new_url = base_url + new_url
+                url = new_url
+                # logger.info(f"new_url: {new_url}")
+                redirect_count += 1
+                continue
+
+            buffer = content_str
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                # print("line", repr(line))
                 if line and line != "data: " and line != "data:" and not line.startswith(": "):
                     yield line + "\n"
+
+            async for chunk in response.aiter_text():
+                # logger.info(f"chunk: {repr(chunk)}")
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    # logger.info("line: %s", repr(line))
+                    if line and line != "data: " and line != "data:" and not line.startswith(": "):
+                        yield line + "\n"
+            return
+
+    yield {"error": "Too many redirects", "details": f"Reached maximum of {max_redirects} redirects"}
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())

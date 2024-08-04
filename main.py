@@ -160,7 +160,7 @@ class ModelRequestHandler:
                 else:
                     raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
 
-        raise HTTPException(status_code=500, detail="All providers failed")
+        raise HTTPException(status_code=500, detail=f"All providers failed: {request.model}")
 
 model_handler = ModelRequestHandler()
 
