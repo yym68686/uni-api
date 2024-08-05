@@ -1,6 +1,5 @@
 import json
-from fastapi import HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import HTTPException
 
 from log_config import logger
 
@@ -89,7 +88,7 @@ async def error_handling_wrapper(generator, status_code=200):
                 first_item_str = first_item_str[6:]
             elif first_item_str.startswith("data:"):
                 first_item_str = first_item_str[5:]
-            if first_item_str == "[DONE]":
+            if first_item_str.startswith("[DONE]"):
                 logger.error("error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration
             try:
