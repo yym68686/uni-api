@@ -91,39 +91,34 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
                 yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
                 return
 
-            # 检查是否存在重定向脚本
-            content = await response.aread()
-            content_str = content.decode('utf-8', errors='replace')
-            # logger.info(f"chunk: {repr(content_str)}")
-            import re
-            redirect_match = re.search(r"window\.location\.href\s*=\s*'([^']+)'", content_str)
-            if redirect_match:
-                new_url = redirect_match.group(1)
-                # logger.info(f"new_url: {new_url}")
-                if not new_url.startswith('http'):
-                    # 如果是相对路径，构造完整URL
-                    # logger.info(url.split('/'))
-                    base_url = '/'.join(url.split('/')[:3])  # 提取协议和域名
-                    new_url = base_url + new_url
-                url = new_url
-                # logger.info(f"new_url: {new_url}")
-                redirect_count += 1
-                continue
-
-            buffer = content_str
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                    yield line + "\n"
-
+            buffer = ""
             async for chunk in response.aiter_text():
                 # logger.info(f"chunk: {repr(chunk)}")
                 buffer += chunk
+                if chunk.startswith("<script"):
+                    import re
+                    redirect_match = re.search(r"window\.location\.href\s*=\s*'([^']+)'", chunk)
+                    if redirect_match:
+                        new_url = redirect_match.group(1)
+                        # logger.info(f"new_url: {new_url}")
+                        if not new_url.startswith('http'):
+                            # 如果是相对路径，构造完整URL
+                            # logger.info(url.split('/'))
+                            base_url = '/'.join(url.split('/')[:3])
+                            new_url = base_url + new_url
+                        url = new_url
+                        # logger.info(f"new_url: {new_url}")
+                        redirect_count += 1
+                        break
+                redirect_count = 0
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     # logger.info("line: %s", repr(line))
                     if line and line != "data: " and line != "data:" and not line.startswith(": "):
                         yield line + "\n"
+        if redirect_count != 0:
+            continue
+        else:
             return
 
     yield {"error": "Too many redirects", "details": f"Reached maximum of {max_redirects} redirects"}
