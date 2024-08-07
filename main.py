@@ -111,8 +111,8 @@ class ModelRequestHandler:
 
         provider_list = []
         # print("provider_rules", provider_rules)
-        for provider in config['providers']:
-            for item in provider_rules:
+        for item in provider_rules:
+            for provider in config['providers']:
                 if provider['provider'] in item:
                     if "/" in item:
                         if item.split("/")[1] == model_name:
@@ -129,6 +129,7 @@ class ModelRequestHandler:
 
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name, token)
+        # import json
         # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
