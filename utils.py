@@ -1,5 +1,6 @@
 import json
 from fastapi import HTTPException
+import httpx
 
 from log_config import logger
 
@@ -103,16 +104,16 @@ async def error_handling_wrapper(generator, status_code=200):
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
         async def new_generator():
             yield ensure_string(first_item)
-            async for item in generator:
-                yield ensure_string(item)
+            try:
+                async for item in generator:
+                    yield ensure_string(item)
+            except httpx.RemoteProtocolError as e:
+                logger.error(f"Remote protocol error occurred: {e}")
+                raise StopAsyncIteration
 
         return new_generator()
+
     except StopAsyncIteration:
-        raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
-    except Exception as e:
-        logger.error(f"error_handling_wrapper Exception: {str(e)}")
-        import traceback
-        logger.error(f"error_handling_wrapper Exception: {traceback.print_exc()}")
         raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
 
 def post_all_models(token, config, api_list):
