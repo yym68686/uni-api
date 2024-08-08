@@ -78,6 +78,9 @@ async def async_generator(items):
     for item in items:
         yield item
 
+class GeneratorStopError(Exception):
+    pass
+
 async def error_handling_wrapper(generator, status_code=200):
     try:
         first_item = await generator.__anext__()
@@ -109,11 +112,13 @@ async def error_handling_wrapper(generator, status_code=200):
                     yield ensure_string(item)
             except httpx.RemoteProtocolError as e:
                 logger.error(f"Remote protocol error occurred: {e}")
-                raise StopAsyncIteration
+                raise GeneratorStopError("Generator stopped due to remote protocol error")
 
         return new_generator()
 
     except StopAsyncIteration:
+        raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
+    except GeneratorStopError:
         raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
 
 def post_all_models(token, config, api_list):
