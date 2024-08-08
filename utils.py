@@ -109,6 +109,11 @@ async def error_handling_wrapper(generator, status_code=200):
         return new_generator()
     except StopAsyncIteration:
         raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
+    except Exception as e:
+        logger.error(f"error_handling_wrapper Exception: {str(e)}")
+        import traceback
+        logger.error(f"error_handling_wrapper Exception: {traceback.print_exc()}")
+        raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
 
 def post_all_models(token, config, api_list):
     all_models = []
