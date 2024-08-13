@@ -118,9 +118,10 @@ async def get_gemini_payload(request, engine, provider):
 
 async def get_gpt_payload(request, engine, provider):
     headers = {
-        'Authorization': f"Bearer {provider['api']}",
         'Content-Type': 'application/json'
     }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api']}"
     url = provider['base_url']
 
     messages = []
