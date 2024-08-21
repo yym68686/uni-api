@@ -12,7 +12,7 @@ def update_config(config_data):
                 model_dict[model] = model
             if type(model) == dict:
                 model_dict.update({new: old for old, new in model.items()})
-                model_dict.update({old: old for old, new in model.items()})
+                # model_dict.update({old: old for old, new in model.items()})
         provider['model'] = model_dict
         config_data['providers'][index] = provider
     api_keys_db = config_data['api_keys']
