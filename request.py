@@ -277,7 +277,8 @@ async def get_claude_payload(request, engine, provider):
     messages = []
     system_prompt = None
     for msg in request.messages:
-        name = None
+        tool_calls = None
+        tool_call_id = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -289,37 +290,25 @@ async def get_claude_payload(request, engine, provider):
                     content.append(image_message)
         else:
             content = msg.content
-            name = msg.name
-            arguments = msg.arguments
-            if arguments:
-                arguments = json.loads(arguments)
-        if name:
-            # messages.append({"role": "assistant", "name": name, "content": content})
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
-                            "name": name,
-                            "input": arguments,
-                        }
-                    ]
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_01RofFmKHUKsEaZvqESG5Hwz",
-                            "content": content
-                        }
-                    ]
-                }
-            )
+            tool_calls = msg.tool_calls
+            tool_call_id = msg.tool_call_id
+
+        if tool_calls:
+            tool_calls_list = []
+            for tool_call in tool_calls:
+                tool_calls_list.append({
+                    "type": "tool_use",
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "input": json.loads(tool_call.function.arguments),
+                })
+                messages.append({"role": msg.role, "content": tool_calls_list})
+        elif tool_call_id:
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_call.id,
+                "content": content
+            }]})
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
