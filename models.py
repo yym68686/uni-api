@@ -17,6 +17,15 @@ class Tool(BaseModel):
     type: str
     function: Function
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+class ToolCall(BaseModel):
+    id: str
+    type: str
+    function: FunctionCall
+
 class ImageUrl(BaseModel):
     url: str
 
@@ -29,7 +38,18 @@ class Message(BaseModel):
     role: str
     name: Optional[str] = None
     arguments: Optional[str] = None
-    content: Union[str, List[ContentItem]]
+    content: Optional[Union[str, List[ContentItem]]] = None
+    tool_calls: Optional[List[ToolCall]] = None
+
+class Message(BaseModel):
+    role: str
+    name: Optional[str] = None
+    content: Optional[Union[str, List[ContentItem]]] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+
+    class Config:
+        extra = "allow"  # 允许额外的字段
 
 class RequestModel(BaseModel):
     model: str

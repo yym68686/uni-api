@@ -126,7 +126,8 @@ async def get_gpt_payload(request, engine, provider):
 
     messages = []
     for msg in request.messages:
-        name = None
+        tool_calls = None
+        tool_call_id = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -138,9 +139,23 @@ async def get_gpt_payload(request, engine, provider):
                     content.append(image_message)
         else:
             content = msg.content
-            name = msg.name
-        if name:
-            messages.append({"role": msg.role, "name": name, "content": content})
+            tool_calls = msg.tool_calls
+            tool_call_id = msg.tool_call_id
+
+        if tool_calls:
+            tool_calls_list = []
+            for tool_call in tool_calls:
+                tool_calls_list.append({
+                    "id": tool_call.id,
+                    "type": tool_call.type,
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments
+                    }
+                })
+                messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+        elif tool_call_id:
+            messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
         else:
             messages.append({"role": msg.role, "content": content})
 
