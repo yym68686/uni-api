@@ -124,7 +124,7 @@ async def error_handling_wrapper(generator, status_code=200):
     except StopAsyncIteration:
         raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
     except HTTPException as http_exc:
-        raise http_exc
+        raise HTTPException(status_code=status_code, detail=f"Wrapper error: {str(http_exc)}")
     except Exception as e:
         logger.exception(f"Error in error_handling_wrapper: {e}")
         raise HTTPException(status_code=status_code, detail=f"Wrapper error: {str(e)}")
