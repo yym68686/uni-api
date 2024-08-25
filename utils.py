@@ -73,12 +73,16 @@ def ensure_string(item):
     else:
         return str(item)
 
+import asyncio
 async def error_handling_wrapper(generator, status_code=200):
     async def new_generator():
         try:
             yield ensure_string(first_item)
             async for item in generator:
                 yield ensure_string(item)
+        except (httpx.ReadError, asyncio.CancelledError) as e:
+            logger.error(f"Network error in new_generator: {e}")
+            raise HTTPException(status_code=503, detail=f"Stream interrupted: {str(e)}")
         except Exception as e:
             logger.exception(f"Error in new_generator: {e}")
             raise HTTPException(status_code=status_code, detail=f"Stream error: {str(e)}")
@@ -104,13 +108,15 @@ async def error_handling_wrapper(generator, status_code=200):
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             raise HTTPException(status_code=status_code, detail=f"{first_item_str}"[:300])
 
-        # 创建新的生成器并包装在 try-except 块中
         wrapped_generator = new_generator()
         try:
             async for item in wrapped_generator:
                 yield item
         except HTTPException as http_exc:
             raise http_exc
+        except (httpx.ReadError, asyncio.CancelledError) as e:
+            logger.error(f"Network error during streaming: {e}")
+            raise HTTPException(status_code=503, detail=f"Stream interrupted: {str(e)}")
         except Exception as e:
             logger.exception(f"Unexpected error in error_handling_wrapper: {e}")
             raise HTTPException(status_code=status_code, detail=f"Unexpected error: {str(e)}")
