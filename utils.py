@@ -113,7 +113,7 @@ async def error_handling_wrapper(generator, status_code=200):
             async for item in wrapped_generator:
                 yield item
         except HTTPException as http_exc:
-            raise http_exc
+            raise HTTPException(status_code=status_code, detail=f"Wrapper error: {str(http_exc)}")
         except (httpx.ReadError, asyncio.CancelledError) as e:
             logger.error(f"Network error during streaming: {e}")
             raise HTTPException(status_code=503, detail=f"Stream interrupted: {str(e)}")
