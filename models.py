@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Union
 
 class FunctionParameter(BaseModel):
@@ -10,7 +10,7 @@ class FunctionParameter(BaseModel):
 class Function(BaseModel):
     name: str
     description: str
-    parameters: FunctionParameter
+    parameters: Optional[FunctionParameter] = Field(default=None, exclude=None)
 
 # 定义 Tool 模型
 class Tool(BaseModel):

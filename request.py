@@ -255,13 +255,14 @@ async def gpt2claude_tools_json(json_dict):
     for old_key, new_key in keys_to_change.items():
         if old_key in json_dict:
             if new_key:
+                if json_dict[old_key] == None:
+                    json_dict[old_key] = {
+                        "type": "object",
+                        "properties": {}
+                    }
                 json_dict[new_key] = json_dict.pop(old_key)
             else:
                 json_dict.pop(old_key)
-    # if "tools" in json_dict.keys():
-    #     json_dict["tool_choice"] = {
-    #         "type": "auto"
-    #     }
     return json_dict
 
 async def get_claude_payload(request, engine, provider):
