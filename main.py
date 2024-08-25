@@ -74,7 +74,7 @@ async def process_request(request: RequestModel, provider: Dict):
     if request.stream:
         model = provider['model'][request.model]
         generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-        wrapped_generator = error_handling_wrapper(generator, status_code=500)
+        wrapped_generator = await error_handling_wrapper(generator, status_code=500)
         return StreamingResponse(wrapped_generator, media_type="text/event-stream")
     else:
         return await fetch_response(app.state.client, url, headers, payload)
