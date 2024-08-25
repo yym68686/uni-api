@@ -79,6 +79,7 @@ async def process_request(request: RequestModel, provider: Dict):
     else:
         return await fetch_response(app.state.client, url, headers, payload)
 
+import asyncio
 class ModelRequestHandler:
     def __init__(self):
         self.last_provider_index = -1
@@ -154,7 +155,7 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request, provider)
                 return response
-            except (Exception, HTTPException) as e:
+            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
                 if auto_retry:
                     continue
