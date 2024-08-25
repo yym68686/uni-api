@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
-    timeout = httpx.Timeout(connect=15.0, read=10.0, write=30.0, pool=30.0)
+    timeout = httpx.Timeout(connect=15.0, read=20.0, write=30.0, pool=30.0)
     app.state.client = httpx.AsyncClient(timeout=timeout)
     app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
     yield
@@ -74,7 +74,7 @@ async def process_request(request: RequestModel, provider: Dict):
     if request.stream:
         model = provider['model'][request.model]
         generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-        wrapped_generator = await error_handling_wrapper(generator, status_code=500)
+        wrapped_generator = error_handling_wrapper(generator, status_code=500)
         return StreamingResponse(wrapped_generator, media_type="text/event-stream")
     else:
         return await fetch_response(app.state.client, url, headers, payload)
