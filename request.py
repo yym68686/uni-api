@@ -39,32 +39,70 @@ async def get_gemini_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
     }
-    url = provider['base_url']
     model = provider['model'][request.model]
     if request.stream:
         gemini_stream = "streamGenerateContent"
-    url = url.format(model=model, stream=gemini_stream, api_key=provider['api'])
+    url = provider['base_url']
+    if url.endswith("v1beta"):
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'])
+    if url.endswith("v1"):
+        url = "https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'])
 
     messages = []
     systemInstruction = None
+    function_arguments = None
     for msg in request.messages:
         if msg.role == "assistant":
             msg.role = "model"
+        tool_calls = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
-                    # print("text_message", text_message)
                     content.append(text_message)
                 elif item.type == "image_url":
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
             content = [{"text": msg.content}]
-        if msg.role != "system":
+            tool_calls = msg.tool_calls
+
+        if tool_calls:
+            tool_call = tool_calls[0]
+            function_arguments = {
+                "functionCall": {
+                    "name": tool_call.function.name,
+                    "args": json.loads(tool_call.function.arguments)
+                }
+            }
+            messages.append(
+                {
+                    "role": "model",
+                    "parts": [function_arguments]
+                }
+            )
+        elif msg.role == "tool":
+            function_call_name = function_arguments["functionCall"]["name"]
+            messages.append(
+                {
+                    "role": "function",
+                    "parts": [{
+                    "functionResponse": {
+                        "name": function_call_name,
+                        "response": {
+                            "name": function_call_name,
+                            "content": {
+                                "result": msg.content,
+                            }
+                        }
+                    }
+                    }]
+                }
+            )
+        elif msg.role != "system":
             messages.append({"role": msg.role, "parts": content})
-        if msg.role == "system":
+        elif msg.role == "system":
             systemInstruction = {"parts": content}
 
 
@@ -96,7 +134,6 @@ async def get_gemini_payload(request, engine, provider):
         'model',
         'messages',
         'stream',
-        'tools',
         'tool_choice',
         'temperature',
         'top_p',
@@ -112,7 +149,19 @@ async def get_gemini_payload(request, engine, provider):
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
-            payload[field] = value
+            if field == "tools":
+                payload.update({
+                    "tools": [{
+                        "function_declarations": [tool["function"] for tool in value]
+                    }],
+                    "tool_config": {
+                        "function_calling_config": {
+                            "mode": "AUTO"
+                        }
+                    }
+                })
+            else:
+                payload[field] = value
 
     return url, headers, payload
 

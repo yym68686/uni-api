@@ -44,7 +44,7 @@ providers:
     tools: true
 
   - provider: gemini
-    base_url: https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key} # base_url 支持变量替换，{model} 会被替换为模型名称，{stream} 会被替换为 stream 参数，{api_key} 会被替换为 api_key 参数, 仅供 Gemini 模型使用，必填
+    base_url: https://generativelanguage.googleapis.com/v1beta # base_url 支持 v1beta/v1, 仅供 Gemini 模型使用，必填
     api: AIzaSyAN2k6IRdgw
     model:
       - gemini-1.5-pro

@@ -25,7 +25,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     if function_call_content:
         sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"arguments": function_call_content}}]}
     if tools_id and function_call_name:
-        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"id":tools_id,"type":"function","function":{"name":function_call_name,"arguments":""}}]}
+        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"id": tools_id,"type":"function","function":{"name": function_call_name, "arguments":""}}]}
         # sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"id": tools_id, "name": function_call_name}}]}
     if role:
         sample_data["choices"][0]["delta"] = {"role": role, "content": ""}
@@ -48,6 +48,9 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                 error_json = error_str
             yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
         buffer = ""
+        revicing_function_call = False
+        function_full_response = "{"
+        need_function_call = False
         async for chunk in response.aiter_text():
             buffer += chunk
             while "\n" in buffer:
@@ -63,18 +66,23 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                     except json.JSONDecodeError:
                         logger.error(f"无法解析JSON: {line}")
 
-        # # 处理缓冲区中剩余的内容
-        # if buffer:
-        #     # print(buffer)
-        #     if '\"text\": \"' in buffer:
-        #         try:
-        #             json_data = json.loads(buffer)
-        #             content = json_data.get('text', '')
-        #             content = "\n".join(content.split("\\n"))
-        #             sse_string = await generate_sse_response(timestamp, model, content)
-        #             yield sse_string
-        #         except json.JSONDecodeError:
-        #             print(f"无法解析JSON: {buffer}")
+                if line and ('\"functionCall\": {' in line or revicing_function_call):
+                    revicing_function_call = True
+                    need_function_call = True
+                    if ']' in line:
+                        revicing_function_call = False
+                        continue
+
+                    function_full_response += line
+
+        if need_function_call:
+            function_call = json.loads(function_full_response)
+            function_call_name = function_call["functionCall"]["name"]
+            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=function_call_name)
+            yield sse_string
+            function_full_response = json.dumps(function_call["functionCall"]["args"])
+            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response)
+            yield sse_string
 
 async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
     redirect_count = 0
