@@ -5,3 +5,4 @@ __pycache__
 .vscode
 node_modules
 .wrangler
+.pytest_cache

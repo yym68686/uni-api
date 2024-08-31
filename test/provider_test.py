@@ -74,6 +74,7 @@ def test_request_model(test_client, api_key, get_model):
     }
 
     headers = {
+        'Content-Type': 'application/json',
         "Authorization": f"Bearer {api_key}"
     }
 

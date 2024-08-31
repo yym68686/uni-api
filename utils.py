@@ -13,6 +13,8 @@ def update_config(config_data):
             if type(model) == dict:
                 model_dict.update({new: old for old, new in model.items()})
         provider['model'] = model_dict
+        if provider.get('project_id'):
+            provider['base_url'] = 'https://aiplatform.googleapis.com/'
         config_data['providers'][index] = provider
     api_keys_db = config_data['api_keys']
     api_list = [item["api"] for item in api_keys_db]

@@ -12,14 +12,15 @@
 
 ## Introduction
 
-这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、DeepBricks、OpenRouter、Gemini等。
+这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、DeepBricks、OpenRouter、Gemini、Vertex 等。
 
 ## Features
 
 - 统一管理多个后端服务
 - 支持负载均衡
+- 支持 OpenAI, Anthropic, Gemini, Vertex 函数调用
 - 支持多个模型
-- 支持多个API Key
+- 支持多个 API Key
 
 ## Configuration
 
@@ -48,8 +49,17 @@ providers:
     api: AIzaSyAN2k6IRdgw
     model:
       - gemini-1.5-pro
-      - gemini-1.5-flash
+      - gemini-1.5-flash-exp-0827: gemini-1.5-flash
     tools: false
+
+  - provider: vertex
+    project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
+    private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # 描述： Google Cloud Vertex AI服务账号的私钥。格式： 一个JSON格式的字符串，包含服务账号的私钥信息。获取方式： 在Google Cloud Console中创建服务账号，生成JSON格式的密钥文件，然后将其内容设置为此环境变量的值。
+    client_email: xxxxxxxxxx@developer.gserviceaccount.com # 描述： Google Cloud Vertex AI服务账号的电子邮件地址。格式： 通常是形如 "service-account-name@project-id.iam.gserviceaccount.com" 的字符串。获取方式： 在创建服务账号时生成，也可以在Google Cloud Console的"IAM与管理"部分查看服务账号详情获得。
+    model:
+      - gemini-1.5-pro
+      - gemini-1.5-flash
+    tools: true
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages

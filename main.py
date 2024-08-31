@@ -21,7 +21,18 @@ from urllib.parse import urlparse
 async def lifespan(app: FastAPI):
     # 启动时的代码
     timeout = httpx.Timeout(connect=15.0, read=20.0, write=30.0, pool=30.0)
-    app.state.client = httpx.AsyncClient(timeout=timeout)
+    default_headers = {
+        "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
+        "Accept": "*/*",  # curl 的默认 Accept 头
+    }
+    app.state.client = httpx.AsyncClient(
+        timeout=timeout,
+        headers=default_headers,
+        http2=True,  # 禁用 HTTP/2
+        verify=True,  # 保持 SSL 验证（如需禁用，设为 False，但不建议）
+        follow_redirects=True,  # 自动跟随重定向
+    )
+    # app.state.client = httpx.AsyncClient(timeout=timeout)
     app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
     yield
     # 关闭时的代码
@@ -45,6 +56,8 @@ async def process_request(request: RequestModel, provider: Dict):
     engine = None
     if parsed_url.netloc == 'generativelanguage.googleapis.com':
         engine = "gemini"
+    elif parsed_url.netloc == 'aiplatform.googleapis.com':
+        engine = "vertex"
     elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
         engine = "claude"
     elif parsed_url.netloc == 'openrouter.ai':
@@ -59,6 +72,7 @@ async def process_request(request: RequestModel, provider: Dict):
 
     if provider.get("engine"):
         engine = provider["engine"]
+
     logger.info(f"provider: {provider['provider']:<10} model: {request.model:<10} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
