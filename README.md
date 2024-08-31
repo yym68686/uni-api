@@ -55,10 +55,14 @@ providers:
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
     private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # 描述： Google Cloud Vertex AI服务账号的私钥。格式： 一个JSON格式的字符串，包含服务账号的私钥信息。获取方式： 在Google Cloud Console中创建服务账号，生成JSON格式的密钥文件，然后将其内容设置为此环境变量的值。
-    client_email: xxxxxxxxxx@developer.gserviceaccount.com # 描述： Google Cloud Vertex AI服务账号的电子邮件地址。格式： 通常是形如 "service-account-name@project-id.iam.gserviceaccount.com" 的字符串。获取方式： 在创建服务账号时生成，也可以在Google Cloud Console的"IAM与管理"部分查看服务账号详情获得。
+    client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # 描述： Google Cloud Vertex AI服务账号的电子邮件地址。格式： 通常是形如 "service-account-name@project-id.iam.gserviceaccount.com" 的字符串。获取方式： 在创建服务账号时生成，也可以在Google Cloud Console的"IAM与管理"部分查看服务账号详情获得。
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash
+      - claude-3-5-sonnet@20240620: claude-3-5-sonnet
+      - claude-3-opus@20240229: claude-3-opus
+      - claude-3-sonnet@20240229: claude-3-sonnet
+      - claude-3-haiku@20240307: claude-3-haiku
     tools: true
 
   - provider: other-provider

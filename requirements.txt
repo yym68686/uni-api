@@ -1,5 +1,6 @@
-httpx[http2]
 pyyaml
 pytest
 uvicorn
 fastapi
+httpx[http2]
+cryptography

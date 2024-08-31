@@ -186,3 +186,38 @@ def get_all_models(config):
                 all_models.append(model_info)
 
     return all_models
+
+# 【GCP-Vertex AI 目前有這些區域可用】 https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude?hl=zh_cn
+# c3.5s
+# us-east5
+# europe-west1
+
+# c3s
+# us-east5
+# us-central1
+# asia-southeast1
+
+# c3o
+# us-east5
+
+# c3h
+# us-east5
+# us-central1
+# europe-west1
+# europe-west4
+from collections import deque
+class CircularList:
+    def __init__(self, items):
+        self.queue = deque(items)
+
+    def next(self):
+        if not self.queue:
+            return None
+        item = self.queue.popleft()
+        self.queue.append(item)
+        return item
+
+c35s = CircularList(["us-east5", "europe-west1"])
+c3s = CircularList(["us-east5", "us-central1", "asia-southeast1"])
+c3o = CircularList(["us-east5"])
+c3h = CircularList(["us-east5", "us-central1", "europe-west1", "europe-west4"])

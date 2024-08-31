@@ -1,6 +1,6 @@
 import json
 from models import RequestModel
-from log_config import logger
+from utils import c35s, c3s, c3o, c3h, CircularList
 
 async def get_image_message(base64_image, engine = None):
     if "gpt" == engine:
@@ -222,19 +222,168 @@ def get_access_token(client_email, private_key):
         response.raise_for_status()
         return response.json()["access_token"]
 
-async def get_vertex_payload(request, engine, provider):
+async def get_vertex_gemini_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
     }
     if provider.get("client_email") and provider.get("private_key"):
         access_token = get_access_token(provider['client_email'], provider['private_key'])
         headers['Authorization'] = f"Bearer {access_token}"
-    model = provider['model'][request.model]
-    if request.stream:
-        gemini_stream = "streamGenerateContent"
     if provider.get("project_id"):
         project_id = provider.get("project_id")
-        url = "https://us-central1-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/us-central1/publishers/google/models/{MODEL_ID}:{stream}".format(PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
+
+    if request.stream:
+        gemini_stream = "streamGenerateContent"
+    model = provider['model'][request.model]
+    location = CircularList(["us-central1", "us-east4", "us-west1", "us-west4", "europe-west1", "europe-west2"])
+    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
+
+    messages = []
+    systemInstruction = None
+    function_arguments = None
+    for msg in request.messages:
+        if msg.role == "assistant":
+            msg.role = "model"
+        tool_calls = None
+        if isinstance(msg.content, list):
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    text_message = await get_text_message(msg.role, item.text, engine)
+                    content.append(text_message)
+                elif item.type == "image_url":
+                    image_message = await get_image_message(item.image_url.url, engine)
+                    content.append(image_message)
+        else:
+            content = [{"text": msg.content}]
+            tool_calls = msg.tool_calls
+
+        if tool_calls:
+            tool_call = tool_calls[0]
+            function_arguments = {
+                "functionCall": {
+                    "name": tool_call.function.name,
+                    "args": json.loads(tool_call.function.arguments)
+                }
+            }
+            messages.append(
+                {
+                    "role": "model",
+                    "parts": [function_arguments]
+                }
+            )
+        elif msg.role == "tool":
+            function_call_name = function_arguments["functionCall"]["name"]
+            messages.append(
+                {
+                    "role": "function",
+                    "parts": [{
+                    "functionResponse": {
+                        "name": function_call_name,
+                        "response": {
+                            "name": function_call_name,
+                            "content": {
+                                "result": msg.content,
+                            }
+                        }
+                    }
+                    }]
+                }
+            )
+        elif msg.role != "system":
+            messages.append({"role": msg.role, "parts": content})
+        elif msg.role == "system":
+            systemInstruction = {"parts": content}
+
+
+    payload = {
+        "contents": messages,
+        # "safetySettings": [
+        #     {
+        #         "category": "HARM_CATEGORY_HARASSMENT",
+        #         "threshold": "BLOCK_NONE"
+        #     },
+        #     {
+        #         "category": "HARM_CATEGORY_HATE_SPEECH",
+        #         "threshold": "BLOCK_NONE"
+        #     },
+        #     {
+        #         "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        #         "threshold": "BLOCK_NONE"
+        #     },
+        #     {
+        #         "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        #         "threshold": "BLOCK_NONE"
+        #     }
+        # ]
+        "generationConfig": {
+            "temperature": 0.5,
+            "max_output_tokens": 8192,
+            "top_k": 40,
+            "top_p": 0.95
+        },
+    }
+    if systemInstruction:
+        payload["system_instruction"] = systemInstruction
+
+    miss_fields = [
+        'model',
+        'messages',
+        'stream',
+        'tool_choice',
+        'temperature',
+        'top_p',
+        'max_tokens',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+        'logprobs',
+        'top_logprobs'
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            if field == "tools":
+                payload.update({
+                    "tools": [{
+                        "function_declarations": [tool["function"] for tool in value]
+                    }],
+                    "tool_config": {
+                        "function_calling_config": {
+                            "mode": "AUTO"
+                        }
+                    }
+                })
+            else:
+                payload[field] = value
+
+    return url, headers, payload
+
+async def get_vertex_claude_payload(request, engine, provider):
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if provider.get("client_email") and provider.get("private_key"):
+        access_token = get_access_token(provider['client_email'], provider['private_key'])
+        headers['Authorization'] = f"Bearer {access_token}"
+    if provider.get("project_id"):
+        project_id = provider.get("project_id")
+
+    model = provider['model'][request.model]
+    if "claude-3-5-sonnet" in model:
+        location = c35s
+    elif "claude-3-opus" in model:
+        location = c3o
+    elif "claude-3-sonnet" in model:
+        location = c3s
+    elif "claude-3-haiku" in model:
+        location = c3h
+
+    if request.stream:
+        claude_stream = "streamRawPredict"
+    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL=model, stream=claude_stream)
 
     messages = []
     systemInstruction = None
@@ -620,8 +769,10 @@ async def get_claude_payload(request, engine, provider):
 async def get_payload(request: RequestModel, engine, provider):
     if engine == "gemini":
         return await get_gemini_payload(request, engine, provider)
-    elif engine == "vertex":
-        return await get_vertex_payload(request, engine, provider)
+    elif engine == "vertex" and "gemini" in provider['model'][request.model]:
+        return await get_vertex_gemini_payload(request, engine, provider)
+    elif engine == "vertex" and "claude" in provider['model'][request.model]:
+        return await get_vertex_claude_payload(request, engine, provider)
     elif engine == "claude":
         return await get_claude_payload(request, engine, provider)
     elif engine == "gpt":
