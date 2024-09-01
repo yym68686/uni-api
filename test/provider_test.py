@@ -16,7 +16,7 @@ def api_key():
 
 @pytest.fixture
 def get_model():
-    return os.environ.get("MODEL", "claude-3-5-sonnet-20240620")
+    return os.environ.get("MODEL", "claude-3-5-sonnet")
 
 def test_request_model(test_client, api_key, get_model):
     request_data = {

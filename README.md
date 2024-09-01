@@ -12,7 +12,7 @@
 
 ## Introduction
 
-这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、DeepBricks、OpenRouter、Gemini、Vertex 等。
+这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、DeepBricks、OpenRouter 等。
 
 ## Features
 
@@ -21,6 +21,7 @@
 - 支持 OpenAI, Anthropic, Gemini, Vertex 函数调用
 - 支持多个模型
 - 支持多个 API Key
+- 支持 Vertex 区域负载均衡，支持 Vertex 高并发
 
 ## Configuration
 
@@ -49,8 +50,9 @@ providers:
     api: AIzaSyAN2k6IRdgw
     model:
       - gemini-1.5-pro
-      - gemini-1.5-flash-exp-0827: gemini-1.5-flash
-    tools: false
+      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # 重命名后，原来的模型名字 gemini-1.5-flash-exp-0827 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
+      - gemini-1.5-flash-exp-0827 # 加上这一行，gemini-1.5-flash-exp-0827 和 gemini-1.5-flash 都可以被请求
+    tools: true
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
