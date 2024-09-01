@@ -32,18 +32,16 @@ providers:
   - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
-    model:
+    model: # 至少填一个模型
       - gpt-4o # 可以使用的模型名称，必填
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
-    tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
-    url: https://openai.com/ # 服务商的网址，选填
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages
     api: sk-ant-api03-bNnAOJyA-xQw_twAA
     model:
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
-    tools: true
+    tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url 支持 v1beta/v1, 仅供 Gemini 模型使用，必填
@@ -66,6 +64,7 @@ providers:
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
     tools: true
+    notes: https://xxxxx.com/ # 可以放服务商的网址，备注信息，官方文档，选填
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
