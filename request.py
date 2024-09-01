@@ -1,6 +1,6 @@
 import json
 from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, CircularList
+from utils import c35s, c3s, c3o, c3h, gem, CircularList
 
 async def get_image_message(base64_image, engine = None):
     if "gpt" == engine:
@@ -235,7 +235,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
     if request.stream:
         gemini_stream = "streamGenerateContent"
     model = provider['model'][request.model]
-    location = CircularList(["us-central1", "us-east4", "us-west1", "us-west4", "europe-west1", "europe-west2"])
+    location = gem
     url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
 
     messages = []
