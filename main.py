@@ -5,7 +5,7 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -39,6 +39,37 @@ async def lifespan(app: FastAPI):
     await app.state.client.aclose()
 
 app = FastAPI(lifespan=lifespan)
+
+# from time import time
+# from collections import defaultdict
+# import asyncio
+
+# class StatsMiddleware:
+#     def __init__(self):
+#         self.request_counts = defaultdict(int)
+#         self.request_times = defaultdict(float)
+#         self.ip_counts = defaultdict(lambda: defaultdict(int))
+#         self.lock = asyncio.Lock()
+
+#     async def __call__(self, request: Request, call_next):
+#         start_time = time()
+#         response = await call_next(request)
+#         process_time = time() - start_time
+
+#         endpoint = f"{request.method} {request.url.path}"
+#         client_ip = request.client.host
+
+#         async with self.lock:
+#             self.request_counts[endpoint] += 1
+#             self.request_times[endpoint] += process_time
+#             self.ip_counts[endpoint][client_ip] += 1
+
+#         return response
+# # 创建 StatsMiddleware 实例
+# stats_middleware = StatsMiddleware()
+
+# # 添加 StatsMiddleware
+# app.add_middleware(StatsMiddleware)
 
 # 配置 CORS 中间件
 app.add_middleware(
@@ -219,9 +250,24 @@ def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(32)
     return JSONResponse(content={"api_key": api_key})
 
+# @app.get("/stats")
+# async def get_stats(token: str = Depends(verify_api_key)):
+#     async with stats_middleware.lock:
+#         return {
+#             "request_counts": dict(stats_middleware.request_counts),
+#             "average_request_times": {
+#                 endpoint: total_time / count
+#                 for endpoint, total_time in stats_middleware.request_times.items()
+#                 for count in [stats_middleware.request_counts[endpoint]]
+#             },
+#             "ip_counts": {
+#                 endpoint: dict(ips)
+#                 for endpoint, ips in stats_middleware.ip_counts.items()
+#             }
+#         }
+
 # async def on_fetch(request, env):
 #     import asgi
-
 #     return await asgi.fetch(app, request, env)
 
 if __name__ == '__main__':
@@ -232,5 +278,5 @@ if __name__ == '__main__':
         port=8000,
         reload=True,
         ws="none",
-        log_level="warning"
+        # log_level="warning"
     )

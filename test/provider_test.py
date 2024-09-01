@@ -80,7 +80,7 @@ def test_request_model(test_client, api_key, get_model):
 
     response = test_client.post("/v1/chat/completions", json=request_data, headers=headers)
     for line in response.iter_lines():
-        print(line)
+        print(line.lstrip("data: "))
     assert response.status_code == 200
 
 if __name__ == "__main__":

@@ -80,6 +80,7 @@ async def error_handling_wrapper(generator, status_code=200):
     try:
         first_item = await generator.__anext__()
         first_item_str = first_item
+        # logger.info("first_item_str: %s", first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
             first_item_str = first_item_str.decode("utf-8")
         if isinstance(first_item_str, str):

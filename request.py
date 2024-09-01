@@ -363,7 +363,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
 
 async def get_vertex_claude_payload(request, engine, provider):
     headers = {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
     }
     if provider.get("client_email") and provider.get("private_key"):
         access_token = get_access_token(provider['client_email'], provider['private_key'])
@@ -386,12 +386,10 @@ async def get_vertex_claude_payload(request, engine, provider):
     url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL=model, stream=claude_stream)
 
     messages = []
-    systemInstruction = None
-    function_arguments = None
+    system_prompt = None
     for msg in request.messages:
-        if msg.role == "assistant":
-            msg.role = "model"
         tool_calls = None
+        tool_call_id = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -402,109 +400,84 @@ async def get_vertex_claude_payload(request, engine, provider):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
-            content = [{"text": msg.content}]
+            content = msg.content
             tool_calls = msg.tool_calls
+            tool_call_id = msg.tool_call_id
 
         if tool_calls:
-            tool_call = tool_calls[0]
-            function_arguments = {
-                "functionCall": {
+            tool_calls_list = []
+            for tool_call in tool_calls:
+                tool_calls_list.append({
+                    "type": "tool_use",
+                    "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "args": json.loads(tool_call.function.arguments)
-                }
-            }
-            messages.append(
-                {
-                    "role": "model",
-                    "parts": [function_arguments]
-                }
-            )
-        elif msg.role == "tool":
-            function_call_name = function_arguments["functionCall"]["name"]
-            messages.append(
-                {
-                    "role": "function",
-                    "parts": [{
-                    "functionResponse": {
-                        "name": function_call_name,
-                        "response": {
-                            "name": function_call_name,
-                            "content": {
-                                "result": msg.content,
-                            }
-                        }
-                    }
-                    }]
-                }
-            )
+                    "input": json.loads(tool_call.function.arguments),
+                })
+                messages.append({"role": msg.role, "content": tool_calls_list})
+        elif tool_call_id:
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_call.id,
+                "content": content
+            }]})
         elif msg.role != "system":
-            messages.append({"role": msg.role, "parts": content})
+            messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
-            systemInstruction = {"parts": content}
+            system_prompt = content
 
+    conversation_len = len(messages) - 1
+    message_index = 0
+    while message_index < conversation_len:
+        if messages[message_index]["role"] == messages[message_index + 1]["role"]:
+            if messages[message_index].get("content"):
+                if isinstance(messages[message_index]["content"], list):
+                    messages[message_index]["content"].extend(messages[message_index + 1]["content"])
+                elif isinstance(messages[message_index]["content"], str) and isinstance(messages[message_index + 1]["content"], list):
+                    content_list = [{"type": "text", "text": messages[message_index]["content"]}]
+                    content_list.extend(messages[message_index + 1]["content"])
+                    messages[message_index]["content"] = content_list
+                else:
+                    messages[message_index]["content"] += messages[message_index + 1]["content"]
+            messages.pop(message_index + 1)
+            conversation_len = conversation_len - 1
+        else:
+            message_index = message_index + 1
 
+    model = provider['model'][request.model]
     payload = {
-        "contents": messages,
-        # "safetySettings": [
-        #     {
-        #         "category": "HARM_CATEGORY_HARASSMENT",
-        #         "threshold": "BLOCK_NONE"
-        #     },
-        #     {
-        #         "category": "HARM_CATEGORY_HATE_SPEECH",
-        #         "threshold": "BLOCK_NONE"
-        #     },
-        #     {
-        #         "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        #         "threshold": "BLOCK_NONE"
-        #     },
-        #     {
-        #         "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-        #         "threshold": "BLOCK_NONE"
-        #     }
-        # ]
-        "generationConfig": {
-            "temperature": 0.5,
-            "max_output_tokens": 8192,
-            "top_k": 40,
-            "top_p": 0.95
-        },
+        "anthropic_version": "vertex-2023-10-16",
+        "messages": messages,
+        "system": system_prompt or "You are Claude, a large language model trained by Anthropic.",
     }
-    if systemInstruction:
-        payload["system_instruction"] = systemInstruction
 
     miss_fields = [
         'model',
         'messages',
-        'stream',
-        'tool_choice',
-        'temperature',
-        'top_p',
-        'max_tokens',
         'presence_penalty',
         'frequency_penalty',
         'n',
         'user',
         'include_usage',
-        'logprobs',
-        'top_logprobs'
     ]
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
-            if field == "tools":
-                payload.update({
-                    "tools": [{
-                        "function_declarations": [tool["function"] for tool in value]
-                    }],
-                    "tool_config": {
-                        "function_calling_config": {
-                            "mode": "AUTO"
-                        }
-                    }
-                })
-            else:
-                payload[field] = value
+            payload[field] = value
+
+    if request.tools and provider.get("tools"):
+        tools = []
+        for tool in request.tools:
+            json_tool = await gpt2claude_tools_json(tool.dict()["function"])
+            tools.append(json_tool)
+        payload["tools"] = tools
+        if "tool_choice" in payload:
+            payload["tool_choice"] = {
+                "type": "auto"
+            }
+
+    if provider.get("tools") == False:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
 
     return url, headers, payload
 

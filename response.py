@@ -84,6 +84,55 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response)
             yield sse_string
 
+async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
+    timestamp = datetime.timestamp(datetime.now())
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        if response.status_code != 200:
+            error_message = await response.aread()
+            error_str = error_message.decode('utf-8', errors='replace')
+            try:
+                error_json = json.loads(error_str)
+            except json.JSONDecodeError:
+                error_json = error_str
+            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
+        buffer = ""
+        revicing_function_call = False
+        function_full_response = "{"
+        need_function_call = False
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                logger.info(f"{line}")
+                if line and '\"text\": \"' in line:
+                    try:
+                        json_data = json.loads( "{" + line + "}")
+                        content = json_data.get('text', '')
+                        content = "\n".join(content.split("\\n"))
+                        sse_string = await generate_sse_response(timestamp, model, content)
+                        yield sse_string
+                    except json.JSONDecodeError:
+                        logger.error(f"无法解析JSON: {line}")
+
+                if line and ('\"type\": \"tool_use\"' in line or revicing_function_call):
+                    revicing_function_call = True
+                    need_function_call = True
+                    if ']' in line:
+                        revicing_function_call = False
+                        continue
+
+                    function_full_response += line
+
+        if need_function_call:
+            function_call = json.loads(function_full_response)
+            function_call_name = function_call["name"]
+            function_call_id = function_call["id"]
+            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=function_call_name)
+            yield sse_string
+            function_full_response = json.dumps(function_call["input"])
+            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
+            yield sse_string
+
 async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
     redirect_count = 0
     while redirect_count < max_redirects:
@@ -202,10 +251,10 @@ async def fetch_response(client, url, headers, payload):
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     try:
-        if engine == "gemini" or engine == "vertex":
+        if engine == "gemini" or (engine == "vertex" and "gemini" in model):
             async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
                 yield chunk
-        elif engine == "claude":
+        elif engine == "claude" or (engine == "vertex" and "claude" in model):
             async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
                 yield chunk
         elif engine == "gpt":
