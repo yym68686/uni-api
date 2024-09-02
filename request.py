@@ -406,15 +406,16 @@ async def get_vertex_claude_payload(request, engine, provider):
 
         if tool_calls:
             tool_calls_list = []
-            for tool_call in tool_calls:
-                tool_calls_list.append({
-                    "type": "tool_use",
-                    "id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
-                })
-                messages.append({"role": msg.role, "content": tool_calls_list})
-        elif tool_call_id:
+            tool_call = tool_calls[0]
+            tool_calls_list.append({
+                "type": "tool_use",
+                "id": tool_call.id,
+                "name": tool_call.function.name,
+                "input": json.loads(tool_call.function.arguments),
+            })
+            messages.append({"role": msg.role, "content": tool_calls_list})
+        elif tool_call_id and tool_calls:
+            tool_call = tool_calls[0]
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
@@ -668,15 +669,16 @@ async def get_claude_payload(request, engine, provider):
 
         if tool_calls:
             tool_calls_list = []
-            for tool_call in tool_calls:
-                tool_calls_list.append({
-                    "type": "tool_use",
-                    "id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
-                })
-                messages.append({"role": msg.role, "content": tool_calls_list})
-        elif tool_call_id:
+            tool_call = tool_calls[0]
+            tool_calls_list.append({
+                "type": "tool_use",
+                "id": tool_call.id,
+                "name": tool_call.function.name,
+                "input": json.loads(tool_call.function.arguments),
+            })
+            messages.append({"role": msg.role, "content": tool_calls_list})
+        elif tool_call_id and tool_calls:
+            tool_call = tool_calls[0]
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,

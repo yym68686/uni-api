@@ -6,8 +6,12 @@ from main import load_config
 
 provider_name = "linuxdoi"
 model = "claude-3-5-sonnet"
+import asyncio
+config, api_keys_db, api_list = asyncio.run(load_config())
+import json
 
-config, api_keys_db, api_list = load_config()
+print(json.dumps(api_keys_db, indent=2))
+exit(0)
 providers = config["providers"]
 provider_config = None
 for provider in providers:

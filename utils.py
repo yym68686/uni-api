@@ -22,7 +22,7 @@ def update_config(config_data):
     return config_data, api_keys_db, api_list
 
 # 读取YAML配置文件
-async def load_config(app):
+async def load_config(app=None):
     import yaml
     try:
         with open('./api.yaml', 'r') as f:
