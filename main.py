@@ -126,6 +126,8 @@ async def process_request(request: RequestModel, provider: Dict):
 
 import asyncio
 class ModelRequestHandler:
+    last_provider_index = -1  # 类变量
+
     def __init__(self):
         self.last_provider_index = -1
 
@@ -180,31 +182,32 @@ class ModelRequestHandler:
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
 
-        # 检查是否启用轮询
+        # 修改这里：默认为 True，除非明确设置为 False
         api_index = api_list.index(token)
-        use_round_robin = False
+        use_round_robin = True
         auto_retry = False
         if config['api_keys'][api_index].get("preferences"):
-            use_round_robin = config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN")
-            auto_retry = config['api_keys'][api_index]["preferences"].get("AUTO_RETRY")
+            if config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN") == False:
+                use_round_robin = False
+            auto_retry = config['api_keys'][api_index]["preferences"].get("AUTO_RETRY", False)
 
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry)
 
     async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool, auto_retry: bool):
         num_providers = len(providers)
-        start_index = self.last_provider_index + 1 if use_round_robin else 0
+        start_index = (ModelRequestHandler.last_provider_index + 1) % num_providers if use_round_robin else 0
 
-        for i in range(num_providers + 1):
-            self.last_provider_index = (start_index + i) % num_providers
-            provider = providers[self.last_provider_index]
+        for i in range(num_providers):
+            index = (start_index + i) % num_providers
+            provider = providers[index]
             try:
                 response = await process_request(request, provider)
+                if use_round_robin:
+                    ModelRequestHandler.last_provider_index = index
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
-                if auto_retry:
-                    continue
-                else:
+                if not auto_retry:
                     raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
 
         raise HTTPException(status_code=500, detail=f"All providers failed: {request.model}")
