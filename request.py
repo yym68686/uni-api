@@ -450,6 +450,13 @@ async def get_vertex_claude_payload(request, engine, provider):
         "system": system_prompt or "You are Claude, a large language model trained by Anthropic.",
     }
 
+    # 檢查是否需要添加 max_tokens
+    if 'max_tokens' not in payload:
+        if "claude-3-5-sonnet" in model:
+            payload['max_tokens'] = 8192
+        elif "claude-3" in model:  # 處理其他 Claude 3 模型
+            payload['max_tokens'] = 4096
+
     miss_fields = [
         'model',
         'messages',
