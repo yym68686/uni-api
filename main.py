@@ -182,14 +182,15 @@ class ModelRequestHandler:
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
 
-        # 修改这里：默认为 True，除非明确设置为 False
+        # 检查是否启用轮询
         api_index = api_list.index(token)
         use_round_robin = True
-        auto_retry = False
+        auto_retry = True
         if config['api_keys'][api_index].get("preferences"):
             if config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN") == False:
                 use_round_robin = False
-            auto_retry = config['api_keys'][api_index]["preferences"].get("AUTO_RETRY", False)
+            if config['api_keys'][api_index]["preferences"].get("AUTO_RETRY") == False:
+                auto_retry = False
 
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry)
 
