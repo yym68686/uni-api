@@ -126,8 +126,6 @@ async def process_request(request: RequestModel, provider: Dict):
 
 import asyncio
 class ModelRequestHandler:
-    last_provider_index = -1  # 类变量
-
     def __init__(self):
         self.last_provider_index = -1
 
@@ -196,20 +194,21 @@ class ModelRequestHandler:
 
     async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool, auto_retry: bool):
         num_providers = len(providers)
-        start_index = (ModelRequestHandler.last_provider_index + 1) % num_providers if use_round_robin else 0
+        start_index = self.last_provider_index + 1 if use_round_robin else 0
 
-        for i in range(num_providers):
-            index = (start_index + i) % num_providers
-            provider = providers[index]
+        for i in range(num_providers + 1):
+            self.last_provider_index = (start_index + i) % num_providers
+            provider = providers[self.last_provider_index]
             try:
                 response = await process_request(request, provider)
-                if use_round_robin:
-                    ModelRequestHandler.last_provider_index = index
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
-                if not auto_retry:
+                if auto_retry:
+                    continue
+                else:
                     raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
+
 
         raise HTTPException(status_code=500, detail=f"All providers failed: {request.model}")
 
