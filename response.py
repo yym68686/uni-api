@@ -32,7 +32,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
-    sse_response = f"data: {json_data}\n\n"
+    sse_response = f"data: {json_data}\n\r"
 
     return sse_response
 
@@ -173,7 +173,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
                         line, buffer = buffer.split("\n", 1)
                         # logger.info("line: %s", repr(line))
                         if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                            yield line + "\n"
+                            yield line + "\n\r"
             except httpx.RemoteProtocolError as e:
                 yield {"error": f"fetch_gpt_response_stream RemoteProtocolError {e.__class__.__name__}", "details": str(e)}
                 return
