@@ -5,16 +5,16 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from models import RequestModel
+from models import RequestModel, ImageGenerationRequest
 from utils import error_handling_wrapper, get_all_models, post_all_models, load_config
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 
-from typing import List, Dict
+from typing import List, Dict, Union
 from urllib.parse import urlparse
 
 @asynccontextmanager
@@ -80,7 +80,7 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有头部字段
 )
 
-async def process_request(request: RequestModel, provider: Dict):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print(parsed_url)
@@ -100,6 +100,10 @@ async def process_request(request: RequestModel, provider: Dict):
     and "gpt" not in provider['model'][request.model] \
     and "gemini" not in provider['model'][request.model]:
         engine = "openrouter"
+
+    if endpoint == "/v1/images/generations":
+        engine = "dalle"
+        request.stream = False
 
     if provider.get("engine"):
         engine = provider["engine"]
@@ -122,7 +126,7 @@ async def process_request(request: RequestModel, provider: Dict):
         wrapped_generator = await error_handling_wrapper(generator, status_code=500)
         return StreamingResponse(wrapped_generator, media_type="text/event-stream")
     else:
-        return await fetch_response(app.state.client, url, headers, payload)
+        return await anext(fetch_response(app.state.client, url, headers, payload))
 
 import asyncio
 class ModelRequestHandler:
@@ -171,7 +175,7 @@ class ModelRequestHandler:
         #     print(json.dumps(provider, indent=4, ensure_ascii=False))
         return provider_list
 
-    async def request_model(self, request: RequestModel, token: str):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest], token: str, endpoint=None):
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
@@ -193,9 +197,9 @@ class ModelRequestHandler:
             if config['api_keys'][api_index]["preferences"].get("AUTO_RETRY") == False:
                 auto_retry = False
 
-        return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry)
+        return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint)
 
-    async def try_all_providers(self, request: RequestModel, providers: List[Dict], use_round_robin: bool, auto_retry: bool):
+    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None):
         num_providers = len(providers)
         start_index = self.last_provider_index + 1 if use_round_robin else 0
 
@@ -203,7 +207,7 @@ class ModelRequestHandler:
             self.last_provider_index = (start_index + i) % num_providers
             provider = providers[self.last_provider_index]
             try:
-                response = await process_request(request, provider)
+                response = await process_request(request, provider, endpoint)
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
@@ -228,7 +232,7 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
     return token
 
 @app.post("/v1/chat/completions")
-async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
+async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
 
 @app.options("/v1/chat/completions")
@@ -250,6 +254,13 @@ async def list_models():
         "object": "list",
         "data": models
     })
+
+@app.post("/v1/images/generations")
+async def images_generations(
+    request: ImageGenerationRequest,
+    token: str = Depends(verify_api_key)
+):
+    return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
 
 @app.get("/generate-api-key")
 def generate_api_key():

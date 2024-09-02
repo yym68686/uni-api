@@ -36,17 +36,24 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
 
     return sse_response
 
+async def check_response(response, error_log):
+    if response.status_code != 200:
+        error_message = await response.aread()
+        error_str = error_message.decode('utf-8', errors='replace')
+        try:
+            error_json = json.loads(error_str)
+        except json.JSONDecodeError:
+            error_json = error_str
+        return {"error": f"{error_log} HTTP Error {response.status_code}", "details": error_json}
+    return None
+
 async def fetch_gemini_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
     async with client.stream('POST', url, headers=headers, json=payload) as response:
-        if response.status_code != 200:
-            error_message = await response.aread()
-            error_str = error_message.decode('utf-8', errors='replace')
-            try:
-                error_json = json.loads(error_str)
-            except json.JSONDecodeError:
-                error_json = error_str
-            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
+        error_message = await check_response(response, "fetch_gemini_response_stream")
+        if error_message:
+            yield error_message
+            return
         buffer = ""
         revicing_function_call = False
         function_full_response = "{"
@@ -87,14 +94,11 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
     async with client.stream('POST', url, headers=headers, json=payload) as response:
-        if response.status_code != 200:
-            error_message = await response.aread()
-            error_str = error_message.decode('utf-8', errors='replace')
-            try:
-                error_json = json.loads(error_str)
-            except json.JSONDecodeError:
-                error_json = error_str
-            yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
+        error_message = await check_response(response, "fetch_vertex_claude_response_stream")
+        if error_message:
+            yield error_message
+            return
+
         buffer = ""
         revicing_function_call = False
         function_full_response = "{"
@@ -138,14 +142,9 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
     while redirect_count < max_redirects:
         # logger.info(f"fetch_gpt_response_stream: {url}")
         async with client.stream('POST', url, headers=headers, json=payload) as response:
-            if response.status_code != 200:
-                error_message = await response.aread()
-                error_str = error_message.decode('utf-8', errors='replace')
-                try:
-                    error_json = json.loads(error_str)
-                except json.JSONDecodeError:
-                    error_json = error_str
-                yield {"error": f"fetch_gpt_response_stream HTTP Error {response.status_code}", "details": error_json}
+            error_message = await check_response(response, "fetch_gpt_response_stream")
+            if error_message:
+                yield error_message
                 return
 
             buffer = ""
@@ -185,14 +184,10 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
     async with client.stream('POST', url, headers=headers, json=payload) as response:
-        if response.status_code != 200:
-            error_message = await response.aread()
-            error_str = error_message.decode('utf-8', errors='replace')
-            try:
-                error_json = json.loads(error_str)
-            except json.JSONDecodeError:
-                error_json = error_str
-            yield {"error": f"fetch_claude_response_stream HTTP Error {response.status_code}", "details": error_json}
+        error_message = await check_response(response, "fetch_claude_response_stream")
+        if error_message:
+            yield error_message
+            return
         buffer = ""
         async for chunk in response.aiter_text():
             # logger.info(f"chunk: {repr(chunk)}")
@@ -241,13 +236,12 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         yield sse_string
 
 async def fetch_response(client, url, headers, payload):
-    try:
-        response = await client.post(url, headers=headers, json=payload)
-        return response.json()
-    except httpx.ConnectError as e:
-        return {"error": f"500", "details": "fetch_response Connect Error"}
-    except httpx.ReadTimeout as e:
-        return {"error": f"500", "details": "fetch_response Read Response Timeout"}
+    response = await client.post(url, headers=headers, json=payload)
+    error_message = await check_response(response, "fetch_response")
+    if error_message:
+        yield error_message
+        return
+    yield response.json()
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     try:
