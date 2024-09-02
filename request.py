@@ -387,9 +387,10 @@ async def get_vertex_claude_payload(request, engine, provider):
 
     messages = []
     system_prompt = None
+    tool_id = None
     for msg in request.messages:
-        tool_calls = None
         tool_call_id = None
+        tool_calls = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -402,6 +403,7 @@ async def get_vertex_claude_payload(request, engine, provider):
         else:
             content = msg.content
             tool_calls = msg.tool_calls
+            tool_id = tool_calls[0].id if tool_calls else None or tool_id
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
@@ -414,11 +416,10 @@ async def get_vertex_claude_payload(request, engine, provider):
                 "input": json.loads(tool_call.function.arguments),
             })
             messages.append({"role": msg.role, "content": tool_calls_list})
-        elif tool_call_id and tool_calls:
-            tool_call = tool_calls[0]
+        elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_call.id,
+                "tool_use_id": tool_id,
                 "content": content
             }]})
         elif msg.role != "system":
@@ -650,9 +651,10 @@ async def get_claude_payload(request, engine, provider):
 
     messages = []
     system_prompt = None
+    tool_id = None
     for msg in request.messages:
-        tool_calls = None
         tool_call_id = None
+        tool_calls = None
         if isinstance(msg.content, list):
             content = []
             for item in msg.content:
@@ -665,6 +667,7 @@ async def get_claude_payload(request, engine, provider):
         else:
             content = msg.content
             tool_calls = msg.tool_calls
+            tool_id = tool_calls[0].id if tool_calls else None or tool_id
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
@@ -677,11 +680,10 @@ async def get_claude_payload(request, engine, provider):
                 "input": json.loads(tool_call.function.arguments),
             })
             messages.append({"role": msg.role, "content": tool_calls_list})
-        elif tool_call_id and tool_calls:
-            tool_call = tool_calls[0]
+        elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_call.id,
+                "tool_use_id": tool_id,
                 "content": content
             }]})
         elif msg.role != "system":
