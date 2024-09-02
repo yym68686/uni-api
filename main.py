@@ -159,13 +159,16 @@ class ModelRequestHandler:
         # print("provider_rules", provider_rules)
         for item in provider_rules:
             for provider in config['providers']:
-                if provider['provider'] in item:
+                if provider['provider'] == item:
                     if "/" in item:
                         if item.split("/")[1] == model_name:
                             provider_list.append(provider)
                     else:
                         if model_name in provider['model'].keys():
                             provider_list.append(provider)
+        # import json
+        # for provider in provider_list:
+        #     print(json.dumps(provider, indent=4, ensure_ascii=False))
         return provider_list
 
     async def request_model(self, request: RequestModel, token: str):
