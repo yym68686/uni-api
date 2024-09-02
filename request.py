@@ -1,6 +1,6 @@
 import json
 from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, gem, CircularList
+from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
 
 async def get_image_message(base64_image, engine = None):
     if "gpt" == engine:
@@ -748,6 +748,25 @@ async def get_claude_payload(request, engine, provider):
 
     return url, headers, payload
 
+async def get_dalle_payload(request, engine, provider):
+    model = provider['model'][request.model]
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api']}"
+    url = provider['base_url']
+    url = BaseAPI(url).image_url
+
+    payload = {
+        "model": model,
+        "prompt": request.prompt,
+        "n": request.n,
+        "size": request.size
+    }
+
+    return url, headers, payload
+
 async def get_payload(request: RequestModel, engine, provider):
     if engine == "gemini":
         return await get_gemini_payload(request, engine, provider)
@@ -761,5 +780,7 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_gpt_payload(request, engine, provider)
     elif engine == "openrouter":
         return await get_openrouter_payload(request, engine, provider)
+    elif engine == "dalle":
+        return await get_dalle_payload(request, engine, provider)
     else:
         raise ValueError("Unknown payload")

@@ -1,6 +1,13 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Union
 
+class ImageGenerationRequest(BaseModel):
+    model: str
+    prompt: str
+    n: int
+    size: str
+    stream: bool = False
+
 class FunctionParameter(BaseModel):
     type: str
     properties: Dict[str, Dict[str, str]]

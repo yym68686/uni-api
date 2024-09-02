@@ -12,20 +12,23 @@
 
 ## Introduction
 
-这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、DeepBricks、OpenRouter 等。
+如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、DeepBricks、OpenRouter 等。
 
 ## Features
 
-- 统一管理多个后端服务
-- 支持负载均衡
-- 支持 OpenAI, Anthropic, Gemini, Vertex 函数调用
-- 支持多个模型
-- 支持多个 API Key
-- 支持 Vertex 区域负载均衡，支持 Vertex 高并发
+- 无前端，纯配置文件配置 API 渠道。只要写一个文件就能运行起一个属于自己的 API 站，文档有详细的配置指南，小白友好。
+- 统一管理多个后端服务，支持 OpenAI、Deepseek、DeepBricks、OpenRouter 等其他API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
+- 同时支持 Anthropic、Gemini、Vertex API。Vertex 同时支持 Claude 和 Gemini API。
+- 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
+- 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
+- 支持负载均衡，支持 Vertex 区域负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。除了 Vertex 区域负载均衡，所有 API 均支持渠道级负载均衡，提高沉浸式翻译体验。
+- 支持自动重试，当一个 API 渠道响应失败时，自动重试下一个 API 渠道。
+- 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
+- 支持多个 API Key。
 
 ## Configuration
 
-使用api.yaml配置文件，可以配置多个模型，每个模型可以配置多个后端服务，支持负载均衡。下面是 api.yaml 配置文件的示例：
+使用 api.yaml 配置文件，可以配置多个模型，每个模型可以配置多个后端服务，支持负载均衡。下面是 api.yaml 配置文件的示例：
 
 ```yaml
 providers:
@@ -35,6 +38,7 @@ providers:
     model: # 至少填一个模型
       - gpt-4o # 可以使用的模型名称，必填
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+      - dall-e-3
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages
@@ -86,7 +90,7 @@ api_keys:
     model:
       - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。
     preferences:
-      USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true
+      USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true。开启轮训后每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true
 ```
 
@@ -151,6 +155,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Authorization: Bearer ${API}" \
 -d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
+
 
 ## Star History
 
