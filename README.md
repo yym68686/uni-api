@@ -94,6 +94,11 @@ api_keys:
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true
 ```
 
+## 环境变量
+
+- CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填
+- TIMEOUT: 请求超时时间，默认为 20 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间。选填
+
 ## Docker Local Deployment
 
 Start the container
@@ -118,6 +123,8 @@ services:
     volumes:
       - ./api.yaml:/home/api.yaml
 ```
+
+CONFIG_URL 就是可以自动下载远程的配置文件。比如你在某个平台不方便修改配置文件，可以把配置文件传到某个托管服务，可以提供直链给 uni-api 下载，CONFIG_URL 就是这个直链。
 
 Run Docker Compose container in the background
 
