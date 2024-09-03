@@ -20,7 +20,9 @@ from urllib.parse import urlparse
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
-    timeout = httpx.Timeout(connect=15.0, read=20.0, write=30.0, pool=30.0)
+    import os
+    TIMEOUT = os.getenv("TIMEOUT", 20)
+    timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
     default_headers = {
         "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
         "Accept": "*/*",  # curl 的默认 Accept 头
@@ -239,17 +241,9 @@ async def request_model(request: Union[RequestModel, ImageGenerationRequest], to
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
-@app.post("/v1/models")
+@app.get("/v1/models")
 async def list_models(token: str = Depends(verify_api_key)):
     models = post_all_models(token, app.state.config, app.state.api_list)
-    return JSONResponse(content={
-        "object": "list",
-        "data": models
-    })
-
-@app.get("/v1/models")
-async def list_models():
-    models = get_all_models(config=app.state.config)
     return JSONResponse(content={
         "object": "list",
         "data": models
