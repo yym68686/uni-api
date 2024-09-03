@@ -2,5 +2,6 @@ pyyaml
 pytest
 uvicorn
 fastapi
+aiofiles
 httpx[http2]
 cryptography
