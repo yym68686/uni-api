@@ -222,13 +222,25 @@ class ModelRequestHandler:
         # print("provider_rules", provider_rules)
         for item in provider_rules:
             for provider in config['providers']:
-                if provider['provider'] == item:
-                    if "/" in item:
-                        if item.split("/")[1] == model_name:
+                # print("provider", provider, provider['provider'] == item, item)
+                if "/" in item:
+                    if provider['provider'] == item.split("/")[0]:
+                        if model_name in provider['model'].keys() and item.split("/")[1] == model_name:
                             provider_list.append(provider)
-                    else:
-                        if model_name in provider['model'].keys():
-                            provider_list.append(provider)
+                elif provider['provider'] == item:
+                    if model_name in provider['model'].keys():
+                        provider_list.append(provider)
+                else:
+                    pass
+
+                # if provider['provider'] == item:
+                #     if "/" in item:
+                #         if item.split("/")[1] == model_name:
+                #             provider_list.append(provider)
+                #     else:
+                #         if model_name in provider['model'].keys():
+                #             provider_list.append(provider)
+
         # import json
         # for provider in provider_list:
         #     print(json.dumps(provider, indent=4, ensure_ascii=False))
