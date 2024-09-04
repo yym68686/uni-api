@@ -478,6 +478,10 @@ async def get_vertex_claude_payload(request, engine, provider):
                 payload["tool_choice"] = {
                     "type": "auto"
                 }
+            if payload["tool_choice"]["type"] == "any":
+                payload["tool_choice"] = {
+                    "type": "any"
+                }
             if payload["tool_choice"]["type"] == "function":
                 payload["tool_choice"] = {
                     "type": "tool",
@@ -745,6 +749,10 @@ async def get_claude_payload(request, engine, provider):
             if payload["tool_choice"]["type"] == "auto":
                 payload["tool_choice"] = {
                     "type": "auto"
+                }
+            if payload["tool_choice"]["type"] == "any":
+                payload["tool_choice"] = {
+                    "type": "any"
                 }
             if payload["tool_choice"]["type"] == "function":
                 payload["tool_choice"] = {
