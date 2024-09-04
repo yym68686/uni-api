@@ -40,8 +40,7 @@ async def get_gemini_payload(request, engine, provider):
         'Content-Type': 'application/json'
     }
     model = provider['model'][request.model]
-    if request.stream:
-        gemini_stream = "streamGenerateContent"
+    gemini_stream = "streamGenerateContent"
     url = provider['base_url']
     if url.endswith("v1beta"):
         url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'])
@@ -232,8 +231,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
     if provider.get("project_id"):
         project_id = provider.get("project_id")
 
-    if request.stream:
-        gemini_stream = "streamGenerateContent"
+    gemini_stream = "streamGenerateContent"
     model = provider['model'][request.model]
     location = gem
     url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
@@ -381,8 +379,7 @@ async def get_vertex_claude_payload(request, engine, provider):
     elif "claude-3-haiku" in model:
         location = c3h
 
-    if request.stream:
-        claude_stream = "streamRawPredict"
+    claude_stream = "streamRawPredict"
     url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL=model, stream=claude_stream)
 
     messages = []
