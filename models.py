@@ -10,16 +10,14 @@ class ImageGenerationRequest(BaseModel):
 
 class FunctionParameter(BaseModel):
     type: str
-    properties: Dict[str, Dict[str, str]]
+    properties: Dict[str, Dict[str, Union[str, Dict[str, str]]]]
     required: List[str]
 
-# 定义 Function 模型
 class Function(BaseModel):
     name: str
     description: str
     parameters: Optional[FunctionParameter] = Field(default=None, exclude=None)
 
-# 定义 Tool 模型
 class Tool(BaseModel):
     type: str
     function: Function
@@ -58,6 +56,13 @@ class Message(BaseModel):
     class Config:
         extra = "allow"  # 允许额外的字段
 
+class FunctionChoice(BaseModel):
+    name: str
+
+class ToolChoice(BaseModel):
+    type: str
+    function: Optional[FunctionChoice] = None
+
 class RequestModel(BaseModel):
     model: str
     messages: List[Message]
@@ -72,5 +77,5 @@ class RequestModel(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     n: Optional[int] = 1
     user: Optional[str] = None
-    tool_choice: Optional[str] = None
+    tool_choice: Optional[Union[str, ToolChoice]] = None
     tools: Optional[List[Tool]] = None

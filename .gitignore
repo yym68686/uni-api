@@ -6,3 +6,5 @@ __pycache__
 node_modules
 .wrangler
 .pytest_cache
+*.jpg
+*.json
