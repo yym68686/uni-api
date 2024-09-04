@@ -474,19 +474,21 @@ async def get_vertex_claude_payload(request, engine, provider):
             tools.append(json_tool)
         payload["tools"] = tools
         if "tool_choice" in payload:
-            if payload["tool_choice"]["type"] == "auto":
-                payload["tool_choice"] = {
-                    "type": "auto"
-                }
-            if payload["tool_choice"]["type"] == "any":
-                payload["tool_choice"] = {
-                    "type": "any"
-                }
-            if payload["tool_choice"]["type"] == "function":
-                payload["tool_choice"] = {
-                    "type": "tool",
-                    "name": payload["tool_choice"]["function"]["name"]
-                }
+            if isinstance(payload["tool_choice"], dict):
+                if payload["tool_choice"]["type"] == "function":
+                    payload["tool_choice"] = {
+                        "type": "tool",
+                        "name": payload["tool_choice"]["function"]["name"]
+                    }
+            if isinstance(payload["tool_choice"], str):
+                if payload["tool_choice"] == "auto":
+                    payload["tool_choice"] = {
+                        "type": "auto"
+                    }
+                if payload["tool_choice"] == "none":
+                    payload["tool_choice"] = {
+                        "type": "any"
+                    }
 
     if provider.get("tools") == False:
         payload.pop("tools", None)
@@ -746,19 +748,21 @@ async def get_claude_payload(request, engine, provider):
             tools.append(json_tool)
         payload["tools"] = tools
         if "tool_choice" in payload:
-            if payload["tool_choice"]["type"] == "auto":
-                payload["tool_choice"] = {
-                    "type": "auto"
-                }
-            if payload["tool_choice"]["type"] == "any":
-                payload["tool_choice"] = {
-                    "type": "any"
-                }
-            if payload["tool_choice"]["type"] == "function":
-                payload["tool_choice"] = {
-                    "type": "tool",
-                    "name": payload["tool_choice"]["function"]["name"]
-                }
+            if isinstance(payload["tool_choice"], dict):
+                if payload["tool_choice"]["type"] == "function":
+                    payload["tool_choice"] = {
+                        "type": "tool",
+                        "name": payload["tool_choice"]["function"]["name"]
+                    }
+            if isinstance(payload["tool_choice"], str):
+                if payload["tool_choice"] == "auto":
+                    payload["tool_choice"] = {
+                        "type": "auto"
+                    }
+                if payload["tool_choice"] == "none":
+                    payload["tool_choice"] = {
+                        "type": "any"
+                    }
 
     if provider.get("tools") == False:
         payload.pop("tools", None)

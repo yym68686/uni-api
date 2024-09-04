@@ -45,7 +45,6 @@ def get_model_response(image_base64):
     ]
 
     payload = {
-
         "model": "claude-3-5-sonnet",
         "messages": [
             {
@@ -64,7 +63,7 @@ def get_model_response(image_base64):
                 ]
             }
         ],
-        "stream": True,
+        # "stream": True,
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "extract_underlined_text"}},
         "max_tokens": 300
@@ -117,5 +116,5 @@ def main(image_path):
         print("\n無法解析回應。")
 
 if __name__ == "__main__":
-    image_path = "00001 (8).jpg"  # 替換為您的圖像路徑
+    image_path = "1.jpg"  # 替換為您的圖像路徑
     main(image_path)
