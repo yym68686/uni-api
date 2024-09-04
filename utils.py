@@ -15,7 +15,15 @@ def update_config(config_data):
         provider['model'] = model_dict
         if provider.get('project_id'):
             provider['base_url'] = 'https://aiplatform.googleapis.com/'
+
+        if provider.get('api'):
+            if isinstance(provider.get('api'), str):
+                provider['api'] = CircularList([provider.get('api')])
+            if isinstance(provider.get('api'), list):
+                provider['api'] = CircularList(provider.get('api'))
+
         config_data['providers'][index] = provider
+
     api_keys_db = config_data['api_keys']
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))

@@ -43,9 +43,9 @@ async def get_gemini_payload(request, engine, provider):
     gemini_stream = "streamGenerateContent"
     url = provider['base_url']
     if url.endswith("v1beta"):
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'])
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'].next())
     if url.endswith("v1"):
-        url = "https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'])
+        url = "https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=provider['api'].next())
 
     messages = []
     systemInstruction = None
@@ -492,7 +492,7 @@ async def get_gpt_payload(request, engine, provider):
         'Content-Type': 'application/json',
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {provider['api']}"
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
     url = provider['base_url']
 
     messages = []
@@ -556,7 +556,7 @@ async def get_openrouter_payload(request, engine, provider):
         'Content-Type': 'application/json'
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {provider['api']}"
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
 
     url = provider['base_url']
 
@@ -640,7 +640,7 @@ async def get_claude_payload(request, engine, provider):
     model = provider['model'][request.model]
     headers = {
         "content-type": "application/json",
-        "x-api-key": f"{provider['api']}",
+        "x-api-key": f"{provider['api'].next()}",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15" if "claude-3-5-sonnet" in model else "tools-2024-05-16",
     }
@@ -753,7 +753,7 @@ async def get_dalle_payload(request, engine, provider):
         "Content-Type": "application/json",
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {provider['api']}"
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
     url = provider['base_url']
     url = BaseAPI(url).image_url
 

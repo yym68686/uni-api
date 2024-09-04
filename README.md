@@ -21,10 +21,9 @@
 - 同时支持 Anthropic、Gemini、Vertex API。Vertex 同时支持 Claude 和 Gemini API。
 - 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
 - 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
-- 支持负载均衡，支持 Vertex 区域负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。除了 Vertex 区域负载均衡，所有 API 均支持渠道级负载均衡，提高沉浸式翻译体验。
+- 支持三种负载均衡，默认同时开启。1. 支持单个渠道多个 API Key 自动开启 API key 级别的轮训负载均衡。2. 支持 Vertex 区域级负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。3. 除了 Vertex 区域级负载均衡，所有 API 均支持渠道级负载均衡，提高沉浸式翻译体验。
 - 支持自动重试，当一个 API 渠道响应失败时，自动重试下一个 API 渠道。
 - 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
-- 支持多个 API Key。
 
 ## Configuration
 
@@ -42,7 +41,9 @@ providers:
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages
-    api: sk-ant-api03-bNnAOJyA-xQw_twAA
+    api: # 支持多个 API Key，多个 key 自动开启轮训负载均衡，至少一个 key，必填
+      - sk-ant-api03-bNnAOJyA-xQw_twAA
+      - sk-ant-api02-bNnxxxx
     model:
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
     tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
