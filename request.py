@@ -10,7 +10,7 @@ async def get_image_message(base64_image, engine = None):
                 "url": base64_image,
             }
         }
-    if "claude" == engine:
+    if "claude" == engine or "vertex-claude" == engine:
         return {
             "type": "image",
             "source": {
@@ -19,7 +19,7 @@ async def get_image_message(base64_image, engine = None):
                 "data": base64_image.split(",")[1],
             }
         }
-    if "gemini" == engine:
+    if "gemini" == engine or "vertex-gemini" == engine:
         return {
             "inlineData": {
                 "mimeType": "image/jpeg",
@@ -29,9 +29,9 @@ async def get_image_message(base64_image, engine = None):
     raise ValueError("Unknown engine")
 
 async def get_text_message(role, message, engine = None):
-    if "gpt" == engine or "claude" == engine or "openrouter" == engine:
+    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine:
         return {"type": "text", "text": message}
-    if "gemini" == engine:
+    if "gemini" == engine or "vertex-gemini" == engine:
         return {"text": message}
     raise ValueError("Unknown engine")
 
@@ -794,9 +794,9 @@ async def get_dalle_payload(request, engine, provider):
 async def get_payload(request: RequestModel, engine, provider):
     if engine == "gemini":
         return await get_gemini_payload(request, engine, provider)
-    elif engine == "vertex" and "gemini" in provider['model'][request.model]:
+    elif engine == "vertex-gemini":
         return await get_vertex_gemini_payload(request, engine, provider)
-    elif engine == "vertex" and "claude" in provider['model'][request.model]:
+    elif engine == "vertex-claude":
         return await get_vertex_claude_payload(request, engine, provider)
     elif engine == "claude":
         return await get_claude_payload(request, engine, provider)

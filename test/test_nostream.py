@@ -66,7 +66,7 @@ def get_model_response(image_base64):
         # "stream": True,
         "tools": tools,
         "tool_choice": {"type": "function", "function": {"name": "extract_underlined_text"}},
-        "max_tokens": 300
+        "max_tokens": 1000
     }
 
     try:
