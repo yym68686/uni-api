@@ -8,3 +8,4 @@ node_modules
 .pytest_cache
 *.jpg
 *.json
+*.png

@@ -12,7 +12,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from models import RequestModel, ImageGenerationRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
-from utils import error_handling_wrapper, post_all_models, load_config
+from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
 
 from typing import List, Dict, Union
 from urllib.parse import urlparse
@@ -224,6 +224,29 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
         raise e
 
+def weighted_round_robin(weights):
+    provider_names = list(weights.keys())
+    current_weights = {name: 0 for name in provider_names}
+    num_selections = total_weight = sum(weights.values())
+    weighted_provider_list = []
+
+    for _ in range(num_selections):
+        max_ratio = -1
+        selected_letter = None
+
+        for name in provider_names:
+            current_weights[name] += weights[name]
+            ratio = current_weights[name] / weights[name]
+
+            if ratio > max_ratio:
+                max_ratio = ratio
+                selected_letter = name
+
+        weighted_provider_list.append(selected_letter)
+        current_weights[selected_letter] -= total_weight
+
+    return weighted_provider_list
+
 import asyncio
 class ModelRequestHandler:
     def __init__(self):
@@ -297,13 +320,31 @@ class ModelRequestHandler:
 
         # 检查是否启用轮询
         api_index = api_list.index(token)
+        weights = safe_get(config, 'api_keys', api_index, "weights")
+        if weights:
+            # 步骤 1: 提取 matching_providers 中的所有 provider 值
+            providers = set(provider['provider'] for provider in matching_providers)
+            weight_keys = set(weights.keys())
+
+            # 步骤 3: 计算交集
+            intersection = providers.intersection(weight_keys)
+            weights = dict(filter(lambda item: item[0] in intersection, weights.items()))
+            weighted_provider_name_list = weighted_round_robin(weights)
+            new_matching_providers = []
+            for provider_name in weighted_provider_name_list:
+                for provider in matching_providers:
+                    if provider['provider'] == provider_name:
+                        new_matching_providers.append(provider)
+            matching_providers = new_matching_providers
+            # import json
+            # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False, default=circular_list_encoder))
+
         use_round_robin = True
         auto_retry = True
-        if config['api_keys'][api_index].get("preferences"):
-            if config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN") == False:
-                use_round_robin = False
-            if config['api_keys'][api_index]["preferences"].get("AUTO_RETRY") == False:
-                auto_retry = False
+        if safe_get(config, 'api_keys', api_index, "preferences", "USE_ROUND_ROBIN") == False:
+            use_round_robin = False
+        if safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY") == False:
+            auto_retry = False
 
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint)
 

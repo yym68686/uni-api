@@ -25,8 +25,25 @@ def update_config(config_data):
         config_data['providers'][index] = provider
 
     api_keys_db = config_data['api_keys']
+
+    for index, api_key in enumerate(config_data['api_keys']):
+        weights_dict = {}
+        models = []
+        for model in api_key.get('model'):
+            if isinstance(model, dict):
+                key, value = list(model.items())[0]
+                provider_name = key.split("/")[0]
+                if "/" in key:
+                    weights_dict.update({provider_name: int(value)})
+                models.append(key)
+            if isinstance(model, str):
+                models.append(model)
+        config_data['api_keys'][index]['weights'] = weights_dict
+        config_data['api_keys'][index]['model'] = models
+        api_keys_db[index]['model'] = models
+
     api_list = [item["api"] for item in api_keys_db]
-    # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
+    # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False, default=circular_list_encoder))
     return config_data, api_keys_db, api_list
 
 # 读取YAML配置文件
@@ -214,6 +231,12 @@ def get_all_models(config):
 # us-central1
 # europe-west1
 # europe-west4
+
+def circular_list_encoder(obj):
+    if isinstance(obj, CircularList):
+        return obj.to_dict()
+    raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
+
 from collections import deque
 class CircularList:
     def __init__(self, items):
@@ -225,6 +248,13 @@ class CircularList:
         item = self.queue.popleft()
         self.queue.append(item)
         return item
+
+    def to_dict(self):
+        return {
+            'queue': list(self.queue)
+        }
+
+
 
 c35s = CircularList(["us-east5", "europe-west1"])
 c3s = CircularList(["us-east5", "us-central1", "asia-southeast1"])
@@ -257,3 +287,11 @@ class BaseAPI:
             self.chat_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/chat/completions",) + ("",) * 3)
         self.image_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/images/generations",) + ("",) * 3)
         self.audio_transcriptions: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/audio/transcriptions",) + ("",) * 3)
+
+def safe_get(data, *keys):
+    for key in keys:
+        try:
+            data = data[key] if isinstance(data, (dict, list)) else data.get(key)
+        except (KeyError, IndexError, AttributeError, TypeError):
+            return None
+    return data
