@@ -248,10 +248,10 @@ async def fetch_response(client, url, headers, payload):
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     try:
-        if engine == "gemini" or (engine == "vertex" and "gemini" in model):
+        if engine == "gemini" or engine == "vertex-gemini":
             async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
                 yield chunk
-        elif engine == "claude" or (engine == "vertex" and "claude" in model):
+        elif engine == "claude" or engine == "vertex-claude":
             async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
                 yield chunk
         elif engine == "gpt":

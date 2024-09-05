@@ -58,6 +58,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
         self.request_times = defaultdict(float)
         self.ip_counts = defaultdict(lambda: defaultdict(int))
         self.request_arrivals = defaultdict(list)
+        self.channel_success_counts = defaultdict(int)
+        self.channel_failure_counts = defaultdict(int)
         self.lock = asyncio.Lock()
         self.exclude_paths = set(exclude_paths or [])
         self.save_interval = save_interval
@@ -101,7 +103,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 "request_counts": dict(self.request_counts),
                 "request_times": dict(self.request_times),
                 "ip_counts": {k: dict(v) for k, v in self.ip_counts.items()},
-                "request_arrivals": {k: [t.isoformat() for t in v] for k, v in self.request_arrivals.items()}
+                "request_arrivals": {k: [t.isoformat() for t in v] for k, v in self.request_arrivals.items()},
+                "channel_success_counts": dict(self.channel_success_counts),
+                "channel_failure_counts": dict(self.channel_failure_counts),
+                "channel_success_percentages": self.calculate_success_percentages(),
+                "channel_failure_percentages": self.calculate_failure_percentages()
             }
 
         filename = self.filename
@@ -109,10 +115,28 @@ class StatsMiddleware(BaseHTTPMiddleware):
             await f.write(json.dumps(stats, indent=2))
 
         self.last_save_time = current_time
-        # print(f"Stats saved to {filename}")
+
+    def calculate_success_percentages(self):
+        percentages = {}
+        for channel, success_count in self.channel_success_counts.items():
+            total_count = success_count + self.channel_failure_counts[channel]
+            if total_count > 0:
+                percentages[channel] = success_count / total_count * 100
+            else:
+                percentages[channel] = 0
+        return percentages
+
+    def calculate_failure_percentages(self):
+        percentages = {}
+        for channel, failure_count in self.channel_failure_counts.items():
+            total_count = failure_count + self.channel_success_counts[channel]
+            if total_count > 0:
+                percentages[channel] = failure_count / total_count * 100
+            else:
+                percentages[channel] = 0
+        return percentages
 
     async def cleanup_old_data(self):
-        # cutoff_time = datetime.now() - timedelta(seconds=30)
         cutoff_time = datetime.now() - timedelta(hours=24)
         async with self.lock:
             for endpoint in list(self.request_arrivals.keys()):
@@ -139,10 +163,10 @@ app.add_middleware(
 
 app.add_middleware(StatsMiddleware, exclude_paths=["/stats", "/generate-api-key"])
 
+# 在 process_request 函数中更新成功和失败计数
 async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
-    # print(parsed_url)
     engine = None
     if parsed_url.netloc == 'generativelanguage.googleapis.com':
         engine = "gemini"
@@ -160,6 +184,12 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     and "gemini" not in provider['model'][request.model]:
         engine = "openrouter"
 
+    if "claude" in provider['model'][request.model] and engine == "vertex":
+        engine = "vertex-claude"
+
+    if "gemini" in provider['model'][request.model] and engine == "vertex":
+        engine = "vertex-gemini"
+
     if endpoint == "/v1/images/generations":
         engine = "dalle"
         request.stream = False
@@ -171,21 +201,28 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
     url, headers, payload = await get_payload(request, engine, provider)
 
-    # request_info = {
-    #     "url": url,
-    #     "headers": headers,
-    #     "payload": payload
-    # }
-    # import json
-    # logger.info(f"Request details: {json.dumps(request_info, indent=4, ensure_ascii=False)}")
+    try:
+        if request.stream:
+            model = provider['model'][request.model]
+            generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
+            wrapped_generator = await error_handling_wrapper(generator, status_code=500)
+            response = StreamingResponse(wrapped_generator, media_type="text/event-stream")
+        else:
+            response = await anext(fetch_response(app.state.client, url, headers, payload))
 
-    if request.stream:
-        model = provider['model'][request.model]
-        generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-        wrapped_generator = await error_handling_wrapper(generator, status_code=500)
-        return StreamingResponse(wrapped_generator, media_type="text/event-stream")
-    else:
-        return await anext(fetch_response(app.state.client, url, headers, payload))
+        # 更新成功计数
+        async with app.middleware_stack.app.lock:
+            app.middleware_stack.app.channel_success_counts[provider['provider']] += 1
+
+        return response
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
+        logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+
+        # 更新失败计数
+        async with app.middleware_stack.app.lock:
+            app.middleware_stack.app.channel_failure_counts[provider['provider']] += 1
+
+        raise e
 
 import asyncio
 class ModelRequestHandler:
@@ -270,10 +307,10 @@ class ModelRequestHandler:
 
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint)
 
+    # 在 try_all_providers 函数中处理失败的情况
     async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None):
         num_providers = len(providers)
         start_index = self.last_provider_index + 1 if use_round_robin else 0
-
         for i in range(num_providers + 1):
             self.last_provider_index = (start_index + i) % num_providers
             provider = providers[self.last_provider_index]
@@ -286,7 +323,6 @@ class ModelRequestHandler:
                     continue
                 else:
                     raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
-
 
         raise HTTPException(status_code=500, detail=f"All providers failed: {request.model}")
 
@@ -341,6 +377,7 @@ def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(36)
     return JSONResponse(content={"api_key": api_key})
 
+# 在 /stats 路由中返回成功和失败百分比
 @app.get("/stats")
 async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)):
     middleware = app.middleware_stack.app
@@ -350,7 +387,11 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
                 "request_counts": dict(middleware.request_counts),
                 "request_times": dict(middleware.request_times),
                 "ip_counts": {k: dict(v) for k, v in middleware.ip_counts.items()},
-                "request_arrivals": {k: [t.isoformat() for t in v] for k, v in middleware.request_arrivals.items()}
+                "request_arrivals": {k: [t.isoformat() for t in v] for k, v in middleware.request_arrivals.items()},
+                "channel_success_counts": dict(middleware.channel_success_counts),
+                "channel_failure_counts": dict(middleware.channel_failure_counts),
+                "channel_success_percentages": middleware.calculate_success_percentages(),
+                "channel_failure_percentages": middleware.calculate_failure_percentages()
             }
         return JSONResponse(content=stats)
     return {"error": "StatsMiddleware not found"}
