@@ -32,7 +32,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
-    sse_response = f"data: {json_data}\n\r"
+    sse_response = f"data: {json_data}\n\r\n"
 
     return sse_response
 
@@ -90,7 +90,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
             function_full_response = json.dumps(function_call["functionCall"]["args"])
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response)
             yield sse_string
-        yield "data: [DONE]\n\r"
+        yield "data: [DONE]\n\r\n"
 
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
@@ -137,7 +137,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             function_full_response = json.dumps(function_call["input"])
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
             yield sse_string
-        yield "data: [DONE]\n\r"
+        yield "data: [DONE]\n\r\n"
 
 async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
     redirect_count = 0
@@ -174,7 +174,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
                         line, buffer = buffer.split("\n", 1)
                         # logger.info("line: %s", repr(line))
                         if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                            yield line + "\n\r"
+                            yield line.strip() + "\n\r\n"
             except httpx.RemoteProtocolError as e:
                 yield {"error": f"fetch_gpt_response_stream RemoteProtocolError {e.__class__.__name__}", "details": str(e)}
                 return
@@ -236,7 +236,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         function_call_content = delta["partial_json"]
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
                         yield sse_string
-        yield "data: [DONE]\n\r"
+        yield "data: [DONE]\n\r\n"
 
 async def fetch_response(client, url, headers, payload):
     response = await client.post(url, headers=headers, json=payload)
