@@ -20,7 +20,7 @@ def create_pic(request_arrivals, key):
     latest_time = max(datetimes)
 
     # 创建24小时的时间范围
-    time_range = [latest_time - timedelta(hours=i) for i in range(24, 0, -1)]
+    time_range = [latest_time - timedelta(hours=i) for i in range(32, 0, -1)]
     # 统计每小时的请求数
     hourly_counts = defaultdict(int)
     for dt in datetimes:

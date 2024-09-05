@@ -124,7 +124,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 percentages[channel] = success_count / total_count * 100
             else:
                 percentages[channel] = 0
-        return percentages
+
+        sorted_percentages = dict(sorted(percentages.items(), key=lambda item: item[1], reverse=True))
+        return sorted_percentages
 
     def calculate_failure_percentages(self):
         percentages = {}
@@ -134,7 +136,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 percentages[channel] = failure_count / total_count * 100
             else:
                 percentages[channel] = 0
-        return percentages
+
+        sorted_percentages = dict(sorted(percentages.items(), key=lambda item: item[1], reverse=True))
+        return sorted_percentages
 
     async def cleanup_old_data(self):
         cutoff_time = datetime.now() - timedelta(hours=24)
