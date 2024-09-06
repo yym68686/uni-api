@@ -1,7 +1,9 @@
 from log_config import logger
 
+import re
 import httpx
 import secrets
+import time as time_module
 from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,7 @@ from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
 
+from collections import defaultdict
 from typing import List, Dict, Union
 from urllib.parse import urlparse
 
@@ -374,8 +377,73 @@ class ModelRequestHandler:
 
 model_handler = ModelRequestHandler()
 
-# 安全性依赖
+def parse_rate_limit(limit_string):
+    # 定义时间单位到秒的映射
+    time_units = {
+        's': 1, 'sec': 1, 'second': 1,
+        'm': 60, 'min': 60, 'minute': 60,
+        'h': 3600, 'hr': 3600, 'hour': 3600,
+        'd': 86400, 'day': 86400,
+        'mo': 2592000, 'month': 2592000,
+        'y': 31536000, 'year': 31536000
+    }
+
+    # 使用正则表达式匹配数字和单位
+    match = re.match(r'^(\d+)/(\w+)$', limit_string)
+    if not match:
+        raise ValueError(f"Invalid rate limit format: {limit_string}")
+
+    count, unit = match.groups()
+    count = int(count)
+
+    # 转换单位到秒
+    if unit not in time_units:
+        raise ValueError(f"Unknown time unit: {unit}")
+
+    seconds = time_units[unit]
+
+    return (count, seconds)
+
+class InMemoryRateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+
+    async def is_rate_limited(self, key: str, limit: int, period: int) -> bool:
+        now = time_module.time()
+        self.requests[key] = [req for req in self.requests[key] if req > now - period]
+        if len(self.requests[key]) >= limit:
+            return True
+        self.requests[key].append(now)
+        return False
+
+rate_limiter = InMemoryRateLimiter()
+
+async def get_user_rate_limit(token: str = None):
+    # 这里应该实现根据 token 获取用户速率限制的逻辑
+    # 示例： 返回 (次数， 秒数)
+    config = app.state.config
+    api_list = app.state.api_list
+    api_index = api_list.index(token)
+    raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
+
+    if not token or not raw_rate_limit:
+        return (60, 60)
+
+    rate_limit = parse_rate_limit(raw_rate_limit)
+    return rate_limit
+
 security = HTTPBearer()
+async def rate_limit_dependency(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials if credentials else None
+    # print("token", token)
+    limit, period = await get_user_rate_limit(token)
+
+    # 使用 IP 地址和 token（如果有）作为限制键
+    client_ip = request.client.host
+    rate_limit_key = f"{client_ip}:{token}" if token else client_ip
+
+    if await rate_limiter.is_rate_limited(rate_limit_key, limit, period):
+        raise HTTPException(status_code=429, detail="Too many requests")
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
@@ -395,15 +463,15 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
                 raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
 
-@app.options("/v1/chat/completions")
+@app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
 async def list_models(token: str = Depends(verify_api_key)):
     models = post_all_models(token, app.state.config, app.state.api_list)
     return JSONResponse(content={
@@ -411,20 +479,20 @@ async def list_models(token: str = Depends(verify_api_key)):
         "data": models
     })
 
-@app.post("/v1/images/generations")
+@app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
 async def images_generations(
     request: ImageGenerationRequest,
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
 
-@app.get("/generate-api-key")
+@app.get("/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(36)
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(rate_limit_dependency)])
 async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)):
     middleware = app.middleware_stack.app
     if isinstance(middleware, StatsMiddleware):

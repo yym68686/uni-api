@@ -21,9 +21,14 @@
 - 同时支持 Anthropic、Gemini、Vertex API。Vertex 同时支持 Claude 和 Gemini API。
 - 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
 - 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
-- 支持四种负载均衡。1. 支持渠道级加权负载均衡，可以根据不同的渠道权重分配请求。默认不开启，需要配置渠道权重。2. 支持 Vertex 区域级负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。自动开启不需要额外配置。3. 除了 Vertex 区域级负载均衡，所有 API 均支持渠道级顺序负载均衡，提高沉浸式翻译体验。自动开启不需要额外配置。4. 支持单个渠道多个 API Key 自动开启 API key 级别的轮训负载均衡。
+- 支持四种负载均衡。
+  1. 支持渠道级加权负载均衡，可以根据不同的渠道权重分配请求。默认不开启，需要配置渠道权重。
+  2. 支持 Vertex 区域级负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。自动开启不需要额外配置。
+  3. 除了 Vertex 区域级负载均衡，所有 API 均支持渠道级顺序负载均衡，提高沉浸式翻译体验。自动开启不需要额外配置。
+  4. 支持单个渠道多个 API Key 自动开启 API key 级别的轮训负载均衡。
 - 支持自动重试，当一个 API 渠道响应失败时，自动重试下一个 API 渠道。
 - 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
+- 支持限流，可以设置每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min。
 
 ## Configuration
 
@@ -93,6 +98,7 @@ api_keys:
     preferences:
       USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true。开启轮训后每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true
+      RATE_LIMIT: 2/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min，选填
 
   # 渠道级加权负载均衡配置示例
   - api: sk-KjjI60Yf0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
