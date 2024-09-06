@@ -260,8 +260,9 @@ class ModelRequestHandler:
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
-
         api_index = api_list.index(token)
+        if not safe_get(config, 'api_keys', api_index, 'model'):
+            raise HTTPException(status_code=404, detail="No matching model found")
         provider_rules = []
 
         for model in config['api_keys'][api_index]['model']:
