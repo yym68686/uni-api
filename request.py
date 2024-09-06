@@ -533,9 +533,11 @@ async def get_gpt_payload(request, engine, provider):
                         "arguments": tool_call.function.arguments
                     }
                 })
-                messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+                if provider.get("tools"):
+                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
         elif tool_call_id:
-            messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
+            if provider.get("tools"):
+                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
         else:
             messages.append({"role": msg.role, "content": content})
 

@@ -205,6 +205,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
     url, headers, payload = await get_payload(request, engine, provider)
 
+    # logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
+    # logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     try:
         if request.stream:
             model = provider['model'][request.model]
