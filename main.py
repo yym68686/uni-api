@@ -220,8 +220,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
         return response
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
-        logger.error(f"Error with provider {provider['provider']}: {str(e)}")
-
         # 更新失败计数
         async with app.middleware_stack.app.lock:
             app.middleware_stack.app.channel_failure_counts[provider['provider']] += 1
@@ -340,9 +338,9 @@ class ModelRequestHandler:
                     if provider['provider'] == provider_name:
                         new_matching_providers.append(provider)
             matching_providers = new_matching_providers
-            # import json
-            # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False, default=circular_list_encoder))
 
+        # import json
+        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False, default=circular_list_encoder))
         use_round_robin = True
         auto_retry = True
         if safe_get(config, 'api_keys', api_index, "preferences", "USE_ROUND_ROBIN") == False:

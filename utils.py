@@ -29,18 +29,19 @@ def update_config(config_data):
     for index, api_key in enumerate(config_data['api_keys']):
         weights_dict = {}
         models = []
-        for model in api_key.get('model'):
-            if isinstance(model, dict):
-                key, value = list(model.items())[0]
-                provider_name = key.split("/")[0]
-                if "/" in key:
-                    weights_dict.update({provider_name: int(value)})
-                models.append(key)
-            if isinstance(model, str):
-                models.append(model)
-        config_data['api_keys'][index]['weights'] = weights_dict
-        config_data['api_keys'][index]['model'] = models
-        api_keys_db[index]['model'] = models
+        if api_key.get('model'):
+            for model in api_key.get('model'):
+                if isinstance(model, dict):
+                    key, value = list(model.items())[0]
+                    provider_name = key.split("/")[0]
+                    if "/" in key:
+                        weights_dict.update({provider_name: int(value)})
+                    models.append(key)
+                if isinstance(model, str):
+                    models.append(model)
+            config_data['api_keys'][index]['weights'] = weights_dict
+            config_data['api_keys'][index]['model'] = models
+            api_keys_db[index]['model'] = models
 
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False, default=circular_list_encoder))

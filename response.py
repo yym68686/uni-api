@@ -140,48 +140,20 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         yield "data: [DONE]\n\r\n"
 
 async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
-    redirect_count = 0
-    while redirect_count < max_redirects:
-        # logger.info(f"fetch_gpt_response_stream: {url}")
-        async with client.stream('POST', url, headers=headers, json=payload) as response:
-            error_message = await check_response(response, "fetch_gpt_response_stream")
-            if error_message:
-                yield error_message
-                return
-
-            buffer = ""
-            try:
-                async for chunk in response.aiter_text():
-                    # logger.info(f"chunk: {repr(chunk)}")
-                    buffer += chunk
-                    if chunk.startswith("<script"):
-                        import re
-                        redirect_match = re.search(r"window\.location\.href\s*=\s*'([^']+)'", chunk)
-                        if redirect_match:
-                            new_url = redirect_match.group(1)
-                            # logger.info(f"new_url: {new_url}")
-                            if not new_url.startswith('http'):
-                                # 如果是相对路径，构造完整URL
-                                # logger.info(url.split('/'))
-                                base_url = '/'.join(url.split('/')[:3])
-                                new_url = base_url + new_url
-                            url = new_url
-                            # logger.info(f"new_url: {new_url}")
-                            redirect_count += 1
-                            break
-                    redirect_count = 0
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        # logger.info("line: %s", repr(line))
-                        if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                            yield line.strip() + "\n\r\n"
-            except httpx.RemoteProtocolError as e:
-                yield {"error": f"fetch_gpt_response_stream RemoteProtocolError {e.__class__.__name__}", "details": str(e)}
-                return
-        if redirect_count == 0:
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_gpt_response_stream")
+        if error_message:
+            yield error_message
             return
 
-    yield {"error": "Too many redirects", "details": f"Reached maximum of {max_redirects} redirects"}
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                if line and line != "data: " and line != "data:" and not line.startswith(": "):
+                    yield line.strip() + "\n\r\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
