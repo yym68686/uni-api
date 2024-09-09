@@ -419,6 +419,18 @@ async def get_vertex_claude_payload(request, engine, provider):
                 "tool_use_id": tool_id,
                 "content": content
             }]})
+        elif msg.role == "function":
+            messages.append({"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "name": msg.name,
+                "input": {"prompt": "..."}
+            }]})
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "content": msg.content
+            }]})
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
@@ -693,6 +705,18 @@ async def get_claude_payload(request, engine, provider):
                 "type": "tool_result",
                 "tool_use_id": tool_id,
                 "content": content
+            }]})
+        elif msg.role == "function":
+            messages.append({"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "name": msg.name,
+                "input": {"prompt": "..."}
+            }]})
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "content": msg.content
             }]})
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
