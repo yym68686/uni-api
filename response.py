@@ -112,7 +112,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                logger.info(f"{line}")
+                # logger.info(f"{line}")
                 if line and '\"text\": \"' in line:
                     try:
                         json_data = json.loads( "{" + line + "}")
@@ -143,7 +143,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             yield sse_string
         yield "data: [DONE]\n\r\n"
 
-async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
+async def fetch_gpt_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_gpt_response_stream")
         if error_message:
@@ -158,6 +158,31 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
                 # logger.info("line: %s", repr(line))
                 if line and line != "data: " and line != "data:" and not line.startswith(": "):
                     yield line.strip() + "\n\r\n"
+
+async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_gpt_response_stream")
+        if error_message:
+            yield error_message
+            return
+
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                if line.startswith("data:"):
+                    line = line.lstrip("data: ")
+                    if line == "[DONE]":
+                        yield "data: [DONE]\n\r\n"
+                        return
+                    resp: dict = json.loads(line)
+                    message = resp.get("response")
+                    if message:
+                        sse_string = await generate_sse_response(timestamp, model, content=message)
+                        yield sse_string
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
@@ -241,6 +266,9 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                 yield chunk
         elif engine == "openrouter":
             async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+                yield chunk
+        elif engine == "cloudflare":
+            async for chunk in fetch_cloudflare_response_stream(client, url, headers, payload, model):
                 yield chunk
         else:
             raise ValueError("Unknown response")

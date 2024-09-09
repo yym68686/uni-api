@@ -174,11 +174,14 @@ app.add_middleware(StatsMiddleware, exclude_paths=["/stats", "/generate-api-key"
 async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
+    # print("parsed_url", parsed_url)
     engine = None
     if parsed_url.netloc == 'generativelanguage.googleapis.com':
         engine = "gemini"
     elif parsed_url.netloc == 'aiplatform.googleapis.com':
         engine = "vertex"
+    elif parsed_url.netloc == 'api.cloudflare.com':
+        engine = "cloudflare"
     elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
         engine = "claude"
     elif parsed_url.netloc == 'openrouter.ai':
@@ -188,7 +191,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
     if "claude" not in provider['model'][request.model] \
     and "gpt" not in provider['model'][request.model] \
-    and "gemini" not in provider['model'][request.model]:
+    and "gemini" not in provider['model'][request.model] \
+    and parsed_url.netloc != 'api.cloudflare.com':
         engine = "openrouter"
 
     if "claude" in provider['model'][request.model] and engine == "vertex":
@@ -311,7 +315,7 @@ class ModelRequestHandler:
 
         # import json
         # for provider in provider_list:
-        #     print(json.dumps(provider, indent=4, ensure_ascii=False))
+        #     print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
     async def request_model(self, request: Union[RequestModel, ImageGenerationRequest], token: str, endpoint=None):

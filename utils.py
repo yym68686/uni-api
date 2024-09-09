@@ -15,6 +15,8 @@ def update_config(config_data):
         provider['model'] = model_dict
         if provider.get('project_id'):
             provider['base_url'] = 'https://aiplatform.googleapis.com/'
+        if provider.get('cf_account_id'):
+            provider['base_url'] = 'https://api.cloudflare.com/'
 
         if provider.get('api'):
             if isinstance(provider.get('api'), str):
