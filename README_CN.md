@@ -13,13 +13,13 @@
 
 ## Introduction
 
-如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、DeepBricks、OpenRouter 等。
+如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、cloudflare、DeepBricks、OpenRouter 等。
 
 ## Features
 
 - 无前端，纯配置文件配置 API 渠道。只要写一个文件就能运行起一个属于自己的 API 站，文档有详细的配置指南，小白友好。
-- 统一管理多个后端服务，支持 OpenAI、Deepseek、DeepBricks、OpenRouter 等其他API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
-- 同时支持 Anthropic、Gemini、Vertex API。Vertex 同时支持 Claude 和 Gemini API。
+- 统一管理多个后端服务，支持 OpenAI、Deepseek、DeepBricks、OpenRouter 等其他 API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
+- 同时支持 Anthropic、Gemini、Vertex API、cloudflare。Vertex 同时支持 Claude 和 Gemini API。
 - 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
 - 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
 - 支持四种负载均衡。
@@ -76,6 +76,13 @@ providers:
       - claude-3-haiku@20240307: claude-3-haiku
     tools: true
     notes: https://xxxxx.com/ # 可以放服务商的网址，备注信息，官方文档，选填
+
+  - provider: cloudflare
+    api: f42b3xxxxxxxxxxq4aoGAh # Cloudflare API Key，必填
+    cf_account_id: 8ec0xxxxxxxxxxxxe721 # Cloudflare Account ID，必填
+    model:
+      - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # 重命名模型，@cf/meta/llama-3.1-8b-instruct 是服务商的原始的模型名称，必须使用引号包裹模型名，否则yaml语法错误，llama-3.1-8b 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+      - '@cf/meta/llama-3.1-8b-instruct' # 必须使用引号包裹模型名，否则yaml语法错误
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
