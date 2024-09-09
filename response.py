@@ -48,7 +48,7 @@ async def check_response(response, error_log):
     return None
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model):
-    timestamp = datetime.timestamp(datetime.now())
+    timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_gemini_response_stream")
         if error_message:
@@ -93,7 +93,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
         yield "data: [DONE]\n\r\n"
 
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
-    timestamp = datetime.timestamp(datetime.now())
+    timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_vertex_claude_response_stream")
         if error_message:
@@ -156,7 +156,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
                     yield line.strip() + "\n\r\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
-    timestamp = datetime.timestamp(datetime.now())
+    timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_claude_response_stream")
         if error_message:
