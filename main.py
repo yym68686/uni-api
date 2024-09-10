@@ -274,27 +274,28 @@ class ModelRequestHandler:
 
         for model in config['api_keys'][api_index]['model']:
             if "/" in model:
-                provider_name = model.split("/")[0]
-                model_name_split = "/".join(model.split("/")[1:])
-                models_list = []
-                for provider in config['providers']:
-                    if provider['provider'] == provider_name:
-                        models_list.extend(list(provider['model'].keys()))
-                # print("models_list", models_list)
-                # print("model_name", model_name)
-
-                # 处理带斜杠的模型名
-                for provider in config['providers']:
-                    if model in provider['model'].keys():
-                        provider_rules.append(provider['provider'] + "/" + model)
-
-                # print("model", model)
-                if (model_name_split and model_name in models_list) or (model_name_split == "*" and model_name in models_list):
-                    provider_rules.append(provider_name)
+                if model.startswith("<") and model.endswith(">"):
+                    model = model[1:-1]
+                    # 处理带斜杠的模型名
+                    for provider in config['providers']:
+                        if model in provider['model'].keys():
+                            provider_rules.append(provider['provider'] + "/" + model)
+                else:
+                    provider_name = model.split("/")[0]
+                    model_name_split = "/".join(model.split("/")[1:])
+                    models_list = []
+                    for provider in config['providers']:
+                        if provider['provider'] == provider_name:
+                            models_list.extend(list(provider['model'].keys()))
+                    # print("models_list", models_list)
+                    # print("model_name", model_name)
+                    # print("model", model)
+                    if (model_name_split and model_name in models_list) or (model_name_split == "*" and model_name in models_list):
+                        provider_rules.append(provider_name)
             else:
                 for provider in config['providers']:
                     if model in provider['model'].keys():
-                        provider_rules.append(provider['provider'] + "/" + model_name_split)
+                        provider_rules.append(provider['provider'] + "/" + model)
 
         provider_list = []
         # print("provider_rules", provider_rules)

@@ -89,6 +89,7 @@ providers:
     api: sk-bNnAOJyA-xQw_twAA
     model:
       - causallm-35b-beta2ep-q6k: causallm-35b
+      - anthropic/claude-3-5-sonnet
     tools: false
     engine: openrouter # 强制使用某个消息格式，目前支持 gpt，claude，gemini，openrouter 原生格式，选填
 
@@ -102,7 +103,8 @@ api_keys:
 
   - api: sk-pkhf60Yf0JGyJygRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
-      - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。
+      - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。这种写法不会匹配到other-provider提供的名为anthropic/claude-3-5-sonnet的模型。
+      - <anthropic/claude-3-5-sonnet> # 通过在模型名两侧加上尖括号，这样就不会去名为anthropic的渠道下去寻找claude-3-5-sonnet模型，而是将整个 anthropic/claude-3-5-sonnet 作为模型名称。这种写法可以匹配到other-provider提供的名为 anthropic/claude-3-5-sonnet 的模型。但不会匹配到anthropic下面的claude-3-5-sonnet模型。
     preferences:
       USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true。开启轮训后每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true

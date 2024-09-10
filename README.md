@@ -1,7 +1,7 @@
 # uni-api
 
 <p align="center">
-<a href="https://t.me/uni_api">
+  <a href="https://t.me/uni_api">
     <img src="https://img.shields.io/badge/Join Telegram Group-blue?&logo=telegram">
   </a>
    <a href="https://hub.docker.com/repository/docker/yym68686/uni-api">
@@ -13,36 +13,36 @@
 
 ## Introduction
 
-If used personally, one/new-api is overly complex, with many commercial features that individuals do not need. If you do not want a complex front-end interface and want to support more models, you can try uni-api. This is a project for unified management of large model APIs, allowing you to call multiple backend services through a unified API interface, uniformly converting them to OpenAI format and supporting load balancing. The currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cloudflare, DeepBricks, OpenRouter, etc.
+If used personally, one/new-api is too complex and has many commercial functions that individuals do not need. If you do not want a complicated front-end interface and want to support more models, you can try uni-api. This is a project for unified management of large model APIs, allowing you to call multiple backend services through a unified API interface, converting them uniformly to OpenAI format and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cloudflare, DeepBricks, OpenRouter, etc.
 
 ## Features
 
-- No front-end, pure configuration file setup for API channels. You can run your own API site just by writing a single file, and the documentation includes a detailed configuration guide, beginner-friendly.
-- Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, DeepBricks, OpenRouter, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
-- Supports Anthropic, Gemini, Vertex API, and Cloudflare simultaneously. Vertex supports both Claude and Gemini API.
-- Support for OpenAI, Anthropic, Gemini, Vertex native tool use function calls.
+- No frontend, pure configuration file setup for API channels. You can run your own API site by just writing one file, with detailed configuration guides in the documentation, beginner-friendly.
+- Unified management of multiple backend services, supporting providers like OpenAI, Deepseek, DeepBricks, OpenRouter, and other APIs in the OpenAI format. Supports OpenAI Dalle-3 image generation.
+- Supports Anthropic, Gemini, Vertex API, and Cloudflare. Vertex supports both Claude and Gemini API.
+- Supports OpenAI, Anthropic, Gemini, Vertex native tool use function calls.
 - Supports OpenAI, Anthropic, Gemini, Vertex native image recognition API.
 - Supports four types of load balancing.
-  1. Supports channel-level weighted load balancing, which can allocate requests based on different channel weights. Disabled by default, channel weights need to be configured.
-  2. Supports Vertex regional load balancing, supports Vertex high concurrency, and can increase Gemini and Claude concurrency up to (API quantity * regional quantity) times. Automatically enabled without additional configuration.
-  3. Except for Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. Automatically enabled without additional configuration.
-  4. Support automatic API key-level round-robin load balancing for multiple API keys in a single channel.
+  1. Supports channel-level weighted load balancing, which can allocate requests based on different channel weights. Disabled by default, requires channel weight configuration.
+  2. Supports Vertex regional load balancing, supports Vertex high concurrency, and can increase Gemini, Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
+  3. In addition to Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. Automatically enabled without additional configuration.
+  4. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
 - Supports automatic retry, when an API channel response fails, automatically retry the next API channel.
-- Supports fine-grained permission control. Supports using wildcards to set specific models available for API key channels.
-- Supports rate limiting, allowing you to set the maximum number of requests per minute. It can be set as an integer, such as 2/min (2 times per minute), 5/hour (5 times per hour), 10/day (10 times per day), 10/month (10 times per month), 10/year (10 times per year). The default is 60/min.
+- Supports fine-grained access control. Supports using wildcards to set specific models for API key available channels.
+- Supports rate limiting, can set the maximum number of requests per minute, can be set as an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min.
 
 ## Configuration
 
-Using the api.yaml configuration file, you can configure multiple models, and each model can configure multiple backend services, supporting load balancing. Below is an example of the api.yaml configuration file:
+Using the api.yaml configuration file, multiple models can be configured, and each model can be configured with multiple backend services, supporting load balancing. Below is an example of the api.yaml configuration file:
 
 ```yaml
 providers:
-  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, any name, required
+  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, can be any name, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required
     model: # At least one model is required
       - gpt-4o # Usable model name, required
-      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a simpler name instead of the original complex name, optional
+      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a concise name instead of the original complex name, optional
       - dall-e-3
 
   - provider: anthropic
@@ -51,22 +51,22 @@ providers:
       - sk-ant-api03-bNnAOJyA-xQw_twAA
       - sk-ant-api02-bNnxxxx
     model:
-      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a simpler name instead of the original complex name, optional
-    tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
+      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a concise name instead of the original complex name, optional
+    tools: true # Whether to support tools, such as code generation, document generation, etc., default is true, optional
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url supports v1beta/v1, only for Gemini models, required
     api: AIzaSyAN2k6IRdgw
     model:
       - gemini-1.5-pro
-      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used. If you want to use the original name, you can add the original name in the model, just add the line below to use the original name.
+      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
       - gemini-1.5-flash-exp-0827 # Add this line, both gemini-1.5-flash-exp-0827 and gemini-1.5-flash can be requested
     tools: true
 
   - provider: vertex
-    project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud project ID. Format: String, usually consists of lowercase letters, numbers, and hyphens. How to get: You can find your project ID in the project selector of the Google Cloud Console.
-    private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key of Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to get: Create a service account in the Google Cloud Console, generate a JSON formatted key file, and set its content as the value of this environment variable.
-    client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to get: Generated when creating the service account, or you can view the service account details in the "IAM & Admin" section of the Google Cloud Console.
+    project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud Project ID. Format: String, usually consists of lowercase letters, numbers, and hyphens. How to get it: You can find your project ID in the project selector of the Google Cloud Console.
+    private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key of Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to get it: Create a service account in the Google Cloud Console, generate a JSON formatted key file, and then set its content as the value of this environment variable.
+    client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to get it: Generated when creating the service account, can also be found in the "IAM & admin" section of the Google Cloud Console.
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash
@@ -75,25 +75,26 @@ providers:
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
     tools: true
-    notes: https://xxxxx.com/ # You can put the provider's website, notes, official documentation, optional
+    notes: https://xxxxx.com/ # You can put the service provider's website, notes, official documentation, optional
 
   - provider: cloudflare
     api: f42b3xxxxxxxxxxq4aoGAh # Cloudflare API Key, required
     cf_account_id: 8ec0xxxxxxxxxxxxe721 # Cloudflare Account ID, required
     model:
-      - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # Rename model, @cf/meta/llama-3.1-8b-instruct is the provider's original model name, must be enclosed in quotes otherwise YAML syntax error, llama-3.1-8b is the renamed name, you can use a simpler name instead of the original complex name, optional
-      - '@cf/meta/llama-3.1-8b-instruct' # Must be enclosed in quotes otherwise YAML syntax error
+      - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # Rename model, @cf/meta/llama-3.1-8b-instruct is the provider's original model name, must be enclosed in quotes, otherwise a yaml syntax error, llama-3.1-8b is the renamed name, you can use a concise name instead of the original complex name, optional
+      - '@cf/meta/llama-3.1-8b-instruct' # Must be enclosed in quotes, otherwise a yaml syntax error
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
     api: sk-bNnAOJyA-xQw_twAA
     model:
       - causallm-35b-beta2ep-q6k: causallm-35b
+      - anthropic/claude-3-5-sonnet
     tools: false
     engine: openrouter # Force the use of a specific message format, currently supports gpt, claude, gemini, openrouter native format, optional
 
 api_keys:
-  - api: sk-KjjI60Yf0JFWtfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, required for users to use this service
+  - api: sk-KjjI60Yf0JFWtfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, users need an API key to use this service, required
     model: # Models that this API Key can use, required
       - gpt-4o # Usable model name, can use all gpt-4o models provided by providers
       - claude-3-5-sonnet # Usable model name, can use all claude-3-5-sonnet models provided by providers
@@ -102,28 +103,29 @@ api_keys:
 
   - api: sk-pkhf60Yf0JGyJygRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
-      - anthropic/claude-3-5-sonnet # Usable model name, can only use the claude-3-5-sonnet model provided by the provider named anthropic. Models with the same name from other providers cannot be used.
+      - anthropic/claude-3-5-sonnet # Usable model name, can only use the claude-3-5-sonnet model provided by the provider named anthropic. This method will not match the model named anthropic/claude-3-5-sonnet provided by other-provider.
+      - <anthropic/claude-3-5-sonnet> # By adding angle brackets on both sides of the model name, it will not look for the claude-3-5-sonnet model under the channel named anthropic, but will take the entire anthropic/claude-3-5-sonnet as the model name. This method can match the model named anthropic/claude-3-5-sonnet provided by other-provider. But it will not match the claude-3-5-sonnet model under anthropic.
     preferences:
-      USE_ROUND_ROBIN: true # Whether to use round-robin load balancing, true to use, false to not use, default is true. When enabled, each request to the model is made in the order configured in the model. This is independent of the original channel order in providers. Therefore, you can set different request orders for each API key.
+      USE_ROUND_ROBIN: true # Whether to use round-robin load balancing, true to use, false to not use, default is true. When enabled, each request to the model will be made in sequence according to the model configuration. It has nothing to do with the original channel order in providers. Therefore, you can set a different request order for each API key.
       AUTO_RETRY: true # Whether to automatically retry, automatically retry the next provider, true to automatically retry, false to not automatically retry, default is true
       RATE_LIMIT: 2/min # Supports rate limiting, maximum number of requests per minute, can be set to an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min, optional
 
   # Channel-level weighted load balancing configuration example
   - api: sk-KjjI60Yf0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
     model:
-      - gcp1/*: 5 # The number after the colon is the weight, only positive integers are supported.
-      - gcp2/*: 3 # The larger the number, the higher the probability of the request.
-      - gcp3/*: 2 # In this example, there are a total of 10 weights for all channels, and out of 10 requests, 5 requests will request the gcp1/* model, 2 requests will request the gcp2/* model, and 3 requests will request the gcp3/* model.
+      - gcp1/*: 5 # The number after the colon is the weight, the weight only supports positive integers.
+      - gcp2/*: 3 # The larger the number, the greater the probability of the request.
+      - gcp3/*: 2 # In this example, there are a total of 10 weights for all channels, and 5 out of 10 requests will request the gcp1/* model, 2 requests will request the gcp2/* model, and 3 requests will request the gcp3/* model.
 
     preferences:
-      USE_ROUND_ROBIN: true # When USE_ROUND_ROBIN must be true and there is no weight after the above channels, requests will be made in the original channel order. If there are weights, requests will be made in the weighted order.
+      USE_ROUND_ROBIN: true # When USE_ROUND_ROBIN must be true and there is no weight after the above channels, it will request according to the original channel order, if there is weight, it will request according to the weighted order.
       AUTO_RETRY: true
 ```
 
 ## Environment Variables
 
 - CONFIG_URL: The download address of the configuration file, it can be a local file or a remote file, optional
-- TIMEOUT: Request timeout, default is 20 seconds, the timeout can control the time needed to switch to the next channel when a channel does not respond. Optional
+- TIMEOUT: Request timeout, default is 20 seconds. The timeout can control the time needed to switch to the next channel when a channel does not respond. Optional.
 
 ## Docker Local Deployment
 
@@ -150,7 +152,7 @@ services:
       - ./api.yaml:/home/api.yaml
 ```
 
-CONFIG_URL is a direct link that can automatically download remote configuration files. For instance, if you find it inconvenient to modify configuration files on a certain platform, you can upload the configuration files to a hosting service that provides a direct link for uni-api to download. CONFIG_URL is this direct link.
+CONFIG_URL is a link that can automatically download a remote configuration file. For example, if you find it inconvenient to modify the configuration file on a certain platform, you can upload the configuration file to a hosting service that provides a direct link for uni-api to download. CONFIG_URL is this direct link.
 
 Run Docker Compose container in the background
 
