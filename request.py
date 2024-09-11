@@ -3,6 +3,10 @@ from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
 
 async def get_image_message(base64_image, engine = None):
+    colon_index = base64_image.index(":")
+    semicolon_index = base64_image.index(";")
+    image_type = base64_image[colon_index + 1:semicolon_index]
+    # print("image_type", image_type)
     if "gpt" == engine:
         return {
             "type": "image_url",
@@ -15,14 +19,14 @@ async def get_image_message(base64_image, engine = None):
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": "image/jpeg",
+                "media_type": image_type,
                 "data": base64_image.split(",")[1],
             }
         }
     if "gemini" == engine or "vertex-gemini" == engine:
         return {
             "inlineData": {
-                "mimeType": "image/jpeg",
+                "mimeType": image_type,
                 "data": base64_image.split(",")[1],
             }
         }
