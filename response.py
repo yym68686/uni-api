@@ -48,7 +48,7 @@ async def check_response(response, error_log):
             error_json = json.loads(error_str)
         except json.JSONDecodeError:
             error_json = error_str
-        return {"error": f"{error_log} HTTP Error {response.status_code}", "details": error_json}
+        return {"error": f"{error_log} HTTP Error", "status_code": response.status_code, "details": error_json}
     return None
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model):

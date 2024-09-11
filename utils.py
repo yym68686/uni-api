@@ -104,7 +104,7 @@ def ensure_string(item):
         return str(item)
 
 import asyncio
-async def error_handling_wrapper(generator, status_code=200):
+async def error_handling_wrapper(generator):
     try:
         first_item = await generator.__anext__()
         first_item_str = first_item
@@ -126,7 +126,9 @@ async def error_handling_wrapper(generator, status_code=200):
                 raise StopAsyncIteration
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
-            raise HTTPException(status_code=status_code, detail=f"{first_item_str}"[:300])
+            status_code = first_item_str.get('status_code', 500)
+            detail = first_item_str.get('details', f"{first_item_str}")
+            raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
 
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
         async def new_generator():
@@ -141,7 +143,7 @@ async def error_handling_wrapper(generator, status_code=200):
         return new_generator()
 
     except StopAsyncIteration:
-        raise HTTPException(status_code=status_code, detail="data: {'error': 'No data returned'}")
+        raise HTTPException(status_code=400, detail="data: {'error': 'No data returned'}")
 
 def post_all_models(token, config, api_list):
     all_models = []

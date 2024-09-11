@@ -218,7 +218,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
         if request.stream:
             model = provider['model'][request.model]
             generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-            wrapped_generator = await error_handling_wrapper(generator, status_code=500)
+            wrapped_generator = await error_handling_wrapper(generator)
             response = StreamingResponse(wrapped_generator, media_type="text/event-stream")
         else:
             response = await anext(fetch_response(app.state.client, url, headers, payload))
@@ -369,6 +369,8 @@ class ModelRequestHandler:
 
     # 在 try_all_providers 函数中处理失败的情况
     async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None):
+        status_code = 500
+        error_message = None
         num_providers = len(providers)
         start_index = self.last_provider_index + 1 if use_round_robin else 0
         for i in range(num_providers + 1):
@@ -377,14 +379,24 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request, provider, endpoint)
                 return response
-            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
+            except HTTPException as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                status_code = e.status_code
+                error_message = e.detail
+
                 if auto_retry:
                     continue
                 else:
-                    raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
+                    raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
+            except (Exception, asyncio.CancelledError, httpx.ReadError) as e:
+                logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                error_message = str(e)
+                if auto_retry:
+                    continue
+                else:
+                    raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
 
-        raise HTTPException(status_code=500, detail=f"All providers failed: {request.model}")
+        raise HTTPException(status_code=status_code, detail=f"All {request.model} error: {error_message}")
 
 model_handler = ModelRequestHandler()
 
