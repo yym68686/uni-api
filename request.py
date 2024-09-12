@@ -1,12 +1,54 @@
+import os
 import json
 from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
 
+import base64
+import urllib.parse
+
+def encode_image(image_path):
+  with open(image_path, "rb") as image_file:
+    return base64.b64encode(image_file.read()).decode('utf-8')
+
+async def get_doc_from_url(url):
+    filename = urllib.parse.unquote(url.split("/")[-1])
+    transport = httpx.AsyncHTTPTransport(
+        http2=True,
+        verify=False,
+        retries=1
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        try:
+            response = await client.get(
+                url,
+                timeout=30.0
+            )
+            with open(filename, 'wb') as f:
+                f.write(response.content)
+
+        except httpx.RequestError as e:
+            print(f"An error occurred while requesting {e.request.url!r}.")
+
+    return filename
+
+async def get_encode_image(image_url):
+    filename = await get_doc_from_url(image_url)
+    image_path = os.getcwd() + "/" + filename
+    base64_image = encode_image(image_path)
+    if filename.endswith(".png"):
+        prompt = f"data:image/png;base64,{base64_image}"
+    else:
+        prompt = f"data:image/jpeg;base64,{base64_image}"
+    os.remove(image_path)
+    return prompt
+
 async def get_image_message(base64_image, engine = None):
+    if base64_image.startswith("http"):
+        base64_image = await get_encode_image(base64_image)
     colon_index = base64_image.index(":")
     semicolon_index = base64_image.index(";")
     image_type = base64_image[colon_index + 1:semicolon_index]
-    # print("image_type", image_type)
+
     if "gpt" == engine:
         return {
             "type": "image_url",
