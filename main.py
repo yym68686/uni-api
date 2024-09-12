@@ -228,7 +228,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
             app.middleware_stack.app.channel_success_counts[provider['provider']] += 1
 
         return response
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
         # 更新失败计数
         async with app.middleware_stack.app.lock:
             app.middleware_stack.app.channel_failure_counts[provider['provider']] += 1
@@ -388,7 +388,7 @@ class ModelRequestHandler:
                     continue
                 else:
                     raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
-            except (Exception, asyncio.CancelledError, httpx.ReadError) as e:
+            except (Exception, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
                 error_message = str(e)
                 if auto_retry:
