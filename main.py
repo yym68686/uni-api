@@ -492,6 +492,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
+    # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
 @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
