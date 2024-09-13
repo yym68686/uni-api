@@ -201,6 +201,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     if "gemini" in provider['model'][request.model] and engine == "vertex":
         engine = "vertex-gemini"
 
+    if "o1-preview" in provider['model'][request.model] or "o1-mini" in provider['model'][request.model]:
+        engine = "o1"
+        request.stream = False
+
     if endpoint == "/v1/images/generations":
         engine = "dalle"
         request.stream = False

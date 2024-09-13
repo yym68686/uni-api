@@ -53,6 +53,15 @@ def update_config(config_data):
 async def load_config(app=None):
     import yaml
     try:
+        # with open('./api.yaml', 'r') as f:
+        #     tokens = yaml.scan(f)
+        #     for token in tokens:
+        #         if isinstance(token, yaml.ScalarToken):
+        #             value = token.value
+        #             # 如果plain为False，表示字符串被引号包裹
+        #             is_quoted = not token.plain
+        #             print(f"值: {value}, 是否被引号包裹: {is_quoted}")
+
         with open('./api.yaml', 'r') as f:
             # 判断是否为空文件
             conf = yaml.safe_load(f)
