@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
@@ -150,6 +151,7 @@ async def get_gemini_payload(request, engine, provider):
         elif msg.role != "system":
             messages.append({"role": msg.role, "parts": content})
         elif msg.role == "system":
+            content[0]["text"] = re.sub(r"_+", "_", content[0]["text"])
             systemInstruction = {"parts": content}
 
 
