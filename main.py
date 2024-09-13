@@ -26,6 +26,11 @@ is_debug = os.getenv("DEBUG", False)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
+
+    # # 启动事件
+    # routes = [{"path": route.path, "name": route.name} for route in app.routes]
+    # logger.info(f"Registered routes: {routes}")
+
     TIMEOUT = float(os.getenv("TIMEOUT", 100))
     timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
     default_headers = {
@@ -45,7 +50,7 @@ async def lifespan(app: FastAPI):
     # 关闭时的代码
     await app.state.client.aclose()
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, debug=is_debug)
 
 import asyncio
 from time import time
@@ -454,7 +459,7 @@ async def get_user_rate_limit(api_index: str = None):
     raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
 
     if not api_index or not raw_rate_limit:
-        return (60, 60)
+        return (30, 60)
 
     rate_limit = parse_rate_limit(raw_rate_limit)
     return rate_limit
@@ -495,6 +500,10 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
             if api_key.get('role') != "admin":
                 raise HTTPException(status_code=403, detail="Permission denied")
     return token
+
+@app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
+async def request_model(request: Union[RequestModel, ImageGenerationRequest]):
+    logger.info(f"Request received: {request}")
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
