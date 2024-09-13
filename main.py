@@ -52,6 +52,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == 404:
+        logger.error(f"404 Error: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+    )
+
 import asyncio
 from time import time
 from collections import defaultdict
@@ -500,10 +509,6 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
             if api_key.get('role') != "admin":
                 raise HTTPException(status_code=403, detail="Permission denied")
     return token
-
-@app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: Union[RequestModel, ImageGenerationRequest]):
-    logger.info(f"Request received: {request}")
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
