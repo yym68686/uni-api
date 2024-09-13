@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 async def lifespan(app: FastAPI):
     # 启动时的代码
     import os
-    TIMEOUT = float(os.getenv("TIMEOUT", 20))
+    TIMEOUT = float(os.getenv("TIMEOUT", 40))
     timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
     default_headers = {
         "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
