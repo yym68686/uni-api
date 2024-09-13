@@ -757,11 +757,11 @@ async def get_o1_payload(request, engine, provider):
         else:
             content = msg.content
 
-        if isinstance(content, list):
+        if isinstance(content, list) and msg.role != "system":
             for item in content:
                 if item["type"] == "text":
                     messages.append({"role": msg.role, "content": item["text"]})
-        else:
+        elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
 
     model = provider['model'][request.model]
