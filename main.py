@@ -20,11 +20,13 @@ from collections import defaultdict
 from typing import List, Dict, Union
 from urllib.parse import urlparse
 
+import os
+is_debug = os.getenv("DEBUG", False)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
-    import os
-    TIMEOUT = float(os.getenv("TIMEOUT", 40))
+    TIMEOUT = float(os.getenv("TIMEOUT", 100))
     timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
     default_headers = {
         "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
@@ -215,9 +217,9 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     logger.info(f"provider: {provider['provider']:<10} model: {request.model:<10} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
-
-    # logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-    # logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+    if is_debug:
+        logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
+        logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     try:
         if request.stream:
             model = provider['model'][request.model]
@@ -323,10 +325,10 @@ class ModelRequestHandler:
                 #     else:
                 #         if model_name in provider['model'].keys():
                 #             provider_list.append(provider)
-
-        # import json
-        # for provider in provider_list:
-        #     print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
+        if is_debug:
+            import json
+            for provider in provider_list:
+                print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
     async def request_model(self, request: Union[RequestModel, ImageGenerationRequest], token: str, endpoint=None):
@@ -530,14 +532,14 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
     if isinstance(middleware, StatsMiddleware):
         async with middleware.lock:
             stats = {
+                "channel_success_percentages": middleware.calculate_success_percentages(),
+                "channel_failure_percentages": middleware.calculate_failure_percentages(),
                 "request_counts": dict(middleware.request_counts),
                 "request_times": dict(middleware.request_times),
                 "ip_counts": {k: dict(v) for k, v in middleware.ip_counts.items()},
                 "request_arrivals": {k: [t.isoformat() for t in v] for k, v in middleware.request_arrivals.items()},
                 "channel_success_counts": dict(middleware.channel_success_counts),
                 "channel_failure_counts": dict(middleware.channel_failure_counts),
-                "channel_success_percentages": middleware.calculate_success_percentages(),
-                "channel_failure_percentages": middleware.calculate_failure_percentages()
             }
         return JSONResponse(content=stats)
     return {"error": "StatsMiddleware not found"}
