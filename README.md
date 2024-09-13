@@ -125,7 +125,7 @@ api_keys:
 ## Environment Variables
 
 - CONFIG_URL: The download address of the configuration file, it can be a local file or a remote file, optional
-- TIMEOUT: Request timeout, default is 20 seconds. The timeout can control the time needed to switch to the next channel when a channel does not respond. Optional.
+- TIMEOUT: Request timeout, default is 40 seconds. The timeout can control the time needed to switch to the next channel when a channel does not respond. Optional.
 
 ## Docker Local Deployment
 
