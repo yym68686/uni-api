@@ -121,10 +121,8 @@ async def error_handling_wrapper(generator):
         if isinstance(first_item_str, (bytes, bytearray)):
             first_item_str = first_item_str.decode("utf-8")
         if isinstance(first_item_str, str):
-            if first_item_str.startswith("data: "):
-                first_item_str = first_item_str[6:]
-            elif first_item_str.startswith("data:"):
-                first_item_str = first_item_str[5:]
+            if first_item_str.startswith("data:"):
+                first_item_str = first_item_str.lstrip("data: ")
             if first_item_str.startswith("[DONE]"):
                 logger.error("error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration

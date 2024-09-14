@@ -241,7 +241,12 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
             wrapped_generator = await error_handling_wrapper(generator)
             response = StreamingResponse(wrapped_generator, media_type="text/event-stream")
         else:
-            response = await anext(fetch_response(app.state.client, url, headers, payload))
+            generator = fetch_response(app.state.client, url, headers, payload)
+            wrapped_generator = await error_handling_wrapper(generator)
+            first_element = await anext(wrapped_generator)
+            first_element = first_element.lstrip("data: ")
+            first_element = json.loads(first_element)
+            response = JSONResponse(first_element)
 
         # 更新成功计数
         async with app.middleware_stack.app.lock:
