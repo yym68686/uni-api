@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.exceptions import RequestValidationError
 
 from models import RequestModel, ImageGenerationRequest
 from request import get_payload
@@ -70,6 +71,14 @@ from datetime import timedelta
 import json
 import aiofiles
 
+async def parse_request_body(request: Request):
+    if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
+        try:
+            return await request.json()
+        except json.JSONDecodeError:
+            return None
+    return None
+
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, exclude_paths=None, save_interval=3600, filename="stats.json"):
         super().__init__(app)
@@ -78,6 +87,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
         self.ip_counts = defaultdict(lambda: defaultdict(int))
         self.request_arrivals = defaultdict(list)
         self.channel_success_counts = defaultdict(int)
+        self.model_counts = defaultdict(int)
         self.channel_failure_counts = defaultdict(int)
         self.lock = asyncio.Lock()
         self.exclude_paths = set(exclude_paths or [])
@@ -91,6 +101,20 @@ class StatsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         arrival_time = datetime.now()
         start_time = time()
+
+        # 使用依赖注入获取预解析的请求体
+        request.state.parsed_body = await parse_request_body(request)
+
+        model = "unknown"
+        if request.state.parsed_body:
+            try:
+                request_model = RequestModel(**request.state.parsed_body)
+                model = request_model.model
+            except RequestValidationError:
+                pass
+            except Exception as e:
+                logger.error(f"Error processing request: {str(e)}")
+
         response = await call_next(request)
         process_time = time() - start_time
 
@@ -103,6 +127,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 self.request_times[endpoint] += process_time
                 self.ip_counts[endpoint][client_ip] += 1
                 self.request_arrivals[endpoint].append(arrival_time)
+                self.model_counts[model] += 1
 
         return response
 
@@ -121,6 +146,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
             stats = {
                 "request_counts": dict(self.request_counts),
                 "request_times": dict(self.request_times),
+                "model_counts": dict(self.model_counts),
                 "ip_counts": {k: dict(v) for k, v in self.ip_counts.items()},
                 "request_arrivals": {k: [t.isoformat() for t in v] for k, v in self.request_arrivals.items()},
                 "channel_success_counts": dict(self.channel_success_counts),
@@ -553,6 +579,7 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
             stats = {
                 "channel_success_percentages": middleware.calculate_success_percentages(),
                 "channel_failure_percentages": middleware.calculate_failure_percentages(),
+                "model_counts": dict(middleware.model_counts),
                 "request_counts": dict(middleware.request_counts),
                 "request_times": dict(middleware.request_times),
                 "ip_counts": {k: dict(v) for k, v in middleware.ip_counts.items()},
