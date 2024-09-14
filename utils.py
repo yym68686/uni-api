@@ -145,7 +145,7 @@ async def error_handling_wrapper(generator):
             try:
                 async for item in generator:
                     yield ensure_string(item)
-            except (httpx.ReadError, asyncio.CancelledError) as e:
+            except (httpx.ReadError, asyncio.CancelledError, httpx.RemoteProtocolError) as e:
                 logger.error(f"Network error in new_generator: {e}")
                 raise
 
