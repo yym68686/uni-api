@@ -3,5 +3,6 @@ pytest
 uvicorn
 fastapi
 aiofiles
+watchfiles
 httpx[http2]
 cryptography
