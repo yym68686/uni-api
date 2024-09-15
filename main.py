@@ -127,7 +127,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 self.request_times[endpoint] += process_time
                 self.ip_counts[endpoint][client_ip] += 1
                 self.request_arrivals[endpoint].append(arrival_time)
-                self.model_counts[model] += 1
+                if model != "unknown":
+                    self.model_counts[model] += 1
 
         return response
 
