@@ -72,10 +72,13 @@ async def load_config(app=None):
                 # logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
                 config, api_keys_db, api_list = [], [], []
     except FileNotFoundError:
-        logger.error("配置文件 'api.yaml' 未找到。请确保文件存在于正确的位置。")
+        logger.error("'api.yaml' not found. Please check the file path.")
         config, api_keys_db, api_list = [], [], []
     except yaml.YAMLError:
         logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。")
+        config, api_keys_db, api_list = [], [], []
+    except OSError as e:
+        logger.error(f"open 'api.yaml' failed: {e}")
         config, api_keys_db, api_list = [], [], []
 
     if config != []:
