@@ -184,6 +184,29 @@ async def fetch_cloudflare_response_stream(client, url, headers, payload, model)
                         sse_string = await generate_sse_response(timestamp, model, content=message)
                         yield sse_string
 
+async def fetch_cohere_response_stream(client, url, headers, payload, model):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_gpt_response_stream")
+        if error_message:
+            yield error_message
+            return
+
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                resp: dict = json.loads(line)
+                if resp.get("is_finished") == True:
+                    yield "data: [DONE]\n\r\n"
+                    return
+                if resp.get("event_type") == "text-generation":
+                    message = resp.get("text")
+                    sse_string = await generate_sse_response(timestamp, model, content=message)
+                    yield sse_string
+
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
@@ -269,6 +292,9 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                 yield chunk
         elif engine == "cloudflare":
             async for chunk in fetch_cloudflare_response_stream(client, url, headers, payload, model):
+                yield chunk
+        elif engine == "cohere":
+            async for chunk in fetch_cohere_response_stream(client, url, headers, payload, model):
                 yield chunk
         else:
             raise ValueError("Unknown response")

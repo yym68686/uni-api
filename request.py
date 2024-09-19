@@ -1,11 +1,12 @@
 import os
 import re
 import json
-from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
-
+import httpx
 import base64
 import urllib.parse
+
+from models import RequestModel
+from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
 
 def encode_image(image_path):
   with open(image_path, "rb") as image_file:
@@ -81,6 +82,8 @@ async def get_text_message(role, message, engine = None):
     if "gemini" == engine or "vertex-gemini" == engine:
         return {"text": message}
     if engine == "cloudflare":
+        return message
+    if engine == "cohere":
         return message
     raise ValueError("Unknown engine")
 
@@ -215,8 +218,6 @@ async def get_gemini_payload(request, engine, provider):
     return url, headers, payload
 
 import time
-import httpx
-import base64
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -690,6 +691,73 @@ async def get_openrouter_payload(request, engine, provider):
 
     return url, headers, payload
 
+async def get_cohere_payload(request, engine, provider):
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
+
+    url = provider['base_url']
+
+    role_map = {
+        "user": "USER",
+        "assistant" : "CHATBOT",
+        "system": "SYSTEM"
+    }
+
+    messages = []
+    for msg in request.messages:
+        if isinstance(msg.content, list):
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    text_message = await get_text_message(msg.role, item.text, engine)
+                    content.append(text_message)
+        else:
+            content = msg.content
+
+        if isinstance(content, list):
+            for item in content:
+                if item["type"] == "text":
+                    messages.append({"role": role_map[msg.role], "message": item["text"]})
+        else:
+            messages.append({"role": role_map[msg.role], "message": content})
+
+    model = provider['model'][request.model]
+    chat_history = messages[:-1]
+    query = messages[-1].get("message")
+    payload = {
+        "model": model,
+        "message": query,
+    }
+
+    if chat_history:
+        payload["chat_history"] = chat_history
+
+    miss_fields = [
+        'model',
+        'messages',
+        'tools',
+        'tool_choice',
+        'temperature',
+        'top_p',
+        'max_tokens',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+        'logprobs',
+        'top_logprobs'
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            payload[field] = value
+
+    return url, headers, payload
+
 async def get_cloudflare_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
@@ -989,6 +1057,8 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_cloudflare_payload(request, engine, provider)
     elif engine == "o1":
         return await get_o1_payload(request, engine, provider)
+    elif engine == "cohere":
+        return await get_cohere_payload(request, engine, provider)
     elif engine == "dalle":
         return await get_dalle_payload(request, engine, provider)
     else:
