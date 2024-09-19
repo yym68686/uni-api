@@ -13,13 +13,13 @@
 
 ## Introduction
 
-If used personally, one/new-api is too complex and has many commercial functions that individuals do not need. If you do not want a complicated front-end interface and want to support more models, you can try uni-api. This is a project for unified management of large model APIs, allowing you to call multiple backend services through a unified API interface, converting them uniformly to OpenAI format and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cloudflare, DeepBricks, OpenRouter, etc.
+If used for personal purposes, one/new-api is too complex and has many commercial features that individuals do not need. If you do not want a complex front-end interface and want to support more models, you can try uni-api. This is a project that manages large model APIs uniformly and allows you to call multiple backend services through a unified API interface, converting them uniformly to the OpenAI format and supporting load balancing. The currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cohere, Cloudflare, DeepBricks, OpenRouter, etc.
 
 ## Features
 
 - No frontend, pure configuration file setup for API channels. You can run your own API site by just writing one file, with detailed configuration guides in the documentation, beginner-friendly.
 - Unified management of multiple backend services, supporting providers like OpenAI, Deepseek, DeepBricks, OpenRouter, and other APIs in the OpenAI format. Supports OpenAI Dalle-3 image generation.
-- Supports Anthropic, Gemini, Vertex API, and Cloudflare. Vertex supports both Claude and Gemini API.
+- Supports Anthropic, Gemini, Vertex AI, Cohere, Cloudflare. Vertex supports both Claude and Gemini API.
 - Supports OpenAI, Anthropic, Gemini, Vertex native tool use function calls.
 - Supports OpenAI, Anthropic, Gemini, Vertex native image recognition API.
 - Supports four types of load balancing.
@@ -125,7 +125,7 @@ api_keys:
 ## Environment Variables
 
 - CONFIG_URL: The download address of the configuration file, it can be a local file or a remote file, optional
-- TIMEOUT: Request timeout, default is 40 seconds. The timeout can control the time needed to switch to the next channel when a channel does not respond. Optional.
+- TIMEOUT: Request timeout, default is 100 seconds, the timeout can control the time needed to switch to the next channel when a channel does not respond. Optional
 
 ## Docker Local Deployment
 

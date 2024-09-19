@@ -2,6 +2,7 @@ import json
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from collections import defaultdict
+import numpy as np
 
 import matplotlib.font_manager as fm
 font_path = '/System/Library/Fonts/PingFang.ttc'
@@ -45,5 +46,75 @@ def create_pic(request_arrivals, key):
     # 保存图片
     plt.savefig(f'{key.replace("/", "")}.png')
 
+def create_pie_chart(model_counts):
+    models = list(model_counts.keys())
+    counts = list(model_counts.values())
+
+    # 设置颜色和排列顺序
+    colors = plt.cm.Set3(np.linspace(0, 1, len(models)))
+    sorted_data = sorted(zip(counts, models, colors), reverse=True)
+    counts, models, colors = zip(*sorted_data)
+
+    # 创建饼图
+    fig, ax = plt.subplots(figsize=(16, 10))
+    wedges, _ = ax.pie(counts, colors=colors, startangle=90, wedgeprops=dict(width=0.5))
+
+    # 添加圆环效果
+    centre_circle = plt.Circle((0, 0), 0.35, fc='white')
+    fig.gca().add_artist(centre_circle)
+
+    # 计算总数
+    total = sum(counts)
+
+    # 准备标注
+    bbox_props = dict(boxstyle="round,pad=0.3", fc="w", ec="k", lw=0.72)
+    kw = dict(xycoords='data', textcoords='data', arrowprops=dict(arrowstyle="-"), bbox=bbox_props, zorder=0)
+
+    left_labels = []
+    right_labels = []
+
+    for i, p in enumerate(wedges):
+        ang = (p.theta2 - p.theta1) / 2. + p.theta1
+        y = np.sin(np.deg2rad(ang))
+        x = np.cos(np.deg2rad(ang))
+
+        percentage = counts[i] / total * 100
+        label = f"{models[i]}: {percentage:.1f}%"
+
+        if x > 0:
+            right_labels.append((x, y, label))
+        else:
+            left_labels.append((x, y, label))
+
+    # 绘制左侧标注
+    for i, (x, y, label) in enumerate(left_labels):
+        ax.annotate(label, xy=(x, y), xytext=(-1.2, 0.9 - i * 0.15), **kw)
+
+    # 绘制右侧标注
+    for i, (x, y, label) in enumerate(right_labels):
+        ax.annotate(label, xy=(x, y), xytext=(1.2, 0.9 - i * 0.15), **kw)
+
+    plt.title("各模型使用次数对比", size=16)
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.2, 1.2)
+    ax.axis('off')
+    plt.tight_layout()
+    plt.savefig('model_usage_pie_chart.png', bbox_inches='tight', pad_inches=0.5)
+
 if __name__ == '__main__':
-    create_pic(request_arrivals, 'POST /v1/chat/completions')
+    model_counts = {
+        "model_counts": {
+            "claude-3-5-sonnet": 94,
+            "o1-preview": 71,
+            "gpt-4o": 512,
+            "gpt-4o-mini": 5,
+            "gemini-1.5-pro": 5,
+            "deepseek-chat": 7,
+            "grok-2-mini": 1,
+            "grok-2": 9,
+            "o1-mini": 8
+        }
+    }
+    # create_pic(request_arrivals, 'POST /v1/chat/completions')
+
+    create_pie_chart(model_counts["model_counts"])

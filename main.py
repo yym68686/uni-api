@@ -229,13 +229,17 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
         engine = "claude"
     elif parsed_url.netloc == 'openrouter.ai':
         engine = "openrouter"
+    elif parsed_url.netloc == 'api.cohere.com':
+        engine = "cohere"
+        request.stream = True
     else:
         engine = "gpt"
 
     if "claude" not in provider['model'][request.model] \
     and "gpt" not in provider['model'][request.model] \
     and "gemini" not in provider['model'][request.model] \
-    and parsed_url.netloc != 'api.cloudflare.com':
+    and parsed_url.netloc != 'api.cloudflare.com' \
+    and parsed_url.netloc != 'api.cohere.com':
         engine = "openrouter"
 
     if "claude" in provider['model'][request.model] and engine == "vertex":
