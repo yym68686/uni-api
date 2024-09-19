@@ -129,6 +129,9 @@ async def error_handling_wrapper(generator):
             if first_item_str.startswith("[DONE]"):
                 logger.error("error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration
+            if "The bot's usage is covered by the developer" in first_item_str:
+                logger.error("error const string!")
+                raise StopAsyncIteration
             try:
                 first_item_str = json.loads(first_item_str)
             except json.JSONDecodeError:
