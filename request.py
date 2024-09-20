@@ -77,7 +77,7 @@ async def get_image_message(base64_image, engine = None):
     raise ValueError("Unknown engine")
 
 async def get_text_message(role, message, engine = None):
-    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine:
+    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine or "o1" == engine:
         return {"type": "text", "text": message}
     if "gemini" == engine or "vertex-gemini" == engine:
         return {"text": message}
