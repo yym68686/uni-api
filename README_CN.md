@@ -13,13 +13,13 @@
 
 ## Introduction
 
-如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Cohere、Cloudflare、DeepBricks、OpenRouter 等。
+如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Cohere、Groq、Cloudflare、DeepBricks、OpenRouter 等。
 
 ## Features
 
 - 无前端，纯配置文件配置 API 渠道。只要写一个文件就能运行起一个属于自己的 API 站，文档有详细的配置指南，小白友好。
 - 统一管理多个后端服务，支持 OpenAI、Deepseek、DeepBricks、OpenRouter 等其他 API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
-- 同时支持 Anthropic、Gemini、Vertex AI、Cohere、Cloudflare。Vertex 同时支持 Claude 和 Gemini API。
+- 同时支持 Anthropic、Gemini、Vertex AI、Cohere、Groq、Cloudflare。Vertex 同时支持 Claude 和 Gemini API。
 - 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
 - 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
 - 支持四种负载均衡。
