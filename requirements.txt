@@ -3,6 +3,9 @@ pytest
 uvicorn
 fastapi
 aiofiles
+greenlet
+aiosqlite
+sqlalchemy
 watchfiles
 httpx[http2]
 cryptography

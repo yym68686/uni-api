@@ -70,7 +70,8 @@ def test_request_model(test_client, api_key, get_model):
                     }
                 }
             }
-        ]
+        ],
+        "tool_choice": "auto"
     }
 
     headers = {

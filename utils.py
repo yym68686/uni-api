@@ -116,9 +116,12 @@ def ensure_string(item):
         return str(item)
 
 import asyncio
+import time as time_module
 async def error_handling_wrapper(generator):
+    start_time = time_module.time()
     try:
         first_item = await generator.__anext__()
+        first_response_time = time_module.time() - start_time
         first_item_str = first_item
         # logger.info("first_item_str: %s", first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
@@ -153,7 +156,7 @@ async def error_handling_wrapper(generator):
                 logger.error(f"Network error in new_generator: {e}")
                 raise
 
-        return new_generator()
+        return new_generator(), first_response_time
 
     except StopAsyncIteration:
         raise HTTPException(status_code=400, detail="data: {'error': 'No data returned'}")

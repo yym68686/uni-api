@@ -133,7 +133,9 @@ Start the container
 
 ```bash
 docker run --user root -p 8001:8000 --name uni-api -dit \
--v ./api.yaml:/home/api.yaml \
+-e CONFIG_URL=http://file_url/api.yaml \ # 如果已经挂载了本地配置文件，不需要设置 CONFIG_URL
+-v ./api.yaml:/home/api.yaml \ # 如果已经设置 CONFIG_URL，不需要挂载配置文件
+-v ./stats.db:/home/stats.db \ # 如果不想保存统计数据，不需要挂载 stats.db 文件
 yym68686/uni-api:latest
 ```
 
@@ -145,14 +147,15 @@ services:
     container_name: uni-api
     image: yym68686/uni-api:latest
     environment:
-      - CONFIG_URL=http://file_url/api.yaml
+      - CONFIG_URL=http://file_url/api.yaml # 如果已经挂载了本地配置文件，不需要设置 CONFIG_URL
     ports:
       - 8001:8000
     volumes:
-      - ./api.yaml:/home/api.yaml
+      - ./api.yaml:/home/api.yaml # 如果已经设置 CONFIG_URL，不需要挂载配置文件
+      - ./stats.db:/home/stats.db # 如果不想保存统计数据，不需要挂载 stats.db 文件
 ```
 
-CONFIG_URL 就是可以自动下载远程的配置文件。比如你在某个平台不方便修改配置文件，可以把配置文件传到某个托管服务，可以提供直链给 uni-api 下载，CONFIG_URL 就是这个直链。
+CONFIG_URL 就是可以自动下载远程的配置文件。比如你在某个平台不方便修改配置文件，可以把配置文件传到某个托管服务，可以提供直链给 uni-api 下载，CONFIG_URL 就是这个直链。如果使用本地挂载的配置文件，不需要设置 CONFIG_URL。CONFIG_URL 是在不方便挂载配置文件的情况下使用。
 
 Run Docker Compose container in the background
 
@@ -178,6 +181,7 @@ docker rm -f uni-api
 docker run --user root -p 8001:8000 -dit --name uni-api \
 -e CONFIG_URL=http://file_url/api.yaml \
 -v ./api.yaml:/home/api.yaml \
+-v ./stats.db:/home/stats.db \
 yym68686/uni-api:latest
 docker logs -f uni-api
 ```
