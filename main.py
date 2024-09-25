@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
@@ -191,7 +191,7 @@ app.add_middleware(
 app.add_middleware(StatsMiddleware)
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], provider: Dict, endpoint=None, token=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], provider: Dict, endpoint=None, token=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
@@ -235,6 +235,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     if endpoint == "/v1/audio/transcriptions":
         engine = "whisper"
+        request.stream = False
+
+    if endpoint == "/v1/moderations":
+        engine = "moderation"
         request.stream = False
 
     if provider.get("engine"):
@@ -363,7 +367,7 @@ class ModelRequestHandler:
                 print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], token: str, endpoint=None):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str, endpoint=None):
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
@@ -406,7 +410,7 @@ class ModelRequestHandler:
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint, token)
 
     # 在 try_all_providers 函数中处理失败的情况
-    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
+    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
         status_code = 500
         error_message = None
         num_providers = len(providers)
@@ -533,7 +537,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return token
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], token: str = Depends(verify_api_key)):
+async def request_model(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str = Depends(verify_api_key)):
     # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
@@ -555,6 +559,13 @@ async def images_generations(
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
+
+@app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
+async def images_generations(
+    request: ModerationRequest,
+    token: str = Depends(verify_api_key)
+):
+    return await model_handler.request_model(request, token, endpoint="/v1/moderations")
 
 from fastapi import UploadFile, File, Form, HTTPException
 import io

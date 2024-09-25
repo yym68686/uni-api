@@ -21,6 +21,11 @@ class AudioTranscriptionRequest(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+class ModerationRequest(BaseModel):
+    input: str
+    model: Optional[str] = "text-moderation-latest"
+    stream: bool = False
+
 class FunctionParameter(BaseModel):
     type: str
     properties: Dict[str, Dict[str, Union[str, Dict[str, str]]]]
