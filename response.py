@@ -273,7 +273,6 @@ async def fetch_response(client, url, headers, payload):
     response = None
     if payload.get("file"):
         file = payload.pop("file")
-        headers.pop("Content-Type")
         response = await client.post(url, headers=headers, data=payload, files={"file": file})
     else:
         response = await client.post(url, headers=headers, json=payload)

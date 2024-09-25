@@ -1043,7 +1043,7 @@ async def get_dalle_payload(request, engine, provider):
 async def get_whisper_payload(request, engine, provider):
     model = provider['model'][request.model]
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type": "multipart/form-data",
     }
     if provider.get("api"):
         headers['Authorization'] = f"Bearer {provider['api'].next()}"
@@ -1063,6 +1063,22 @@ async def get_whisper_payload(request, engine, provider):
         payload["temperature"] = request.temperature
     if request.language:
         payload["language"] = request.language
+
+    return url, headers, payload
+
+async def get_moderation_payload(request, engine, provider):
+    model = provider['model'][request.model]
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
+    url = provider['base_url']
+    url = BaseAPI(url).moderations
+
+    payload = {
+        "input": request.input,
+    }
 
     return url, headers, payload
 
@@ -1089,5 +1105,7 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_dalle_payload(request, engine, provider)
     elif engine == "whisper":
         return await get_whisper_payload(request, engine, provider)
+    elif engine == "moderation":
+        return await get_moderation_payload(request, engine, provider)
     else:
         raise ValueError("Unknown payload")
