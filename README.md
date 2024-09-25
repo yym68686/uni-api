@@ -135,7 +135,7 @@ Start the container
 docker run --user root -p 8001:8000 --name uni-api -dit \
 -e CONFIG_URL=http://file_url/api.yaml \ # If the local configuration file is already mounted, you do not need to set CONFIG_URL
 -v ./api.yaml:/home/api.yaml \ # If CONFIG_URL is already set, you do not need to mount the configuration file
--v ./stats.db:/stats.db \ # If you do not want to save statistical data, you do not need to mount the stats.db file
+-v ./uniapi_db:/home/data \ # If you do not want to save statistical data, you do not need to mount the stats.db file
 yym68686/uni-api:latest
 ```
 
@@ -152,7 +152,7 @@ services:
       - 8001:8000
     volumes:
       - ./api.yaml:/home/api.yaml # If CONFIG_URL is already set, there is no need to mount the configuration file
-      - ./stats.db:/stats.db # If you do not want to save statistical data, there is no need to mount the stats.db file
+      - ./uniapi_db:/home/data # If you do not want to save statistical data, there is no need to mount the stats.db file
 ```
 
 CONFIG_URL is used to automatically download remote configuration files. For example, if it is inconvenient to modify the configuration file on a certain platform, you can upload the configuration file to a hosting service and provide a direct link for uni-api to download. CONFIG_URL is this direct link. If you are using a locally mounted configuration file, you do not need to set CONFIG_URL. CONFIG_URL is used in situations where it is inconvenient to mount the configuration file.
@@ -181,7 +181,7 @@ docker rm -f uni-api
 docker run --user root -p 8001:8000 -dit --name uni-api \
 -e CONFIG_URL=http://file_url/api.yaml \
 -v ./api.yaml:/home/api.yaml \
--v ./stats.db:/stats.db \
+-v ./uniapi_db:/home/data \
 yym68686/uni-api:latest
 docker logs -f uni-api
 ```
