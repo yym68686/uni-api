@@ -1,3 +1,7 @@
 api.yaml
 test
 json_str
+*.jpg
+*.json
+*.png
+*.db
