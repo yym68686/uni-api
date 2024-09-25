@@ -1040,6 +1040,32 @@ async def get_dalle_payload(request, engine, provider):
 
     return url, headers, payload
 
+async def get_whisper_payload(request, engine, provider):
+    model = provider['model'][request.model]
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
+    url = provider['base_url']
+    url = BaseAPI(url).audio_transcriptions
+
+    payload = {
+        "model": model,
+        "file": request.file,
+    }
+
+    if request.prompt:
+        payload["prompt"] = request.prompt
+    if request.response_format:
+        payload["response_format"] = request.response_format
+    if request.temperature:
+        payload["temperature"] = request.temperature
+    if request.language:
+        payload["language"] = request.language
+
+    return url, headers, payload
+
 async def get_payload(request: RequestModel, engine, provider):
     if engine == "gemini":
         return await get_gemini_payload(request, engine, provider)
@@ -1061,5 +1087,7 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_cohere_payload(request, engine, provider)
     elif engine == "dalle":
         return await get_dalle_payload(request, engine, provider)
+    elif engine == "whisper":
+        return await get_whisper_payload(request, engine, provider)
     else:
         raise ValueError("Unknown payload")

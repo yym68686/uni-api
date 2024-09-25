@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
@@ -191,7 +191,7 @@ app.add_middleware(
 app.add_middleware(StatsMiddleware)
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None, token=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], provider: Dict, endpoint=None, token=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
@@ -233,6 +233,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
         engine = "dalle"
         request.stream = False
 
+    if endpoint == "/v1/audio/transcriptions":
+        engine = "whisper"
+        request.stream = False
+
     if provider.get("engine"):
         engine = provider["engine"]
 
@@ -241,7 +245,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     url, headers, payload = await get_payload(request, engine, provider)
     if is_debug:
         logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-        logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+        if payload.get("file"):
+            pass
+        else:
+            logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     try:
         if request.stream:
             model = provider['model'][request.model]
@@ -356,7 +363,7 @@ class ModelRequestHandler:
                 print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest], token: str, endpoint=None):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], token: str, endpoint=None):
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
@@ -399,7 +406,7 @@ class ModelRequestHandler:
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint, token)
 
     # 在 try_all_providers 函数中处理失败的情况
-    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
+    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
         status_code = 500
         error_message = None
         num_providers = len(providers)
@@ -421,6 +428,9 @@ class ModelRequestHandler:
                     raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
             except (Exception, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                if is_debug:
+                    import traceback
+                    traceback.print_exc()
                 error_message = str(e)
                 if auto_retry:
                     continue
@@ -523,7 +533,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return token
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
+async def request_model(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest], token: str = Depends(verify_api_key)):
     # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
@@ -545,6 +555,34 @@ async def images_generations(
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
+
+from fastapi import UploadFile, File, Form, HTTPException
+import io
+@app.post("/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    token: str = Depends(verify_api_key)
+):
+    try:
+        # 读取上传的文件内容
+        content = await file.read()
+        file_obj = io.BytesIO(content)
+
+        # 创建AudioTranscriptionRequest对象
+        request = AudioTranscriptionRequest(
+            file=(file.filename, file_obj, file.content_type),
+            model=model
+        )
+
+        return await model_handler.request_model(request, token, endpoint="/v1/audio/transcriptions")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid audio file encoding")
+    except Exception as e:
+        if is_debug:
+            import traceback
+            traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error processing audio file: {str(e)}")
 
 @app.get("/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 def generate_api_key():
