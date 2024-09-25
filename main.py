@@ -105,8 +105,15 @@ class ChannelStat(Base):
     first_response_time = Column(Float)  # 新增: 记录首次响应时间
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
+# 获取数据库路径
+db_path = os.getenv('DB_PATH', './data/stats.db')
+
+# 确保 data 目录存在
+data_dir = os.path.dirname(db_path)
+os.makedirs(data_dir, exist_ok=True)
+
 # 创建异步引擎和会话
-engine = create_async_engine('sqlite+aiosqlite:///stats.db', echo=is_debug)
+engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 class StatsMiddleware(BaseHTTPMiddleware):

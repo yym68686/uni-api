@@ -8,4 +8,4 @@ services:
       - 8001:8000
     volumes:
       - ./api.yaml:/home/api.yaml
-      - ./stats.db:/stats.db
+      - ./uniapi_db:/home/data
