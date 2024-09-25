@@ -8,4 +8,4 @@ services:
       - 8001:8000
     volumes:
       - ./api.yaml:/home/api.yaml
-      - ./stats.db:/home/stats.db
+      - ./stats.db:/stats.db
