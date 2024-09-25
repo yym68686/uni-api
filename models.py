@@ -1,5 +1,6 @@
+from io import IOBase
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 
 class ImageGenerationRequest(BaseModel):
     model: str
@@ -7,6 +8,18 @@ class ImageGenerationRequest(BaseModel):
     n: int
     size: str
     stream: bool = False
+
+class AudioTranscriptionRequest(BaseModel):
+    file: Tuple[str, IOBase, str]
+    model: str
+    language: Optional[str] = None
+    prompt: Optional[str] = None
+    response_format: Optional[str] = None
+    temperature: Optional[float] = None
+    stream: bool = False
+
+    class Config:
+        arbitrary_types_allowed = True
 
 class FunctionParameter(BaseModel):
     type: str

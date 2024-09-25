@@ -1,6 +1,7 @@
 import json
 import httpx
 from datetime import datetime
+from io import BytesIO
 
 from log_config import logger
 
@@ -41,7 +42,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     return sse_response
 
 async def check_response(response, error_log):
-    if response.status_code != 200:
+    if response and response.status_code != 200:
         error_message = await response.aread()
         error_str = error_message.decode('utf-8', errors='replace')
         try:
@@ -269,7 +270,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
         yield "data: [DONE]\n\r\n"
 
 async def fetch_response(client, url, headers, payload):
-    response = await client.post(url, headers=headers, json=payload)
+    response = None
+    if payload.get("file"):
+        file = payload.pop("file")
+        headers.pop("Content-Type")
+        response = await client.post(url, headers=headers, data=payload, files={"file": file})
+    else:
+        response = await client.post(url, headers=headers, json=payload)
     error_message = await check_response(response, "fetch_response")
     if error_message:
         yield error_message
