@@ -31,6 +31,9 @@ async def create_tables():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
+    if not os.path.exists("stats.db"):
+        # 如果数据库文件不存在，创建它
+        open("stats.db", 'a').close()
     await create_tables()
 
     TIMEOUT = float(os.getenv("TIMEOUT", 100))
