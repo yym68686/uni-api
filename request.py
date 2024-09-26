@@ -8,9 +8,20 @@ import urllib.parse
 from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
 
+import imghdr
+
 def encode_image(image_path):
-  with open(image_path, "rb") as image_file:
-    return base64.b64encode(image_file.read()).decode('utf-8')
+    with open(image_path, "rb") as image_file:
+        file_content = image_file.read()
+        file_type = imghdr.what(None, file_content)
+        base64_encoded = base64.b64encode(file_content).decode('utf-8')
+
+        if file_type == 'png':
+            return f"data:image/png;base64,{base64_encoded}"
+        elif file_type in ['jpeg', 'jpg']:
+            return f"data:image/jpeg;base64,{base64_encoded}"
+        else:
+            raise ValueError(f"不支持的图片格式: {file_type}")
 
 async def get_doc_from_url(url):
     filename = urllib.parse.unquote(url.split("/")[-1])
@@ -37,12 +48,28 @@ async def get_encode_image(image_url):
     filename = await get_doc_from_url(image_url)
     image_path = os.getcwd() + "/" + filename
     base64_image = encode_image(image_path)
-    if filename.endswith(".png"):
-        prompt = f"data:image/png;base64,{base64_image}"
-    else:
-        prompt = f"data:image/jpeg;base64,{base64_image}"
     os.remove(image_path)
-    return prompt
+    return base64_image
+
+from PIL import Image
+import io
+def validate_image(image_data, image_type):
+    try:
+        decoded_image = base64.b64decode(image_data)
+        image = Image.open(io.BytesIO(decoded_image))
+
+        # 检查图片格式是否与声明的类型匹配
+        # print("image.format", image.format)
+        if image_type == "image/png" and image.format != "PNG":
+            raise ValueError("Image is not a valid PNG")
+        elif image_type == "image/jpeg" and image.format not in ["JPEG", "JPG"]:
+            raise ValueError("Image is not a valid JPEG")
+
+        # 如果没有异常,则图片有效
+        return True
+    except Exception as e:
+        print(f"Image validation failed: {str(e)}")
+        return False
 
 async def get_image_message(base64_image, engine = None):
     if base64_image.startswith("http"):
@@ -59,6 +86,8 @@ async def get_image_message(base64_image, engine = None):
             }
         }
     if "claude" == engine or "vertex-claude" == engine:
+        # if not validate_image(base64_image.split(",")[1], image_type):
+        #     raise ValueError(f"Invalid image format. Expected {image_type}")
         return {
             "type": "image",
             "source": {

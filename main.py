@@ -24,9 +24,49 @@ from urllib.parse import urlparse
 import os
 is_debug = bool(os.getenv("DEBUG", False))
 
+from sqlalchemy import inspect, text
+from sqlalchemy.sql import sqltypes
+
 async def create_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # 检查并添加缺失的列
+        def check_and_add_columns(connection):
+            inspector = inspect(connection)
+            for table in [RequestStat, ChannelStat]:
+                table_name = table.__tablename__
+                existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
+
+                for column_name, column in table.__table__.columns.items():
+                    if column_name not in existing_columns:
+                        col_type = _map_sa_type_to_sql_type(column.type)
+                        default = _get_default_sql(column.default)
+                        connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {col_type}{default}"))
+
+        await conn.run_sync(check_and_add_columns)
+
+def _map_sa_type_to_sql_type(sa_type):
+    type_map = {
+        sqltypes.Integer: "INTEGER",
+        sqltypes.String: "TEXT",
+        sqltypes.Float: "REAL",
+        sqltypes.Boolean: "BOOLEAN",
+        sqltypes.DateTime: "DATETIME",
+        sqltypes.Text: "TEXT"
+    }
+    return type_map.get(type(sa_type), "TEXT")
+
+def _get_default_sql(default):
+    if default is None:
+        return ""
+    if isinstance(default.arg, bool):
+        return f" DEFAULT {str(default.arg).upper()}"
+    if isinstance(default.arg, (int, float)):
+        return f" DEFAULT {default.arg}"
+    if isinstance(default.arg, str):
+        return f" DEFAULT '{default.arg}'"
+    return ""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -79,7 +119,7 @@ async def parse_request_body(request: Request):
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean, Text
 from sqlalchemy.sql import func
 
 # 定义数据库模型
@@ -93,6 +133,8 @@ class RequestStat(Base):
     token = Column(String)
     total_time = Column(Float)
     model = Column(String)
+    is_flagged = Column(Boolean, default=False)
+    moderated_content = Column(Text)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 class ChannelStat(Base):
@@ -113,6 +155,7 @@ data_dir = os.path.dirname(db_path)
 os.makedirs(data_dir, exist_ok=True)
 
 # 创建异步引擎和会话
+# engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=False)
 engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -132,37 +175,76 @@ class StatsMiddleware(BaseHTTPMiddleware):
         start_time = time()
 
         request.state.parsed_body = await parse_request_body(request)
+        endpoint = f"{request.method} {request.url.path}"
+        client_ip = request.client.host
 
         model = "unknown"
+        enable_moderation = False  # 默认不开启道德审查
+        is_flagged = False
+        moderated_content = ""
+
+        config = app.state.config
+        api_list = app.state.api_list
+
+        # 根据token决定是否启用道德审查
+        if token:
+            try:
+                api_index = api_list.index(token)
+                enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
+            except ValueError:
+                # token不在api_list中，使用默认值（不开启）
+                pass
+        else:
+            # 如果token为None，检查全局设置
+            enable_moderation = config.get('ENABLE_MODERATION', False)
+
         if request.state.parsed_body:
             try:
                 request_model = RequestModel(**request.state.parsed_body)
                 model = request_model.model
+                moderated_content = request_model.get_last_text_message()
+
+                if enable_moderation and moderated_content:
+                    moderation_response = await self.moderate_content(moderated_content, token)
+                    moderation_result = moderation_response.body
+                    moderation_data = json.loads(moderation_result)
+                    is_flagged = moderation_data.get('results', [{}])[0].get('flagged', False)
+
+                    if is_flagged:
+                        logger.error(f"Content did not pass the moral check: %s", moderated_content)
+                        process_time = time() - start_time
+                        await self.update_stats(endpoint, process_time, client_ip, model, token, is_flagged, moderated_content)
+                        return JSONResponse(
+                            status_code=400,
+                            content={"error": "Content did not pass the moral check, please modify and try again."}
+                        )
             except RequestValidationError:
                 pass
             except Exception as e:
-                logger.error(f"Error processing request: {str(e)}")
+                if is_debug:
+                    import traceback
+                    traceback.print_exc()
+
+                logger.error(f"处理请求或进行道德检查时出错: {str(e)}")
 
         response = await call_next(request)
         process_time = time() - start_time
 
-        endpoint = f"{request.method} {request.url.path}"
-        client_ip = request.client.host
-
         # 异步更新数据库
-        await self.update_stats(endpoint, process_time, client_ip, model, token)
+        await self.update_stats(endpoint, process_time, client_ip, model, token, is_flagged, moderated_content)
 
         return response
 
-    async def update_stats(self, endpoint, process_time, client_ip, model, token):
+    async def update_stats(self, endpoint, process_time, client_ip, model, token, is_flagged, moderated_content):
         async with self.db as session:
-            # 为每个请求创建一条新的记录
             new_request_stat = RequestStat(
                 endpoint=endpoint,
                 ip=client_ip,
                 token=token,
                 total_time=process_time,
-                model=model
+                model=model,
+                is_flagged=is_flagged,
+                moderated_content=moderated_content
             )
             session.add(new_request_stat)
             await session.commit()
@@ -178,6 +260,14 @@ class StatsMiddleware(BaseHTTPMiddleware):
             )
             session.add(channel_stat)
             await session.commit()
+
+    async def moderate_content(self, content, token):
+        moderation_request = ModerationRequest(input=content)
+
+        # 直接调用 moderations 函数
+        response = await moderations(moderation_request, token)
+
+        return response
 
 # 配置 CORS 中间件
 app.add_middleware(
@@ -561,7 +651,7 @@ async def images_generations(
     return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
-async def images_generations(
+async def moderations(
     request: ModerationRequest,
     token: str = Depends(verify_api_key)
 ):
@@ -601,9 +691,6 @@ def generate_api_key():
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
-from collections import defaultdict
-from sqlalchemy import func
-
 from collections import defaultdict
 from sqlalchemy import func, desc, case
 
