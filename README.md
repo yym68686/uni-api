@@ -30,6 +30,8 @@ If used personally, one/new-api is too complex and has many commercial features 
 - Supports automatic retry, when an API channel response fails, automatically retry the next API channel.
 - Supports fine-grained access control. Supports using wildcards to set specific models for API key available channels.
 - Supports rate limiting, can set the maximum number of requests per minute, can be set as an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min.
+- Supports multiple standard OpenAI format interfaces: `/v1/chat/completions`, `/v1/images/generations`, `/v1/audio/transcriptions`, `/v1/moderations`, `/v1/models`.
+- Supports OpenAI moderation for ethical review, allowing for ethical review of user messages. If inappropriate messages are detected, an error message will be returned. This reduces the risk of the backend API being banned by providers.
 
 ## Configuration
 

@@ -30,6 +30,8 @@
 - 支持自动重试，当一个 API 渠道响应失败时，自动重试下一个 API 渠道。
 - 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
 - 支持限流，可以设置每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min。
+- 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/images/generations`，`/v1/audio/transcriptions`，`/v1/moderations`，`/v1/models`。
+- 支持 OpenAI moderation 道德审查，可以对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。降低后台 API 被提供商封禁的风险。
 
 ## Configuration
 
