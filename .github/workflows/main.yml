@@ -5,6 +5,7 @@ on:
     branches:
       - main
     paths:
+      - VERSION
       - main.py
       - utils.py
       - models.py
@@ -36,6 +37,23 @@ jobs:
         username: ${{ secrets.DOCKER_HUB_USERNAME }}
         password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
+    - name: Get current version
+      id: get_version
+      run: |
+        VERSION=$(cat VERSION || echo "0.0.0")
+        echo "Current version: $VERSION"
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Bump version
+      id: bump_version
+      run: |
+        IFS='.' read -ra VERSION_PARTS <<< "${{ steps.get_version.outputs.version }}"
+        PATCH=$((VERSION_PARTS[2] + 1))
+        NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
+        echo $NEW_VERSION > VERSION
+        echo "New version: $NEW_VERSION"
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
     - name: Build and push Docker image
       uses: docker/build-push-action@v2.7.0
       with:
@@ -43,4 +61,6 @@ jobs:
         file: Dockerfile
         platforms: linux/amd64,linux/arm64
         push: true
-        tags: yym68686/uni-api:latest
+        tags: |
+          yym68686/uni-api:latest
+          yym68686/uni-api:${{ steps.bump_version.outputs.new_version }}
