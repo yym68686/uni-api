@@ -37,36 +37,36 @@ Using the api.yaml configuration file, multiple models can be configured, and ea
 
 ```yaml
 providers:
-  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, can be any name, required
+  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, any name is fine, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required
-    model: # At least one model is required
+    model: # At least one model must be filled in
       - gpt-4o # Usable model name, required
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a concise name instead of the original complex name, optional
       - dall-e-3
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages
-    api: # Supports multiple API Keys, multiple keys automatically enable round-robin load balancing, at least one key, required
+    api: # Supports multiple API Keys, multiple keys automatically enable polling load balancing, at least one key, required
       - sk-ant-api03-bNnAOJyA-xQw_twAA
       - sk-ant-api02-bNnxxxx
     model:
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a concise name instead of the original complex name, optional
-    tools: true # Whether to support tools, such as code generation, document generation, etc., default is true, optional
+    tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url supports v1beta/v1, only for Gemini models, required
     api: AIzaSyAN2k6IRdgw
     model:
       - gemini-1.5-pro
-      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
+      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used. If you want to use the original name, you can add the original name in the model, just add the following line to use the original name.
       - gemini-1.5-flash-exp-0827 # Add this line, both gemini-1.5-flash-exp-0827 and gemini-1.5-flash can be requested
     tools: true
 
   - provider: vertex
-    project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud Project ID. Format: String, usually consists of lowercase letters, numbers, and hyphens. How to get it: You can find your project ID in the project selector of the Google Cloud Console.
-    private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key of Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to get it: Create a service account in the Google Cloud Console, generate a JSON formatted key file, and then set its content as the value of this environment variable.
-    client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to get it: Generated when creating the service account, can also be found in the "IAM & admin" section of the Google Cloud Console.
+    project_id: gen-lang-client-xxxxxxxxxxxxxx #    Description: Your Google Cloud project ID. Format: String, usually composed of lowercase letters, numbers, and hyphens. How to obtain: You can find your project ID in the project selector of the Google Cloud Console.
+    private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key of the Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to obtain: Create a service account in the Google Cloud Console, generate a JSON formatted key file, and then set its content as the value of this environment variable.
+    client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to obtain: Generated when creating the service account, you can also view the service account details in the "IAM & Admin" section of the Google Cloud Console.
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash
@@ -75,14 +75,14 @@ providers:
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
     tools: true
-    notes: https://xxxxx.com/ # You can put the service provider's website, notes, official documentation, optional
+    notes: https://xxxxx.com/ # You can put the provider's website, notes, official documentation, optional
 
   - provider: cloudflare
     api: f42b3xxxxxxxxxxq4aoGAh # Cloudflare API Key, required
     cf_account_id: 8ec0xxxxxxxxxxxxe721 # Cloudflare Account ID, required
     model:
-      - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # Rename model, @cf/meta/llama-3.1-8b-instruct is the provider's original model name, must be enclosed in quotes, otherwise a yaml syntax error, llama-3.1-8b is the renamed name, you can use a concise name instead of the original complex name, optional
-      - '@cf/meta/llama-3.1-8b-instruct' # Must be enclosed in quotes, otherwise a yaml syntax error
+      - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # Rename model, @cf/meta/llama-3.1-8b-instruct is the provider's original model name, the model name must be enclosed in quotes, otherwise yaml syntax error, llama-3.1-8b is the renamed name, you can use a concise name instead of the original complex name, optional
+      - '@cf/meta/llama-3.1-8b-instruct' # The model name must be enclosed in quotes, otherwise yaml syntax error
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
@@ -91,34 +91,36 @@ providers:
       - causallm-35b-beta2ep-q6k: causallm-35b
       - anthropic/claude-3-5-sonnet
     tools: false
-    engine: openrouter # Force the use of a specific message format, currently supports gpt, claude, gemini, openrouter native format, optional
+    engine: openrouter # Force to use a specific message format, currently supports gpt, claude, gemini, openrouter native format, optional
 
 api_keys:
-  - api: sk-KjjI60Yf0JFWtfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, users need an API key to use this service, required
+  - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, users need an API key to use this service, required
     model: # Models that this API Key can use, required
       - gpt-4o # Usable model name, can use all gpt-4o models provided by providers
       - claude-3-5-sonnet # Usable model name, can use all claude-3-5-sonnet models provided by providers
       - gemini/* # Usable model name, can only use all models provided by the provider named gemini, where gemini is the provider name, * represents all models
     role: admin
 
-  - api: sk-pkhf60Yf0JGyJygRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
+  - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
-      - anthropic/claude-3-5-sonnet # Usable model name, can only use the claude-3-5-sonnet model provided by the provider named anthropic. This method will not match the model named anthropic/claude-3-5-sonnet provided by other-provider.
-      - <anthropic/claude-3-5-sonnet> # By adding angle brackets on both sides of the model name, it will not look for the claude-3-5-sonnet model under the channel named anthropic, but will take the entire anthropic/claude-3-5-sonnet as the model name. This method can match the model named anthropic/claude-3-5-sonnet provided by other-provider. But it will not match the claude-3-5-sonnet model under anthropic.
+      - anthropic/claude-3-5-sonnet # Usable model name, can only use the claude-3-5-sonnet model provided by the provider named anthropic. Other providers' claude-3-5-sonnet models cannot be used. This way of writing will not match the model named anthropic/claude-3-5-sonnet provided by other-provider.
+      - <anthropic/claude-3-5-sonnet> # By adding angle brackets on both sides of the model name, it will not look for the claude-3-5-sonnet model under the channel named anthropic, but will treat the entire anthropic/claude-3-5-sonnet as the model name. This way of writing can match the model named anthropic/claude-3-5-sonnet provided by other-provider. But it will not match the claude-3-5-sonnet model under anthropic.
+      - openai-test/text-moderation-latest # When message moderation is enabled, you can use the text-moderation-latest model under the channel named openai-test for moderation.
     preferences:
-      USE_ROUND_ROBIN: true # Whether to use round-robin load balancing, true to use, false to not use, default is true. When enabled, each request to the model will be made in sequence according to the model configuration. It has nothing to do with the original channel order in providers. Therefore, you can set a different request order for each API key.
+      USE_ROUND_ROBIN: true # Whether to use polling load balancing, true to use, false to not use, default is true. When polling is enabled, each request will be made in the order configured in the model. It is not related to the original channel order in providers. Therefore, you can set different request orders for each API key.
       AUTO_RETRY: true # Whether to automatically retry, automatically retry the next provider, true to automatically retry, false to not automatically retry, default is true
-      RATE_LIMIT: 2/min # Supports rate limiting, maximum number of requests per minute, can be set to an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min, optional
+      RATE_LIMIT: 2/min # Supports rate limiting, the maximum number of requests per minute, can be set to an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min, optional
+      ENABLE_MODERATION: true # Whether to enable message moderation, true to enable, false to not enable, default is false. When enabled, it will conduct moderation on the user's message, if inappropriate messages are found, it will return an error message.
 
   # Channel-level weighted load balancing configuration example
-  - api: sk-KjjI60Yf0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
+  - api: sk-KjjI60Yd0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
     model:
       - gcp1/*: 5 # The number after the colon is the weight, the weight only supports positive integers.
       - gcp2/*: 3 # The larger the number, the greater the probability of the request.
       - gcp3/*: 2 # In this example, there are a total of 10 weights for all channels, and 5 out of 10 requests will request the gcp1/* model, 2 requests will request the gcp2/* model, and 3 requests will request the gcp3/* model.
 
     preferences:
-      USE_ROUND_ROBIN: true # When USE_ROUND_ROBIN must be true and there is no weight after the above channels, it will request according to the original channel order, if there is weight, it will request according to the weighted order.
+      USE_ROUND_ROBIN: true # When USE_ROUND_ROBIN must be true and there is no weight after the above channels, it will request in the original channel order, if there is weight, it will request in the weighted order.
       AUTO_RETRY: true
 ```
 
