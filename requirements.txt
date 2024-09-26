@@ -9,3 +9,4 @@ sqlalchemy
 watchfiles
 httpx[http2]
 cryptography
+python-multipart
