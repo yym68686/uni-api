@@ -55,12 +55,14 @@ jobs:
         echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
     - name: Commit version bump
+      env:
+        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git add VERSION
         git commit -m "Bump version to ${{ steps.bump_version.outputs.new_version }}"
-        git push
+        git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:main
 
     - name: Build and push Docker image
       uses: docker/build-push-action@v2.7.0
