@@ -54,6 +54,14 @@ jobs:
         echo "New version: $NEW_VERSION"
         echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
+    - name: Commit version bump
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add VERSION
+        git commit -m "Bump version to ${{ steps.bump_version.outputs.new_version }}"
+        git push
+
     - name: Build and push Docker image
       uses: docker/build-push-action@v2.7.0
       with:
