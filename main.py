@@ -162,7 +162,6 @@ async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
-        self.db = async_session()
 
     async def dispatch(self, request: Request, call_next):
         if request.headers.get("x-api-key"):
@@ -236,30 +235,40 @@ class StatsMiddleware(BaseHTTPMiddleware):
         return response
 
     async def update_stats(self, endpoint, process_time, client_ip, model, token, is_flagged, moderated_content):
-        async with self.db as session:
-            new_request_stat = RequestStat(
-                endpoint=endpoint,
-                ip=client_ip,
-                token=token,
-                total_time=process_time,
-                model=model,
-                is_flagged=is_flagged,
-                moderated_content=moderated_content
-            )
-            session.add(new_request_stat)
-            await session.commit()
+        async with async_session() as session:
+            async with session.begin():
+                try:
+                    new_request_stat = RequestStat(
+                        endpoint=endpoint,
+                        ip=client_ip,
+                        token=token,
+                        total_time=process_time,
+                        model=model,
+                        is_flagged=is_flagged,
+                        moderated_content=moderated_content
+                    )
+                    session.add(new_request_stat)
+                    await session.commit()
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"Error updating stats: {str(e)}")
 
     async def update_channel_stats(self, provider, model, api_key, success, first_response_time):
-        async with self.db as session:
-            channel_stat = ChannelStat(
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                success=success,
-                first_response_time=first_response_time
-            )
-            session.add(channel_stat)
-            await session.commit()
+        async with async_session() as session:
+            async with session.begin():
+                try:
+                    channel_stat = ChannelStat(
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        success=success,
+                        first_response_time=first_response_time
+                    )
+                    session.add(channel_stat)
+                    await session.commit()
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"Error updating channel stats: {str(e)}")
 
     async def moderate_content(self, content, token):
         moderation_request = ModerationRequest(input=content)
