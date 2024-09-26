@@ -51,25 +51,25 @@ async def get_encode_image(image_url):
     os.remove(image_path)
     return base64_image
 
-from PIL import Image
-import io
-def validate_image(image_data, image_type):
-    try:
-        decoded_image = base64.b64decode(image_data)
-        image = Image.open(io.BytesIO(decoded_image))
+# from PIL import Image
+# import io
+# def validate_image(image_data, image_type):
+#     try:
+#         decoded_image = base64.b64decode(image_data)
+#         image = Image.open(io.BytesIO(decoded_image))
 
-        # 检查图片格式是否与声明的类型匹配
-        # print("image.format", image.format)
-        if image_type == "image/png" and image.format != "PNG":
-            raise ValueError("Image is not a valid PNG")
-        elif image_type == "image/jpeg" and image.format not in ["JPEG", "JPG"]:
-            raise ValueError("Image is not a valid JPEG")
+#         # 检查图片格式是否与声明的类型匹配
+#         # print("image.format", image.format)
+#         if image_type == "image/png" and image.format != "PNG":
+#             raise ValueError("Image is not a valid PNG")
+#         elif image_type == "image/jpeg" and image.format not in ["JPEG", "JPG"]:
+#             raise ValueError("Image is not a valid JPEG")
 
-        # 如果没有异常,则图片有效
-        return True
-    except Exception as e:
-        print(f"Image validation failed: {str(e)}")
-        return False
+#         # 如果没有异常,则图片有效
+#         return True
+#     except Exception as e:
+#         print(f"Image validation failed: {str(e)}")
+#         return False
 
 async def get_image_message(base64_image, engine = None):
     if base64_image.startswith("http"):
