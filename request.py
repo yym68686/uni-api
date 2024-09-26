@@ -1072,7 +1072,7 @@ async def get_dalle_payload(request, engine, provider):
 async def get_whisper_payload(request, engine, provider):
     model = provider['model'][request.model]
     headers = {
-        "Content-Type": "multipart/form-data",
+        # "Content-Type": "multipart/form-data",
     }
     if provider.get("api"):
         headers['Authorization'] = f"Bearer {provider['api'].next()}"
