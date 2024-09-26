@@ -97,3 +97,14 @@ class RequestModel(BaseModel):
     user: Optional[str] = None
     tool_choice: Optional[Union[str, ToolChoice]] = None
     tools: Optional[List[Tool]] = None
+
+    def get_last_text_message(self) -> Optional[str]:
+        for message in reversed(self.messages):
+            if message.content:
+                if isinstance(message.content, str):
+                    return message.content
+                elif isinstance(message.content, list):
+                    for item in reversed(message.content):
+                        if item.type == "text" and item.text:
+                            return item.text
+        return ""
