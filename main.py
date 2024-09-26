@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
@@ -164,30 +164,27 @@ class StatsMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next):
+        start_time = time()
+
+        endpoint = f"{request.method} {request.url.path}"
+        client_ip = request.client.host
+
+        model = "unknown"
+        is_flagged = False
+        moderated_content = ""
+        enable_moderation = False  # 默认不开启道德审查
+
+        config = app.state.config
+        # 根据token决定是否启用道德审查
         if request.headers.get("x-api-key"):
             token = request.headers.get("x-api-key")
         elif request.headers.get("Authorization"):
             token = request.headers.get("Authorization").split(" ")[1]
         else:
             token = None
-
-        start_time = time()
-
-        request.state.parsed_body = await parse_request_body(request)
-        endpoint = f"{request.method} {request.url.path}"
-        client_ip = request.client.host
-
-        model = "unknown"
-        enable_moderation = False  # 默认不开启道德审查
-        is_flagged = False
-        moderated_content = ""
-
-        config = app.state.config
-        api_list = app.state.api_list
-
-        # 根据token决定是否启用道德审查
         if token:
             try:
+                api_list = app.state.api_list
                 api_index = api_list.index(token)
                 enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
             except ValueError:
@@ -197,11 +194,16 @@ class StatsMiddleware(BaseHTTPMiddleware):
             # 如果token为None，检查全局设置
             enable_moderation = config.get('ENABLE_MODERATION', False)
 
-        if request.state.parsed_body:
+        parsed_body = await parse_request_body(request)
+        if parsed_body:
             try:
-                request_model = RequestModel(**request.state.parsed_body)
+                request_model = UnifiedRequest.model_validate(parsed_body).data
                 model = request_model.model
-                moderated_content = request_model.get_last_text_message()
+
+                if request_model.request_type == "chat":
+                    moderated_content = request_model.get_last_text_message()
+                elif request_model.request_type == "image":
+                    moderated_content = request_model.prompt
 
                 if enable_moderation and moderated_content:
                     moderation_response = await self.moderate_content(moderated_content, token)
@@ -636,7 +638,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return token
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str = Depends(verify_api_key)):
+async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
     # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
