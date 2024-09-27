@@ -22,6 +22,9 @@ from typing import List, Dict, Union
 from urllib.parse import urlparse
 
 import os
+import string
+import json
+
 is_debug = bool(os.getenv("DEBUG", False))
 
 from sqlalchemy import inspect, text
@@ -463,9 +466,8 @@ class ModelRequestHandler:
                 #         if model_name in provider['model'].keys():
                 #             provider_list.append(provider)
         if is_debug:
-            import json
             for provider in provider_list:
-                print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
+                logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
     async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str, endpoint=None):
@@ -698,7 +700,11 @@ async def audio_transcriptions(
 
 @app.get("/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 def generate_api_key():
-    api_key = "sk-" + secrets.token_urlsafe(36)
+    # Define the character set (only alphanumeric)
+    chars = string.ascii_letters + string.digits
+    # Generate a random string of 36 characters
+    random_string = ''.join(secrets.choice(chars) for _ in range(36))
+    api_key = "sk-" + random_string
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
