@@ -62,7 +62,7 @@ async def load_config(app=None):
         #             is_quoted = not token.plain
         #             print(f"值: {value}, 是否被引号包裹: {is_quoted}")
 
-        with open('./api.yaml', 'r') as f:
+        with open("./api.yaml", "r", encoding="utf-8") as f:
             # 判断是否为空文件
             conf = yaml.safe_load(f)
             # conf = None
@@ -170,6 +170,10 @@ def post_all_models(token, config, api_list):
     api_index = api_list.index(token)
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
+            if model == "*":
+                # 如果模型名为 *，则返回所有模型
+                all_models = get_all_models(config)
+                return all_models
             if "/" in model:
                 provider = model.split("/")[0]
                 model = model.split("/")[1]

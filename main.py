@@ -419,6 +419,12 @@ class ModelRequestHandler:
         provider_rules = []
 
         for model in config['api_keys'][api_index]['model']:
+            if model == "*":
+                # 如果模型名为 *，则返回所有模型
+                for provider in config["providers"]:
+                    for model in provider["model"].keys():
+                        provider_rules.append(provider["provider"] + "/" + model)
+                break
             if "/" in model:
                 if model.startswith("<") and model.endswith(">"):
                     model = model[1:-1]
