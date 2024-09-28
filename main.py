@@ -9,7 +9,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
+from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
@@ -390,7 +392,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
 
-            if isinstance(response, StreamingResponse):
+            if isinstance(response, (FastAPIStreamingResponse, StarletteStreamingResponse)):
                 response = LoggingStreamingResponse(
                     content=response.body_iterator,
                     status_code=response.status_code,
@@ -527,14 +529,15 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             model = provider['model'][request.model]
             generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
             wrapped_generator, first_response_time = await error_handling_wrapper(generator)
-            response = StreamingResponse(wrapped_generator, media_type="text/event-stream")
+            response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
         else:
             generator = fetch_response(app.state.client, url, headers, payload)
             wrapped_generator, first_response_time = await error_handling_wrapper(generator)
             first_element = await anext(wrapped_generator)
             first_element = first_element.lstrip("data: ")
             first_element = json.loads(first_element)
-            response = JSONResponse(first_element)
+            response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
+            # response = JSONResponse(first_element)
 
         # 更新成功计数和首次响应时间
         await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
