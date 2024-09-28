@@ -1,6 +1,7 @@
 from io import IOBase
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Optional, Union, Tuple, Literal
+from log_config import logger
 
 class FunctionParameter(BaseModel):
     type: str
@@ -57,8 +58,10 @@ class ToolChoice(BaseModel):
     type: str
     function: Optional[FunctionChoice] = None
 
-class RequestModel(BaseModel):
-    request_type: Literal["chat"] = "chat"
+class BaseRequest(BaseModel):
+    request_type: Optional[Literal["chat", "image", "audio", "moderation"]] = Field(default=None, exclude=True)
+
+class RequestModel(BaseRequest):
     model: str
     messages: List[Message]
     logprobs: Optional[bool] = None
@@ -86,16 +89,14 @@ class RequestModel(BaseModel):
                             return item.text
         return ""
 
-class ImageGenerationRequest(BaseModel):
-    request_type: Literal["image"] = "image"
+class ImageGenerationRequest(BaseRequest):
     prompt: str
     model: Optional[str] = "dall-e-3"
     n:  Optional[int] = 1
     size: Optional[str] = "1024x1024"
     stream: bool = False
 
-class AudioTranscriptionRequest(BaseModel):
-    request_type: Literal["audio"] = "audio"
+class AudioTranscriptionRequest(BaseRequest):
     file: Tuple[str, IOBase, str]
     model: str
     language: Optional[str] = None
@@ -107,31 +108,30 @@ class AudioTranscriptionRequest(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-class ModerationRequest(BaseModel):
-    request_type: Literal["moderation"] = "moderation"
+class ModerationRequest(BaseRequest):
     input: str
     model: Optional[str] = "text-moderation-latest"
     stream: bool = False
 
 class UnifiedRequest(BaseModel):
-    data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest] = Field(..., discriminator="request_type")
+    data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest]
 
     @model_validator(mode='before')
     @classmethod
     def set_request_type(cls, values):
         if isinstance(values, dict):
             if "messages" in values:
-                values["request_type"] = "chat"
                 values["data"] = RequestModel(**values)
+                values["data"].request_type = "chat"
             elif "prompt" in values:
-                values["request_type"] = "image"
                 values["data"] = ImageGenerationRequest(**values)
+                values["data"].request_type = "image"
             elif "file" in values:
-                values["request_type"] = "audio"
                 values["data"] = AudioTranscriptionRequest(**values)
+                values["data"].request_type = "audio"
             elif "input" in values:
-                values["request_type"] = "moderation"
                 values["data"] = ModerationRequest(**values)
+                values["data"].request_type = "moderation"
             else:
                 raise ValueError("无法确定请求类型")
         return values

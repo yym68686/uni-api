@@ -126,6 +126,17 @@ api_keys:
       AUTO_RETRY: true
 ```
 
+If you do not want to set available channels for each `api` one by one in `api_keys`, `uni-api` supports setting the `api key` to be able to use all models. The configuration is as follows:
+
+```yaml
+# ... providers configuration unchanged ...
+api_keys:
+  - api: sk-LjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, users need an API key to request uni-api, required
+    model: # The model that can be used with this API Key, required
+      - * # Can use all models in all channels set under providers, no need to add available channels one by one.
+# ... other configurations unchanged ...
+```
+
 ## Environment Variables
 
 - CONFIG_URL: The download address of the configuration file, it can be a local file or a remote file, optional
