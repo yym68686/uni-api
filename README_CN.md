@@ -126,6 +126,17 @@ api_keys:
       AUTO_RETRY: true
 ```
 
+如果你不想在 `api_keys` 里面给每个 `api` 一个个设置可用渠道，`uni-api` 支持将 `api key` 设置为可以使用所有模型，配置如下：
+
+```yaml
+# ... providers 配置不变 ...
+api_keys:
+  - api: sk-LjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户请求 uni-api 需要 API key，必填
+    model: # 该 API Key 可以使用的模型，必填
+      - * # 可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。
+# ... 其他配置不变 ...
+```
+
 ## 环境变量
 
 - CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填

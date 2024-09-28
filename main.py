@@ -5,6 +5,7 @@ import httpx
 import secrets
 import time as time_module
 from contextlib import asynccontextmanager
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -26,6 +27,7 @@ import string
 import json
 
 is_debug = bool(os.getenv("DEBUG", False))
+# is_debug = False
 
 from sqlalchemy import inspect, text
 from sqlalchemy.sql import sqltypes
@@ -106,11 +108,12 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"message": exc.detail},
     )
 
+import uuid
+import json
 import asyncio
 from time import time
-from collections import defaultdict
-from starlette.middleware.base import BaseHTTPMiddleware
-import json
+import contextvars
+request_info = contextvars.ContextVar('request_info', default={})
 
 async def parse_request_body(request: Request):
     if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
@@ -131,23 +134,31 @@ Base = declarative_base()
 class RequestStat(Base):
     __tablename__ = 'request_stats'
     id = Column(Integer, primary_key=True)
+    request_id = Column(String)
     endpoint = Column(String)
-    ip = Column(String)
-    token = Column(String)
-    total_time = Column(Float)
+    client_ip = Column(String)
+    process_time = Column(Float)
+    first_response_time = Column(Float)
+    provider = Column(String)
     model = Column(String)
+    # success = Column(Boolean, default=False)
+    api_key = Column(String)
     is_flagged = Column(Boolean, default=False)
-    moderated_content = Column(Text)
+    text = Column(Text)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    # cost = Column(Float, default=0)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 class ChannelStat(Base):
     __tablename__ = 'channel_stats'
     id = Column(Integer, primary_key=True)
+    request_id = Column(String)
     provider = Column(String)
     model = Column(String)
     api_key = Column(String)
-    success = Column(Boolean)
-    first_response_time = Column(Float)  # 新增: 记录首次响应时间
+    success = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 # 获取数据库路径
@@ -162,6 +173,123 @@ os.makedirs(data_dir, exist_ok=True)
 engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+from starlette.types import Scope, Receive, Send
+from starlette.responses import Response
+
+from decimal import Decimal, getcontext
+
+# 设置全局精度
+getcontext().prec = 17  # 设置为17是为了确保15位小数的精度
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+    costs = {
+        "gpt-4": {"input": Decimal('5.0') / Decimal('1000000'), "output": Decimal('15.0') / Decimal('1000000')},
+        "claude-3-sonnet": {"input": Decimal('3.0') / Decimal('1000000'), "output": Decimal('15.0') / Decimal('1000000')}
+    }
+
+    if model not in costs:
+        logger.error(f"Unknown model: {model}")
+        return 0
+
+    model_costs = costs[model]
+    input_cost = Decimal(input_tokens) * model_costs["input"]
+    output_cost = Decimal(output_tokens) * model_costs["output"]
+    total_cost = input_cost + output_cost
+
+    # 返回精确到15位小数的结果
+    return total_cost.quantize(Decimal('0.000000000000001'))
+
+class LoggingStreamingResponse(Response):
+    def __init__(self, content, status_code=200, headers=None, media_type=None, current_info=None):
+        super().__init__(content=None, status_code=status_code, headers=headers, media_type=media_type)
+        self.body_iterator = content
+        self._closed = False
+        self.current_info = current_info
+
+        # Remove Content-Length header if it exists
+        if 'content-length' in self.headers:
+            del self.headers['content-length']
+        # Set Transfer-Encoding to chunked
+        self.headers['transfer-encoding'] = 'chunked'
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await send({
+            'type': 'http.response.start',
+            'status': self.status_code,
+            'headers': self.raw_headers,
+        })
+
+        try:
+            async for chunk in self._logging_iterator():
+                await send({
+                    'type': 'http.response.body',
+                    'body': chunk,
+                    'more_body': True,
+                })
+        finally:
+            await send({
+                'type': 'http.response.body',
+                'body': b'',
+                'more_body': False,
+            })
+            if hasattr(self.body_iterator, 'aclose') and not self._closed:
+                await self.body_iterator.aclose()
+                self._closed = True
+
+        process_time = time() - self.current_info["start_time"]
+        self.current_info["process_time"] = process_time
+        await self.update_stats()
+
+    async def update_stats(self):
+        # 这里添加更新数据库的逻辑
+        # print("current_info2")
+        async with async_session() as session:
+            async with session.begin():
+                try:
+                    columns = [column.key for column in RequestStat.__table__.columns]
+                    filtered_info = {k: v for k, v in self.current_info.items() if k in columns}
+                    new_request_stat = RequestStat(**filtered_info)
+                    session.add(new_request_stat)
+                    await session.commit()
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"Error updating stats: {str(e)}")
+
+    async def _logging_iterator(self):
+        try:
+            async for chunk in self.body_iterator:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode('utf-8')
+                line = chunk.decode()
+                if is_debug:
+                    logger.info(f"{line}")
+                if line.startswith("data:"):
+                    line = line.lstrip("data: ")
+                if not line.startswith("[DONE]"):
+                    resp: dict = json.loads(line)
+                    input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
+                    input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
+                    output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
+                    total_tokens = input_tokens + output_tokens
+
+                    model = self.current_info.get("model", "")
+                    # total_cost = calculate_cost(model, input_tokens, output_tokens)
+                    self.current_info["prompt_tokens"] = input_tokens
+                    self.current_info["completion_tokens"] = output_tokens
+                    self.current_info["total_tokens"] = total_tokens
+                    # self.current_info["cost"] = total_cost
+                yield chunk
+        except Exception as e:
+            raise
+        finally:
+            logger.debug("_logging_iterator finished")
+
+    async def close(self):
+        if not self._closed:
+            self._closed = True
+            if hasattr(self.body_iterator, 'aclose'):
+                await self.body_iterator.aclose()
+
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -169,12 +297,6 @@ class StatsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start_time = time()
 
-        endpoint = f"{request.method} {request.url.path}"
-        client_ip = request.client.host
-
-        model = "unknown"
-        is_flagged = False
-        moderated_content = ""
         enable_moderation = False  # 默认不开启道德审查
 
         config = app.state.config
@@ -197,16 +319,47 @@ class StatsMiddleware(BaseHTTPMiddleware):
             # 如果token为None，检查全局设置
             enable_moderation = config.get('ENABLE_MODERATION', False)
 
+        # 在 app.state 中存储此请求的信息
+        request_id = str(uuid.uuid4())
+
+        # 初始化请求信息
+        request_info_data = {
+            "request_id": request_id,
+            "start_time": start_time,
+            "endpoint": f"{request.method} {request.url.path}",
+            "client_ip": request.client.host,
+            "process_time": 0,
+            "first_response_time": -1,
+            "provider": None,
+            "model": None,
+            "success": False,
+            "api_key": token,
+            "is_flagged": False,
+            "text": None,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            # "cost": 0,
+            "total_tokens": 0
+        }
+
+        # 设置请求信息到上下文
+        current_request_info = request_info.set(request_info_data)
+        current_info = request_info.get()
+
         parsed_body = await parse_request_body(request)
         if parsed_body:
             try:
                 request_model = UnifiedRequest.model_validate(parsed_body).data
                 model = request_model.model
+                current_info["model"] = model
 
                 if request_model.request_type == "chat":
                     moderated_content = request_model.get_last_text_message()
                 elif request_model.request_type == "image":
                     moderated_content = request_model.prompt
+                if moderated_content:
+                    current_info["text"] = moderated_content
+
 
                 if enable_moderation and moderated_content:
                     moderation_response = await self.moderate_content(moderated_content, token)
@@ -217,12 +370,15 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     if is_flagged:
                         logger.error(f"Content did not pass the moral check: %s", moderated_content)
                         process_time = time() - start_time
-                        await self.update_stats(endpoint, process_time, client_ip, model, token, is_flagged, moderated_content)
+                        current_info["process_time"] = process_time
+                        current_info["is_flagged"] = is_flagged
+                        await self.update_stats(current_info)
                         return JSONResponse(
                             status_code=400,
                             content={"error": "Content did not pass the moral check, please modify and try again."}
                         )
             except RequestValidationError:
+                logger.error(f"Invalid request body: {parsed_body}")
                 pass
             except Exception as e:
                 if is_debug:
@@ -231,43 +387,51 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
                 logger.error(f"处理请求或进行道德检查时出错: {str(e)}")
 
-        response = await call_next(request)
-        process_time = time() - start_time
+        try:
+            response = await call_next(request)
 
-        # 异步更新数据库
-        await self.update_stats(endpoint, process_time, client_ip, model, token, is_flagged, moderated_content)
+            if isinstance(response, StreamingResponse):
+                response = LoggingStreamingResponse(
+                    content=response.body_iterator,
+                    status_code=response.status_code,
+                    media_type=response.media_type,
+                    headers=response.headers,
+                    current_info=current_info,
+                )
+            elif hasattr(response, 'json'):
+                logger.info(f"Response: {await response.json()}")
+            else:
+                logger.info(f"Response: type={type(response).__name__}, status_code={response.status_code}, headers={response.headers}")
 
-        return response
+            return response
+        finally:
+            # print("current_request_info", current_request_info)
+            request_info.reset(current_request_info)
 
-    async def update_stats(self, endpoint, process_time, client_ip, model, token, is_flagged, moderated_content):
+    async def update_stats(self, current_info):
+        # 这里添加更新数据库的逻辑
         async with async_session() as session:
             async with session.begin():
                 try:
-                    new_request_stat = RequestStat(
-                        endpoint=endpoint,
-                        ip=client_ip,
-                        token=token,
-                        total_time=process_time,
-                        model=model,
-                        is_flagged=is_flagged,
-                        moderated_content=moderated_content
-                    )
+                    columns = [column.key for column in RequestStat.__table__.columns]
+                    filtered_info = {k: v for k, v in current_info.items() if k in columns}
+                    new_request_stat = RequestStat(**filtered_info)
                     session.add(new_request_stat)
                     await session.commit()
                 except Exception as e:
                     await session.rollback()
                     logger.error(f"Error updating stats: {str(e)}")
 
-    async def update_channel_stats(self, provider, model, api_key, success, first_response_time):
+    async def update_channel_stats(self, request_id, provider, model, api_key, success):
         async with async_session() as session:
             async with session.begin():
                 try:
                     channel_stat = ChannelStat(
+                        request_id=request_id,
                         provider=provider,
                         model=model,
                         api_key=api_key,
                         success=success,
-                        first_response_time=first_response_time
                     )
                     session.add(channel_stat)
                     await session.commit()
@@ -357,6 +521,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             pass
         else:
             logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+    current_info = request_info.get()
     try:
         if request.stream:
             model = provider['model'][request.model]
@@ -372,12 +537,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             response = JSONResponse(first_element)
 
         # 更新成功计数和首次响应时间
-        await app.middleware_stack.app.update_channel_stats(provider['provider'], request.model, token, success=True, first_response_time=first_response_time)
+        await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
+        current_info["first_response_time"] = first_response_time
+        current_info["success"] = True
+        current_info["provider"] = provider['provider']
 
         return response
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-        # 更新失败计数,首次响应时间为-1表示失败
-        await app.middleware_stack.app.update_channel_stats(provider['provider'], request.model, token, success=False, first_response_time=-1)
+        await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=False)
 
         raise e
 
@@ -550,6 +717,10 @@ class ModelRequestHandler:
                 else:
                     raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
 
+        current_info = request_info.get()
+        current_info["first_response_time"] = -1
+        current_info["success"] = False
+        current_info["provider"] = None
         raise HTTPException(status_code=status_code, detail=f"All {request.model} error: {error_message}")
 
 model_handler = ModelRequestHandler()
@@ -647,7 +818,6 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
-    # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
 @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
