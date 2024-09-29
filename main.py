@@ -620,9 +620,14 @@ class ModelRequestHandler:
                             models_list.extend(list(provider['model'].keys()))
                     # print("models_list", models_list)
                     # print("model_name", model_name)
+                    # print("model_name_split", model_name_split)
                     # print("model", model)
-                    if (model_name_split and model_name in models_list) or (model_name_split == "*" and model_name in models_list):
-                        provider_rules.append(provider_name)
+                    if model_name_split == "*":
+                        if model_name in models_list:
+                            provider_rules.append(provider_name)
+                    elif model_name_split == model_name:
+                        if model_name in models_list:
+                            provider_rules.append(provider_name)
             else:
                 for provider in config['providers']:
                     if model in provider['model'].keys():
@@ -666,7 +671,7 @@ class ModelRequestHandler:
         # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
-
+        # exit(0)
         # 检查是否启用轮询
         api_index = api_list.index(token)
         weights = safe_get(config, 'api_keys', api_index, "weights")
