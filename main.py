@@ -365,9 +365,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
                 if enable_moderation and moderated_content:
                     moderation_response = await self.moderate_content(moderated_content, token)
-                    moderation_result = moderation_response.body
-                    moderation_data = json.loads(moderation_result)
-                    is_flagged = moderation_data.get('results', [{}])[0].get('flagged', False)
+                    is_flagged = moderation_response.get('results', [{}])[0].get('flagged', False)
 
                     if is_flagged:
                         logger.error(f"Content did not pass the moral check: %s", moderated_content)
@@ -447,7 +445,18 @@ class StatsMiddleware(BaseHTTPMiddleware):
         # 直接调用 moderations 函数
         response = await moderations(moderation_request, token)
 
-        return response
+        # 读取流式响应的内容
+        moderation_result = b""
+        async for chunk in response.body_iterator:
+            if isinstance(chunk, str):
+                moderation_result += chunk.encode('utf-8')
+            else:
+                moderation_result += chunk
+
+        # 解码并解析 JSON
+        moderation_data = json.loads(moderation_result.decode('utf-8'))
+
+        return moderation_data
 
 # 配置 CORS 中间件
 app.add_middleware(
