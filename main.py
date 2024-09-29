@@ -268,18 +268,19 @@ class LoggingStreamingResponse(Response):
                 if line.startswith("data:"):
                     line = line.lstrip("data: ")
                 if not line.startswith("[DONE]"):
-                    resp: dict = json.loads(line)
-                    input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
-                    input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
-                    output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
-                    total_tokens = input_tokens + output_tokens
+                    try:
+                        resp: dict = json.loads(line)
+                        input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
+                        input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
+                        output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
+                        total_tokens = input_tokens + output_tokens
 
-                    model = self.current_info.get("model", "")
-                    # total_cost = calculate_cost(model, input_tokens, output_tokens)
-                    self.current_info["prompt_tokens"] = input_tokens
-                    self.current_info["completion_tokens"] = output_tokens
-                    self.current_info["total_tokens"] = total_tokens
-                    # self.current_info["cost"] = total_cost
+                        self.current_info["prompt_tokens"] = input_tokens
+                        self.current_info["completion_tokens"] = output_tokens
+                        self.current_info["total_tokens"] = total_tokens
+                    except Exception as e:
+                        logger.error(f"Error parsing response: {str(e)}, line: {repr(line)}")
+                        continue
                 yield chunk
         except Exception as e:
             raise
