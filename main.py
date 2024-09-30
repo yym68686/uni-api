@@ -902,12 +902,20 @@ def generate_api_key():
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
-from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, desc, case
+from fastapi import Query
 
 @app.get("/stats", dependencies=[Depends(rate_limit_dependency)])
-async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)):
+async def get_stats(
+    request: Request,
+    token: str = Depends(verify_admin_api_key),
+    hours: int = Query(default=24, ge=1, le=720, description="Number of hours to look back for stats (1-720)")
+):
     async with async_session() as session:
+        # 计算指定时间范围的开始时间
+        start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+
         # 1. 每个渠道下面每个模型的成功率
         channel_model_stats = await session.execute(
             select(
@@ -915,7 +923,9 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
                 ChannelStat.model,
                 func.count().label('total'),
                 func.sum(case((ChannelStat.success == True, 1), else_=0)).label('success_count')
-            ).group_by(ChannelStat.provider, ChannelStat.model)
+            )
+            .where(ChannelStat.timestamp >= start_time)
+            .group_by(ChannelStat.provider, ChannelStat.model)
         )
         channel_model_stats = channel_model_stats.fetchall()
 
@@ -925,14 +935,17 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
                 ChannelStat.provider,
                 func.count().label('total'),
                 func.sum(case((ChannelStat.success == True, 1), else_=0)).label('success_count')
-            ).group_by(ChannelStat.provider)
+            )
+            .where(ChannelStat.timestamp >= start_time)
+            .group_by(ChannelStat.provider)
         )
         channel_stats = channel_stats.fetchall()
 
         # 3. 每个模型在所有渠道总的请求次数
         model_stats = await session.execute(
-            select(ChannelStat.model, func.count().label('count'))
-            .group_by(ChannelStat.model)
+            select(RequestStat.model, func.count().label('count'))
+            .where(RequestStat.timestamp >= start_time)
+            .group_by(RequestStat.model)
             .order_by(desc('count'))
         )
         model_stats = model_stats.fetchall()
@@ -940,6 +953,7 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
         # 4. 每个端点的请求次数
         endpoint_stats = await session.execute(
             select(RequestStat.endpoint, func.count().label('count'))
+            .where(RequestStat.timestamp >= start_time)
             .group_by(RequestStat.endpoint)
             .order_by(desc('count'))
         )
@@ -947,25 +961,29 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
 
         # 5. 每个ip请求的次数
         ip_stats = await session.execute(
-            select(RequestStat.ip, func.count().label('count'))
-            .group_by(RequestStat.ip)
+            select(RequestStat.client_ip, func.count().label('count'))
+            .where(RequestStat.timestamp >= start_time)
+            .group_by(RequestStat.client_ip)
             .order_by(desc('count'))
         )
         ip_stats = ip_stats.fetchall()
 
     # 处理统计数据并返回
     stats = {
+        "time_range": f"Last {hours} hours",
         "channel_model_success_rates": [
             {
                 "provider": stat.provider,
                 "model": stat.model,
-                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0
+                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0,
+                "total_requests": stat.total
             } for stat in sorted(channel_model_stats, key=lambda x: x.success_count / x.total if x.total > 0 else 0, reverse=True)
         ],
         "channel_success_rates": [
             {
                 "provider": stat.provider,
-                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0
+                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0,
+                "total_requests": stat.total
             } for stat in sorted(channel_stats, key=lambda x: x.success_count / x.total if x.total > 0 else 0, reverse=True)
         ],
         "model_request_counts": [
@@ -982,7 +1000,7 @@ async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)
         ],
         "ip_request_counts": [
             {
-                "ip": stat.ip,
+                "ip": stat.client_ip,
                 "count": stat.count
             } for stat in ip_stats
         ]
