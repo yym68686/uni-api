@@ -170,8 +170,8 @@ def post_all_models(token, config, api_list):
     api_index = api_list.index(token)
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
-            if model == "*":
-                # 如果模型名为 *，则返回所有模型
+            if model == "all":
+                # 如果模型名为 all，则返回所有模型
                 all_models = get_all_models(config)
                 return all_models
             if "/" in model:

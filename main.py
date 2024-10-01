@@ -599,7 +599,7 @@ class ModelRequestHandler:
         provider_rules = []
 
         for model in config['api_keys'][api_index]['model']:
-            if model == "*":
+            if model == "all":
                 # 如果模型名为 *，则返回所有模型
                 for provider in config["providers"]:
                     for model in provider["model"].keys():
