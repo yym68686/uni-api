@@ -267,7 +267,7 @@ class LoggingStreamingResponse(Response):
                     logger.info(f"{line}")
                 if line.startswith("data:"):
                     line = line.lstrip("data: ")
-                if not line.startswith("[DONE]"):
+                if not line.startswith("[DONE]") and not line.startswith("OK"):
                     try:
                         resp: dict = json.loads(line)
                         input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
@@ -587,7 +587,8 @@ def weighted_round_robin(weights):
 import asyncio
 class ModelRequestHandler:
     def __init__(self):
-        self.last_provider_index = -1
+        self.last_provider_indices = defaultdict(lambda: -1)
+        self.locks = defaultdict(asyncio.Lock)
 
     def get_matching_providers(self, model_name, token):
         config = app.state.config
@@ -708,10 +709,18 @@ class ModelRequestHandler:
         status_code = 500
         error_message = None
         num_providers = len(providers)
-        start_index = self.last_provider_index + 1 if use_round_robin else 0
+        model_name = request.model
+
+        if use_round_robin:
+            async with self.locks[model_name]:
+                self.last_provider_indices[model_name] = (self.last_provider_indices[model_name] + 1) % num_providers
+                start_index = self.last_provider_indices[model_name]
+        else:
+            start_index = 0
+
         for i in range(num_providers + 1):
-            self.last_provider_index = (start_index + i) % num_providers
-            provider = providers[self.last_provider_index]
+            current_index = (start_index + i) % num_providers
+            provider = providers[current_index]
             try:
                 response = await process_request(request, provider, endpoint, token)
                 return response
