@@ -268,6 +268,16 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         yield sse_string
         yield "data: [DONE]\n\r\n"
 
+        
+async def get_response(client, url, headers):
+    response = await client.get(url, headers=headers)
+    error_message = await check_response(response, "fetch_response")
+    if error_message:
+        yield error_message
+        return
+    yield response.json()
+
+
 async def fetch_response(client, url, headers, payload):
     response = None
     if payload.get("file"):

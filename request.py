@@ -1,3 +1,4 @@
+import datetime
 import os
 import re
 import json
@@ -1138,3 +1139,145 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_moderation_payload(request, engine, provider)
     else:
         raise ValueError("Unknown payload")
+
+
+async def get_gemini_models(request: RequestModel, provider):
+    from response import get_response
+    from utils import error_handling_wrapper
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if provider.get("models_url") is None:
+        return []
+
+    url = provider["models_url"]
+    url = url.replace("{api_key}", provider['api'])
+
+    # print("request.get_gemini_models", headers, url)
+
+    models = []
+    # 请求 url 获取 models
+    generator = get_response(request, url, headers)
+    wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+    resp_json = await anext(wrapped_generator)
+    resp_json = resp_json.lstrip("data: ")
+    resp_json = json.loads(resp_json)
+    for one in resp_json["models"]:
+        models.append(
+            {
+                "id": one["name"].split("/")[-1],
+                "object": "model",
+                "created": 1620000000,
+                "owned_by": "ollama",
+            }
+        )
+
+    return models
+
+
+async def get_gpt_models(request: RequestModel, provider):
+    from response import get_response
+    from utils import error_handling_wrapper
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {provider['api']}",
+    }
+
+    if provider.get("models_url") is None:
+        return []
+
+    url = provider["models_url"]
+    # print("request.get_gpt_models", headers, url)
+
+    models = []
+    # 请求 url 获取 models
+    generator = get_response(request, url, headers)
+    wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+    resp_json = await anext(wrapped_generator)
+    resp_json = resp_json.lstrip("data: ")
+    resp_json = json.loads(resp_json)
+    models = resp_json["data"]
+
+    return models
+
+
+async def get_ollama_models(request: RequestModel, provider):
+    from response import get_response
+    from utils import error_handling_wrapper
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if provider.get("models_url") is None:
+        return []
+
+    url = provider["models_url"]
+    # print("request.get_ollama_models", headers, url)
+
+    models = []
+    # 请求 url 获取 models
+    generator = get_response(request, url, headers)
+    wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+    resp_json = await anext(wrapped_generator)
+    resp_json = resp_json.lstrip("data: ")
+    resp_json = json.loads(resp_json)
+    # print("request.get_ollama_models: resp_json", len(resp_json.get("models", [])))
+    for one in resp_json["models"]:
+        # '2024-09-26T13:17:48.2532749+08:00'
+        modified_at = one["modified_at"]
+        unix_time = int(datetime.datetime.fromisoformat(modified_at).timestamp())
+        models.append(
+            {
+                "id": one["name"],
+                "object": "model",
+                "created": unix_time,
+                "owned_by": "ollama",
+            }
+        )
+
+    return models
+
+
+async def get_online_models(request: RequestModel, engine, provider):
+    # print("request.get_online_models", engine, provider)
+    if engine == "gemini":
+        return await get_gemini_models(request, provider)
+    elif engine == "ollama" or provider.get("provider") == "ollama":
+        return await get_ollama_models(request, provider)
+    elif engine == "vertex-gemini":
+        # 没有 key，没法测试
+        return []
+    elif engine == "vertex-claude":
+        # 没有 key，没法测试
+        return []
+    elif engine == "claude":
+        # 没有 key，没法测试
+        return []
+    else:
+        return await get_gpt_models(request, provider)
+
+
+def get_online_models_sync(request, engine, provider):
+    """
+    封装异步请求的同步函数，会等待返回结果。
+    """
+    import asyncio
+    import nest_asyncio
+
+    async def wrapper():
+        return await get_online_models(request, engine, provider)
+
+    loop = asyncio.get_event_loop()
+    nest_asyncio.apply(loop)  # 允许嵌套运行事件循环
+    if loop.is_running():
+        print("get_online_models_sync: loop is running", loop)
+        # 如果事件循环已经在运行，直接运行协程
+        return loop.run_until_complete(wrapper())
+    else:
+        # 如果事件循环没有运行，使用 run_until_complete
+        print("get_online_models_sync: loop is not running")
+        return loop.run_until_complete(wrapper())

@@ -4,7 +4,7 @@ import httpx
 
 from log_config import logger
 
-def update_config(config_data):
+def update_config(config_data, app=None):
     for index, provider in enumerate(config_data['providers']):
         model_dict = {}
         for model in provider['model']:
@@ -12,6 +12,32 @@ def update_config(config_data):
                 model_dict[model] = model
             if type(model) == dict:
                 model_dict.update({new: old for old, new in model.items()})
+
+        # 如果 provider['model'] 只有 1 行，而且是 *
+        if provider["model"] == ["*"]:
+            if app:
+                from request import get_online_models_sync
+
+                provider_name = provider["provider"]
+                engine = provider.get("engine")
+                if engine is None:
+                    # 如果 provider_name 里包含 gemini
+                    if "gemini" in provider_name:
+                        engine = "gemini"
+                    if "ollama" in provider_name:
+                        engine = "ollama"
+                provider["model"] = get_online_models_sync(
+                    app.state.client, engine, provider
+                )
+                # 删掉 "*" 这个要替换的值
+                model_dict.pop("*", None)
+                # print("update_config", provider["model"])
+                # 把数据转换到 model_dict
+                for model in provider["model"]:
+                    model_dict[model["id"]] = (
+                        model["id"]
+                    )
+
         provider['model'] = model_dict
         if provider.get('project_id'):
             provider['base_url'] = 'https://aiplatform.googleapis.com/'
@@ -67,7 +93,7 @@ async def load_config(app=None):
             conf = yaml.safe_load(f)
             # conf = None
             if conf:
-                config, api_keys_db, api_list = update_config(conf)
+                config, api_keys_db, api_list = update_config(conf, app)
             else:
                 # logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
                 config, api_keys_db, api_list = [], [], []
@@ -96,7 +122,7 @@ async def load_config(app=None):
             # 更新配置
             # logger.info(config_data)
             if config_data:
-                config, api_keys_db, api_list = update_config(config_data)
+                config, api_keys_db, api_list = update_config(config_data, app)
             else:
                 logger.error(f"Error fetching or parsing config from {config_url}")
                 config, api_keys_db, api_list = [], [], []
@@ -278,7 +304,6 @@ class CircularList:
         return {
             'queue': list(self.queue)
         }
-
 
 
 c35s = CircularList(["us-east5", "europe-west1"])
