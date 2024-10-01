@@ -135,7 +135,7 @@ api_keys:
 api_keys:
   - api: sk-LjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户请求 uni-api 需要 API key，必填
     model: # 该 API Key 可以使用的模型，必填
-      - * # 可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。
+      - all # 可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。
 # ... 其他配置不变 ...
 ```
 
