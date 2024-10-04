@@ -640,9 +640,12 @@ class ModelRequestHandler:
         for item in provider_rules:
             for provider in config['providers']:
                 # print("provider", provider, provider['provider'] == item, item)
+                import re
+                item_model = re.sub(r'^https?://[^/]+/', '', item)
+                item_domain_prefix = re.match(r'^https?://[^/]+', item).group()
                 if "/" in item:
-                    if provider['provider'] == item.split("/")[0]:
-                        if model_name in provider['model'].keys() and "/".join(item.split("/")[1:]) == model_name:
+                    if provider['provider'] == item_domain_prefix:
+                        if model_name in provider['model'].keys() and item_model == model_name:
                             provider_list.append(provider)
                 elif provider['provider'] == item:
                     if model_name in provider['model'].keys():
