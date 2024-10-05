@@ -135,3 +135,11 @@ class UnifiedRequest(BaseModel):
             else:
                 raise ValueError("无法确定请求类型")
         return values
+
+class TextToSpeechRequest(BaseRequest):
+    model: str
+    input: str
+    voice: str
+    response_format: Optional[str] = "mp3"
+    speed: Optional[float] = 1.0
+    stream: Optional[bool] = False  # Add this line
