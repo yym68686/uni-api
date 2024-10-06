@@ -142,6 +142,22 @@ api_keys:
 - CONFIG_URL: The download address of the configuration file, it can be a local file or a remote file, optional
 - TIMEOUT: Request timeout, default is 100 seconds, the timeout can control the time needed to switch to the next channel when a channel does not respond. Optional
 
+## Retrieve Statistical Data
+
+Use `/stats` to get usage statistics for each channel over the last 24 hours. Include your own uni-api admin API key.
+
+The data includes:
+
+1. Success rate for each model under each channel, sorted from highest to lowest success rate.
+2. Overall success rate for each channel, sorted from highest to lowest.
+3. Total number of requests for each model across all channels.
+4. Number of requests for each endpoint.
+5. Number of requests from each IP address.
+
+`/stats?hours=48` The `hours` parameter can control how many hours of recent data statistics are returned. If the `hours` parameter is not provided, it defaults to statistics for the last 24 hours.
+
+There are other statistical data that you can query yourself by writing SQL in the database. Other data includes: first token time, total processing time for each request, whether each request was successful, whether each request passed ethical review, text content of each request, API key for each request, input token count, and output token count for each request.
+
 ## Docker Local Deployment
 
 Start the container

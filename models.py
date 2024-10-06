@@ -1,6 +1,6 @@
 from io import IOBase
 from pydantic import BaseModel, Field, model_validator
-from typing import List, Dict, Optional, Union, Tuple, Literal
+from typing import List, Dict, Optional, Union, Tuple, Literal, Any
 from log_config import logger
 
 class FunctionParameter(BaseModel):
@@ -61,6 +61,14 @@ class ToolChoice(BaseModel):
 class BaseRequest(BaseModel):
     request_type: Optional[Literal["chat", "image", "audio", "moderation"]] = Field(default=None, exclude=True)
 
+class JsonSchema(BaseModel):
+    name: str
+    schema: Dict[str, Any]
+
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchema] = None
+
 class RequestModel(BaseRequest):
     model: str
     messages: List[Message]
@@ -77,6 +85,7 @@ class RequestModel(BaseRequest):
     user: Optional[str] = None
     tool_choice: Optional[Union[str, ToolChoice]] = None
     tools: Optional[List[Tool]] = None
+    response_format: Optional[ResponseFormat] = None  # 新增字段
 
     def get_last_text_message(self) -> Optional[str]:
         for message in reversed(self.messages):
