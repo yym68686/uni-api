@@ -1,7 +1,6 @@
 import os
 import re
 import json
-from venv import logger
 import httpx
 import base64
 import urllib.parse
