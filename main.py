@@ -15,7 +15,7 @@ from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
@@ -360,6 +360,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     moderated_content = request_model.get_last_text_message()
                 elif request_model.request_type == "image":
                     moderated_content = request_model.prompt
+                elif model.startswith("tts"):
+                    moderated_content = request_model.input
+
                 if moderated_content:
                     current_info["text"] = moderated_content
 
@@ -521,6 +524,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         engine = "moderation"
         request.stream = False
 
+    if endpoint == "/v1/audio/speech":
+        engine = "tts"
+        request.stream = False
+
     if provider.get("engine"):
         engine = provider["engine"]
 
@@ -662,7 +669,7 @@ class ModelRequestHandler:
                 logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str, endpoint=None):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest], token: str, endpoint=None):
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
@@ -705,7 +712,7 @@ class ModelRequestHandler:
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint, token)
 
     # 在 try_all_providers 函数中处理失败的情况
-    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
+    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
         status_code = 500
         error_message = None
         num_providers = len(providers)
@@ -865,6 +872,13 @@ async def images_generations(
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
+
+@app.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
+async def audio_speech(
+    request: TextToSpeechRequest,
+    token: str = Depends(verify_api_key)
+):
+    return await model_handler.request_model(request, token, endpoint="/v1/audio/speech")
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(

@@ -285,7 +285,10 @@ async def fetch_response(client, url, headers, payload):
     if error_message:
         yield error_message
         return
-    yield response.json()
+    if url.endswith("/v1/audio/speech"):
+        yield response.read()
+    else:
+        yield response.json()
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     try:
