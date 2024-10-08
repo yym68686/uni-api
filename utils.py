@@ -316,6 +316,7 @@ class BaseAPI:
         self.image_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/images/generations",) + ("",) * 3)
         self.audio_transcriptions: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/audio/transcriptions",) + ("",) * 3)
         self.moderations: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/moderations",) + ("",) * 3)
+        self.audio_speech: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/audio/speech",) + ("",) * 3)
 
 def safe_get(data, *keys, default=None):
     for key in keys:
