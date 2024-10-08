@@ -41,8 +41,10 @@
 providers:
   - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
+    models_url: https://api.your.com/v1/models # 后端服务的模型列表地址，选填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
     model: # 至少填一个模型
+      - "*" # 如果填 *，表示可以使用所有模型，会请求 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。
       - gpt-4o # 可以使用的模型名称，必填
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
       - dall-e-3
