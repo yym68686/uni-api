@@ -4,6 +4,12 @@ from datetime import datetime
 
 from log_config import logger
 
+# end_of_line = "\n\r\n"
+# end_of_line = "\r\n"
+# end_of_line = "\n\r"
+end_of_line = "\n\n"
+# end_of_line = "\r"
+# end_of_line = "\n"
 
 async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
     sample_data = {
@@ -36,7 +42,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
-    sse_response = f"data: {json_data}\n\r\n"
+    sse_response = f"data: {json_data}" + end_of_line
 
     return sse_response
 
@@ -94,7 +100,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
             function_full_response = json.dumps(function_call["functionCall"]["args"])
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response)
             yield sse_string
-        yield "data: [DONE]\n\r\n"
+        yield "data: [DONE]" + end_of_line
 
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
@@ -141,7 +147,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             function_full_response = json.dumps(function_call["input"])
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
             yield sse_string
-        yield "data: [DONE]\n\r\n"
+        yield "data: [DONE]" + end_of_line
 
 async def fetch_gpt_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
@@ -157,7 +163,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                 line, buffer = buffer.split("\n", 1)
                 # logger.info("line: %s", repr(line))
                 if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                    yield line.strip() + "\n\r\n"
+                    yield line.strip() + end_of_line
 
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
@@ -176,7 +182,7 @@ async def fetch_cloudflare_response_stream(client, url, headers, payload, model)
                 if line.startswith("data:"):
                     line = line.lstrip("data: ")
                     if line == "[DONE]":
-                        yield "data: [DONE]\n\r\n"
+                        yield "data: [DONE]" + end_of_line
                         return
                     resp: dict = json.loads(line)
                     message = resp.get("response")
@@ -200,7 +206,7 @@ async def fetch_cohere_response_stream(client, url, headers, payload, model):
                 # logger.info("line: %s", repr(line))
                 resp: dict = json.loads(line)
                 if resp.get("is_finished") == True:
-                    yield "data: [DONE]\n\r\n"
+                    yield "data: [DONE]" + end_of_line
                     return
                 if resp.get("event_type") == "text-generation":
                     message = resp.get("text")
@@ -266,7 +272,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         function_call_content = delta["partial_json"]
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
                         yield sse_string
-        yield "data: [DONE]\n\r\n"
+        yield "data: [DONE]" + end_of_line
 
         
 async def get_response(client, url, headers):

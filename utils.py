@@ -159,7 +159,10 @@ async def error_handling_wrapper(generator):
                 logger.error("error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration
             if "The bot's usage is covered by the developer" in first_item_str:
-                logger.error("error const string!")
+                logger.error("error const string: %s", first_item_str)
+                raise StopAsyncIteration
+            if "process this request due to overload or policy" in first_item_str:
+                logger.error("error const string: %s", first_item_str)
                 raise StopAsyncIteration
             try:
                 first_item_str = json.loads(first_item_str)
