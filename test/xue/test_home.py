@@ -33,6 +33,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+API_YAML_PATH = "./api.yaml"
 class RequestBodyLoggerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "POST" and request.url.path.startswith("/submit/"):
@@ -47,7 +48,6 @@ from utils import load_config
 from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # app.state.client = httpx.AsyncClient(timeout=timeout)
     app.state.config, app.state.api_keys_db, app.state.api_list = await load_config()
     for item in app.state.api_keys_db:
         if item.get("role") == "admin":
@@ -58,10 +58,6 @@ async def lifespan(app: FastAPI):
         else:
             raise Exception("No admin API key found")
 
-    global data
-    # providers_data = app.state.config["providers"]
-
-    # print("data", data)
     yield
     # 关闭时的代码
     await app.state.client.aclose()
@@ -393,7 +389,10 @@ def update_row_data(row_id, updated_data):
     print(row_id, updated_data)
     index = int(row_id)
     app.state.config["providers"][index] = updated_data
-    with open("./api1.yaml", "w", encoding="utf-8") as f:
+    save_api_yaml()
+
+def save_api_yaml():
+    with open(API_YAML_PATH, "w", encoding="utf-8") as f:
         yaml.dump(app.state.config, f)
 
 @app.post("/submit/{row_id}", response_class=HTMLResponse)
@@ -441,8 +440,7 @@ async def submit_form(
         update_row_data(row_id, updated_data)
 
     # 保存更新后的配置
-    with open("./api1.yaml", "w", encoding="utf-8") as f:
-        yaml.dump(app.state.config, f)
+    save_api_yaml()
 
     return await root()
 
@@ -455,8 +453,7 @@ async def duplicate_row(row_id: str):
     app.state.config["providers"].insert(index + 1, new_data)
 
     # 保存更新后的配置
-    with open("./api1.yaml", "w", encoding="utf-8") as f:
-        yaml.dump(app.state.config, f)
+    save_api_yaml()
 
     return await root()
 
@@ -466,8 +463,7 @@ async def delete_row(row_id: str):
     del app.state.config["providers"][index]
 
     # 保存更新后的配置
-    with open("./api1.yaml", "w", encoding="utf-8") as f:
-        yaml.dump(app.state.config, f)
+    save_api_yaml()
 
     return await root()
 
