@@ -3,26 +3,74 @@ from fastapi import HTTPException
 import httpx
 
 from log_config import logger
+from collections import defaultdict
+
+import asyncio
+
+class ThreadSafeCircularList:
+    def __init__(self, items):
+        self.items = items
+        self.index = 0
+        self.lock = asyncio.Lock()
+
+    async def next(self):
+        async with self.lock:
+            item = self.items[self.index]
+            self.index = (self.index + 1) % len(self.items)
+            return item
+
+def circular_list_encoder(obj):
+    if isinstance(obj, ThreadSafeCircularList):
+        return obj.to_dict()
+    raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
+
+provider_api_circular_list = defaultdict(ThreadSafeCircularList)
+
+def get_model_dict(provider):
+    model_dict = {}
+    for model in provider['model']:
+        if type(model) == str:
+            model_dict[model] = model
+        if type(model) == dict:
+            model_dict.update({new: old for old, new in model.items()})
+    return model_dict
+
+def update_initial_model(api_url, api):
+    try:
+        endpoint = BaseAPI(api_url=api_url)
+        endpoint_models_url = endpoint.v1_models
+        response = httpx.get(
+            endpoint_models_url,
+            headers={"Authorization": f"Bearer {api}"},
+        )
+        models = response.json()
+        # print(models)
+        models_list = models["data"]
+        models_id = [model["id"] for model in models_list]
+        set_models = set()
+        for model_item in models_id:
+            set_models.add(model_item)
+        models_id = list(set_models)
+        # print(models_id)
+        return models_id
+    except Exception as e:
+        print("error:", e)
+        return []
 
 def update_config(config_data):
     for index, provider in enumerate(config_data['providers']):
-        model_dict = {}
-        for model in provider['model']:
-            if type(model) == str:
-                model_dict[model] = model
-            if type(model) == dict:
-                model_dict.update({new: old for old, new in model.items()})
-        provider['model'] = model_dict
         if provider.get('project_id'):
             provider['base_url'] = 'https://aiplatform.googleapis.com/'
         if provider.get('cf_account_id'):
             provider['base_url'] = 'https://api.cloudflare.com/'
 
-        if provider.get('api'):
-            if isinstance(provider.get('api'), str):
-                provider['api'] = CircularList([provider.get('api')])
-            if isinstance(provider.get('api'), list):
-                provider['api'] = CircularList(provider.get('api'))
+        provider_api_circular_list[provider['provider']] = ThreadSafeCircularList([provider.get('api', None)])
+
+        if not provider.get("model"):
+            provider["model"] = update_initial_model(provider['base_url'], provider['api'])
+
+        if provider.get("tools") == None:
+            provider["tools"] = True
 
         config_data['providers'][index] = provider
 
@@ -46,31 +94,24 @@ def update_config(config_data):
             api_keys_db[index]['model'] = models
 
     api_list = [item["api"] for item in api_keys_db]
-    # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False, default=circular_list_encoder))
+    # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
     return config_data, api_keys_db, api_list
 
 # 读取YAML配置文件
 async def load_config(app=None):
-    import yaml
     try:
-        # with open('./api.yaml', 'r') as f:
-        #     tokens = yaml.scan(f)
-        #     for token in tokens:
-        #         if isinstance(token, yaml.ScalarToken):
-        #             value = token.value
-        #             # 如果plain为False，表示字符串被引号包裹
-        #             is_quoted = not token.plain
-        #             print(f"值: {value}, 是否被引号包裹: {is_quoted}")
+        from ruamel.yaml import YAML
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        yaml.indent(mapping=2, sequence=4, offset=2)
+        with open('api.yaml', 'r', encoding='utf-8') as file:
+            conf = yaml.load(file)
 
-        with open("./api.yaml", "r", encoding="utf-8") as f:
-            # 判断是否为空文件
-            conf = yaml.safe_load(f)
-            # conf = None
-            if conf:
-                config, api_keys_db, api_list = update_config(conf)
-            else:
-                # logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
-                config, api_keys_db, api_list = [], [], []
+        if conf:
+            config, api_keys_db, api_list = update_config(conf)
+        else:
+            # logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
+            config, api_keys_db, api_list = [], [], []
     except FileNotFoundError:
         logger.error("'api.yaml' not found. Please check the file path.")
         config, api_keys_db, api_list = [], [], []
@@ -228,7 +269,8 @@ def get_all_models(config):
     unique_models = set()
 
     for provider in config["providers"]:
-        for model in provider['model'].keys():
+        model_dict = get_model_dict(provider)
+        for model in model_dict.keys():
             if model not in unique_models:
                 unique_models.add(model)
                 model_info = {
@@ -260,35 +302,12 @@ def get_all_models(config):
 # europe-west1
 # europe-west4
 
-def circular_list_encoder(obj):
-    if isinstance(obj, CircularList):
-        return obj.to_dict()
-    raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
 
-from collections import deque
-class CircularList:
-    def __init__(self, items):
-        self.queue = deque(items)
-
-    def next(self):
-        if not self.queue:
-            return None
-        item = self.queue.popleft()
-        self.queue.append(item)
-        return item
-
-    def to_dict(self):
-        return {
-            'queue': list(self.queue)
-        }
-
-
-
-c35s = CircularList(["us-east5", "europe-west1"])
-c3s = CircularList(["us-east5", "us-central1", "asia-southeast1"])
-c3o = CircularList(["us-east5"])
-c3h = CircularList(["us-east5", "us-central1", "europe-west1", "europe-west4"])
-gem = CircularList(["us-central1", "us-east4", "us-west1", "us-west4", "europe-west1", "europe-west2"])
+c35s = ThreadSafeCircularList(["us-east5", "europe-west1"])
+c3s = ThreadSafeCircularList(["us-east5", "us-central1", "asia-southeast1"])
+c3o = ThreadSafeCircularList(["us-east5"])
+c3h = ThreadSafeCircularList(["us-east5", "us-central1", "europe-west1", "europe-west4"])
+gem = ThreadSafeCircularList(["us-central1", "us-east4", "us-west1", "us-west4", "europe-west1", "europe-west2"])
 
 class BaseAPI:
     def __init__(

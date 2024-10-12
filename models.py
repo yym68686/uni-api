@@ -1,5 +1,5 @@
 from io import IOBase
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 from typing import List, Dict, Optional, Union, Tuple, Literal, Any
 from log_config import logger
 
@@ -61,10 +61,16 @@ class ToolChoice(BaseModel):
 class BaseRequest(BaseModel):
     request_type: Optional[Literal["chat", "image", "audio", "moderation"]] = Field(default=None, exclude=True)
 
-class JsonSchema(BaseModel):
-    name: str
-    schema: Dict[str, Any]
+def create_json_schema_class():
+    class JsonSchema(BaseModel):
+        name: str
 
+        model_config = ConfigDict(protected_namespaces=())
+
+    JsonSchema.__annotations__['schema'] = Dict[str, Any]
+    return JsonSchema
+
+JsonSchema = create_json_schema_class()
 class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"]
     json_schema: Optional[JsonSchema] = None

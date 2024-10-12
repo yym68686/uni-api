@@ -1,5 +1,5 @@
 api.json
-api.yaml
+*.yaml
 .env
 __pycache__
 .vscode

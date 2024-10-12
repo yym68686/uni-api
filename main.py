@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
-from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
+from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder, get_model_dict
 
 from collections import defaultdict
 from typing import List, Dict, Union
@@ -492,20 +492,21 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     else:
         engine = "gpt"
 
-    if "claude" not in provider['model'][request.model] \
-    and "gpt" not in provider['model'][request.model] \
-    and "gemini" not in provider['model'][request.model] \
+    model_dict = get_model_dict(provider)
+    if "claude" not in model_dict[request.model] \
+    and "gpt" not in model_dict[request.model] \
+    and "gemini" not in model_dict[request.model] \
     and parsed_url.netloc != 'api.cloudflare.com' \
     and parsed_url.netloc != 'api.cohere.com':
         engine = "openrouter"
 
-    if "claude" in provider['model'][request.model] and engine == "vertex":
+    if "claude" in model_dict[request.model] and engine == "vertex":
         engine = "vertex-claude"
 
-    if "gemini" in provider['model'][request.model] and engine == "vertex":
+    if "gemini" in model_dict[request.model] and engine == "vertex":
         engine = "vertex-gemini"
 
-    if "o1-preview" in provider['model'][request.model] or "o1-mini" in provider['model'][request.model]:
+    if "o1-preview" in model_dict[request.model] or "o1-mini" in model_dict[request.model]:
         engine = "o1"
         request.stream = False
 
@@ -536,7 +537,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     current_info = request_info.get()
     try:
         if request.stream:
-            model = provider['model'][request.model]
+            model = model_dict[request.model]
             generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
             wrapped_generator, first_response_time = await error_handling_wrapper(generator)
             response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
@@ -603,7 +604,8 @@ class ModelRequestHandler:
             if model == "all":
                 # 如果模型名为 *，则返回所有模型
                 for provider in config["providers"]:
-                    for model in provider["model"].keys():
+                    model_dict = get_model_dict(provider)
+                    for model in model_dict.keys():
                         provider_rules.append(provider["provider"] + "/" + model)
                 break
             if "/" in model:
@@ -611,15 +613,17 @@ class ModelRequestHandler:
                     model = model[1:-1]
                     # 处理带斜杠的模型名
                     for provider in config['providers']:
-                        if model in provider['model'].keys():
+                        model_dict = get_model_dict(provider)
+                        if model in model_dict.keys():
                             provider_rules.append(provider['provider'] + "/" + model)
                 else:
                     provider_name = model.split("/")[0]
                     model_name_split = "/".join(model.split("/")[1:])
                     models_list = []
                     for provider in config['providers']:
+                        model_dict = get_model_dict(provider)
                         if provider['provider'] == provider_name:
-                            models_list.extend(list(provider['model'].keys()))
+                            models_list.extend(list(model_dict.keys()))
                     # print("models_list", models_list)
                     # print("model_name", model_name)
                     # print("model_name_split", model_name_split)
@@ -632,7 +636,8 @@ class ModelRequestHandler:
                             provider_rules.append(provider_name)
             else:
                 for provider in config['providers']:
-                    if model in provider['model'].keys():
+                    model_dict = get_model_dict(provider)
+                    if model in model_dict.keys():
                         provider_rules.append(provider['provider'] + "/" + model)
 
         provider_list = []
@@ -642,10 +647,13 @@ class ModelRequestHandler:
                 # print("provider", provider, provider['provider'] == item, item)
                 if "/" in item:
                     if provider['provider'] == item.split("/")[0]:
-                        if model_name in provider['model'].keys() and "/".join(item.split("/")[1:]) == model_name:
+                        model_dict = get_model_dict(provider)
+                        if model_name in model_dict.keys() and "/".join(item.split("/")[1:]) == model_name:
                             provider_list.append(provider)
+                # 如果 item 不包含 /，则直接匹配 provider，说明整个渠道所有模型都能用
                 elif provider['provider'] == item:
-                    if model_name in provider['model'].keys():
+                    model_dict = get_model_dict(provider)
+                    if model_name in model_dict.keys():
                         provider_list.append(provider)
                 else:
                     pass
@@ -655,7 +663,8 @@ class ModelRequestHandler:
                 #         if item.split("/")[1] == model_name:
                 #             provider_list.append(provider)
                 #     else:
-                #         if model_name in provider['model'].keys():
+                #         model_dict = get_model_dict(provider)
+                #         if model_name in model_dict.keys():
                 #             provider_list.append(provider)
         if is_debug:
             for provider in provider_list:
