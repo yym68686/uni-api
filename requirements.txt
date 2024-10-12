@@ -1,4 +1,4 @@
-pyyaml
+xue
 pytest
 uvicorn
 fastapi
@@ -7,6 +7,7 @@ greenlet
 aiosqlite
 sqlalchemy
 watchfiles
+ruamel.yaml
 httpx[http2]
 cryptography
 python-multipart
