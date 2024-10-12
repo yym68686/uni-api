@@ -225,7 +225,8 @@ def post_all_models(token, config, api_list):
                     for provider_item in config["providers"]:
                         if provider_item['provider'] != provider:
                             continue
-                        for model_item in provider_item['model'].keys():
+                        model_dict = get_model_dict(provider_item)
+                        for model_item in model_dict.keys():
                             if model_item not in unique_models:
                                 unique_models.add(model_item)
                                 model_info = {
@@ -240,7 +241,8 @@ def post_all_models(token, config, api_list):
                     for provider_item in config["providers"]:
                         if provider_item['provider'] != provider:
                             continue
-                        for model_item in provider_item['model'].keys() :
+                        model_dict = get_model_dict(provider_item)
+                        for model_item in model_dict.keys() :
                             if model_item not in unique_models and model_item == model:
                                 unique_models.add(model_item)
                                 model_info = {
