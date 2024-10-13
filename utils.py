@@ -46,6 +46,8 @@ def update_initial_model(api_url, api):
             headers={"Authorization": f"Bearer {api}"},
         )
         models = response.json()
+        if models.get("error"):
+            raise Exception({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
         # print(models)
         models_list = models["data"]
         models_id = [model["id"] for model in models_list]
