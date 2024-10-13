@@ -39,6 +39,8 @@ def update_initial_model(api_url, api):
     try:
         endpoint = BaseAPI(api_url=api_url)
         endpoint_models_url = endpoint.v1_models
+        if isinstance(api, list):
+            api = api[0]
         response = httpx.get(
             endpoint_models_url,
             headers={"Authorization": f"Bearer {api}"},
@@ -55,6 +57,8 @@ def update_initial_model(api_url, api):
         return models_id
     except Exception as e:
         print("error:", e)
+        import traceback
+        traceback.print_exc()
         return []
 
 def update_config(config_data):
