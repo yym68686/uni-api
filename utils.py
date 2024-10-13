@@ -70,7 +70,12 @@ def update_config(config_data):
         if provider.get('cf_account_id'):
             provider['base_url'] = 'https://api.cloudflare.com/'
 
-        provider_api_circular_list[provider['provider']] = ThreadSafeCircularList([provider.get('api', None)])
+        provider_api = provider.get('api', None)
+        if provider_api:
+            if isinstance(provider_api, str):
+                provider_api_circular_list[provider['provider']] = ThreadSafeCircularList([provider_api])
+            if isinstance(provider_api, list):
+                provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(provider_api)
 
         if not provider.get("model"):
             provider["model"] = update_initial_model(provider['base_url'], provider['api'])
