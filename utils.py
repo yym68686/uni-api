@@ -58,7 +58,7 @@ def update_initial_model(api_url, api):
         # print(models_id)
         return models_id
     except Exception as e:
-        print("error:", e)
+        # print("error:", e)
         import traceback
         traceback.print_exc()
         return []
@@ -110,11 +110,11 @@ def update_config(config_data):
 
 # 读取YAML配置文件
 async def load_config(app=None):
+    from ruamel.yaml import YAML
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.indent(mapping=2, sequence=4, offset=2)
     try:
-        from ruamel.yaml import YAML
-        yaml = YAML()
-        yaml.preserve_quotes = True
-        yaml.indent(mapping=2, sequence=4, offset=2)
         with open('api.yaml', 'r', encoding='utf-8') as file:
             conf = yaml.load(file)
 
@@ -144,7 +144,7 @@ async def load_config(app=None):
             response = await app.state.client.get(config_url)
             # logger.info(f"Fetching config from {response.text}")
             response.raise_for_status()
-            config_data = yaml.safe_load(response.text)
+            config_data = yaml.load(response.text)
             # 更新配置
             # logger.info(config_data)
             if config_data:
