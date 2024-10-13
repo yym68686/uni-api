@@ -12,3 +12,4 @@ node_modules
 *.db
 .aider*
 .idea
+docker-compose-test.yml
