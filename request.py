@@ -142,7 +142,7 @@ async def get_gemini_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url":
+                elif item.type == "image_url" and provider.get("image", True):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
@@ -331,7 +331,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url":
+                elif item.type == "image_url" and provider.get("image", True):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
@@ -477,7 +477,7 @@ async def get_vertex_claude_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url":
+                elif item.type == "image_url" and provider.get("image", True):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
@@ -610,7 +610,7 @@ async def get_gpt_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url":
+                elif item.type == "image_url" and provider.get("image", True):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
@@ -677,7 +677,7 @@ async def get_openrouter_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url":
+                elif item.type == "image_url" and provider.get("image", True):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
@@ -943,7 +943,7 @@ async def get_claude_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url":
+                elif item.type == "image_url" and provider.get("image", True):
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
