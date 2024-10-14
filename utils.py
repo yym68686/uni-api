@@ -110,7 +110,7 @@ def update_config(config_data):
 
 # 读取YAML配置文件
 async def load_config(app=None):
-    from ruamel.yaml import YAML
+    from ruamel.yaml import YAML, YAMLError
     yaml = YAML()
     yaml.preserve_quotes = True
     yaml.indent(mapping=2, sequence=4, offset=2)
@@ -126,8 +126,8 @@ async def load_config(app=None):
     except FileNotFoundError:
         logger.error("'api.yaml' not found. Please check the file path.")
         config, api_keys_db, api_list = [], [], []
-    except yaml.YAMLError:
-        logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。")
+    except YAMLError as e:
+        logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。%s", e)
         config, api_keys_db, api_list = [], [], []
     except OSError as e:
         logger.error(f"open 'api.yaml' failed: {e}")

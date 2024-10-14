@@ -1321,7 +1321,8 @@ async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
                         Div("Models", class_="text-lg font-semibold mb-2"),
                         Div(
                             *model_list,
-                            id="models-container"
+                            id="models-container",
+                            class_="space-y-2 max-h-[40vh] overflow-y-auto"
                         ),
                         button.button(
                             "Add Model",
@@ -1349,7 +1350,8 @@ async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
                 ),
                 class_="container mx-auto p-4 max-w-2xl"
             )
-        )
+        ),
+        class_="max-h-[90vh] overflow-y-auto"
     )
 
     result = sheet.Sheet(
@@ -1429,7 +1431,7 @@ def update_row_data(row_id, updated_data):
 
 def save_api_yaml():
     with open(API_YAML_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(app.state.config, f)
+        yaml.round_trip_dump(app.state.config, f)
 
 @frontend_router.post("/submit/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def submit_form(
