@@ -31,7 +31,7 @@ def get_model_dict(provider):
     for model in provider['model']:
         if type(model) == str:
             model_dict[model] = model
-        if type(model) == dict:
+        if isinstance(model, dict):
             model_dict.update({new: old for old, new in model.items()})
     return model_dict
 
