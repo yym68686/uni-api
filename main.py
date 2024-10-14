@@ -1278,12 +1278,12 @@ async def get_columns_menu(menu_id: str):
 @frontend_router.get("/filter-table", response_class=HTMLResponse)
 async def filter_table(filter: str = ""):
     filtered_data = [
-        provider for provider in app.state.config["providers"]
+        (i, provider) for i, provider in enumerate(app.state.config["providers"])
         if filter.lower() in str(provider["provider"]).lower() or
            filter.lower() in str(provider["base_url"]).lower() or
            filter.lower() in str(provider["tools"]).lower()
     ]
-    return data_table(data_table_columns, filtered_data, "users-table", with_filter=False).render()
+    return data_table(data_table_columns, [p for _, p in filtered_data], "users-table", with_filter=False, row_ids=[i for i, _ in filtered_data]).render()
 
 @frontend_router.post("/add-model", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def add_model():
