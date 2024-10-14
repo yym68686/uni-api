@@ -1363,6 +1363,7 @@ async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
 
 @frontend_router.get("/add-provider-sheet", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def get_add_provider_sheet():
+    sheet_id = "add-provider-sheet"
     edit_sheet_content = sheet.SheetContent(
         sheet.SheetHeader(
             sheet.SheetTitle("Add New Provider"),
@@ -1393,7 +1394,7 @@ async def get_add_provider_sheet():
                     form.FormField("Notes", "notes", placeholder="Enter any additional notes"),
                     Div(
                         button.button("Submit", variant="primary", type="submit"),
-                        button.button("Cancel", variant="outline", class_="ml-2"),
+                        button.button("Cancel", variant="outline", type="button", class_="ml-2", onclick=f"toggleSheet('{sheet_id}')"),
                         class_="flex justify-end mt-4"
                     ),
                     hx_post="/submit/new",
@@ -1407,7 +1408,7 @@ async def get_add_provider_sheet():
     )
 
     result = sheet.Sheet(
-        "add-provider-sheet",
+        sheet_id,
         Div(),
         edit_sheet_content,
         width="80%",
