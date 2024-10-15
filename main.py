@@ -1051,7 +1051,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from typing import Optional, List
 
-from xue import HTML, Head, Body, Div, xue_initialize, Script
+from xue import HTML, Head, Body, Div, xue_initialize, Script, Ul, Li
 from xue.components.menubar import (
     Menubar, MenubarMenu, MenubarTrigger, MenubarContent,
     MenubarItem, MenubarSeparator
@@ -1068,7 +1068,6 @@ from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
 yaml.indent(mapping=2, sequence=4, offset=2)
-
 
 frontend_router = APIRouter()
 
@@ -1262,7 +1261,7 @@ async def get_columns_menu(menu_id: str, row_id: str):
             "hx-delete": f"/delete/{row_id}",
             "hx-target": "body",
             "hx-swap": "outerHTML",
-            "hx-confirm": "确定要删除这个配置吗？"
+            "hx-confirm": "Are you sure you want to delete this configuration?"
         },
     ]
     result = dropdown.dropdown_menu_content(menu_id, columns).render()
@@ -1291,6 +1290,36 @@ async def add_model():
     new_model = model_config_row(new_model_id).render()
     return new_model
 
+def render_api_keys(row_id, api_keys):
+    return Ul(
+        *[Li(
+            Div(
+                Div(
+                    input.input(
+                        type="text",
+                        placeholder="Enter API key",
+                        value=api_key,
+                        name=f"api_key_{i}",
+                        class_="flex-grow w-full"
+                    ),
+                    class_="flex-grow"
+                ),
+                button.button(
+                    "Delete",
+                    variant="outline",
+                    type="button",
+                    class_="ml-2",
+                    hx_delete=f"/delete-api-key/{row_id}/{i}",
+                    hx_target="#api-keys-container",
+                    hx_swap="outerHTML"
+                ),
+                class_="flex items-center mb-2 w-full"
+            )
+        ) for i, api_key in enumerate(api_keys)],
+        id="api-keys-container",
+        class_="space-y-2 w-full"
+    )
+
 @frontend_router.get("/edit-sheet/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
     row_data = get_row_data(row_id)
@@ -1305,6 +1334,10 @@ async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
             key, value = list(model.items())[0]
             model_list.append(model_config_row(f"model{index}", key, value, True))
 
+    # 处理多个 API keys
+    api_keys = row_data["api"] if isinstance(row_data["api"], list) else [row_data["api"]]
+    api_key_inputs = render_api_keys(row_id, api_keys)
+
     sheet_id = "edit-sheet"
     edit_sheet_content = sheet.SheetContent(
         sheet.SheetHeader(
@@ -1316,7 +1349,19 @@ async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
                 form.Form(
                     form.FormField("Provider", "provider", value=row_data["provider"], placeholder="Enter provider name", required=True),
                     form.FormField("Base URL", "base_url", value=row_data["base_url"], placeholder="Enter base URL", required=True),
-                    form.FormField("API Key", "api_key", value=row_data["api"], type="text", placeholder="Enter API key"),
+                    # form.FormField("API Key", "api_key", value=row_data["api"], type="text", placeholder="Enter API key"),
+                    Div(
+                        Div("API Keys", class_="text-lg font-semibold mb-2"),
+                        api_key_inputs,
+                        button.button(
+                            "Add API Key",
+                            class_="mt-2",
+                            hx_post=f"/add-api-key/{row_id}",
+                            hx_target="#api-keys-container",
+                            hx_swap="outerHTML"
+                        ),
+                        class_="mb-4"
+                    ),
                     Div(
                         Div("Models", class_="text-lg font-semibold mb-2"),
                         Div(
@@ -1362,6 +1407,27 @@ async def get_edit_sheet(row_id: str, x_api_key: str = Depends(get_api_key)):
         max_width="800px"
     ).render()
     return result
+
+@frontend_router.post("/add-api-key/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
+async def add_api_key(row_id: str):
+    row_data = get_row_data(row_id)
+    api_keys = row_data["api"] if isinstance(row_data["api"], list) else [row_data["api"]]
+    api_keys.append("")  # 添加一个空的API key
+
+    api_key_inputs = render_api_keys(row_id, api_keys)
+
+    return api_key_inputs.render()
+
+@frontend_router.delete("/delete-api-key/{row_id}/{index}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
+async def delete_api_key(row_id: str, index: int):
+    row_data = get_row_data(row_id)
+    api_keys = row_data["api"] if isinstance(row_data["api"], list) else [row_data["api"]]
+    if len(api_keys) > 1:
+        del api_keys[index]
+
+    api_key_inputs = render_api_keys(row_id, api_keys)
+
+    return api_key_inputs.render()
 
 @frontend_router.get("/add-provider-sheet", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def get_add_provider_sheet():
@@ -1427,11 +1493,10 @@ def update_row_data(row_id, updated_data):
     print(row_id, updated_data)
     index = int(row_id)
     app.state.config["providers"][index] = updated_data
-    save_api_yaml()
 
 def save_api_yaml():
     with open(API_YAML_PATH, "w", encoding="utf-8") as f:
-        yaml.round_trip_dump(app.state.config, f)
+        yaml.dump(app.state.config, f)
 
 @frontend_router.post("/submit/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def submit_form(
@@ -1439,12 +1504,14 @@ async def submit_form(
     request: Request,
     provider: str = FastapiForm(...),
     base_url: str = FastapiForm(...),
-    api_key: Optional[str] = FastapiForm(None),
+    # api_key: Optional[str] = FastapiForm(None),
     tools: Optional[str] = FastapiForm(None),
     notes: Optional[str] = FastapiForm(None),
     x_api_key: str = Depends(get_api_key)
 ):
     form_data = await request.form()
+
+    api_keys = [value for key, value in form_data.items() if key.startswith("api_key_") and value]
 
     # 收集模型数据
     models = []
@@ -1462,7 +1529,7 @@ async def submit_form(
     updated_data = {
         "provider": provider,
         "base_url": base_url,
-        "api": api_key,
+        "api": api_keys[0] if len(api_keys) == 1 else api_keys,  # 如果只有一个 API key，就不使用列表
         "model": models,
         "tools": tools == "on",
         "notes": notes,
