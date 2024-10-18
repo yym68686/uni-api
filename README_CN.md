@@ -170,6 +170,7 @@ yym68686/uni-api:latest
 
 - CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填
 - TIMEOUT: 请求超时时间，默认为 100 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间。选填
+- DISABLE_DATABASE: 是否禁用数据库，默认为 false，选填
 
 ## 获取统计数据
 
@@ -189,7 +190,9 @@ yym68686/uni-api:latest
 
 ## Vercel 部署
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+
+点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链，然后点击 Create 创建项目。
 
 ## Docker 本地部署
 

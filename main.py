@@ -34,8 +34,13 @@ is_debug = bool(os.getenv("DEBUG", False))
 from sqlalchemy import inspect, text
 from sqlalchemy.sql import sqltypes
 
+# 添加新的环境变量检查
+DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
+
 async def create_tables():
-    async with engine.begin() as conn:
+    if DISABLE_DATABASE:
+        return
+    async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
         # 检查并添加缺失的列
@@ -85,7 +90,8 @@ async def lifespan(app: FastAPI):
     # for route in frontend_router.routes:
     #     print(f"Route: {route.path}, methods: {route.methods}")
     # 启动时的代码
-    await create_tables()
+    if not DISABLE_DATABASE:
+        await create_tables()
 
     TIMEOUT = float(os.getenv("TIMEOUT", 100))
     timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
@@ -178,17 +184,19 @@ class ChannelStat(Base):
     success = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
-# 获取数据库路径
-db_path = os.getenv('DB_PATH', './data/stats.db')
 
-# 确保 data 目录存在
-data_dir = os.path.dirname(db_path)
-os.makedirs(data_dir, exist_ok=True)
+if not DISABLE_DATABASE:
+    # 获取数据库路径
+    db_path = os.getenv('DB_PATH', './data/stats.db')
 
-# 创建异步引擎和会话
-# engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=False)
-engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
-async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    # 确保 data 目录存在
+    data_dir = os.path.dirname(db_path)
+    os.makedirs(data_dir, exist_ok=True)
+
+    # 创建异步引擎和会话
+    # db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=False)
+    db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
+    async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
 
 from starlette.types import Scope, Receive, Send
 from starlette.responses import Response
@@ -260,6 +268,8 @@ class LoggingStreamingResponse(Response):
     async def update_stats(self):
         # 这里添加更新数据库的逻辑
         # print("current_info2")
+        if DISABLE_DATABASE:
+            return
         async with async_session() as session:
             async with session.begin():
                 try:
@@ -426,6 +436,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
             request_info.reset(current_request_info)
 
     async def update_stats(self, current_info):
+        if DISABLE_DATABASE:
+            return
         # 这里添加更新数据库的逻辑
         async with async_session() as session:
             async with session.begin():
@@ -440,6 +452,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     logger.error(f"Error updating stats: {str(e)}")
 
     async def update_channel_stats(self, request_id, provider, model, api_key, success):
+        if DISABLE_DATABASE:
+            return
         async with async_session() as session:
             async with session.begin():
                 try:
@@ -958,6 +972,8 @@ async def get_stats(
     token: str = Depends(verify_admin_api_key),
     hours: int = Query(default=24, ge=1, le=720, description="Number of hours to look back for stats (1-720)")
 ):
+    if DISABLE_DATABASE:
+        return JSONResponse(content={"stats": {}})
     async with async_session() as session:
         # 计算指定时间范围的开始时间
         start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
