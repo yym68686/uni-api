@@ -170,6 +170,7 @@ yym68686/uni-api:latest
 
 - CONFIG_URL: The download address of the configuration file, which can be a local file or a remote file, optional
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
+- DISABLE_DATABASE: Whether to disable the database, default is false, optional
 
 ## Get statistical data
 
@@ -189,7 +190,7 @@ There are other statistical data that you can query yourself by writing SQL in t
 
 ## Vercel Deployment
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
 
 ## Docker local deployment
 
