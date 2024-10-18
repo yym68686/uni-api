@@ -128,7 +128,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 import uuid
-import json
 import asyncio
 import contextvars
 request_info = contextvars.ContextVar('request_info', default={})
@@ -602,6 +601,21 @@ def weighted_round_robin(weights):
 
     return weighted_provider_list
 
+import random
+
+def lottery_scheduling(weights):
+    total_tickets = sum(weights.values())
+    selections = []
+    for _ in range(total_tickets):
+        ticket = random.randint(1, total_tickets)
+        cumulative = 0
+        for provider, weight in weights.items():
+            cumulative += weight
+            if ticket <= cumulative:
+                selections.append(provider)
+                break
+    return selections
+
 import asyncio
 class ModelRequestHandler:
     def __init__(self):
@@ -683,25 +697,25 @@ class ModelRequestHandler:
                 #         model_dict = get_model_dict(provider)
                 #         if model_name in model_dict.keys():
                 #             provider_list.append(provider)
-        if is_debug:
-            for provider in provider_list:
-                logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
     async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str, endpoint=None):
         config = app.state.config
-        # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
+        api_index = api_list.index(token)
 
         model_name = request.model
         matching_providers = self.get_matching_providers(model_name, token)
-        # import json
-        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False))
+        num_matching_providers = len(matching_providers)
+
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
-        # exit(0)
+
         # 检查是否启用轮询
-        api_index = api_list.index(token)
+        scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+        if scheduling_algorithm == "random":
+            matching_providers = random.sample(matching_providers, num_matching_providers)
+
         weights = safe_get(config, 'api_keys', api_index, "weights")
         if weights:
             # 步骤 1: 提取 matching_providers 中的所有 provider 值
@@ -711,7 +725,14 @@ class ModelRequestHandler:
             # 步骤 3: 计算交集
             intersection = providers.intersection(weight_keys)
             weights = dict(filter(lambda item: item[0] in intersection, weights.items()))
-            weighted_provider_name_list = weighted_round_robin(weights)
+
+            if scheduling_algorithm == "weighted_round_robin":
+                weighted_provider_name_list = weighted_round_robin(weights)
+            elif scheduling_algorithm == "lottery":
+                weighted_provider_name_list = lottery_scheduling(weights)
+            else:
+                weighted_provider_name_list = list(weights.keys())
+
             new_matching_providers = []
             for provider_name in weighted_provider_name_list:
                 for provider in matching_providers:
@@ -719,34 +740,24 @@ class ModelRequestHandler:
                         new_matching_providers.append(provider)
             matching_providers = new_matching_providers
 
-        # import json
-        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False, default=circular_list_encoder))
-        use_round_robin = True
-        auto_retry = True
-        if safe_get(config, 'api_keys', api_index, "preferences", "USE_ROUND_ROBIN") == False:
-            use_round_robin = False
-        if safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY") == False:
-            auto_retry = False
+        if is_debug:
+            for provider in matching_providers:
+                logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
 
-        return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint, token)
-
-    # 在 try_all_providers 函数中处理失败的情况
-    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
         status_code = 500
         error_message = None
-        num_providers = len(providers)
-        model_name = request.model
 
-        if use_round_robin:
+        start_index = 0
+        if scheduling_algorithm != "fixed_priority":
             async with self.locks[model_name]:
-                self.last_provider_indices[model_name] = (self.last_provider_indices[model_name] + 1) % num_providers
+                self.last_provider_indices[model_name] = (self.last_provider_indices[model_name] + 1) % num_matching_providers
                 start_index = self.last_provider_indices[model_name]
-        else:
-            start_index = 0
 
-        for i in range(num_providers + 1):
-            current_index = (start_index + i) % num_providers
-            provider = providers[current_index]
+        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
+
+        for i in range(num_matching_providers + 1):
+            current_index = (start_index + i) % num_matching_providers
+            provider = matching_providers[current_index]
             try:
                 response = await process_request(request, provider, endpoint, token)
                 return response
