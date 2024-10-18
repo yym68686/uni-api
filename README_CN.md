@@ -187,6 +187,10 @@ yym68686/uni-api:latest
 
 还有其他统计数据，可以自己写sql在数据库自己查。其他数据包括：首字时间，每个请求的总处理时间，每次请求是否成功，每次请求是否符合道德审查，每次请求的文本内容，每次请求的 API key，每次请求的输入 token，输出 token 数量。
 
+## Vercel 部署
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+
 ## Docker 本地部署
 
 Start the container

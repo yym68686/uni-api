@@ -187,6 +187,10 @@ The `hours` parameter in `/stats?hours=48` allows you to control how many hours 
 
 There are other statistical data that you can query yourself by writing SQL in the database. Other data includes: first token time, total processing time for each request, whether each request was successful, whether each request passed content moderation, the text content of each request, the API key for each request, the number of input tokens, and the number of output tokens for each request.
 
+## Vercel Deployment
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+
 ## Docker local deployment
 
 Start the container
