@@ -11,11 +11,11 @@
 
 [英文](./README.md) | [中文](./README_CN.md)
 
-## Introduction
+## 介绍
 
 如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Cohere、Groq、Cloudflare、DeepBricks、OpenRouter 等。
 
-## Features
+## ✨ 特性
 
 - 无前端，纯配置文件配置 API 渠道。只要写一个文件就能运行起一个属于自己的 API 站，文档有详细的配置指南，小白友好。
 - 统一管理多个后端服务，支持 OpenAI、Deepseek、DeepBricks、OpenRouter 等其他 API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
@@ -33,16 +33,37 @@
 - 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/images/generations`，`/v1/audio/transcriptions`，`/v1/moderations`，`/v1/models`。
 - 支持 OpenAI moderation 道德审查，可以对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。降低后台 API 被提供商封禁的风险。
 
-## Configuration
+## 使用方法
 
-使用 api.yaml 配置文件，可以配置多个模型，每个模型可以配置多个后端服务，支持负载均衡。下面是 api.yaml 配置文件的示例：
+启动 uni-api 必须使用配置文件，有两种方式可以启动配置文件：
+
+1. 第一种是使用 `CONFIG_URL` 环境变量填写配置文件 URL，uni-api启动时会自动下载。
+2. 第二种就是挂载名为 `api.yaml` 的配置文件到容器内。
+
+### 方法一：挂载 `api.yaml` 配置文件启动 uni-api
+
+必须事先填写完成配置文件才能启动 `uni-api`，必须使用名为 `api.yaml` 的配置文件才能启动 `uni-api`，可以配置多个模型，每个模型可以配置多个后端服务，支持负载均衡。下面是最小可运行的 `api.yaml` 配置文件的示例：
+
+```yaml
+providers:
+  - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
+    base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
+    api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填，自动使用 base_url 和 api 通过 /v1/models 端点获取可用的所有模型。
+  # 这里可以配置多个提供商，每个提供商可以配置多个 API Key，每个 API Key 可以配置多个模型。
+api_keys:
+  - api: sk-Pkj60Yf8JFWxfgRmXQFWyGtWUddGZnmi3KlvowmRWpWpQxx # API Key，用户请求 uni-api 需要 API key，必填
+    model: # 该 API Key 可以使用的模型，必填。默认开启渠道级轮询负载均衡，每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
+      - all # 可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。如果你不想在 `api_keys` 里面给每个 `api` 一个个设置可用渠道，`uni-api` 支持将 `api key` 设置为可以使用 providers 下面所有渠道的所有模型。
+```
+
+`api.yaml` 详细的高级配置：
 
 ```yaml
 providers:
   - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
-    model: # 至少填一个模型
+    model: # 选填，如果不配置 model，会自动通过 base_url 和 api 通过 /v1/models 端点获取可用的所有模型。
       - gpt-4o # 可以使用的模型名称，必填
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
       - dall-e-3
@@ -97,7 +118,7 @@ providers:
 
 api_keys:
   - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
-    model: # 该 API Key 可以使用的模型，必填
+    model: # 该 API Key 可以使用的模型，必填。默认开启渠道级轮询负载均衡，每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
       - gpt-4o # 可以使用的模型名称，可以使用所有提供商提供的 gpt-4o 模型
       - claude-3-5-sonnet # 可以使用的模型名称，可以使用所有提供商提供的 claude-3-5-sonnet 模型
       - gemini/* # 可以使用的模型名称，仅可以使用名为 gemini 提供商提供的所有模型，其中 gemini 是 provider 名称，* 代表所有模型
@@ -109,7 +130,8 @@ api_keys:
       - <anthropic/claude-3-5-sonnet> # 通过在模型名两侧加上尖括号，这样就不会去名为anthropic的渠道下去寻找claude-3-5-sonnet模型，而是将整个 anthropic/claude-3-5-sonnet 作为模型名称。这种写法可以匹配到other-provider提供的名为 anthropic/claude-3-5-sonnet 的模型。但不会匹配到anthropic下面的claude-3-5-sonnet模型。
       - openai-test/text-moderation-latest # 当开启消息道德审查后，可以使用名为 openai-test 渠道下的 text-moderation-latest 模型进行道德审查。
     preferences:
-      USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true。开启轮训后每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
+      SCHEDULING_ALGORITHM: fixed_priority # 当 SCHEDULING_ALGORITHM 为 fixed_priority 时，使用固定优先级调度，永远执行第一个拥有请求的模型的渠道。修改默认开启的渠道轮询负载均衡。SCHEDULING_ALGORITHM 可选值为：fixed_priority，weighted_round_robin, lottery, random。
+      # 当 SCHEDULING_ALGORITHM 为 random 时，使用随机轮训负载均衡，随机请求拥有请求的模型的渠道。
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true
       RATE_LIMIT: 2/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min，选填
       ENABLE_MODERATION: true # 是否开启消息道德审查，true 为开启，false 为不开启，默认为 false，当开启后，会对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。
@@ -122,19 +144,26 @@ api_keys:
       - gcp3/*: 2 # 在该示例中，所有渠道加起来一共有 10 个权重，及 10 个请求里面有 5 个请求会请求 gcp1/* 模型，2 个请求会请求 gcp2/* 模型，3 个请求会请求 gcp3/* 模型。
 
     preferences:
-      USE_ROUND_ROBIN: true # 当 USE_ROUND_ROBIN 必须为 true 并且上面的渠道后面没有权重时，会按照原始的渠道顺序请求，如果有权重，会按照加权后的顺序请求。
+      SCHEDULING_ALGORITHM: weighted_round_robin # 仅当 SCHEDULING_ALGORITHM 为 weighted_round_robin 并且上面的渠道如果有权重，会按照加权后的顺序请求。使用加权轮训负载均衡，按照权重顺序请求拥有请求的模型的渠道。当 SCHEDULING_ALGORITHM 为 lottery 时，使用抽奖轮训负载均衡，按照权重随机请求拥有请求的模型的渠道。
       AUTO_RETRY: true
 ```
 
-如果你不想在 `api_keys` 里面给每个 `api` 一个个设置可用渠道，`uni-api` 支持将 `api key` 设置为可以使用所有模型，配置如下：
+挂载配置文件并启动 uni-api docker 容器：
 
-```yaml
-# ... providers 配置不变 ...
-api_keys:
-  - api: sk-LjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户请求 uni-api 需要 API key，必填
-    model: # 该 API Key 可以使用的模型，必填
-      - all # 可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。
-# ... 其他配置不变 ...
+```bash
+docker run --user root -p 8001:8000 --name uni-api -dit \
+-v ./api.yaml:/home/api.yaml \
+yym68686/uni-api:latest
+```
+
+### 方法二：使用 `CONFIG_URL` 环境变量启动 uni-api
+
+按照方法一写完配置文件后，上传到云端硬盘，获取文件的直链，然后使用 `CONFIG_URL` 环境变量启动 uni-api docker 容器：
+
+```bash
+docker run --user root -p 8001:8000 --name uni-api -dit \
+-e CONFIG_URL=http://file_url/api.yaml \
+yym68686/uni-api:latest
 ```
 
 ## 环境变量
@@ -158,7 +187,7 @@ api_keys:
 
 还有其他统计数据，可以自己写sql在数据库自己查。其他数据包括：首字时间，每个请求的总处理时间，每次请求是否成功，每次请求是否符合道德审查，每次请求的文本内容，每次请求的 API key，每次请求的输入 token，输出 token 数量。
 
-## Docker Local Deployment
+## Docker 本地部署
 
 Start the container
 
@@ -226,8 +255,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
 
-
-## Star History
+## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
         <img width="500" alt="Star History Chart" src="https://api.star-history.com/svg?repos=yym68686/uni-api&type=Date">

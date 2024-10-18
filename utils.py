@@ -100,7 +100,8 @@ def update_config(config_data):
                     models.append(key)
                 if isinstance(model, str):
                     models.append(model)
-            config_data['api_keys'][index]['weights'] = weights_dict
+            if weights_dict:
+                config_data['api_keys'][index]['weights'] = weights_dict
             config_data['api_keys'][index]['model'] = models
             api_keys_db[index]['model'] = models
 
