@@ -192,7 +192,7 @@ yym68686/uni-api:latest
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
 
-点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链，然后点击 Create 创建项目。
+点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链， `DISABLE_DATABASE` 为 true，然后点击 Create 创建项目。
 
 ## Docker 本地部署
 
