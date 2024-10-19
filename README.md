@@ -188,11 +188,66 @@ The `hours` parameter in `/stats?hours=48` allows you to control how many hours 
 
 There are other statistical data that you can query yourself by writing SQL in the database. Other data includes: first token time, total processing time for each request, whether each request was successful, whether each request passed content moderation, the text content of each request, the API key for each request, the number of input tokens, and the number of output tokens for each request.
 
-## Vercel Deployment
+## Vercel remote deployment
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
 
 After clicking the one-click deployment button, set the environment variable `CONFIG_URL` to the direct link of the configuration file, and set `DISABLE_DATABASE` to true, then click Create to create the project.
+
+## Serv00 remote deployment
+
+First, log in to the panel, in Additional services click on the tab Run your own applications to enable the option to run your own programs, then go to the panel Port reservation to randomly open a port.
+
+If you don't have your own domain name, go to the panel WWW websites and delete the default domain name provided. Then create a new domain with the Domain being the one you just deleted. After clicking Advanced settings, set the Website type to Proxy domain, and the Proxy port should point to the port you just opened. Do not select Use HTTPS.
+
+ssh login to the serv00 server, execute the following command:
+
+```bash
+git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
+cd uni-api
+python -m venv uni-api
+tmux new -s uni-api
+source uni-api/bin/activate
+export CFLAGS="-I/usr/local/include"
+export CXXFLAGS="-I/usr/local/include"
+export CC=gcc
+export CXX=g++
+export MAX_CONCURRENCY=1
+export CPUCOUNT=1
+export MAKEFLAGS="-j1"
+CMAKE_BUILD_PARALLEL_LEVEL=1 cpuset -l 0 pip install -vv -r requirements.txt
+cpuset -l 0 pip install -r -vv requirements.txt
+```
+
+ctrl+b d to exit tmux, wait a few hours for the installation to complete, and after the installation is complete, execute the following command:
+
+```bash
+tmux attach -t uni-api
+source uni-api/bin/activate
+export CONFIG_URL=http://file_url/api.yaml
+export DISABLE_DATABASE=true
+# Modify the port, xxx is the port, modify it yourself, corresponding to the port opened in the panel Port reservation
+sed -i '' 's/port=8000/port=xxx/' main.py
+sed -i '' 's/reload=True/reload=False/' main.py
+python main.py
+```
+
+Use ctrl+b d to exit tmux, allowing the program to run in the background. At this point, you can use uni-api in other chat clients. curl test script:
+
+```bash
+curl -X POST https://xxx.serv00.net/v1/chat/completions \
+-H 'Content-Type: application/json' \
+-H 'Authorization: Bearer sk-xxx' \
+-d '{"model": "gpt-4o","messages": [{"role": "user","content": "Hello"}]}'
+```
+
+Reference document:
+
+https://docs.serv00.com/Python/
+
+https://linux.do/t/topic/201181
+
+https://linux.do/t/topic/218738
 
 ## Docker local deployment
 

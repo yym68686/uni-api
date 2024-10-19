@@ -194,6 +194,61 @@ yym68686/uni-api:latest
 
 点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链， `DISABLE_DATABASE` 为 true，然后点击 Create 创建项目。
 
+## serv00 远程部署
+
+首先登录面板，Additional services 里面点击选项卡 Run your own applications 开启允许运行自己的程序，然后到面板 Port reservation 去随便开一个端口。
+
+如果没有自己的域名，去面板 WWW websites 删掉默认给的域名，再新建一个域名 Domain 为刚才删掉的域名，点击 Advanced settings 后设置 Website type 为 Proxy 域名，Proxy port 指向你刚才开的端口，不要选中 Use HTTPS。
+
+ssh 登陆到 serv00 服务器，执行下面的命令：
+
+```bash
+git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
+cd uni-api
+python -m venv uni-api
+tmux new -s uni-api
+source uni-api/bin/activate
+export CFLAGS="-I/usr/local/include"
+export CXXFLAGS="-I/usr/local/include"
+export CC=gcc
+export CXX=g++
+export MAX_CONCURRENCY=1
+export CPUCOUNT=1
+export MAKEFLAGS="-j1"
+CMAKE_BUILD_PARALLEL_LEVEL=1 cpuset -l 0 pip install -vv -r requirements.txt
+cpuset -l 0 pip install -r -vv requirements.txt
+```
+
+ctrl+b d 退出 tmux 等待几个小时安装完成，安装完成后执行下面的命令：
+
+```bash
+tmux attach -t uni-api
+source uni-api/bin/activate
+export CONFIG_URL=http://file_url/api.yaml
+export DISABLE_DATABASE=true
+# 修改端口，xxx 为端口，自行修改，对应刚刚在面板 Port reservation 开的端口
+sed -i '' 's/port=8000/port=xxx/' main.py
+sed -i '' 's/reload=True/reload=False/' main.py
+python main.py
+```
+
+使用 ctrl+b d 退出 tmux，即可让程序后台运行。此时就可以在其他聊天客户端使用 uni-api 了。curl 测试脚本：
+
+```bash
+curl -X POST https://xxx.serv00.net/v1/chat/completions \
+-H 'Content-Type: application/json' \
+-H 'Authorization: Bearer sk-xxx' \
+-d '{"model": "gpt-4o","messages": [{"role": "user","content": "你好"}]}'
+```
+
+参考文档：
+
+https://docs.serv00.com/Python/
+
+https://linux.do/t/topic/201181
+
+https://linux.do/t/topic/218738
+
 ## Docker 本地部署
 
 Start the container

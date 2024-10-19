@@ -111,6 +111,23 @@ def update_config(config_data):
 
 # 读取YAML配置文件
 async def load_config(app=None):
+
+    if app and not hasattr(app.state, 'client'):
+        import os
+        TIMEOUT = float(os.getenv("TIMEOUT", 100))
+        timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
+        default_headers = {
+            "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
+            "Accept": "*/*",  # curl 的默认 Accept 头
+        }
+        app.state.client = httpx.AsyncClient(
+            timeout=timeout,
+            headers=default_headers,
+            http2=True,  # 禁用 HTTP/2
+            verify=True,  # 保持 SSL 验证（如需禁用，设为 False，但不建议）
+            follow_redirects=True,  # 自动跟随重定向
+        )
+
     from ruamel.yaml import YAML, YAMLError
     yaml = YAML()
     yaml.preserve_quotes = True
@@ -122,19 +139,19 @@ async def load_config(app=None):
         if conf:
             config, api_keys_db, api_list = update_config(conf)
         else:
-            # logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
-            config, api_keys_db, api_list = [], [], []
+            logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
+            config, api_keys_db, api_list = {}, {}, []
     except FileNotFoundError:
         logger.error("'api.yaml' not found. Please check the file path.")
-        config, api_keys_db, api_list = [], [], []
+        config, api_keys_db, api_list = {}, {}, []
     except YAMLError as e:
         logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。%s", e)
-        config, api_keys_db, api_list = [], [], []
+        config, api_keys_db, api_list = {}, {}, []
     except OSError as e:
         logger.error(f"open 'api.yaml' failed: {e}")
-        config, api_keys_db, api_list = [], [], []
+        config, api_keys_db, api_list = {}, {}, []
 
-    if config != []:
+    if config != {}:
         return config, api_keys_db, api_list
 
     import os
@@ -152,10 +169,10 @@ async def load_config(app=None):
                 config, api_keys_db, api_list = update_config(config_data)
             else:
                 logger.error(f"Error fetching or parsing config from {config_url}")
-                config, api_keys_db, api_list = [], [], []
+                config, api_keys_db, api_list = {}, {}, []
         except Exception as e:
             logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
-            config, api_keys_db, api_list = [], [], []
+            config, api_keys_db, api_list = {}, {}, []
     return config, api_keys_db, api_list
 
 def ensure_string(item):

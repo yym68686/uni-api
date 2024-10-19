@@ -89,23 +89,10 @@ async def lifespan(app: FastAPI):
     # print("\nFrontend router routes:")
     # for route in frontend_router.routes:
     #     print(f"Route: {route.path}, methods: {route.methods}")
+
     # 启动时的代码
     if not DISABLE_DATABASE:
         await create_tables()
-
-    TIMEOUT = float(os.getenv("TIMEOUT", 100))
-    timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
-    default_headers = {
-        "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
-        "Accept": "*/*",  # curl 的默认 Accept 头
-    }
-    app.state.client = httpx.AsyncClient(
-        timeout=timeout,
-        headers=default_headers,
-        http2=True,  # 禁用 HTTP/2
-        verify=True,  # 保持 SSL 验证（如需禁用，设为 False，但不建议）
-        follow_redirects=True,  # 自动跟随重定向
-    )
 
     yield
     # 关闭时的代码
