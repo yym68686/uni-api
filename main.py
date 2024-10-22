@@ -531,7 +531,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if provider.get("engine"):
         engine = provider["engine"]
 
-    logger.info(f"provider: {provider['provider']:<10} model: {request.model:<10} engine: {engine}")
+    logger.info(f"provider: {provider['provider']:<11} model: {request.model:<22} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
     if is_debug:
@@ -542,16 +542,17 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     current_info = request_info.get()
     try:
+        model = model_dict[request.model]
         if request.stream:
-            model = model_dict[request.model]
             generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
             wrapped_generator, first_response_time = await error_handling_wrapper(generator)
             response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
         else:
-            generator = fetch_response(app.state.client, url, headers, payload)
+            generator = fetch_response(app.state.client, url, headers, payload, engine, model)
             wrapped_generator, first_response_time = await error_handling_wrapper(generator)
             first_element = await anext(wrapped_generator)
             first_element = first_element.lstrip("data: ")
+            print("first_element", first_element)
             first_element = json.loads(first_element)
             response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
             # response = JSONResponse(first_element)
