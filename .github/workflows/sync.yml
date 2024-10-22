@@ -10,6 +10,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     if: |
+      github.repository != 'yym68686/uni-api' &&
       secrets.UPSTREAM_REPO != '' &&
       secrets.GITHUB_TOKEN != ''
 
@@ -20,6 +21,6 @@ jobs:
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          upstream_sync_repo: ${{ secrets.UPSTREAM_REPO }}
+          upstream_sync_repo: yym68686/uni-api
           upstream_sync_branch: main
           target_sync_branch: main
