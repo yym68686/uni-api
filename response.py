@@ -4,6 +4,8 @@ from datetime import datetime
 
 from log_config import logger
 
+from utils import safe_get
+
 # end_of_line = "\n\r\n"
 # end_of_line = "\r\n"
 # end_of_line = "\n\r"
@@ -17,7 +19,6 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
         "object": "chat.completion.chunk",
         "created": timestamp,
         "model": model,
-        "system_fingerprint": "fp_d576307f90",
         "choices": [
             {
                 "index": 0,
@@ -26,7 +27,8 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
                 "finish_reason": None
             }
         ],
-        "usage": None
+        "usage": None,
+        "system_fingerprint": "fp_d576307f90",
     }
     if function_call_content:
         sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"arguments": function_call_content}}]}
@@ -45,6 +47,34 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     sse_response = f"data: {json_data}" + end_of_line
 
     return sse_response
+
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
+    sample_data = {
+        "id": "chatcmpl-ALGS9hpJBb8xVAe62DRriY2SpoT4L",
+        "object": "chat.completion",
+        "created": timestamp,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": role,
+                    "content": content,
+                    "refusal": None
+                },
+                "logprobs": None,
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": None,
+        "system_fingerprint": "fp_a7d06e42a7"
+    }
+    if total_tokens:
+        total_tokens = prompt_tokens + completion_tokens
+        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+    json_data = json.dumps(sample_data, ensure_ascii=False)
+
+    return json_data
 
 async def check_response(response, error_log):
     if response and response.status_code != 200:
@@ -274,7 +304,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         yield sse_string
         yield "data: [DONE]" + end_of_line
 
-async def fetch_response(client, url, headers, payload):
+async def fetch_response(client, url, headers, payload, engine, model):
     response = None
     if payload.get("file"):
         file = payload.pop("file")
@@ -285,7 +315,42 @@ async def fetch_response(client, url, headers, payload):
     if error_message:
         yield error_message
         return
-    yield response.json()
+    response_json = response.json()
+    if engine == "gemini" or engine == "vertex-gemini":
+
+        if isinstance(response_json, str):
+            import ast
+            parsed_data = ast.literal_eval(str(response_json))
+        elif isinstance(response_json, list):
+            parsed_data = response_json
+        else:
+            logger.error(f"error fetch_response: Unknown response_json type: {type(response_json)}")
+            parsed_data = response_json
+
+        content = ""
+        for item in parsed_data:
+            chunk = safe_get(item, "candidates", 0, "content", "parts", 0, "text")
+            # logger.info(f"chunk: {repr(chunk)}")
+            if chunk:
+                content += chunk
+
+        usage_metadata = safe_get(parsed_data, -1, "usageMetadata")
+        prompt_tokens = usage_metadata.get("promptTokenCount", 0)
+        candidates_tokens = usage_metadata.get("candidatesTokenCount", 0)
+        total_tokens = usage_metadata.get("totalTokenCount", 0)
+
+        role = safe_get(parsed_data, -1, "candidates", 0, "content", "role")
+        if role == "model":
+            role = "assistant"
+        else:
+            logger.error(f"Unknown role: {role}")
+            role = "assistant"
+
+        timestamp = int(datetime.timestamp(datetime.now()))
+        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens)
+
+    else:
+        yield response_json
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
     try:
