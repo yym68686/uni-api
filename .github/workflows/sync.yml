@@ -26,7 +26,6 @@ jobs:
           upstream_sync_branch: main
           target_sync_branch: main
           upstream_pull_args: --allow-unrelated-histories --no-edit --strategy-option theirs
-          force_push: true
           test_mode: false
 
       - name: Check for new commits
