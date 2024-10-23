@@ -9,11 +9,18 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    if: |
-      github.repository != 'yym68686/uni-api' &&
-      secrets.GITHUB_TOKEN != ''
+    if: github.repository != 'yym68686/uni-api'
 
     steps:
+      - name: Check if GITHUB_TOKEN exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "GITHUB_TOKEN is not set"
+            exit 1
+          fi
+
       - uses: actions/checkout@v3
 
       - name: Sync Fork
