@@ -12,12 +12,23 @@ jobs:
     if: github.repository != 'yym68686/uni-api'
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout target repo
+        uses: actions/checkout@v4.2.1
+        with:
+          fetch-depth: 0  # 获取所有历史记录，以确保正确同步
 
       - name: Sync Fork
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
         with:
           target_repo_token: ${{ secrets.GITHUB_TOKEN }}
           upstream_sync_repo: yym68686/uni-api
           upstream_sync_branch: main
           target_sync_branch: main
+
+      - name: Check for new commits
+        if: steps.sync.outputs.has_new_commits == 'true'
+        run: echo "新的提交已同步。"
+
+      - name: No new commits
+        if: steps.sync.outputs.has_new_commits == 'false'
+        run: echo "没有新的提交需要同步。"
