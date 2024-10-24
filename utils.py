@@ -63,7 +63,18 @@ def update_initial_model(api_url, api):
         traceback.print_exc()
         return []
 
-def update_config(config_data):
+from ruamel.yaml import YAML, YAMLError
+yaml = YAML()
+yaml.preserve_quotes = True
+yaml.indent(mapping=2, sequence=4, offset=2)
+
+API_YAML_PATH = "./api.yaml"
+
+def save_api_yaml(config_data):
+    with open(API_YAML_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(config_data, f)
+
+def update_config(config_data, use_config_url=False):
     for index, provider in enumerate(config_data['providers']):
         if provider.get('project_id'):
             provider['base_url'] = 'https://aiplatform.googleapis.com/'
@@ -78,7 +89,11 @@ def update_config(config_data):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(provider_api)
 
         if not provider.get("model"):
-            provider["model"] = update_initial_model(provider['base_url'], provider['api'])
+            model_list = update_initial_model(provider['base_url'], provider['api'])
+            if model_list:
+                provider["model"] = model_list
+                if not use_config_url:
+                    save_api_yaml(config_data)
 
         if provider.get("tools") == None:
             provider["tools"] = True
@@ -128,16 +143,12 @@ async def load_config(app=None):
             follow_redirects=True,  # 自动跟随重定向
         )
 
-    from ruamel.yaml import YAML, YAMLError
-    yaml = YAML()
-    yaml.preserve_quotes = True
-    yaml.indent(mapping=2, sequence=4, offset=2)
     try:
-        with open('api.yaml', 'r', encoding='utf-8') as file:
+        with open(API_YAML_PATH, 'r', encoding='utf-8') as file:
             conf = yaml.load(file)
 
         if conf:
-            config, api_keys_db, api_list = update_config(conf)
+            config, api_keys_db, api_list = update_config(conf, use_config_url=False)
         else:
             logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
             config, api_keys_db, api_list = {}, {}, []
@@ -166,7 +177,7 @@ async def load_config(app=None):
             # 更新配置
             # logger.info(config_data)
             if config_data:
-                config, api_keys_db, api_list = update_config(config_data)
+                config, api_keys_db, api_list = update_config(config_data, use_config_url=True)
             else:
                 logger.error(f"Error fetching or parsing config from {config_url}")
                 config, api_keys_db, api_list = {}, {}, []
