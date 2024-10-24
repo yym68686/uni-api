@@ -111,6 +111,12 @@ class ImageGenerationRequest(BaseRequest):
     size: Optional[str] = "1024x1024"
     stream: bool = False
 
+class EmbeddingRequest(BaseRequest):
+    input: str
+    model: str
+    encoding_format: Optional[str] = "float"
+    stream: bool = False
+
 class AudioTranscriptionRequest(BaseRequest):
     file: Tuple[str, IOBase, str]
     model: str
@@ -129,7 +135,7 @@ class ModerationRequest(BaseRequest):
     stream: bool = False
 
 class UnifiedRequest(BaseModel):
-    data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest]
+    data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest]
 
     @model_validator(mode='before')
     @classmethod
@@ -147,6 +153,9 @@ class UnifiedRequest(BaseModel):
             elif "input" in values:
                 values["data"] = ModerationRequest(**values)
                 values["data"].request_type = "moderation"
+            elif "input" in values:
+                values["data"] = EmbeddingRequest(**values)
+                values["data"].request_type = "embedding"
             else:
                 raise ValueError("无法确定请求类型")
         return values
