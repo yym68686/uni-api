@@ -5,7 +5,7 @@ from log_config import logger
 
 class FunctionParameter(BaseModel):
     type: str
-    properties: Dict[str, Dict[str, Union[str, Dict[str, str]]]]
+    properties: Dict[str, Dict[str, Any]]
     required: List[str]
 
 class Function(BaseModel):
