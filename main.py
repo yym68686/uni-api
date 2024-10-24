@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
-from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder, get_model_dict
+from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder, get_model_dict, save_api_yaml
 
 from collections import defaultdict
 from typing import List, Dict, Union
@@ -1120,8 +1120,6 @@ async def frontend_rate_limit_dependency(request: Request, x_api_key: str = Depe
 
 xue_initialize(tailwind=True)
 
-API_YAML_PATH = "./api.yaml"
-
 data_table_columns = [
     # {"label": "Status", "value": "status", "sortable": True},
     {"label": "Provider", "value": "provider", "sortable": True},
@@ -1500,10 +1498,6 @@ def update_row_data(row_id, updated_data):
     index = int(row_id)
     app.state.config["providers"][index] = updated_data
 
-def save_api_yaml():
-    with open(API_YAML_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(app.state.config, f)
-
 @frontend_router.post("/submit/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def submit_form(
     row_id: str,
@@ -1551,7 +1545,8 @@ async def submit_form(
         update_row_data(row_id, updated_data)
 
     # 保存更新后的配置
-    save_api_yaml()
+    if not DISABLE_DATABASE:
+        save_api_yaml(app.state.config)
 
     return await root()
 
@@ -1564,7 +1559,8 @@ async def duplicate_row(row_id: str):
     app.state.config["providers"].insert(index + 1, new_data)
 
     # 保存更新后的配置
-    save_api_yaml()
+    if not DISABLE_DATABASE:
+        save_api_yaml(app.state.config)
 
     return await root()
 
@@ -1574,7 +1570,8 @@ async def delete_row(row_id: str):
     del app.state.config["providers"][index]
 
     # 保存更新后的配置
-    save_api_yaml()
+    if not DISABLE_DATABASE:
+        save_api_yaml(app.state.config)
 
     return await root()
 
