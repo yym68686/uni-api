@@ -16,7 +16,7 @@ from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest, EmbeddingRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder, get_model_dict, save_api_yaml
@@ -478,7 +478,7 @@ async def ensure_config(request: Request, call_next):
     return await call_next(request)
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], provider: Dict, endpoint=None, token=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, token=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
@@ -527,6 +527,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     if endpoint == "/v1/moderations":
         engine = "moderation"
+        request.stream = False
+
+    if endpoint == "/v1/embeddings":
+        engine = "embedding"
         request.stream = False
 
     if provider.get("engine"):
@@ -700,7 +704,7 @@ class ModelRequestHandler:
         # print("provider_list", provider_list)
         return provider_list
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str, endpoint=None):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], token: str, endpoint=None):
         config = app.state.config
         api_list = app.state.api_list
         api_index = api_list.index(token)
@@ -903,6 +907,13 @@ async def images_generations(
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
+
+@app.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
+async def embeddings(
+    request: EmbeddingRequest,
+    token: str = Depends(verify_api_key)
+):
+    return await model_handler.request_model(request, token, endpoint="/v1/embeddings")
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(
