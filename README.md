@@ -49,11 +49,10 @@ providers:
   - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, can be any name, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required, automatically uses base_url and api to get all available models through the /v1/models endpoint.
-  # Multiple providers can be configured here, each provider can have multiple API Keys, and each API Key can have multiple models configured.
+  # Multiple providers can be configured here, each provider can configure multiple API Keys, and each API Key can configure multiple models.
 api_keys:
-  - api: sk-Pkj60Yf8JFWxfgRmXQFWyGtWUddGZnmi3KlvowmRWpWpQxx # API Key, required for user requests to uni-api
-    model: # Models that can be used by this API Key, required. Channel-level round-robin load balancing is enabled by default, and each request to the model follows the order configured in model. It is independent of the original channel order in providers. Therefore, you can set a different request order for each API key.
-      - all # Can use all models from all channels set under providers, no need to add available channels one by one. If you don't want to set available channels for each api in api_keys, uni-api supports setting the api key to use all models from all channels under providers.
+  - api: sk-Pkj60Yf8JFWxfgRmXQFWyGtWUddGZnmi3KlvowmRWpWpQxx # API Key, user request uni-api requires API key, required
+  # This API Key can use all models, that is, it can use all models in all channels set under providers, without needing to add available channels one by one.
 ```
 
 Detailed advanced configuration of `api.yaml`:
