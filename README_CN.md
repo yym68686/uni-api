@@ -52,8 +52,7 @@ providers:
   # 这里可以配置多个提供商，每个提供商可以配置多个 API Key，每个 API Key 可以配置多个模型。
 api_keys:
   - api: sk-Pkj60Yf8JFWxfgRmXQFWyGtWUddGZnmi3KlvowmRWpWpQxx # API Key，用户请求 uni-api 需要 API key，必填
-    model: # 该 API Key 可以使用的模型，必填。默认开启渠道级轮询负载均衡，每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
-      - all # 可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。如果你不想在 `api_keys` 里面给每个 `api` 一个个设置可用渠道，`uni-api` 支持将 `api key` 设置为可以使用 providers 下面所有渠道的所有模型。
+  # 该 API Key 可以使用所有模型，即可以使用 providers 下面设置的所有渠道里面的所有模型，不需要一个个添加可用渠道。
 ```
 
 `api.yaml` 详细的高级配置：
