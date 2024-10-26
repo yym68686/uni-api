@@ -119,6 +119,10 @@ def update_config(config_data, use_config_url=False):
                 config_data['api_keys'][index]['weights'] = weights_dict
             config_data['api_keys'][index]['model'] = models
             api_keys_db[index]['model'] = models
+        else:
+            # Default to all models if 'model' field is not set
+            config_data['api_keys'][index]['model'] = ["all"]
+            api_keys_db[index]['model'] = ["all"]
 
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
