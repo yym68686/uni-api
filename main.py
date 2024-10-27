@@ -1077,8 +1077,7 @@ from xue.components.menubar import (
     Menubar, MenubarMenu, MenubarTrigger, MenubarContent,
     MenubarItem, MenubarSeparator
 )
-from xue.components import input
-from xue.components import dropdown, sheet, form, button, checkbox
+from xue.components import input, dropdown, sheet, form, button, checkbox, sidebar
 from xue.components.model_config_row import model_config_row
 # import sys
 # import os
@@ -1184,6 +1183,38 @@ async def verify_api_key(x_api_key: str = FastapiForm(...)):
     else:
         return Div("无效的API密钥", class_="text-red-500").render()
 
+# 添加侧边栏配置
+sidebar_items = [
+    {
+        "icon": "layout-dashboard",
+        # "label": "仪表盘",
+        "label": "Dashboard",
+        "value": "dashboard",
+        "hx": {"get": "/dashboard", "target": "#main-content"}
+    },
+    # {
+    #     "icon": "settings",
+    #     # "label": "设置",
+    #     "label": "Settings",
+    #     "value": "settings",
+    #     "hx": {"get": "/settings", "target": "#main-content"}
+    # },
+    # {
+    #     "icon": "database",
+    #     # "label": "数据",
+    #     "label": "Data",
+    #     "value": "data",
+    #     "hx": {"get": "/data", "target": "#main-content"}
+    # },
+    # {
+    #     "icon": "scroll-text",
+    #     # "label": "日志",
+    #     "label": "Logs",
+    #     "value": "logs",
+    #     "hx": {"get": "/logs", "target": "#main-content"}
+    # }
+]
+
 @frontend_router.get("/", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def root(x_api_key: str = Depends(get_api_key)):
     if not x_api_key:
@@ -1200,62 +1231,38 @@ async def root(x_api_key: str = Depends(get_api_key)):
                     });
                 });
             """),
-            title="Menubar Example"
+            title="uni-api"
         ),
         Body(
             Div(
-                Menubar(
-                    MenubarMenu(
-                        MenubarTrigger("File", "file-menu"),
-                        MenubarContent(
-                            MenubarItem("New Tab", shortcut="⌘T"),
-                            MenubarItem("New Window", shortcut="⌘N"),
-                            MenubarItem("New Incognito Window", disabled=True),
-                            MenubarSeparator(),
-                            MenubarItem("Print...", shortcut="⌘P"),
-                        ),
-                        id="file-menu"
+                sidebar.Sidebar("zap", "uni-api", sidebar_items, is_collapsed=False, active_item="dashboard"),
+                Div(
+                    Div(
+                        data_table(data_table_columns, app.state.config["providers"], "users-table"),
+                        class_="p-4"
                     ),
-                    MenubarMenu(
-                        MenubarTrigger("Edit", "edit-menu"),
-                        MenubarContent(
-                            MenubarItem("Undo", shortcut="⌘Z"),
-                            MenubarItem("Redo", shortcut="⇧⌘Z"),
-                            MenubarSeparator(),
-                            MenubarItem("Cut"),
-                            MenubarItem("Copy"),
-                            MenubarItem("Paste"),
-                        ),
-                        id="edit-menu"
-                    ),
-                    MenubarMenu(
-                        MenubarTrigger("View", "view-menu"),
-                        MenubarContent(
-                            MenubarItem("Always Show Bookmarks Bar"),
-                            MenubarItem("Always Show Full URLs"),
-                            MenubarSeparator(),
-                            MenubarItem("Reload", shortcut="⌘R"),
-                            MenubarItem("Force Reload", shortcut="⇧⌘R", disabled=True),
-                            MenubarSeparator(),
-                            MenubarItem("Toggle Fullscreen"),
-                            MenubarItem("Hide Sidebar"),
-                        ),
-                        id="view-menu"
-                    ),
+                    Div(id="sheet-container"),  # sheet加载位置
+                    id="main-content",
+                    class_="ml-[240px] p-6 transition-[margin] duration-200 ease-in-out"
                 ),
-                class_="p-4"
+                class_="flex"
             ),
-            Div(
-                data_table(data_table_columns, app.state.config["providers"], "users-table"),
-                class_="p-4"
-            ),
-            Div(id="sheet-container"),  # 这里是 sheet 将被加载的地方
             class_="container mx-auto",
             id="body"
         )
     ).render()
     # print(result)
     return result
+
+@frontend_router.get("/sidebar/toggle", response_class=HTMLResponse)
+async def toggle_sidebar(is_collapsed: bool = False):
+    return sidebar.Sidebar(
+        "zap",
+        "uni-api",
+        sidebar_items,
+        is_collapsed=not is_collapsed,
+        active_item="dashboard"
+    ).render()
 
 @frontend_router.get("/dropdown-menu/{menu_id}/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def get_columns_menu(menu_id: str, row_id: str):
