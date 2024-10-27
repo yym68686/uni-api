@@ -717,13 +717,14 @@ class ModelRequestHandler:
             matching_providers = random.sample(matching_providers, num_matching_providers)
 
         weights = safe_get(config, 'api_keys', api_index, "weights")
-        if weights:
-            # 步骤 1: 提取 matching_providers 中的所有 provider 值
-            providers = set(provider['provider'] for provider in matching_providers)
-            weight_keys = set(weights.keys())
 
-            # 步骤 3: 计算交集
-            intersection = providers.intersection(weight_keys)
+        # 步骤 1: 提取 matching_providers 中的所有 provider 值
+        all_providers = set(provider['provider'] for provider in matching_providers)
+        weight_keys = set(weights.keys())
+        # 步骤 3: 计算交集
+        intersection = all_providers.intersection(weight_keys)
+
+        if weights and intersection:
             weights = dict(filter(lambda item: item[0] in intersection, weights.items()))
 
             if scheduling_algorithm == "weighted_round_robin":
