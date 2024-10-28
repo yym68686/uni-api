@@ -172,22 +172,6 @@ yym68686/uni-api:latest
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
 - DISABLE_DATABASE: Whether to disable the database, default is false, optional
 
-## Get statistical data
-
-Use `/stats` to get the usage statistics of each channel for the past 24 hours. Also include your uni-api admin API key.
-
-Data includes:
-
-1. The success rate of each model under each channel, sorted from high to low.
-2. The overall success rate of each channel, sorted from high to low.
-3. The total number of requests for each model across all channels.
-4. The number of requests for each endpoint.
-5. The number of requests per IP.
-
-The `hours` parameter in `/stats?hours=48` allows you to control how many hours of recent data statistics to return. If the `hours` parameter is not provided, it defaults to statistics for the last 24 hours.
-
-There are other statistical data that you can query yourself by writing SQL in the database. Other data includes: first token time, total processing time for each request, whether each request was successful, whether each request passed content moderation, the text content of each request, the API key for each request, the number of input tokens, and the number of output tokens for each request.
-
 ## Vercel remote deployment
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
