@@ -101,6 +101,39 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 
+def generate_markdown_docs():
+    openapi_schema = app.openapi()
+
+    markdown = f"# {openapi_schema['info']['title']}\n\n"
+    markdown += f"Version: {openapi_schema['info']['version']}\n\n"
+    markdown += f"{openapi_schema['info'].get('description', '')}\n\n"
+
+    markdown += "## API Endpoints\n\n"
+
+    paths = openapi_schema['paths']
+    for path, path_info in paths.items():
+        for method, operation in path_info.items():
+            markdown += f"### {method.upper()} {path}\n\n"
+            markdown += f"{operation.get('summary', '')}\n\n"
+            markdown += f"{operation.get('description', '')}\n\n"
+
+            if 'parameters' in operation:
+                markdown += "Parameters:\n"
+                for param in operation['parameters']:
+                    markdown += f"- {param['name']} ({param['in']}): {param.get('description', '')}\n"
+
+            markdown += "\n---\n\n"
+
+    return markdown
+
+@app.get("/docs/markdown")
+async def get_markdown_docs():
+    markdown = generate_markdown_docs()
+    return Response(
+        content=markdown,
+        media_type="text/markdown"
+    )
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
