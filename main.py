@@ -647,98 +647,105 @@ def lottery_scheduling(weights):
                 break
     return selections
 
+def get_provider_rules(model_rule, config, request_model):
+    provider_rules = []
+    if model_rule == "all":
+        # 如果模型名为 all，则返回所有模型
+        for provider in config["providers"]:
+            model_dict = get_model_dict(provider)
+            for model in model_dict.keys():
+                provider_rules.append(provider["provider"] + "/" + model)
+
+    elif "/" in model_rule:
+        if model_rule.startswith("<") and model_rule.endswith(">"):
+            model_rule = model_rule[1:-1]
+            # 处理带斜杠的模型名
+            for provider in config['providers']:
+                model_dict = get_model_dict(provider)
+                if model_rule in model_dict.keys():
+                    provider_rules.append(provider['provider'] + "/" + model_rule)
+        else:
+            provider_name = model_rule.split("/")[0]
+            model_name_split = "/".join(model_rule.split("/")[1:])
+            models_list = []
+            for provider in config['providers']:
+                model_dict = get_model_dict(provider)
+                if provider['provider'] == provider_name:
+                    models_list.extend(list(model_dict.keys()))
+            # print("models_list", models_list)
+            # print("model_name", model_name)
+            # print("model_name_split", model_name_split)
+            # print("model", model)
+
+            # api_keys 中 model 为 provider_name/* 时，表示所有模型都匹配
+            if model_name_split == "*":
+                if request_model in models_list:
+                    provider_rules.append(provider_name + "/" + request_model)
+
+                # 如果请求模型名： gpt-4* ，则匹配所有以模型名开头且不以 * 结尾的模型
+                for models_list_model in models_list:
+                    if request_model.endswith("*") and models_list_model.startswith(request_model.rstrip("*")):
+                        provider_rules.append(provider_name + "/" + models_list_model)
+
+            # api_keys 中 model 为 provider_name/model_name 时，表示模型名完全匹配
+            elif model_name_split == request_model \
+            or (request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*"))): # api_keys 中 model 为 provider_name/model_name 时，请求模型名： model_name*
+                if model_name_split in models_list:
+                    provider_rules.append(provider_name + "/" + model_name_split)
+
+    else:
+        for provider in config["providers"]:
+            model_dict = get_model_dict(provider)
+            if model_rule in model_dict.keys():
+                provider_rules.append(provider["provider"] + "/" + model_rule)
+
+    return provider_rules
+
+def get_provider_list(provider_rules, config, request_model):
+    provider_list = []
+    # print("provider_rules", provider_rules)
+    for item in provider_rules:
+        for provider in config['providers']:
+            if "/" in item and provider['provider'] == item.split("/")[0]:
+                new_provider = copy.deepcopy(provider)
+                model_dict = get_model_dict(provider)
+                model_name_split = "/".join(item.split("/")[1:])
+                # old: new
+                new_provider["model"] = [{model_dict[model_name_split]: request_model}]
+                if request_model in model_dict.keys() and model_name_split == request_model:
+                    provider_list.append(new_provider)
+
+                elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
+                    provider_list.append(new_provider)
+    return provider_list
+
+def get_matching_providers(request_model, config, api_index):
+    provider_rules = []
+
+    for model_rule in config['api_keys'][api_index]['model']:
+        provider_rules.extend(get_provider_rules(model_rule, config, request_model))
+
+    provider_list = get_provider_list(provider_rules, config, request_model)
+
+    # print("provider_list", provider_list)
+    return provider_list
+
 import asyncio
 class ModelRequestHandler:
     def __init__(self):
         self.last_provider_indices = defaultdict(lambda: -1)
         self.locks = defaultdict(asyncio.Lock)
 
-    def get_matching_providers(self, model_name, token):
-        config = app.state.config
-        # api_keys_db = app.state.api_keys_db
-        api_list = app.state.api_list
-        api_index = api_list.index(token)
-        if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail="No matching model found")
-        provider_rules = []
-
-        for model in config['api_keys'][api_index]['model']:
-            if model == "all":
-                # 如果模型名为 all，则返回所有模型
-                for provider in config["providers"]:
-                    model_dict = get_model_dict(provider)
-                    for model in model_dict.keys():
-                        provider_rules.append(provider["provider"] + "/" + model)
-                break
-            if "/" in model:
-                if model.startswith("<") and model.endswith(">"):
-                    model = model[1:-1]
-                    # 处理带斜杠的模型名
-                    for provider in config['providers']:
-                        model_dict = get_model_dict(provider)
-                        if model in model_dict.keys():
-                            provider_rules.append(provider['provider'] + "/" + model)
-                else:
-                    provider_name = model.split("/")[0]
-                    model_name_split = "/".join(model.split("/")[1:])
-                    models_list = []
-                    for provider in config['providers']:
-                        model_dict = get_model_dict(provider)
-                        if provider['provider'] == provider_name:
-                            models_list.extend(list(model_dict.keys()))
-                    # print("models_list", models_list)
-                    # print("model_name", model_name)
-                    # print("model_name_split", model_name_split)
-                    # print("model", model)
-
-                    # api_keys 中 model 为 provider_name/* 时，表示所有模型都匹配
-                    if model_name_split == "*":
-                        if model_name in models_list:
-                            provider_rules.append(provider_name + "/" + model_name)
-
-                        # 如果请求模型名： gpt-4* ，则匹配所有以模型名开头且不以 * 结尾的模型
-                        for models_list_model in models_list:
-                            if model_name.endswith("*") and models_list_model.startswith(model_name.rstrip("*")):
-                                provider_rules.append(provider_name + "/" + models_list_model)
-
-                    # api_keys 中 model 为 provider_name/model_name 时，表示模型名完全匹配
-                    elif model_name_split == model_name \
-                    or (model_name.endswith("*") and model_name_split.startswith(model_name.rstrip("*"))): # api_keys 中 model 为 provider_name/model_name 时，请求模型名： model_name*
-                        if model_name_split in models_list:
-                            provider_rules.append(provider_name + "/" + model_name_split)
-
-            else:
-                for provider in config["providers"]:
-                    model_dict = get_model_dict(provider)
-                    if model in model_dict.keys():
-                        provider_rules.append(provider["provider"] + "/" + model)
-
-        provider_list = []
-        # print("provider_rules", provider_rules)
-        for item in provider_rules:
-            for provider in config['providers']:
-                if "/" in item and provider['provider'] == item.split("/")[0]:
-                    new_provider = copy.deepcopy(provider)
-                    model_dict = get_model_dict(provider)
-                    model_name_split = "/".join(item.split("/")[1:])
-                    # old: new
-                    new_provider["model"] = [{model_dict[model_name_split]: model_name}]
-                    if model_name in model_dict.keys() and model_name_split == model_name:
-                        provider_list.append(new_provider)
-
-                    elif model_name.endswith("*") and model_name_split.startswith(model_name.rstrip("*")):
-                        provider_list.append(new_provider)
-
-        # print("provider_list", provider_list)
-        return provider_list
-
     async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], token: str, endpoint=None):
         config = app.state.config
         api_list = app.state.api_list
         api_index = api_list.index(token)
 
-        model_name = request.model
-        matching_providers = self.get_matching_providers(model_name, token)
+        if not safe_get(config, 'api_keys', api_index, 'model'):
+            raise HTTPException(status_code=404, detail="No matching model found")
+
+        request_model = request.model
+        matching_providers = get_matching_providers(request_model, config, api_index)
         num_matching_providers = len(matching_providers)
 
         if not matching_providers:
@@ -757,6 +764,13 @@ class ModelRequestHandler:
         intersection = None
         if weights and all_providers:
             weight_keys = set(weights.keys())
+            provider_rules = []
+            for model_rule in weight_keys:
+                provider_rules.extend(get_provider_rules(model_rule, config, request_model))
+            provider_list = get_provider_list(provider_rules, config, request_model)
+            weight_keys = set([provider['provider'] for provider in provider_list])
+            # print("all_providers", all_providers)
+            # print("weights", weight_keys)
             # 步骤 3: 计算交集
             intersection = all_providers.intersection(weight_keys)
 
@@ -769,6 +783,7 @@ class ModelRequestHandler:
                 weighted_provider_name_list = lottery_scheduling(weights)
             else:
                 weighted_provider_name_list = list(weights.keys())
+            # print("weighted_provider_name_list", weighted_provider_name_list)
 
             new_matching_providers = []
             for provider_name in weighted_provider_name_list:
@@ -786,9 +801,9 @@ class ModelRequestHandler:
 
         start_index = 0
         if scheduling_algorithm != "fixed_priority":
-            async with self.locks[model_name]:
-                self.last_provider_indices[model_name] = (self.last_provider_indices[model_name] + 1) % num_matching_providers
-                start_index = self.last_provider_indices[model_name]
+            async with self.locks[request_model]:
+                self.last_provider_indices[request_model] = (self.last_provider_indices[request_model] + 1) % num_matching_providers
+                start_index = self.last_provider_indices[request_model]
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
 
