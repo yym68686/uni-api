@@ -109,9 +109,9 @@ def update_config(config_data, use_config_url=False):
             for model in api_key.get('model'):
                 if isinstance(model, dict):
                     key, value = list(model.items())[0]
-                    provider_name = key.split("/")[0]
+                    # provider_name = key.split("/")[0]
                     if "/" in key:
-                        weights_dict.update({provider_name: int(value)})
+                        weights_dict.update({key: int(value)})
                     models.append(key)
                 if isinstance(model, str):
                     models.append(model)
