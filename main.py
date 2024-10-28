@@ -969,6 +969,23 @@ async def get_stats(
     token: str = Depends(verify_admin_api_key),
     hours: int = Query(default=24, ge=1, le=720, description="Number of hours to look back for stats (1-720)")
 ):
+    '''
+    ## 获取统计数据
+
+    使用 `/v1/stats` 获取最近 24 小时各个渠道的使用情况统计。同时带上 自己的 uni-api 的 admin API key。
+
+    数据包括：
+
+    1. 每个渠道下面每个模型的成功率，成功率从高到低排序。
+    2. 每个渠道总的成功率，成功率从高到低排序。
+    3. 每个模型在所有渠道总的请求次数。
+    4. 每个端点的请求次数。
+    5. 每个ip请求的次数。
+
+    `/v1/stats?hours=48` 参数 `hours` 可以控制返回最近多少小时的数据统计，不传 `hours` 这个参数，默认统计最近 24 小时的统计数据。
+
+    还有其他统计数据，可以自己写sql在数据库自己查。其他数据包括：首字时间，每个请求的总处理时间，每次请求是否成功，每次请求是否符合道德审查，每次请求的文本内容，每次请求的 API key，每次请求的输入 token，输出 token 数量。
+    '''
     if DISABLE_DATABASE:
         return JSONResponse(content={"stats": {}})
     async with async_session() as session:

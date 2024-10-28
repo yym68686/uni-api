@@ -172,22 +172,6 @@ yym68686/uni-api:latest
 - TIMEOUT: 请求超时时间，默认为 100 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间。选填
 - DISABLE_DATABASE: 是否禁用数据库，默认为 false，选填
 
-## 获取统计数据
-
-使用 `/stats` 获取最近 24 小时各个渠道的使用情况统计。同时带上 自己的 uni-api 的 admin API key。
-
-数据包括：
-
-1. 每个渠道下面每个模型的成功率，成功率从高到低排序。
-2. 每个渠道总的成功率，成功率从高到低排序。
-3. 每个模型在所有渠道总的请求次数。
-4. 每个端点的请求次数。
-5. 每个ip请求的次数。
-
-`/stats?hours=48` 参数 `hours` 可以控制返回最近多少小时的数据统计，不传 `hours` 这个参数，默认统计最近 24 小时的统计数据。
-
-还有其他统计数据，可以自己写sql在数据库自己查。其他数据包括：首字时间，每个请求的总处理时间，每次请求是否成功，每次请求是否符合道德审查，每次请求的文本内容，每次请求的 API key，每次请求的输入 token，输出 token 数量。
-
 ## Vercel 部署
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
