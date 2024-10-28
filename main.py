@@ -720,9 +720,12 @@ class ModelRequestHandler:
 
         # 步骤 1: 提取 matching_providers 中的所有 provider 值
         all_providers = set(provider['provider'] for provider in matching_providers)
-        weight_keys = set(weights.keys())
-        # 步骤 3: 计算交集
-        intersection = all_providers.intersection(weight_keys)
+
+        intersection = None
+        if weights and all_providers:
+            weight_keys = set(weights.keys())
+            # 步骤 3: 计算交集
+            intersection = all_providers.intersection(weight_keys)
 
         if weights and intersection:
             weights = dict(filter(lambda item: item[0] in intersection, weights.items()))
