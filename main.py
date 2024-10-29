@@ -759,7 +759,9 @@ class ModelRequestHandler:
         weights = safe_get(config, 'api_keys', api_index, "weights")
 
         # 步骤 1: 提取 matching_providers 中的所有 provider 值
-        all_providers = set(provider['provider'] for provider in matching_providers)
+        # print("matching_providers", matching_providers)
+        # print(type(matching_providers[0]['model'][0].keys()), list(matching_providers[0]['model'][0].keys())[0], matching_providers[0]['model'][0].keys())
+        all_providers = set(provider['provider'] + "/" + list(provider['model'][0].keys())[0] for provider in matching_providers)
 
         intersection = None
         if weights and all_providers:
@@ -768,21 +770,25 @@ class ModelRequestHandler:
             for model_rule in weight_keys:
                 provider_rules.extend(get_provider_rules(model_rule, config, request_model))
             provider_list = get_provider_list(provider_rules, config, request_model)
-            weight_keys = set([provider['provider'] for provider in provider_list])
+            weight_keys = set([provider['provider'] + "/" + list(provider['model'][0].keys())[0] for provider in provider_list])
             # print("all_providers", all_providers)
-            # print("weights", weight_keys)
+            # print("weights", weights)
+            # print("weight_keys", weight_keys)
+
             # 步骤 3: 计算交集
             intersection = all_providers.intersection(weight_keys)
+            # print("intersection", intersection)
 
         if weights and intersection:
-            weights = dict(filter(lambda item: item[0] in intersection, weights.items()))
+            filtered_weights = {k.split("/")[0]: v for k, v in weights.items() if k in intersection}
+            # print("filtered_weights", filtered_weights)
 
             if scheduling_algorithm == "weighted_round_robin":
-                weighted_provider_name_list = weighted_round_robin(weights)
+                weighted_provider_name_list = weighted_round_robin(filtered_weights)
             elif scheduling_algorithm == "lottery":
-                weighted_provider_name_list = lottery_scheduling(weights)
+                weighted_provider_name_list = lottery_scheduling(filtered_weights)
             else:
-                weighted_provider_name_list = list(weights.keys())
+                weighted_provider_name_list = list(filtered_weights.keys())
             # print("weighted_provider_name_list", weighted_provider_name_list)
 
             new_matching_providers = []
