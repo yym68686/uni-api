@@ -706,11 +706,15 @@ def get_provider_list(provider_rules, config, request_model):
     # print("provider_rules", provider_rules)
     for item in provider_rules:
         for provider in config['providers']:
-            if "/" in item and provider['provider'] == item.split("/")[0]:
+            model_dict = get_model_dict(provider)
+            model_name_split = "/".join(item.split("/")[1:])
+            if "/" in item and provider['provider'] == item.split("/")[0] and model_name_split in model_dict.keys():
                 new_provider = copy.deepcopy(provider)
-                model_dict = get_model_dict(provider)
-                model_name_split = "/".join(item.split("/")[1:])
                 # old: new
+                # print("item", item)
+                # print("model_dict", model_dict)
+                # print("model_name_split", model_name_split)
+                # print("request_model", request_model)
                 new_provider["model"] = [{model_dict[model_name_split]: request_model}]
                 if request_model in model_dict.keys() and model_name_split == request_model:
                     provider_list.append(new_provider)
