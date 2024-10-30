@@ -301,7 +301,27 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
 
-## ⭐ Star History
+## 赞助商
+
+我们感谢以下赞助商的支持：
+<!-- ¥200 -->
+- @PowerHunter：¥200
+
+## 如何赞助我们
+
+如果您想支持我们的项目，您可以通过以下方式赞助我们：
+
+1. [PayPal](https://www.paypal.me/yym68686)
+
+2. [USDT-TRC20](https://pb.yym68686.top/~USDT-TRC20)，USDT-TRC20 钱包地址：`TLFbqSv5pDu5he43mVmK1dNx7yBMFeN7d8`
+
+3. [微信](https://pb.yym68686.top/~wechat)
+
+4. [支付宝](https://pb.yym68686.top/~alipay)
+
+感谢您的支持！
+
+## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
         <img width="500" alt="Star History Chart" src="https://api.star-history.com/svg?repos=yym68686/uni-api&type=Date">
