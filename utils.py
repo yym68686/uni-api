@@ -130,23 +130,6 @@ def update_config(config_data, use_config_url=False):
 
 # 读取YAML配置文件
 async def load_config(app=None):
-
-    if app and not hasattr(app.state, 'client'):
-        import os
-        TIMEOUT = float(os.getenv("TIMEOUT", 100))
-        timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
-        default_headers = {
-            "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
-            "Accept": "*/*",  # curl 的默认 Accept 头
-        }
-        app.state.client = httpx.AsyncClient(
-            timeout=timeout,
-            headers=default_headers,
-            http2=True,  # 禁用 HTTP/2
-            verify=True,  # 保持 SSL 验证（如需禁用，设为 False，但不建议）
-            follow_redirects=True,  # 自动跟随重定向
-        )
-
     try:
         with open(API_YAML_PATH, 'r', encoding='utf-8') as file:
             conf = yaml.load(file)

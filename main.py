@@ -29,6 +29,7 @@ import os
 import string
 import json
 
+DEFAULT_TIMEOUT = float(os.getenv("TIMEOUT", 100))
 is_debug = bool(os.getenv("DEBUG", False))
 # is_debug = False
 
@@ -97,7 +98,9 @@ async def lifespan(app: FastAPI):
 
     yield
     # 关闭时的代码
-    await app.state.client.aclose()
+    # await app.state.client.aclose()
+    if hasattr(app.state, 'client_manager'):
+        await app.state.client_manager.close()
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 
@@ -493,6 +496,49 @@ app.add_middleware(
 
 app.add_middleware(StatsMiddleware)
 
+class ClientManager:
+    def __init__(self, pool_size=100):
+        self.pool_size = pool_size
+        self.clients = {}  # {timeout_value: AsyncClient}
+        self.locks = {}    # {timeout_value: Lock}
+
+    async def init(self, default_config):
+        self.default_config = default_config
+
+    @asynccontextmanager
+    async def get_client(self, timeout_value):
+        # 对同一超时值的客户端加锁
+        if timeout_value not in self.locks:
+            self.locks[timeout_value] = asyncio.Lock()
+
+        async with self.locks[timeout_value]:
+            # 获取或创建指定超时值的客户端
+            if timeout_value not in self.clients:
+                timeout = httpx.Timeout(
+                    connect=15.0,
+                    read=timeout_value,
+                    write=30.0,
+                    pool=self.pool_size
+                )
+                self.clients[timeout_value] = httpx.AsyncClient(
+                    timeout=timeout,
+                    limits=httpx.Limits(max_connections=self.pool_size),
+                    **self.default_config
+                )
+
+            try:
+                yield self.clients[timeout_value]
+            except Exception as e:
+                # 如果客户端出现问题，关闭并重新创建
+                await self.clients[timeout_value].aclose()
+                del self.clients[timeout_value]
+                raise e
+
+    async def close(self):
+        for client in self.clients.values():
+            await client.aclose()
+        self.clients.clear()
+
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
     if not hasattr(app.state, 'config'):
@@ -507,6 +553,32 @@ async def ensure_config(request: Request, call_next):
                 app.state.admin_api_key = app.state.api_keys_db[0].get("api")
             else:
                 raise Exception("No admin API key found")
+
+    if app and not hasattr(app.state, 'client_manager'):
+
+        default_config = {
+            "headers": {
+                "User-Agent": "curl/7.68.0",
+                "Accept": "*/*",
+            },
+            "http2": True,
+            "verify": True,
+            "follow_redirects": True
+        }
+
+        # 初始化客户端管理器
+        app.state.client_manager = ClientManager(pool_size=200)
+        await app.state.client_manager.init(default_config)
+
+        # 存储超时配置
+        app.state.timeouts = {}
+        if app.state.config and 'preferences' in app.state.config:
+            for model_name, timeout_value in app.state.config['preferences'].get('model_timeout', {}).items():
+                app.state.timeouts[model_name] = timeout_value
+            if "default" not in app.state.config['preferences'].get('model_timeout', {}):
+                app.state.timeouts["default"] = DEFAULT_TIMEOUT
+
+        print("app.state.timeouts", app.state.timeouts)
 
     return await call_next(request)
 
@@ -578,32 +650,51 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             pass
         else:
             logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+
     current_info = request_info.get()
+    model = model_dict[request.model]
+
+    timeout_value = None
+    # 先尝试精确匹配
+
+    if model in app.state.timeouts:
+        timeout_value = app.state.timeouts[model]
+    else:
+        # 如果没有精确匹配，尝试模糊匹配
+        for timeout_model in app.state.timeouts:
+            if timeout_model in model:
+                timeout_value = app.state.timeouts[timeout_model]
+                break
+
+    # 如果都没匹配到，使用默认值
+    if timeout_value is None:
+        timeout_value = app.state.timeouts.get("default", DEFAULT_TIMEOUT)
+
     try:
-        model = model_dict[request.model]
-        if request.stream:
-            generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-            wrapped_generator, first_response_time = await error_handling_wrapper(generator)
-            response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
-        else:
-            generator = fetch_response(app.state.client, url, headers, payload, engine, model)
-            wrapped_generator, first_response_time = await error_handling_wrapper(generator)
-            first_element = await anext(wrapped_generator)
-            first_element = first_element.lstrip("data: ")
-            # print("first_element", first_element)
-            first_element = json.loads(first_element)
-            response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
-            # response = JSONResponse(first_element)
+        async with app.state.client_manager.get_client(timeout_value) as client:
+            if request.stream:
+                generator = fetch_response_stream(client, url, headers, payload, engine, model)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+                response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
+            else:
+                generator = fetch_response(client, url, headers, payload, engine, model)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+                first_element = await anext(wrapped_generator)
+                first_element = first_element.lstrip("data: ")
+                # print("first_element", first_element)
+                first_element = json.loads(first_element)
+                response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
+                # response = JSONResponse(first_element)
 
-        # 更新成功计数和首次响应时间
-        await update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
-        # await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
-        current_info["first_response_time"] = first_response_time
-        current_info["success"] = True
-        current_info["provider"] = provider['provider']
+            # 更新成功计数和首次响应时间
+            await update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
+            # await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
+            current_info["first_response_time"] = first_response_time
+            current_info["success"] = True
+            current_info["provider"] = provider['provider']
+            return response
 
-        return response
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
         await update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=False)
         # await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=False)
 
@@ -823,25 +914,36 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request, provider, endpoint, token)
                 return response
-            except HTTPException as e:
-                logger.error(f"Error with provider {provider['provider']}: {str(e)}")
-                status_code = e.status_code
-                error_message = e.detail
+            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
 
-                if auto_retry:
-                    continue
+                # 根据异常类型设置状态码和错误消息
+                if isinstance(e, httpx.ReadTimeout):
+                    status_code = 504  # Gateway Timeout
+                    error_message = "Request timed out"
+                elif isinstance(e, httpx.ReadError):
+                    status_code = 502  # Bad Gateway
+                    error_message = "Network read error"
+                elif isinstance(e, httpx.RemoteProtocolError):
+                    status_code = 502  # Bad Gateway
+                    error_message = "Remote protocol error"
+                elif isinstance(e, asyncio.CancelledError):
+                    status_code = 499  # Client Closed Request
+                    error_message = "Request was cancelled"
+                elif isinstance(e, HTTPException):
+                    status_code = e.status_code
+                    error_message = str(e.detail)
                 else:
-                    raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
-            except (Exception, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                    status_code = 500  # Internal Server Error
+                    error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
+
+                logger.error(f"Error {status_code} with provider {provider['provider']}: {error_message}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()
-                error_message = str(e)
                 if auto_retry:
                     continue
                 else:
-                    raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
+                    raise HTTPException(status_code=status_code, detail=f"Error: Current provider response failed: {error_message}")
 
         current_info = request_info.get()
         current_info["first_response_time"] = -1
@@ -1155,7 +1257,7 @@ from xue.components.menubar import (
     Menubar, MenubarMenu, MenubarTrigger, MenubarContent,
     MenubarItem, MenubarSeparator
 )
-from xue.components import input, dropdown, sheet, form, button, checkbox, sidebar
+from xue.components import input, dropdown, sheet, form, button, checkbox, sidebar, chart
 from xue.components.model_config_row import model_config_row
 # import sys
 # import os
@@ -1277,13 +1379,13 @@ sidebar_items = [
     #     "value": "settings",
     #     "hx": {"get": "/settings", "target": "#main-content"}
     # },
-    # {
-    #     "icon": "database",
-    #     # "label": "数据",
-    #     "label": "Data",
-    #     "value": "data",
-    #     "hx": {"get": "/data", "target": "#main-content"}
-    # },
+    {
+        "icon": "database",
+        # "label": "数据",
+        "label": "Data",
+        "value": "data",
+        "hx": {"get": "/data", "target": "#main-content"}
+    },
     # {
     #     "icon": "scroll-text",
     #     # "label": "日志",
@@ -1341,6 +1443,82 @@ async def toggle_sidebar(is_collapsed: bool = False):
         is_collapsed=not is_collapsed,
         active_item="dashboard"
     ).render()
+
+@frontend_router.get("/data", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
+async def data_page(x_api_key: str = Depends(get_api_key)):
+    if not x_api_key:
+        return RedirectResponse(url="/login", status_code=303)
+
+    if DISABLE_DATABASE:
+        return HTMLResponse("数据库已禁用")
+
+    async with async_session() as session:
+        # 计算过去24小时的开始时间
+        start_time = datetime.now(timezone.utc) - timedelta(hours=24)
+
+        # 获取每个模型的请求数据
+        model_stats = await session.execute(
+            select(
+                RequestStat.model,
+                RequestStat.provider,
+                func.count().label('count')
+            )
+            .where(RequestStat.timestamp >= start_time)
+            .group_by(RequestStat.model, RequestStat.provider)
+            .order_by(desc('count'))
+        )
+        model_stats = model_stats.fetchall()
+
+    # 处理数据以适配图表格式
+    chart_data = []
+    providers = list(set(stat.provider for stat in model_stats))
+    models = list(set(stat.model for stat in model_stats))
+
+    for model in models:
+        data_point = {"model": model}
+        for provider in providers:
+            count = next(
+                (stat.count for stat in model_stats
+                 if stat.model == model and stat.provider == provider),
+                0
+            )
+            data_point[provider] = count
+        chart_data.append(data_point)
+
+    # 定义图表系列
+    series = [
+        {"name": provider, "data_key": provider}
+        for provider in providers
+    ]
+
+    # 图表配置
+    chart_config = {
+        "stacked": True,  # 堆叠柱状图
+        "horizontal": False,
+        "colors": [f"hsl({i * 360 / len(providers)}, 70%, 50%)" for i in range(len(providers))],  # 生成不同的颜色
+        "grid": True,
+        "legend": True,
+        "tooltip": True
+    }
+
+    result = HTML(
+        Head(title="数据统计"),
+        Body(
+            Div(
+                Div(
+                    "模型使用统计 (24小时)",
+                    class_="text-2xl font-bold mb-4"
+                ),
+                Div(
+                    chart.bar_chart("model-usage-chart", chart_data, "model", series, chart_config),
+                    class_="h-[600px]"  # 设置图表高度
+                ),
+                class_="container mx-auto p-4"
+            )
+        )
+    ).render()
+
+    return result
 
 @frontend_router.get("/dropdown-menu/{menu_id}/{row_id}", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def get_columns_menu(menu_id: str, row_id: str):
