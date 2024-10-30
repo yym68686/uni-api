@@ -429,7 +429,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                         process_time = time() - start_time
                         current_info["process_time"] = process_time
                         current_info["is_flagged"] = is_flagged
-                        await self.update_stats(current_info)
+                        await update_stats(current_info)
                         return JSONResponse(
                             status_code=400,
                             content={"error": "Content did not pass the moral check, please modify and try again."}
