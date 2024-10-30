@@ -23,10 +23,10 @@ For personal use, one/new-api is too complex with many commercial features that 
 - Support OpenAI, Anthropic, Gemini, Vertex native tool use function calls.
 - Support OpenAI, Anthropic, Gemini, Vertex native image recognition API.
 - Support four types of load balancing.
-  1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
-  2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
-  3. Except for Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. It is not enabled by default and requires configuring `SCHEDULING_ALGORITHM` as `round_robin`.
-  4. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
+1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
+2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
+3. Except for Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. It is not enabled by default and requires configuring `SCHEDULING_ALGORITHM` as `round_robin`.
+4. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
 - Support automatic retry, when an API channel response fails, automatically retry the next API channel.
 - Support fine-grained permission control. Support using wildcards to set specific models available for API key channels.
 - Support rate limiting, you can set the maximum number of requests per minute as an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min.
@@ -300,6 +300,26 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Authorization: Bearer ${API}" \
 -d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
+
+## Sponsors
+
+We thank the following sponsors for their support:
+<!-- ¥200 -->
+- @PowerHunter: ¥200
+
+## How to sponsor us
+
+If you would like to support our project, you can sponsor us in the following ways:
+
+1. [PayPal](https://www.paypal.me/yym68686)
+
+2. [USDT-TRC20](https://pb.yym68686.top/~USDT-TRC20), USDT-TRC20 wallet address: `TLFbqSv5pDu5he43mVmK1dNx7yBMFeN7d8`
+
+3. [WeChat](https://pb.yym68686.top/~wechat)
+
+4. [Alipay](https://pb.yym68686.top/~alipay)
+
+Thank you for your support!
 
 ## ⭐ Star History
 

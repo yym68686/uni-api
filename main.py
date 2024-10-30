@@ -317,7 +317,7 @@ class LoggingStreamingResponse(Response):
                     chunk = chunk.encode('utf-8')
                 line = chunk.decode('utf-8')
                 if is_debug:
-                    logger.info(f"{line}")
+                    logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
                 if line.startswith("data:"):
                     line = line.lstrip("data: ")
                 if not line.startswith("[DONE]") and not line.startswith("OK"):
@@ -590,7 +590,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             wrapped_generator, first_response_time = await error_handling_wrapper(generator)
             first_element = await anext(wrapped_generator)
             first_element = first_element.lstrip("data: ")
-            print("first_element", first_element)
+            # print("first_element", first_element)
             first_element = json.loads(first_element)
             response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
             # response = JSONResponse(first_element)
