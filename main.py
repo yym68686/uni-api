@@ -159,6 +159,39 @@ async def parse_request_body(request: Request):
             return None
     return None
 
+class ChannelManager:
+    def __init__(self, cooldown_period: int = 300):  # 默认冷却时间5分钟
+        self._excluded_channels: Dict[str, datetime] = {}
+        self._lock = asyncio.Lock()
+        self.cooldown_period = cooldown_period
+
+    async def exclude_channel(self, channel_id: str):
+        """将渠道添加到排除列表"""
+        async with self._lock:
+            self._excluded_channels[channel_id] = datetime.now()
+
+    async def is_channel_excluded(self, channel_id: str) -> bool:
+        """检查渠道是否被排除"""
+        async with self._lock:
+            if channel_id not in self._excluded_channels:
+                return False
+
+            excluded_time = self._excluded_channels[channel_id]
+            if datetime.now() - excluded_time > timedelta(seconds=self.cooldown_period):
+                # 已超过冷却时间，移除限制
+                del self._excluded_channels[channel_id]
+                return False
+            return True
+
+    async def get_available_providers(self, providers: list) -> list:
+        """过滤出可用的providers"""
+        available_providers = []
+        for provider in providers:
+            channel_id = f"{provider['provider']}"
+            if not await self.is_channel_excluded(channel_id):
+                available_providers.append(provider)
+        return available_providers
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean, Text
@@ -541,7 +574,7 @@ class ClientManager:
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
-    if not hasattr(app.state, 'config'):
+    if app and not hasattr(app.state, 'config'):
         logger.warning("Config not found, attempting to reload")
         app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
 
@@ -579,6 +612,14 @@ async def ensure_config(request: Request, call_next):
                 app.state.timeouts["default"] = DEFAULT_TIMEOUT
 
         print("app.state.timeouts", app.state.timeouts)
+
+    if app and not hasattr(app.state, "channel_manager"):
+        if app.state.config and 'preferences' in app.state.config:
+            COOLDOWN_PERIOD = app.state.config['preferences'].get('cooldown_period', 300)
+        else:
+            COOLDOWN_PERIOD = 300
+
+        app.state.channel_manager = ChannelManager(cooldown_period=COOLDOWN_PERIOD)
 
     return await call_next(request)
 
@@ -841,10 +882,17 @@ class ModelRequestHandler:
 
         request_model = request.model
         matching_providers = get_matching_providers(request_model, config, api_index)
-        num_matching_providers = len(matching_providers)
 
         if not matching_providers:
             raise HTTPException(status_code=404, detail="No matching model found")
+
+        if app.state.channel_manager.cooldown_period > 0:
+            matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
+            if not matching_providers:
+                raise HTTPException(status_code=503, detail="No available providers at the moment")
+
+        num_matching_providers = len(matching_providers)
+
 
         # 检查是否启用轮询
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
@@ -936,7 +984,10 @@ class ModelRequestHandler:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
-                logger.error(f"Error {status_code} with provider {provider['provider']}: {error_message}")
+                channel_id = f"{provider['provider']}"
+                if app.state.channel_manager.cooldown_period > 0:
+                    await app.state.channel_manager.exclude_channel(channel_id)
+                logger.error(f"Error {status_code} with provider {channel_id}: {error_message}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()
