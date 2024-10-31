@@ -1540,75 +1540,80 @@ async def data_page(x_api_key: str = Depends(get_api_key)):
         # 计算过去24小时的开始时间
         start_time = datetime.now(timezone.utc) - timedelta(hours=24)
 
-        # 获取每个模型的请求数据
+        # 按小时统计每个模型的请求数据
         model_stats = await session.execute(
             select(
+                func.strftime('%H', RequestStat.timestamp).label('hour'),
                 RequestStat.model,
-                RequestStat.provider,
                 func.count().label('count')
             )
             .where(RequestStat.timestamp >= start_time)
-            .group_by(RequestStat.model, RequestStat.provider)
-            .order_by(desc('count'))
+            .group_by('hour', RequestStat.model)
+            .order_by('hour')
         )
         model_stats = model_stats.fetchall()
 
-    # 处理数据以适配图表格式
-    chart_data = []
-    providers = list(set(stat.provider for stat in model_stats))
+    # 获取所有唯一的模型名称
     models = list(set(stat.model for stat in model_stats))
 
-    for model in models:
-        data_point = {"model": model}
-        for provider in providers:
+    # 生成24小时的数据点
+    chart_data = []
+    current_hour = datetime.now().hour
+
+    for i in range(24):
+        # 计算小时标签(从当前小时往前推24小时)
+        hour = (current_hour - i) % 24
+        hour_str = f"{hour:02d}"
+
+        # 创建该小时的数据点
+        data_point = {"label": hour_str}
+
+        # 添加每个模型在该小时的请求数
+        for model in models:
             count = next(
                 (stat.count for stat in model_stats
-                 if stat.model == model and stat.provider == provider),
+                 if stat.hour == f"{hour:02d}" and stat.model == model),
                 0
             )
-            data_point[provider] = count
+            data_point[model] = count
+
         chart_data.append(data_point)
 
-    # 定义图表系列
-    series = [
-        {"name": provider, "data_key": provider}
-        for provider in providers
-    ]
+    # 反转数据点顺序使其按时间正序显示
+    chart_data.reverse()
 
-    # 图表配置
+    # 为每个模型配置显示属性
     chart_config = {
-        "stacked": True,  # 堆叠柱状图
-        "horizontal": False,
-        "colors": [f"hsl({i * 360 / len(providers)}, 70%, 50%)" for i in range(len(providers))],  # 生成不同的颜色
-        "grid": True,
-        "legend": True,
-        "tooltip": True
+        model: {
+            "label": model,
+            "color": f"hsl({i * 360 / len(models)}, 70%, 50%)"  # 为每个模型生成不同的颜色
+        }
+        for i, model in enumerate(models)
     }
-    chart_config = {
-        "stacked": False,
-        "horizontal": False,
-        "colors": ["#2563eb", "#60a5fa"],
-        "grid": True,  # 隐藏网格
-        "legend": True,  # 显示图例
-        "tooltip": True  # 启用工具提示
-    }
-    print(chart_data)
-    print(series)
 
-    result = Div(
-        Div(
-            "模型使用统计 (24小时)",
-            class_="text-2xl font-bold mb-4"
-        ),
-        Div(
-            chart.bar_chart("basic-chart", chart_data, "month", series, chart_config),
-            # chart.bar_chart("model-usage-chart", chart_data, "model", series, chart_config),
-            class_="mb-8"  # 设置图表高度
-        ),
-        id="main-content",
-        class_="container ml-[200px] mx-auto p-4"
-        # class_="container ml-[200px] mx-auto p-4"
+    result = HTML(
+        Head(title="数据统计"),
+        Body(
+            Div(
+                # 堆叠柱状图
+                Div(
+                    "模型使用统计 (24小时) - 按小时统计",
+                    class_="text-2xl font-bold mb-4"
+                ),
+                Div(
+                    chart.chart(
+                        chart_data,
+                        chart_config,
+                        stacked=True,
+                    ),
+                    class_="mb-8 h-[400px]"  # 添加固定高度
+                ),
+                id="main-content",
+                class_="container ml-[200px] mx-auto p-4"
+            )
+        )
     ).render()
+    print(result)
 
     return result
 
