@@ -866,48 +866,28 @@ def get_matching_providers(request_model, config, api_index):
     # print("provider_list", provider_list)
     return provider_list
 
-import asyncio
-class ModelRequestHandler:
-    def __init__(self):
-        self.last_provider_indices = defaultdict(lambda: -1)
-        self.locks = defaultdict(asyncio.Lock)
+async def get_right_order_providers(request_model, config, api_index, scheduling_algorithm):
+    matching_providers = get_matching_providers(request_model, config, api_index)
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], token: str, endpoint=None):
-        config = app.state.config
-        api_list = app.state.api_list
-        api_index = api_list.index(token)
+    if not matching_providers:
+        raise HTTPException(status_code=404, detail="No matching model found")
 
-        if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail="No matching model found")
-
-        request_model = request.model
-        matching_providers = get_matching_providers(request_model, config, api_index)
-
+    if app.state.channel_manager.cooldown_period > 0:
+        matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
         if not matching_providers:
-            raise HTTPException(status_code=404, detail="No matching model found")
+            raise HTTPException(status_code=503, detail="No available providers at the moment")
 
-        if app.state.channel_manager.cooldown_period > 0:
-            matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
-            if not matching_providers:
-                raise HTTPException(status_code=503, detail="No available providers at the moment")
-
+    # 检查是否启用轮询
+    if scheduling_algorithm == "random":
         num_matching_providers = len(matching_providers)
+        matching_providers = random.sample(matching_providers, num_matching_providers)
 
+    weights = safe_get(config, 'api_keys', api_index, "weights")
 
-        # 检查是否启用轮询
-        scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-        if scheduling_algorithm == "random":
-            matching_providers = random.sample(matching_providers, num_matching_providers)
-
-        weights = safe_get(config, 'api_keys', api_index, "weights")
-
-        # 步骤 1: 提取 matching_providers 中的所有 provider 值
-        # print("matching_providers", matching_providers)
-        # print(type(matching_providers[0]['model'][0].keys()), list(matching_providers[0]['model'][0].keys())[0], matching_providers[0]['model'][0].keys())
-        all_providers = set(provider['provider'] + "/" + list(provider['model'][0].keys())[0] for provider in matching_providers)
-
+    if weights:
         intersection = None
-        if weights and all_providers:
+        all_providers = set(provider['provider'] + "/" + list(provider['model'][0].keys())[0] for provider in matching_providers)
+        if all_providers:
             weight_keys = set(weights.keys())
             provider_rules = []
             for model_rule in weight_keys:
@@ -922,7 +902,7 @@ class ModelRequestHandler:
             intersection = all_providers.intersection(weight_keys)
             # print("intersection", intersection)
 
-        if weights and intersection:
+        if intersection:
             filtered_weights = {k.split("/")[0]: v for k, v in weights.items() if k in intersection}
             # print("filtered_weights", filtered_weights)
 
@@ -941,9 +921,31 @@ class ModelRequestHandler:
                         new_matching_providers.append(provider)
             matching_providers = new_matching_providers
 
-        if is_debug:
-            for provider in matching_providers:
-                logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
+    if is_debug:
+        for provider in matching_providers:
+            logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
+
+    return matching_providers
+
+import asyncio
+class ModelRequestHandler:
+    def __init__(self):
+        self.last_provider_indices = defaultdict(lambda: -1)
+        self.locks = defaultdict(asyncio.Lock)
+
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], token: str, endpoint=None):
+        config = app.state.config
+        api_list = app.state.api_list
+        api_index = api_list.index(token)
+
+        if not safe_get(config, 'api_keys', api_index, 'model'):
+            raise HTTPException(status_code=404, detail="No matching model found")
+
+        request_model = request.model
+        scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+
+        matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
+        num_matching_providers = len(matching_providers)
 
         status_code = 500
         error_message = None
@@ -956,8 +958,12 @@ class ModelRequestHandler:
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
 
-        for i in range(num_matching_providers + 1):
-            current_index = (start_index + i) % num_matching_providers
+        index = 0
+        while True:
+            if index >= num_matching_providers:
+                break
+            current_index = (start_index + index) % num_matching_providers
+            index += 1
             provider = matching_providers[current_index]
             try:
                 response = await process_request(request, provider, endpoint, token)
@@ -987,6 +993,10 @@ class ModelRequestHandler:
                 channel_id = f"{provider['provider']}"
                 if app.state.channel_manager.cooldown_period > 0:
                     await app.state.channel_manager.exclude_channel(channel_id)
+                    matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
+                    num_matching_providers = len(matching_providers)
+                    index = 0
+
                 logger.error(f"Error {status_code} with provider {channel_id}: {error_message}")
                 if is_debug:
                     import traceback
