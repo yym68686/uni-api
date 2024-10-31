@@ -315,8 +315,8 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 ## 赞助商
 
 我们感谢以下赞助商的支持：
-<!-- ¥200 -->
-- @PowerHunter：¥200
+<!-- ¥600 -->
+- @PowerHunter：¥600
 
 ## 如何赞助我们
 
