@@ -1253,10 +1253,6 @@ from fastapi.security import APIKeyHeader
 from typing import Optional, List
 
 from xue import HTML, Head, Body, Div, xue_initialize, Script, Ul, Li
-from xue.components.menubar import (
-    Menubar, MenubarMenu, MenubarTrigger, MenubarContent,
-    MenubarItem, MenubarSeparator
-)
 from xue.components import input, dropdown, sheet, form, button, checkbox, sidebar, chart
 from xue.components.model_config_row import model_config_row
 # import sys
@@ -1423,7 +1419,7 @@ async def root(x_api_key: str = Depends(get_api_key)):
                     ),
                     Div(id="sheet-container"),  # sheet加载位置
                     id="main-content",
-                    class_="ml-[240px] p-6 transition-[margin] duration-200 ease-in-out"
+                    class_="ml-[200px] p-6 transition-[margin] duration-200 ease-in-out"
                 ),
                 class_="flex"
             ),
@@ -1443,6 +1439,33 @@ async def toggle_sidebar(is_collapsed: bool = False):
         is_collapsed=not is_collapsed,
         active_item="dashboard"
     ).render()
+
+@app.get("/sidebar/update/{active_item}", response_class=HTMLResponse)
+async def update_sidebar(active_item: str):
+    return sidebar.Sidebar(
+        "zap",
+        "uni-api",
+        sidebar_items,
+        is_collapsed=False,
+        active_item=active_item
+    ).render()
+
+@frontend_router.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
+async def data_page(x_api_key: str = Depends(get_api_key)):
+    if not x_api_key:
+        return RedirectResponse(url="/login", status_code=303)
+
+    result = Div(
+        Div(
+            data_table(data_table_columns, app.state.config["providers"], "users-table"),
+            class_="p-4"
+        ),
+        Div(id="sheet-container"),  # sheet加载位置
+        id="main-content",
+        class_="ml-[200px] p-6 transition-[margin] duration-200 ease-in-out"
+    ).render()
+
+    return result
 
 @frontend_router.get("/data", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
 async def data_page(x_api_key: str = Depends(get_api_key)):
@@ -1500,22 +1523,30 @@ async def data_page(x_api_key: str = Depends(get_api_key)):
         "legend": True,
         "tooltip": True
     }
+    chart_config = {
+        "stacked": False,
+        "horizontal": False,
+        "colors": ["#2563eb", "#60a5fa"],
+        "grid": True,  # 隐藏网格
+        "legend": True,  # 显示图例
+        "tooltip": True  # 启用工具提示
+    }
+    print(chart_data)
+    print(series)
 
-    result = HTML(
-        Head(title="数据统计"),
-        Body(
-            Div(
-                Div(
-                    "模型使用统计 (24小时)",
-                    class_="text-2xl font-bold mb-4"
-                ),
-                Div(
-                    chart.bar_chart("model-usage-chart", chart_data, "model", series, chart_config),
-                    class_="h-[600px]"  # 设置图表高度
-                ),
-                class_="container mx-auto p-4"
-            )
-        )
+    result = Div(
+        Div(
+            "模型使用统计 (24小时)",
+            class_="text-2xl font-bold mb-4"
+        ),
+        Div(
+            chart.bar_chart("basic-chart", chart_data, "month", series, chart_config),
+            # chart.bar_chart("model-usage-chart", chart_data, "model", series, chart_config),
+            class_="mb-8"  # 设置图表高度
+        ),
+        id="main-content",
+        class_="container ml-[200px] mx-auto p-4"
+        # class_="container ml-[200px] mx-auto p-4"
     ).render()
 
     return result
