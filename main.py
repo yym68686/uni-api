@@ -161,35 +161,43 @@ async def parse_request_body(request: Request):
 
 class ChannelManager:
     def __init__(self, cooldown_period: int = 300):  # 默认冷却时间5分钟
-        self._excluded_channels: Dict[str, datetime] = {}
+        self._excluded_models: Dict[str, datetime] = {}
         self._lock = asyncio.Lock()
         self.cooldown_period = cooldown_period
 
-    async def exclude_channel(self, channel_id: str):
-        """将渠道添加到排除列表"""
+    async def exclude_model(self, provider: str, model: str):
+        """将特定渠道下的特定模型添加到排除列表"""
         async with self._lock:
-            self._excluded_channels[channel_id] = datetime.now()
+            model_key = f"{provider}/{model}"
+            self._excluded_models[model_key] = datetime.now()
 
-    async def is_channel_excluded(self, channel_id: str) -> bool:
-        """检查渠道是否被排除"""
+    async def is_model_excluded(self, provider: str, model: str) -> bool:
+        """检查特定渠道下的特定模型是否被排除"""
         async with self._lock:
-            if channel_id not in self._excluded_channels:
+            model_key = f"{provider}/{model}"
+            if model_key not in self._excluded_models:
                 return False
 
-            excluded_time = self._excluded_channels[channel_id]
+            excluded_time = self._excluded_models[model_key]
             if datetime.now() - excluded_time > timedelta(seconds=self.cooldown_period):
                 # 已超过冷却时间，移除限制
-                del self._excluded_channels[channel_id]
+                del self._excluded_models[model_key]
                 return False
             return True
 
     async def get_available_providers(self, providers: list) -> list:
-        """过滤出可用的providers"""
+        """过滤出可用的providers，仅排除不可用的模型"""
         available_providers = []
         for provider in providers:
-            channel_id = f"{provider['provider']}"
-            if not await self.is_channel_excluded(channel_id):
+            provider_name = provider['provider']
+            model_dict = provider['model'][0]  # 获取唯一的模型字典
+            source_model = list(model_dict.keys())[0]  # 源模型名称
+            # target_model = list(model_dict.values())[0]  # 目标模型名称
+
+            # 检查该模型是否被排除
+            if not await self.is_model_excluded(provider_name, source_model):
                 available_providers.append(provider)
+
         return available_providers
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -992,7 +1000,9 @@ class ModelRequestHandler:
 
                 channel_id = f"{provider['provider']}"
                 if app.state.channel_manager.cooldown_period > 0:
-                    await app.state.channel_manager.exclude_channel(channel_id)
+                    # 获取源模型名称（实际配置的模型名）
+                    source_model = list(provider['model'][0].keys())[0]
+                    await app.state.channel_manager.exclude_model(channel_id, source_model)
                     matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
                     num_matching_providers = len(matching_providers)
                     index = 0
