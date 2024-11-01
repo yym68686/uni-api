@@ -117,9 +117,9 @@ def update_config(config_data, use_config_url=False):
                             continue
                         model_dict = get_model_dict(provider_item)
                         if model_name in model_dict.keys():
-                            weights_dict.update({provider_name + "/" + model_dict[model_name]: int(value)})
+                            weights_dict.update({provider_name + "/" + model_name: int(value)})
                         elif model_name == "*":
-                            weights_dict.update({provider_name + "/" + model_dict[model_item]: int(value) for model_item in model_dict.keys()})
+                            weights_dict.update({provider_name + "/" + model_name: int(value) for model_item in model_dict.keys()})
 
                     models.append(key)
                 if isinstance(model, str):
