@@ -166,7 +166,26 @@ async def load_config(app=None):
     config_url = os.environ.get('CONFIG_URL')
     if config_url:
         try:
-            client = app.state.client_manager.get_client(100)
+            default_config = {
+                "headers": {
+                    "User-Agent": "curl/7.68.0",
+                    "Accept": "*/*",
+                },
+                "http2": True,
+                "verify": True,
+                "follow_redirects": True
+            }
+            # 初始化客户端管理器
+            timeout = httpx.Timeout(
+                connect=15.0,
+                read=100,
+                write=30.0,
+                pool=200
+            )
+            client = httpx.AsyncClient(
+                timeout=timeout,
+                **default_config
+            )
             response = await client.get(config_url)
             # logger.info(f"Fetching config from {response.text}")
             response.raise_for_status()

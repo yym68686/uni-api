@@ -582,8 +582,9 @@ class ClientManager:
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
+
     if app and not hasattr(app.state, 'config'):
-        logger.warning("Config not found, attempting to reload")
+        # logger.warning("Config not found, attempting to reload")
         app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
 
         for item in app.state.api_keys_db:
