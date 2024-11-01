@@ -1348,6 +1348,9 @@ async def get_api_key(request: Request, x_api_key: Optional[str] = Depends(api_k
     # print(f"Header x_api_key: {x_api_key}")  # 添加此行
     # logger.info(f"x_api_key: {x_api_key} {x_api_key == 'your_admin_api_key'}")
 
+    if not hasattr(app.state, 'config'):
+        await ensure_config(request, lambda: None)
+
     if x_api_key == app.state.admin_api_key:  # 替换为实际的管理员API密钥
         return x_api_key
     else:
