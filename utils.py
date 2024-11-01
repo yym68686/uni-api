@@ -166,7 +166,8 @@ async def load_config(app=None):
     config_url = os.environ.get('CONFIG_URL')
     if config_url:
         try:
-            response = await app.state.client.get(config_url)
+            client = app.state.client_manager.get_client(100)
+            response = await client.get(config_url)
             # logger.info(f"Fetching config from {response.text}")
             response.raise_for_status()
             config_data = yaml.load(response.text)
