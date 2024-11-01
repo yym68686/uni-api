@@ -191,11 +191,11 @@ class ChannelManager:
         for provider in providers:
             provider_name = provider['provider']
             model_dict = provider['model'][0]  # 获取唯一的模型字典
-            source_model = list(model_dict.keys())[0]  # 源模型名称
-            # target_model = list(model_dict.values())[0]  # 目标模型名称
+            # source_model = list(model_dict.keys())[0]  # 源模型名称
+            target_model = list(model_dict.values())[0]  # 目标模型名称
 
             # 检查该模型是否被排除
-            if not await self.is_model_excluded(provider_name, source_model):
+            if not await self.is_model_excluded(provider_name, target_model):
                 available_providers.append(provider)
 
         return available_providers
@@ -894,14 +894,14 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
 
     if weights:
         intersection = None
-        all_providers = set(provider['provider'] + "/" + list(provider['model'][0].keys())[0] for provider in matching_providers)
+        all_providers = set(provider['provider'] + "/" + request_model for provider in matching_providers)
         if all_providers:
             weight_keys = set(weights.keys())
             provider_rules = []
             for model_rule in weight_keys:
                 provider_rules.extend(get_provider_rules(model_rule, config, request_model))
             provider_list = get_provider_list(provider_rules, config, request_model)
-            weight_keys = set([provider['provider'] + "/" + list(provider['model'][0].keys())[0] for provider in provider_list])
+            weight_keys = set([provider['provider'] + "/" + request_model for provider in provider_list])
             # print("all_providers", all_providers)
             # print("weights", weights)
             # print("weight_keys", weight_keys)
@@ -1001,8 +1001,8 @@ class ModelRequestHandler:
                 channel_id = f"{provider['provider']}"
                 if app.state.channel_manager.cooldown_period > 0:
                     # 获取源模型名称（实际配置的模型名）
-                    source_model = list(provider['model'][0].keys())[0]
-                    await app.state.channel_manager.exclude_model(channel_id, source_model)
+                    # source_model = list(provider['model'][0].keys())[0]
+                    await app.state.channel_manager.exclude_model(channel_id, request_model)
                     matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
                     num_matching_providers = len(matching_providers)
                     index = 0
