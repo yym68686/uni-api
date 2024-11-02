@@ -868,14 +868,14 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
     if not matching_providers:
         raise HTTPException(status_code=404, detail="No matching model found")
 
-    if app.state.channel_manager.cooldown_period > 0:
+    num_matching_providers = len(matching_providers)
+    if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
         matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
         if not matching_providers:
             raise HTTPException(status_code=503, detail="No available providers at the moment")
 
     # 检查是否启用轮询
     if scheduling_algorithm == "random":
-        num_matching_providers = len(matching_providers)
         matching_providers = random.sample(matching_providers, num_matching_providers)
 
     weights = safe_get(config, 'api_keys', api_index, "weights")
@@ -987,7 +987,7 @@ class ModelRequestHandler:
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
                 channel_id = f"{provider['provider']}"
-                if app.state.channel_manager.cooldown_period > 0:
+                if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
                     # 获取源模型名称（实际配置的模型名）
                     # source_model = list(provider['model'][0].keys())[0]
                     await app.state.channel_manager.exclude_model(channel_id, request_model)
