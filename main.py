@@ -160,30 +160,24 @@ async def parse_request_body(request: Request):
     return None
 
 class ChannelManager:
-    def __init__(self, cooldown_period: int = 300):  # 默认冷却时间5分钟
-        self._excluded_models: Dict[str, datetime] = {}
-        self._lock = asyncio.Lock()
+    def __init__(self, cooldown_period=300):
+        self._excluded_models = defaultdict(lambda: None)
         self.cooldown_period = cooldown_period
 
     async def exclude_model(self, provider: str, model: str):
-        """将特定渠道下的特定模型添加到排除列表"""
-        async with self._lock:
-            model_key = f"{provider}/{model}"
-            self._excluded_models[model_key] = datetime.now()
+        model_key = f"{provider}/{model}"
+        self._excluded_models[model_key] = datetime.now()
 
     async def is_model_excluded(self, provider: str, model: str) -> bool:
-        """检查特定渠道下的特定模型是否被排除"""
-        async with self._lock:
-            model_key = f"{provider}/{model}"
-            if model_key not in self._excluded_models:
-                return False
+        model_key = f"{provider}/{model}"
+        excluded_time = self._excluded_models[model_key]
+        if not excluded_time:
+            return False
 
-            excluded_time = self._excluded_models[model_key]
-            if datetime.now() - excluded_time > timedelta(seconds=self.cooldown_period):
-                # 已超过冷却时间，移除限制
-                del self._excluded_models[model_key]
-                return False
-            return True
+        if datetime.now() - excluded_time > timedelta(seconds=self.cooldown_period):
+            del self._excluded_models[model_key]
+            return False
+        return True
 
     async def get_available_providers(self, providers: list) -> list:
         """过滤出可用的providers，仅排除不可用的模型"""
@@ -541,39 +535,32 @@ class ClientManager:
     def __init__(self, pool_size=100):
         self.pool_size = pool_size
         self.clients = {}  # {timeout_value: AsyncClient}
-        self.locks = {}    # {timeout_value: Lock}
 
     async def init(self, default_config):
         self.default_config = default_config
 
     @asynccontextmanager
     async def get_client(self, timeout_value):
-        # 对同一超时值的客户端加锁
-        if timeout_value not in self.locks:
-            self.locks[timeout_value] = asyncio.Lock()
+        # 直接获取或创建客户端,不使用锁
+        if timeout_value not in self.clients:
+            timeout = httpx.Timeout(
+                connect=15.0,
+                read=timeout_value,
+                write=30.0,
+                pool=self.pool_size
+            )
+            self.clients[timeout_value] = httpx.AsyncClient(
+                timeout=timeout,
+                limits=httpx.Limits(max_connections=self.pool_size),
+                **self.default_config
+            )
 
-        async with self.locks[timeout_value]:
-            # 获取或创建指定超时值的客户端
-            if timeout_value not in self.clients:
-                timeout = httpx.Timeout(
-                    connect=15.0,
-                    read=timeout_value,
-                    write=30.0,
-                    pool=self.pool_size
-                )
-                self.clients[timeout_value] = httpx.AsyncClient(
-                    timeout=timeout,
-                    limits=httpx.Limits(max_connections=self.pool_size),
-                    **self.default_config
-                )
-
-            try:
-                yield self.clients[timeout_value]
-            except Exception as e:
-                # 如果客户端出现问题，关闭并重新创建
-                await self.clients[timeout_value].aclose()
-                del self.clients[timeout_value]
-                raise e
+        try:
+            yield self.clients[timeout_value]
+        except Exception as e:
+            await self.clients[timeout_value].aclose()
+            del self.clients[timeout_value]
+            raise e
 
     async def close(self):
         for client in self.clients.values():
@@ -791,7 +778,7 @@ def lottery_scheduling(weights):
 def get_provider_rules(model_rule, config, request_model):
     provider_rules = []
     if model_rule == "all":
-        # 如果模型名为 all，则返回所有模型
+        # 如���模型名为 all，则返回所有模型
         for provider in config["providers"]:
             model_dict = get_model_dict(provider)
             for model in model_dict.keys():
