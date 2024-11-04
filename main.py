@@ -477,7 +477,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     import traceback
                     traceback.print_exc()
 
-                logger.error(f"处理请求或进行道德检查时出错: {str(e)}")
+                logger.error(f"Error processing request or performing moral check: {str(e)}")
 
         try:
             response = await call_next(request)

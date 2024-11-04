@@ -332,6 +332,12 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 感谢您的支持！
 
+## 常见问题
+
+- 为什么总是出现 `Error processing request or performing moral check: 404: No matching model found` 错误？
+
+将 ENABLE_MODERATION 设置为 false 将修复这个问题。当 ENABLE_MODERATION 为 true 时，API 必须能够使用 text-moderation-latest 模型，如果你没有在提供商模型设置里面提供 text-moderation-latest，将会报错找不到模型。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">

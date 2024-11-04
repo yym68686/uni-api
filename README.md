@@ -332,6 +332,12 @@ If you would like to support our project, you can sponsor us in the following wa
 
 Thank you for your support!
 
+## FAQ
+
+- Why does the error `Error processing request or performing moral check: 404: No matching model found` always appear?
+
+Setting ENABLE_MODERATION to false will fix this issue. When ENABLE_MODERATION is true, the API must be able to use the text-moderation-latest model, and if you have not provided text-moderation-latest in the provider model settings, an error will occur indicating that the model cannot be found.
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
