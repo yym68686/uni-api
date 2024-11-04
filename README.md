@@ -80,12 +80,18 @@ providers:
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url supports v1beta/v1, only for Gemini model use, required
-    api: AIzaSyAN2k6IRdgw
+    api: # Supports multiple API Keys, multiple keys automatically enable polling load balancing, at least one key, required
+      - AIzaSyAN2k6IRdgw123
+      - AIzaSyAN2k6IRdgw456
+      - AIzaSyAN2k6IRdgw789
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
       - gemini-1.5-flash-exp-0827 # Add this line, both gemini-1.5-flash-exp-0827 and gemini-1.5-flash can be requested
     tools: true
+    preferences:
+      API_KEY_RATE_LIMIT: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min.
+      API_KEY_COOLDOWN_PERIOD: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 60 seconds.
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud project ID. Format: String, usually composed of lowercase letters, numbers, and hyphens. How to obtain: You can find your project ID in the project selector of the Google Cloud Console.
@@ -337,6 +343,41 @@ Thank you for your support!
 - Why does the error `Error processing request or performing moral check: 404: No matching model found` always appear?
 
 Setting ENABLE_MODERATION to false will fix this issue. When ENABLE_MODERATION is true, the API must be able to use the text-moderation-latest model, and if you have not provided text-moderation-latest in the provider model settings, an error will occur indicating that the model cannot be found.
+
+- How to prioritize requests for a specific channel, how to set the priority of a channel?
+
+Directly set the channel order in the api_keys. No other settings are required. Sample configuration file:
+
+```yaml
+providers:
+  - provider: ai1
+    base_url: https://xxx/v1/chat/completions
+    api: sk-xxx
+
+  - provider: ai2
+    base_url: https://xxx/v1/chat/completions
+    api: sk-xxx
+
+api_keys:
+  - api: sk-1234
+    model:
+      - ai2/*
+      - ai1/*
+```
+
+In this way, request ai2 first, and if it fails, request ai1.
+
+- What is the behavior behind various scheduling algorithms? For example, fixed_priority, weighted_round_robin, lottery, random, round_robin?
+
+All scheduling algorithms need to be enabled by setting api_keys.(api).preferences.SCHEDULING_ALGORITHM in the configuration file to any of the values: fixed_priority, weighted_round_robin, lottery, random, round_robin.
+
+1. fixed_priority: Fixed priority scheduling. All requests are always executed by the channel of the model that first has a user request. In case of an error, it will switch to the next channel. This is the default scheduling algorithm.
+
+2. weighted_round_robin: Weighted round-robin load balancing, requests channels with the user's requested model according to the weight order set in the configuration file api_keys.(api).model.
+
+3. lottery: Draw round-robin load balancing, randomly request the channel of the model with user requests according to the weight set in the configuration file api_keys.(api).model.
+
+4. round_robin: Round-robin load balancing, requests the channel that owns the model requested by the user according to the configuration order in the configuration file api_keys.(api).model. You can check the previous question on how to set the priority of channels.
 
 ## ⭐ Star History
 
