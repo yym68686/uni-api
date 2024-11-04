@@ -1015,7 +1015,7 @@ class ModelRequestHandler:
 
                 if status_code == 429:
                     current_api = await provider_api_circular_list[channel_id].after_next_current()
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooldown_period=safe_get(provider, "preferences", "API_KEY_COOLDOWN_PERIOD", default=60))
+                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=safe_get(provider, "preferences", "API_KEY_COOLDOWN_PERIOD", default=60))
 
                 logger.error(f"Error {status_code} with provider {channel_id}: {error_message}")
                 if is_debug:
@@ -1045,13 +1045,13 @@ async def rate_limit_dependency(request: Request, credentials: HTTPAuthorization
         print("error: Invalid or missing API Key:", token)
         api_index = None
         token = None
-    limit, period = await get_user_rate_limit(app, api_index)
 
     # 使用 IP 地址和 token（如果有）作为限制键
     client_ip = request.client.host
     rate_limit_key = f"{client_ip}:{token}" if token else client_ip
 
-    if await rate_limiter.is_rate_limited(rate_limit_key, limit, period):
+    limits = await get_user_rate_limit(app, api_index)
+    if await rate_limiter.is_rate_limited(rate_limit_key, limits):
         raise HTTPException(status_code=429, detail="Too many requests")
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -1315,13 +1315,13 @@ async def get_api_key(request: Request, x_api_key: Optional[str] = Depends(api_k
 
 async def frontend_rate_limit_dependency(request: Request, x_api_key: str = Depends(get_api_key)):
     token = x_api_key if x_api_key else None
-    limit, period = 100, 60
 
     # 使用 IP 地址和 token（如果有）作为限制键
     client_ip = request.client.host
     rate_limit_key = f"{client_ip}:{token}" if token else client_ip
 
-    if await rate_limiter.is_rate_limited(rate_limit_key, limit, period):
+    limits = [(100, 60)]
+    if await rate_limiter.is_rate_limited(rate_limit_key, limits):
         raise HTTPException(status_code=429, detail="Too many requests")
 
 # def get_backend_router_api_list():

@@ -17,32 +17,47 @@ def parse_rate_limit(limit_string):
         'y': 31536000, 'year': 31536000
     }
 
-    # 使用正则表达式匹配数字和单位
-    match = re.match(r'^(\d+)/(\w+)$', limit_string)
-    if not match:
-        raise ValueError(f"Invalid rate limit format: {limit_string}")
+    # 处理多个限制条件
+    limits = []
+    for limit in limit_string.split(','):
+        limit = limit.strip()
+        # 使用正则表达式匹配数字和单位
+        match = re.match(r'^(\d+)/(\w+)$', limit)
+        if not match:
+            raise ValueError(f"Invalid rate limit format: {limit}")
 
-    count, unit = match.groups()
-    count = int(count)
+        count, unit = match.groups()
+        count = int(count)
 
-    # 转换单位到秒
-    if unit not in time_units:
-        raise ValueError(f"Unknown time unit: {unit}")
+        # 转换单位到秒
+        if unit not in time_units:
+            raise ValueError(f"Unknown time unit: {unit}")
 
-    seconds = time_units[unit]
+        seconds = time_units[unit]
+        limits.append((count, seconds))
 
-    return (count, seconds)
+    return limits
 
 from collections import defaultdict
 class InMemoryRateLimiter:
     def __init__(self):
         self.requests = defaultdict(list)
 
-    async def is_rate_limited(self, key: str, limit: int, period: int) -> bool:
+    async def is_rate_limited(self, key: str, limits) -> bool:
         now = time()
-        self.requests[key] = [req for req in self.requests[key] if req > now - period]
-        if len(self.requests[key]) >= limit:
-            return True
+
+        # 检查所有速率限制条件
+        for limit, period in limits:
+            # 计算在当前时间窗口内的请求数量
+            recent_requests = sum(1 for req in self.requests[key] if req > now - period)
+            if recent_requests >= limit:
+                return True
+
+        # 清理太旧的请求记录（比最长时间窗口还要老的记录）
+        max_period = max(period for _, period in limits)
+        self.requests[key] = [req for req in self.requests[key] if req > now - max_period]
+
+        # 记录新的请求
         self.requests[key].append(now)
         return False
 
@@ -70,10 +85,8 @@ class ThreadSafeCircularList:
         self.index = 0
         self.lock = asyncio.Lock()
         self.requests = defaultdict(list)  # 用于追踪每个 API key 的请求时间
-        self.cooling_until = defaultdict(float)  # 记录每个 item 的冷却结束时间
-        count, period = parse_rate_limit(rate_limit)
-        self.rate_limit = count
-        self.period = period
+        self.cooling_until = defaultdict(float)
+        self.rate_limits = parse_rate_limit(rate_limit)  # 现在返回一个限制条件列表
 
     async def set_cooling(self, item: str, cooling_time: int = 60):
         """设置某个 item 进入冷却状态
@@ -86,7 +99,7 @@ class ThreadSafeCircularList:
         async with self.lock:
             self.cooling_until[item] = now + cooling_time
             # 清空该 item 的请求记录
-            self.requests[item] = []
+            # self.requests[item] = []
             logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
 
     async def is_rate_limited(self, item) -> bool:
@@ -95,9 +108,19 @@ class ThreadSafeCircularList:
         if now < self.cooling_until[item]:
             return True
 
-        self.requests[item] = [req for req in self.requests[item] if req > now - self.period]
-        if len(self.requests[item]) >= self.rate_limit:
-            return True
+        # 检查所有速率限制条件
+        for limit_count, limit_period in self.rate_limits:
+            # 计算在当前时间窗口内的请求数量，而不是直接修改请求列表
+            recent_requests = sum(1 for req in self.requests[item] if req > now - limit_period)
+            if recent_requests >= limit_count:
+                logger.warning(f"API key {item} 已达到速率限制 ({limit_count}/{limit_period}秒)")
+                return True
+
+        # 清理太旧的请求记录（比最长时间窗口还要老的记录）
+        max_period = max(period for _, period in self.rate_limits)
+        self.requests[item] = [req for req in self.requests[item] if req > now - max_period]
+
+        # 所有限制条件都通过，记录新的请求
         self.requests[item].append(now)
         return False
 
@@ -111,12 +134,10 @@ class ThreadSafeCircularList:
                 if not await self.is_rate_limited(item):
                     return item
 
-                logger.warning(f"API key {item} 已达到速率限制 ({self.rate_limit}/{self.period}秒)")
-
                 # 如果已经检查了所有的 API key 都被限制
                 if self.index == start_index:
-                    logger.warning(f"所有 API key 都已达到速率限制 ({self.rate_limit}/{self.period}秒)")
-                    return None
+                    logger.warning(f"All API keys are rate limited!")
+                    raise HTTPException(status_code=429, detail="Too many requests")
 
     async def after_next_current(self):
         # 返回当前取出的 API，因为已经调用了 next，所以当前API应该是上一个

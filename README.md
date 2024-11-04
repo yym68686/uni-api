@@ -91,6 +91,7 @@ providers:
     tools: true
     preferences:
       API_KEY_RATE_LIMIT: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min.
+      # API_KEY_RATE_LIMIT: 15/min,10/day # Supports multiple frequency constraints
       API_KEY_COOLDOWN_PERIOD: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 60 seconds.
 
   - provider: vertex
@@ -142,6 +143,7 @@ api_keys:
       # When SCHEDULING_ALGORITHM is round_robin, use polling load balancing, request the channel of the model used by the user in order.
       AUTO_RETRY: true # Whether to automatically retry, automatically retry the next provider, true for automatic retry, false for no automatic retry, default is true
       RATE_LIMIT: 2/min # Supports rate limiting, maximum number of requests per minute, can be set to an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min, optional
+      # RATE_LIMIT: 2/min,10/day # Supports multiple frequency constraints
       ENABLE_MODERATION: true # Whether to enable message moderation, true for enable, false for disable, default is false, when enabled, it will moderate the user's message, if inappropriate messages are found, an error message will be returned.
 
   # Channel-level weighted load balancing configuration example
