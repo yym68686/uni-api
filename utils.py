@@ -3,21 +3,134 @@ from fastapi import HTTPException
 import httpx
 
 from log_config import logger
+
+import re
+from time import time
+def parse_rate_limit(limit_string):
+    # 定义时间单位到秒的映射
+    time_units = {
+        's': 1, 'sec': 1, 'second': 1,
+        'm': 60, 'min': 60, 'minute': 60,
+        'h': 3600, 'hr': 3600, 'hour': 3600,
+        'd': 86400, 'day': 86400,
+        'mo': 2592000, 'month': 2592000,
+        'y': 31536000, 'year': 31536000
+    }
+
+    # 使用正则表达式匹配数字和单位
+    match = re.match(r'^(\d+)/(\w+)$', limit_string)
+    if not match:
+        raise ValueError(f"Invalid rate limit format: {limit_string}")
+
+    count, unit = match.groups()
+    count = int(count)
+
+    # 转换单位到秒
+    if unit not in time_units:
+        raise ValueError(f"Unknown time unit: {unit}")
+
+    seconds = time_units[unit]
+
+    return (count, seconds)
+
 from collections import defaultdict
+class InMemoryRateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+
+    async def is_rate_limited(self, key: str, limit: int, period: int) -> bool:
+        now = time()
+        self.requests[key] = [req for req in self.requests[key] if req > now - period]
+        if len(self.requests[key]) >= limit:
+            return True
+        self.requests[key].append(now)
+        return False
+
+rate_limiter = InMemoryRateLimiter()
+
+async def get_user_rate_limit(app, api_index: str = None):
+    # 这里应该实现根据 token 获取用户速率限制的逻辑
+    # 示例： 返回 (次数， 秒数)
+    config = app.state.config
+    raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
+    # print("raw_rate_limit", raw_rate_limit)
+    # print("not api_index or not raw_rate_limit", api_index == None, not raw_rate_limit, api_index == None or not raw_rate_limit, api_index, raw_rate_limit)
+
+    if api_index == None or not raw_rate_limit:
+        return (30, 60)
+
+    rate_limit = parse_rate_limit(raw_rate_limit)
+    return rate_limit
 
 import asyncio
 
 class ThreadSafeCircularList:
-    def __init__(self, items):
+    def __init__(self, items, rate_limit="99999/min"):
         self.items = items
         self.index = 0
         self.lock = asyncio.Lock()
+        self.requests = defaultdict(list)  # 用于追踪每个 API key 的请求时间
+        self.cooling_until = defaultdict(float)  # 记录每个 item 的冷却结束时间
+        count, period = parse_rate_limit(rate_limit)
+        self.rate_limit = count
+        self.period = period
+
+    async def set_cooling(self, item: str, cooling_time: int = 60):
+        """设置某个 item 进入冷却状态
+
+        Args:
+            item: 需要冷却的 item
+            cooling_time: 冷却时间(秒)，默认60秒
+        """
+        now = time()
+        async with self.lock:
+            self.cooling_until[item] = now + cooling_time
+            # 清空该 item 的请求记录
+            self.requests[item] = []
+            logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
+
+    async def is_rate_limited(self, item) -> bool:
+        now = time()
+        # 检查是否在冷却中
+        if now < self.cooling_until[item]:
+            return True
+
+        self.requests[item] = [req for req in self.requests[item] if req > now - self.period]
+        if len(self.requests[item]) >= self.rate_limit:
+            return True
+        self.requests[item].append(now)
+        return False
 
     async def next(self):
         async with self.lock:
-            item = self.items[self.index]
-            self.index = (self.index + 1) % len(self.items)
+            start_index = self.index
+            while True:
+                item = self.items[self.index]
+                self.index = (self.index + 1) % len(self.items)
+
+                if not await self.is_rate_limited(item):
+                    return item
+
+                logger.warning(f"API key {item} 已达到速率限制 ({self.rate_limit}/{self.period}秒)")
+
+                # 如果已经检查了所有的 API key 都被限制
+                if self.index == start_index:
+                    logger.warning(f"所有 API key 都已达到速率限制 ({self.rate_limit}/{self.period}秒)")
+                    return None
+
+    async def after_next_current(self):
+        # 返回当前取出的 API，因为已经调用了 next，所以当前API应该是上一个
+        async with self.lock:
+            item = self.items[(self.index - 1) % len(self.items)]
             return item
+
+    def get_items_count(self) -> int:
+        """返回列表中的项目数量
+
+        Returns:
+            int: items列表的长度
+        """
+        return len(self.items)
 
 def circular_list_encoder(obj):
     if isinstance(obj, ThreadSafeCircularList):
@@ -84,9 +197,15 @@ def update_config(config_data, use_config_url=False):
         provider_api = provider.get('api', None)
         if provider_api:
             if isinstance(provider_api, str):
-                provider_api_circular_list[provider['provider']] = ThreadSafeCircularList([provider_api])
+                provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
+                    [provider_api],
+                    safe_get(provider, "preferences", "API_KEY_RATE_LIMIT", default="999999/min")
+                )
             if isinstance(provider_api, list):
-                provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(provider_api)
+                provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
+                    provider_api,
+                    safe_get(provider, "preferences", "API_KEY_RATE_LIMIT", default="999999/min")
+                )
 
         if not provider.get("model"):
             model_list = update_initial_model(provider['base_url'], provider['api'])

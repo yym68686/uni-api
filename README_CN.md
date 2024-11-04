@@ -80,12 +80,18 @@ providers:
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url 支持 v1beta/v1, 仅供 Gemini 模型使用，必填
-    api: AIzaSyAN2k6IRdgw
+    api: # 支持多个 API Key，多个 key 自动开启轮训负载均衡，至少一个 key，必填
+      - AIzaSyAN2k6IRdgw123
+      - AIzaSyAN2k6IRdgw456
+      - AIzaSyAN2k6IRdgw789
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash-exp-0827: gemini-1.5-flash # 重命名后，原来的模型名字 gemini-1.5-flash-exp-0827 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
       - gemini-1.5-flash-exp-0827 # 加上这一行，gemini-1.5-flash-exp-0827 和 gemini-1.5-flash 都可以被请求
     tools: true
+    preferences:
+      API_KEY_RATE_LIMIT: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min
+      API_KEY_COOLDOWN_PERIOD: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 60 秒
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
@@ -337,6 +343,41 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 - 为什么总是出现 `Error processing request or performing moral check: 404: No matching model found` 错误？
 
 将 ENABLE_MODERATION 设置为 false 将修复这个问题。当 ENABLE_MODERATION 为 true 时，API 必须能够使用 text-moderation-latest 模型，如果你没有在提供商模型设置里面提供 text-moderation-latest，将会报错找不到模型。
+
+- 怎么优先请求某个渠道，怎么设置渠道的优先级？
+
+直接在api_keys里面通过设置渠道顺序即可。不需要做其他设置，示例配置文件：
+
+```yaml
+providers:
+  - provider: ai1
+    base_url: https://xxx/v1/chat/completions
+    api: sk-xxx
+
+  - provider: ai2
+    base_url: https://xxx/v1/chat/completions
+    api: sk-xxx
+
+api_keys:
+  - api: sk-1234
+    model:
+      - ai2/*
+      - ai1/*
+```
+
+这样设置则先请求 ai2，失败后请求 ai1。
+
+- 各种调度算法背后的行为是怎样的？比如 fixed_priority，weighted_round_robin，lottery，random，round_robin？
+
+所有调度算法需要通过在配置文件的 api_keys.(api).preferences.SCHEDULING_ALGORITHM 设置为 fixed_priority，weighted_round_robin，lottery，random，round_robin 中的任意值来开启。
+
+1. fixed_priority：固定优先级调度。所有请求永远执行第一个拥有用户请求的模型的渠道。报错时，会切换下一个渠道。这是默认的调度算法。
+
+2. weighted_round_robin：加权轮训负载均衡，按照配置文件 api_keys.(api).model 设定的权重顺序请求拥有用户请求的模型的渠道。
+
+3. lottery：抽奖轮训负载均衡，按照配置文件 api_keys.(api).model 设置的权重随机请求拥有用户请求的模型的渠道。
+
+4. round_robin：轮训负载均衡，按照配置文件 api_keys.(api).model 的配置顺序请求拥有用户请求的模型的渠道。可以查看上一个问题，如何设置渠道的优先级。
 
 ## ⭐ Star 历史
 

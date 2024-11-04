@@ -1,6 +1,5 @@
 from log_config import logger
 
-import re
 import copy
 import httpx
 import secrets
@@ -19,7 +18,18 @@ from fastapi.exceptions import RequestValidationError
 from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest, EmbeddingRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
-from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder, get_model_dict, save_api_yaml
+from utils import (
+    safe_get,
+    load_config,
+    save_api_yaml,
+    get_model_dict,
+    post_all_models,
+    get_user_rate_limit,
+    circular_list_encoder,
+    error_handling_wrapper,
+    rate_limiter,
+    provider_api_circular_list,
+)
 
 from collections import defaultdict
 from typing import List, Dict, Union
@@ -542,6 +552,7 @@ class ClientManager:
     @asynccontextmanager
     async def get_client(self, timeout_value):
         # 直接获取或创建客户端,不使用锁
+        timeout_value = int(timeout_value)
         if timeout_value not in self.clients:
             timeout = httpx.Timeout(
                 connect=15.0,
@@ -558,8 +569,10 @@ class ClientManager:
         try:
             yield self.clients[timeout_value]
         except Exception as e:
-            await self.clients[timeout_value].aclose()
-            del self.clients[timeout_value]
+            if timeout_value in self.clients:
+                tmp_client = self.clients[timeout_value]
+                del self.clients[timeout_value]  # 先删除引用
+                await tmp_client.aclose()  # 然后关闭客户端
             raise e
 
     async def close(self):
@@ -955,8 +968,13 @@ class ModelRequestHandler:
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
 
         index = 0
+        if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
+            retry_count = count
+        else:
+            retry_count = 0
+
         while True:
-            if index >= num_matching_providers:
+            if index >= num_matching_providers + retry_count:
                 break
             current_index = (start_index + index) % num_matching_providers
             index += 1
@@ -995,6 +1013,10 @@ class ModelRequestHandler:
                     num_matching_providers = len(matching_providers)
                     index = 0
 
+                if status_code == 429:
+                    current_api = await provider_api_circular_list[channel_id].after_next_current()
+                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooldown_period=safe_get(provider, "preferences", "API_KEY_COOLDOWN_PERIOD", default=60))
+
                 logger.error(f"Error {status_code} with provider {channel_id}: {error_message}")
                 if is_debug:
                     import traceback
@@ -1012,59 +1034,6 @@ class ModelRequestHandler:
 
 model_handler = ModelRequestHandler()
 
-def parse_rate_limit(limit_string):
-    # 定义时间单位到秒的映射
-    time_units = {
-        's': 1, 'sec': 1, 'second': 1,
-        'm': 60, 'min': 60, 'minute': 60,
-        'h': 3600, 'hr': 3600, 'hour': 3600,
-        'd': 86400, 'day': 86400,
-        'mo': 2592000, 'month': 2592000,
-        'y': 31536000, 'year': 31536000
-    }
-
-    # 使用正则表达式匹配数字和单位
-    match = re.match(r'^(\d+)/(\w+)$', limit_string)
-    if not match:
-        raise ValueError(f"Invalid rate limit format: {limit_string}")
-
-    count, unit = match.groups()
-    count = int(count)
-
-    # 转换单位到秒
-    if unit not in time_units:
-        raise ValueError(f"Unknown time unit: {unit}")
-
-    seconds = time_units[unit]
-
-    return (count, seconds)
-
-class InMemoryRateLimiter:
-    def __init__(self):
-        self.requests = defaultdict(list)
-
-    async def is_rate_limited(self, key: str, limit: int, period: int) -> bool:
-        now = time()
-        self.requests[key] = [req for req in self.requests[key] if req > now - period]
-        if len(self.requests[key]) >= limit:
-            return True
-        self.requests[key].append(now)
-        return False
-
-rate_limiter = InMemoryRateLimiter()
-
-async def get_user_rate_limit(api_index: str = None):
-    # 这里应该实现根据 token 获取用户速率限制的逻辑
-    # 示例： 返回 (次数， 秒数)
-    config = app.state.config
-    raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
-
-    if not api_index or not raw_rate_limit:
-        return (30, 60)
-
-    rate_limit = parse_rate_limit(raw_rate_limit)
-    return rate_limit
-
 security = HTTPBearer()
 
 async def rate_limit_dependency(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -1076,7 +1045,7 @@ async def rate_limit_dependency(request: Request, credentials: HTTPAuthorization
         print("error: Invalid or missing API Key:", token)
         api_index = None
         token = None
-    limit, period = await get_user_rate_limit(api_index)
+    limit, period = await get_user_rate_limit(app, api_index)
 
     # 使用 IP 地址和 token（如果有）作为限制键
     client_ip = request.client.host
