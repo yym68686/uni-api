@@ -1013,9 +1013,11 @@ class ModelRequestHandler:
                     num_matching_providers = len(matching_providers)
                     index = 0
 
-                if status_code == 429:
+                cooling_time = safe_get(provider, "preferences", "API_KEY_COOLDOWN_PERIOD", default=0)
+                api_key_count = provider_api_circular_list[channel_id].get_items_count()
+                if cooling_time > 0 and api_key_count > 1:
                     current_api = await provider_api_circular_list[channel_id].after_next_current()
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=safe_get(provider, "preferences", "API_KEY_COOLDOWN_PERIOD", default=60))
+                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
 
                 logger.error(f"Error {status_code} with provider {channel_id}: {error_message}")
                 if is_debug:

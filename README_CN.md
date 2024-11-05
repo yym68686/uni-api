@@ -92,7 +92,7 @@ providers:
     preferences:
       API_KEY_RATE_LIMIT: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min
       # API_KEY_RATE_LIMIT: 15/min,10/day # 支持多个频率约束条件
-      API_KEY_COOLDOWN_PERIOD: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 60 秒
+      API_KEY_COOLDOWN_PERIOD: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
