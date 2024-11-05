@@ -195,7 +195,7 @@ yym68686/uni-api:latest
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
 
-After clicking the one-click deployment button, set the environment variable `CONFIG_URL` to the direct link of the configuration file, and set `DISABLE_DATABASE` to true, then click Create to create the project.
+After clicking the one-click deploy button above, set the environment variable `CONFIG_URL` to the direct link of the configuration file, `DISABLE_DATABASE` to true, and then click Create to create the project. After deployment, you need to manually set the Function Max Duration to 60 seconds in the Vercel project panel under Settings -> Functions, and then click the Deployments menu and click Redeploy to redeploy, which will set the timeout to 60 seconds. If you do not redeploy, the default timeout will remain at the original 10 seconds. Note that you should not delete the Vercel project and recreate it; instead, click redeploy in the Deployments menu within the currently deployed Vercel project to make the Function Max Duration modification take effect.
 
 ## Serv00 remote deployment
 
