@@ -3,8 +3,8 @@
     {
       "src": "main.py",
       "use": "@vercel/python",
-      "config": {
-        "maxDuration": 60
+      "functions": {
+        "main.py": { "maxDuration": 60 }
       }
     }
   ],
