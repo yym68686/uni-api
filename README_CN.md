@@ -90,9 +90,12 @@ providers:
       - gemini-1.5-flash-exp-0827 # 加上这一行，gemini-1.5-flash-exp-0827 和 gemini-1.5-flash 都可以被请求
     tools: true
     preferences:
-      API_KEY_RATE_LIMIT: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min
-      # API_KEY_RATE_LIMIT: 15/min,10/day # 支持多个频率约束条件
-      API_KEY_COOLDOWN_PERIOD: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。
+      api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day
+      # api_key_rate_limit: # 可以为每个模型设置不同的频率限制
+      #   gpt-4o: 3/min
+      #   chatgpt-4o-latest: 2/min
+      #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
+      api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。

@@ -655,20 +655,22 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         engine = "gpt"
 
     model_dict = get_model_dict(provider)
-    if "claude" not in model_dict[request.model] \
-    and "gpt" not in model_dict[request.model] \
-    and "gemini" not in model_dict[request.model] \
+    original_model = model_dict[request.model]
+
+    if "claude" not in original_model \
+    and "gpt" not in original_model \
+    and "gemini" not in original_model \
     and parsed_url.netloc != 'api.cloudflare.com' \
     and parsed_url.netloc != 'api.cohere.com':
         engine = "openrouter"
 
-    if "claude" in model_dict[request.model] and engine == "vertex":
+    if "claude" in original_model and engine == "vertex":
         engine = "vertex-claude"
 
-    if "gemini" in model_dict[request.model] and engine == "vertex":
+    if "gemini" in original_model and engine == "vertex":
         engine = "vertex-gemini"
 
-    if "o1-preview" in model_dict[request.model] or "o1-mini" in model_dict[request.model]:
+    if "o1-preview" in original_model or "o1-mini" in original_model:
         engine = "o1"
         request.stream = False
 
@@ -702,17 +704,16 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
 
     current_info = request_info.get()
-    model = model_dict[request.model]
 
     timeout_value = None
     # 先尝试精确匹配
 
-    if model in app.state.timeouts:
-        timeout_value = app.state.timeouts[model]
+    if original_model in app.state.timeouts:
+        timeout_value = app.state.timeouts[original_model]
     else:
         # 如果没有精确匹配，尝试模糊匹配
         for timeout_model in app.state.timeouts:
-            if timeout_model in model:
+            if timeout_model in original_model:
                 timeout_value = app.state.timeouts[timeout_model]
                 break
 
@@ -723,11 +724,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     try:
         async with app.state.client_manager.get_client(timeout_value) as client:
             if request.stream:
-                generator = fetch_response_stream(client, url, headers, payload, engine, model)
+                generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             else:
-                generator = fetch_response(client, url, headers, payload, engine, model)
+                generator = fetch_response(client, url, headers, payload, engine, original_model)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator)
                 first_element = await anext(wrapped_generator)
                 first_element = first_element.lstrip("data: ")
@@ -1013,7 +1014,7 @@ class ModelRequestHandler:
                     num_matching_providers = len(matching_providers)
                     index = 0
 
-                cooling_time = safe_get(provider, "preferences", "API_KEY_COOLDOWN_PERIOD", default=0)
+                cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
                 api_key_count = provider_api_circular_list[channel_id].get_items_count()
                 if cooling_time > 0 and api_key_count > 1:
                     current_api = await provider_api_circular_list[channel_id].after_next_current()

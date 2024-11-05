@@ -125,9 +125,9 @@ async def get_gemini_payload(request, engine, provider):
     gemini_stream = "streamGenerateContent"
     url = provider['base_url']
     if url.endswith("v1beta"):
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=await provider_api_circular_list[provider['provider']].next())
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=await provider_api_circular_list[provider['provider']].next(model))
     if url.endswith("v1"):
-        url = "https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=await provider_api_circular_list[provider['provider']].next())
+        url = "https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=await provider_api_circular_list[provider['provider']].next(model))
 
     messages = []
     systemInstruction = None
@@ -596,8 +596,10 @@ async def get_gpt_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json',
     }
+    model_dict = get_model_dict(provider)
+    model = model_dict[request.model]
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
     url = provider['base_url']
 
     messages = []
@@ -637,8 +639,6 @@ async def get_gpt_payload(request, engine, provider):
         else:
             messages.append({"role": msg.role, "content": content})
 
-    model_dict = get_model_dict(provider)
-    model = model_dict[request.model]
     payload = {
         "model": model,
         "messages": messages,
@@ -663,8 +663,10 @@ async def get_openrouter_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
     }
+    model_dict = get_model_dict(provider)
+    model = model_dict[request.model]
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
 
     url = provider['base_url']
 
@@ -696,8 +698,6 @@ async def get_openrouter_payload(request, engine, provider):
             else:
                 messages.append({"role": msg.role, "content": content})
 
-    model_dict = get_model_dict(provider)
-    model = model_dict[request.model]
     payload = {
         "model": model,
         "messages": messages,
@@ -730,8 +730,10 @@ async def get_cohere_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
     }
+    model_dict = get_model_dict(provider)
+    model = model_dict[request.model]
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
 
     url = provider['base_url']
 
@@ -759,8 +761,6 @@ async def get_cohere_payload(request, engine, provider):
         else:
             messages.append({"role": role_map[msg.role], "message": content})
 
-    model_dict = get_model_dict(provider)
-    model = model_dict[request.model]
     chat_history = messages[:-1]
     query = messages[-1].get("message")
     payload = {
@@ -798,11 +798,11 @@ async def get_cloudflare_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
     }
-    if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
-
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
+
     url = "https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/{cf_model_id}".format(cf_account_id=provider['cf_account_id'], cf_model_id=model)
 
     msg = request.messages[-1]
@@ -816,7 +816,6 @@ async def get_cloudflare_payload(request, engine, provider):
         content = msg.content
         name = msg.name
 
-    model = model_dict[request.model]
     payload = {
         "prompt": content,
     }
@@ -848,8 +847,10 @@ async def get_o1_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
     }
+    model_dict = get_model_dict(provider)
+    model = model_dict[request.model]
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
 
     url = provider['base_url']
 
@@ -871,8 +872,6 @@ async def get_o1_payload(request, engine, provider):
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
 
-    model_dict = get_model_dict(provider)
-    model = model_dict[request.model]
     payload = {
         "model": model,
         "messages": messages,
@@ -925,7 +924,7 @@ async def get_claude_payload(request, engine, provider):
     model = model_dict[request.model]
     headers = {
         "content-type": "application/json",
-        "x-api-key": f"{await provider_api_circular_list[provider['provider']].next()}",
+        "x-api-key": f"{await provider_api_circular_list[provider['provider']].next(model)}",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15" if "claude-3-5-sonnet" in model else "tools-2024-05-16",
     }
@@ -1068,7 +1067,7 @@ async def get_dalle_payload(request, engine, provider):
         "Content-Type": "application/json",
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
     url = provider['base_url']
     url = BaseAPI(url).image_url
 
@@ -1088,7 +1087,7 @@ async def get_whisper_payload(request, engine, provider):
         # "Content-Type": "multipart/form-data",
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
     url = provider['base_url']
     url = BaseAPI(url).audio_transcriptions
 
@@ -1115,7 +1114,7 @@ async def get_moderation_payload(request, engine, provider):
         "Content-Type": "application/json",
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
     url = provider['base_url']
     url = BaseAPI(url).moderations
 
@@ -1132,7 +1131,7 @@ async def get_embedding_payload(request, engine, provider):
         "Content-Type": "application/json",
     }
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next()}"
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
     url = provider['base_url']
     url = BaseAPI(url).embeddings
 
