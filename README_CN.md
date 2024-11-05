@@ -92,8 +92,8 @@ providers:
     preferences:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day
       # api_key_rate_limit: # 可以为每个模型设置不同的频率限制
-      #   gpt-4o: 3/min
-      #   chatgpt-4o-latest: 2/min
+      #   gemini-1.5-pro: 3/min
+      #   gemini-1.5-flash: 2/min
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
 

@@ -92,8 +92,8 @@ providers:
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
       # api_key_rate_limit: # You can set different frequency limits for each model
-      #   gpt-4o: 3/min
-      #   chatgpt-4o-latest: 2/min
+      #   gemini-1.5-pro: 3/min
+      #   gemini-1.5-flash: 2/min
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
 
