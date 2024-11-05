@@ -408,7 +408,14 @@ class StatsMiddleware(BaseHTTPMiddleware):
         if request.headers.get("x-api-key"):
             token = request.headers.get("x-api-key")
         elif request.headers.get("Authorization"):
-            token = request.headers.get("Authorization").split(" ")[1]
+            api_split_list = request.headers.get("Authorization").split(" ")
+            if len(api_split_list) > 1:
+                token = api_split_list[1]
+            else:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Invalid or missing API Key"}
+                )
         else:
             token = None
         if token:
@@ -1016,11 +1023,11 @@ class ModelRequestHandler:
 
                 cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
                 api_key_count = provider_api_circular_list[channel_id].get_items_count()
+                current_api = await provider_api_circular_list[channel_id].after_next_current()
                 if cooling_time > 0 and api_key_count > 1:
-                    current_api = await provider_api_circular_list[channel_id].after_next_current()
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
 
-                logger.error(f"Error {status_code} with provider {channel_id}: {error_message}")
+                logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()
