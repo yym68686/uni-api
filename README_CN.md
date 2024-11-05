@@ -384,6 +384,10 @@ api_keys:
 
 4. round_robin：轮训负载均衡，按照配置文件 api_keys.(api).model 的配置顺序请求拥有用户请求的模型的渠道。可以查看上一个问题，如何设置渠道的优先级。
 
+- 应该怎么正确填写 base_url？
+
+除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completion，而不是 Azure 的 URL。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
