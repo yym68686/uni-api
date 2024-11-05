@@ -80,13 +80,21 @@ async def get_user_rate_limit(app, api_index: str = None):
 import asyncio
 
 class ThreadSafeCircularList:
-    def __init__(self, items, rate_limit="99999/min"):
+    def __init__(self, items, rate_limit={"default": "999999/min"}):
         self.items = items
         self.index = 0
         self.lock = asyncio.Lock()
-        self.requests = defaultdict(list)  # 用于追踪每个 API key 的请求时间
+        # 修改为二级字典，第一级是item，第二级是model
+        self.requests = defaultdict(lambda: defaultdict(list))
         self.cooling_until = defaultdict(float)
-        self.rate_limits = parse_rate_limit(rate_limit)  # 现在返回一个限制条件列表
+        self.rate_limits = {}
+        if isinstance(rate_limit, dict):
+            for rate_limit_model, rate_limit_value in rate_limit.items():
+                self.rate_limits[rate_limit_model] = parse_rate_limit(rate_limit_value)
+        elif isinstance(rate_limit, str):
+            self.rate_limits["default"] = parse_rate_limit(rate_limit)
+        else:
+            logger.error(f"Error ThreadSafeCircularList: Unknown rate_limit type: {type(rate_limit)}, rate_limit: {rate_limit}")
 
     async def set_cooling(self, item: str, cooling_time: int = 60):
         """设置某个 item 进入冷却状态
@@ -102,36 +110,58 @@ class ThreadSafeCircularList:
             # self.requests[item] = []
             logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
 
-    async def is_rate_limited(self, item) -> bool:
+    async def is_rate_limited(self, item, model: str = None) -> bool:
         now = time()
         # 检查是否在冷却中
         if now < self.cooling_until[item]:
             return True
 
+        # 获取适用的速率限制
+
+        if model:
+            model_key = model
+        else:
+            model_key = "default"
+
+        rate_limit = None
+        # 先尝试精确匹配
+        if model and model in self.rate_limits:
+            rate_limit = self.rate_limits[model]
+        else:
+            # 如果没有精确匹配，尝试模糊匹配
+            for limit_model in self.rate_limits:
+                if limit_model != "default" and model and limit_model in model:
+                    rate_limit = self.rate_limits[limit_model]
+                    break
+
+        # 如果都没匹配到，使用默认值
+        if rate_limit is None:
+            rate_limit = self.rate_limits.get("default", [(999999, 60)])  # 默认限制
+
         # 检查所有速率限制条件
-        for limit_count, limit_period in self.rate_limits:
-            # 计算在当前时间窗口内的请求数量，而不是直接修改请求列表
-            recent_requests = sum(1 for req in self.requests[item] if req > now - limit_period)
+        for limit_count, limit_period in rate_limit:
+            # 使用特定模型的请求记录进行计算
+            recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
             if recent_requests >= limit_count:
-                logger.warning(f"API key {item} 已达到速率限制 ({limit_count}/{limit_period}秒)")
+                logger.warning(f"API key {item} 对模型 {model_key} 已达到速率限制 ({limit_count}/{limit_period}秒)")
                 return True
 
-        # 清理太旧的请求记录（比最长时间窗口还要老的记录）
-        max_period = max(period for _, period in self.rate_limits)
-        self.requests[item] = [req for req in self.requests[item] if req > now - max_period]
+        # 清理太旧的请求记录
+        max_period = max(period for _, period in rate_limit)
+        self.requests[item][model_key] = [req for req in self.requests[item][model_key] if req > now - max_period]
 
-        # 所有限制条件都通过，记录新的请求
-        self.requests[item].append(now)
+        # 记录新的请求
+        self.requests[item][model_key].append(now)
         return False
 
-    async def next(self):
+    async def next(self, model: str = None):
         async with self.lock:
             start_index = self.index
             while True:
                 item = self.items[self.index]
                 self.index = (self.index + 1) % len(self.items)
 
-                if not await self.is_rate_limited(item):
+                if not await self.is_rate_limited(item, model):
                     return item
 
                 # 如果已经检查了所有的 API key 都被限制
@@ -220,12 +250,12 @@ def update_config(config_data, use_config_url=False):
             if isinstance(provider_api, str):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     [provider_api],
-                    safe_get(provider, "preferences", "API_KEY_RATE_LIMIT", default="999999/min")
+                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"})
                 )
             if isinstance(provider_api, list):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     provider_api,
-                    safe_get(provider, "preferences", "API_KEY_RATE_LIMIT", default="999999/min")
+                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"})
                 )
 
         if not provider.get("model"):
