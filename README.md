@@ -384,6 +384,10 @@ All scheduling algorithms need to be enabled by setting api_keys.(api).preferenc
 
 4. round_robin: Round-robin load balancing, requests the channel that owns the model requested by the user according to the configuration order in the configuration file api_keys.(api).model. You can check the previous question on how to set the priority of channels.
 
+- How should the base_url be filled in correctly?
+
+Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completion, not Azure's URL.
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
