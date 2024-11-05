@@ -195,7 +195,7 @@ yym68686/uni-api:latest
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
 
-点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链， `DISABLE_DATABASE` 为 true，然后点击 Create 创建项目。
+点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链， `DISABLE_DATABASE` 为 true，然后点击 Create 创建项目。部署完之后需要手动在 vercel 项目面板的 Settings -> Funcitons -> Function Max Duration 设置为 60 秒，然后点击 Deployments 菜单点击 Redeploy 重新部署，即可将超时时间设置为 60 秒，如果不重新部署，默认超时时间将是原来的 10 秒。注意不是删掉 vercel 项目重建，而是在当前部署好的 vercel 项目里面的 Deployments 菜单里面点 redeploy，这样才能让 Function Max Duration 的修改生效。
 
 ## serv00 远程部署
 
