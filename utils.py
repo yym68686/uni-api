@@ -205,9 +205,10 @@ def update_initial_model(api_url, api):
         endpoint_models_url = endpoint.v1_models
         if isinstance(api, list):
             api = api[0]
+        headers = {"Authorization": f"Bearer {api}"}
         response = httpx.get(
             endpoint_models_url,
-            headers={"Authorization": f"Bearer {api}"},
+            headers=headers,
         )
         models = response.json()
         if models.get("error"):
@@ -259,6 +260,16 @@ def update_config(config_data, use_config_url=False):
                     provider_api,
                     safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"})
                 )
+
+        if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
+            provider['model'] = [
+                "gpt-4o",
+                "gpt-4o-mini",
+                "o1-mini",
+                "o1-preview",
+                "text-embedding-3-small",
+                "text-embedding-3-large",
+            ]
 
         if not provider.get("model"):
             model_list = update_initial_model(provider['base_url'], provider['api'])
