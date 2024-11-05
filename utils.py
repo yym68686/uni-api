@@ -279,6 +279,7 @@ def update_config(config_data, use_config_url=False):
 
 # 读取YAML配置文件
 async def load_config(app=None):
+    import os
     try:
         with open(API_YAML_PATH, 'r', encoding='utf-8') as file:
             conf = yaml.load(file)
@@ -302,7 +303,6 @@ async def load_config(app=None):
     if config != {}:
         return config, api_keys_db, api_list
 
-    import os
     # 新增： 从环境变量获取配置URL并拉取配置
     config_url = os.environ.get('CONFIG_URL')
     if config_url:
