@@ -72,7 +72,7 @@ async def get_user_rate_limit(app, api_index: str = None):
     # print("not api_index or not raw_rate_limit", api_index == None, not raw_rate_limit, api_index == None or not raw_rate_limit, api_index, raw_rate_limit)
 
     if api_index == None or not raw_rate_limit:
-        return (30, 60)
+        return [(30, 60)]
 
     rate_limit = parse_rate_limit(raw_rate_limit)
     return rate_limit
