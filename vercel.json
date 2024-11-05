@@ -1,19 +1,17 @@
 {
-    "builds": [
-      {
-        "src": "main.py",
-        "use": "@vercel/python"
-      }
-    ],
-    "routes": [
-      {
-        "src": "/(.*)",
-        "dest": "main.py"
-      }
-    ],
-    "functions": {
-      "main.py": {
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python",
+      "config": {
         "maxDuration": 60
       }
     }
-  }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "main.py"
+    }
+  ]
+}
