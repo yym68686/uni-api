@@ -620,7 +620,7 @@ async def ensure_config(request: Request, call_next):
             if "default" not in app.state.config['preferences'].get('model_timeout', {}):
                 app.state.timeouts["default"] = DEFAULT_TIMEOUT
 
-        print("app.state.timeouts", app.state.timeouts)
+        # print("app.state.timeouts", app.state.timeouts)
 
     if app and not hasattr(app.state, "channel_manager"):
         if app.state.config and 'preferences' in app.state.config:

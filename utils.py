@@ -289,7 +289,8 @@ async def load_config(app=None):
             logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
             config, api_keys_db, api_list = {}, {}, []
     except FileNotFoundError:
-        logger.error("'api.yaml' not found. Please check the file path.")
+        if not os.environ.get('CONFIG_URL'):
+            logger.error("'api.yaml' not found. Please check the file path.")
         config, api_keys_db, api_list = {}, {}, []
     except YAMLError as e:
         logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。%s", e)
