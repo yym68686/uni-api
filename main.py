@@ -879,7 +879,7 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
     matching_providers = get_matching_providers(request_model, config, api_index)
 
     if not matching_providers:
-        raise HTTPException(status_code=404, detail="No matching model found")
+        raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
 
     num_matching_providers = len(matching_providers)
     if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
@@ -947,10 +947,10 @@ class ModelRequestHandler:
         api_list = app.state.api_list
         api_index = api_list.index(token)
 
-        if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail="No matching model found")
-
         request_model = request.model
+        if not safe_get(config, 'api_keys', api_index, 'model'):
+            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
+
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
 
         matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
