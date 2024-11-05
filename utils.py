@@ -80,7 +80,7 @@ async def get_user_rate_limit(app, api_index: str = None):
 import asyncio
 
 class ThreadSafeCircularList:
-    def __init__(self, items, rate_limit={"default": "999999/min"}):
+    def __init__(self, items = [], rate_limit={"default": "999999/min"}):
         self.items = items
         self.index = 0
         self.lock = asyncio.Lock()
@@ -247,6 +247,8 @@ def update_config(config_data, use_config_url=False):
 
         provider_api = provider.get('api', None)
         if provider_api:
+            if isinstance(provider_api, int):
+                provider_api = str(provider_api)
             if isinstance(provider_api, str):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     [provider_api],
