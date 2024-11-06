@@ -1034,13 +1034,19 @@ class ModelRequestHandler:
                 if auto_retry:
                     continue
                 else:
-                    raise HTTPException(status_code=status_code, detail=f"Error: Current provider response failed: {error_message}")
+                    return JSONResponse(
+                        status_code=status_code,
+                        content={"error": f"Error: Current provider response failed: {error_message}"}
+                    )
 
         current_info = request_info.get()
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["provider"] = None
-        raise HTTPException(status_code=status_code, detail=f"All {request.model} error: {error_message}")
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": f"All {request.model} error: {error_message}"}
+        )
 
 model_handler = ModelRequestHandler()
 
