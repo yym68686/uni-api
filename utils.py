@@ -103,6 +103,8 @@ class ThreadSafeCircularList:
             item: 需要冷却的 item
             cooling_time: 冷却时间(秒)，默认60秒
         """
+        if item == None:
+            return
         now = time()
         async with self.lock:
             self.cooling_until[item] = now + cooling_time
@@ -171,6 +173,8 @@ class ThreadSafeCircularList:
 
     async def after_next_current(self):
         # 返回当前取出的 API，因为已经调用了 next，所以当前API应该是上一个
+        if len(self.items) == 0:
+            return None
         async with self.lock:
             item = self.items[(self.index - 1) % len(self.items)]
             return item
