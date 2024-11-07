@@ -13,20 +13,20 @@
 
 ## Introduction
 
-For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cohere, Groq, Cloudflare, DeepBricks, OpenRouter, and more.
+For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cohere, Groq, Cloudflare, OpenRouter, and more.
 
 ## ✨ Features
 
 - No front-end, pure configuration file to configure API channels. You can run your own API station just by writing a file, and the documentation has a detailed configuration guide, beginner-friendly.
-- Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, DeepBricks, OpenRouter, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
+- Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, OpenRouter, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
 - Simultaneously supports Anthropic, Gemini, Vertex AI, Cohere, Groq, Cloudflare. Vertex simultaneously supports Claude and Gemini API.
 - Support OpenAI, Anthropic, Gemini, Vertex native tool use function calls.
 - Support OpenAI, Anthropic, Gemini, Vertex native image recognition API.
 - Support four types of load balancing.
-1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
-2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
-3. Except for Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. It is not enabled by default and requires configuring `SCHEDULING_ALGORITHM` as `round_robin`.
-4. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
+  1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
+  2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
+  3. Except for Vertex region-level load balancing, all APIs support channel-level sequential load balancing, enhancing the immersive translation experience. It is not enabled by default and requires configuring `SCHEDULING_ALGORITHM` as `round_robin`.
+  4. Support automatic API key-level round-robin load balancing for multiple API Keys in a single channel.
 - Support automatic retry, when an API channel response fails, automatically retry the next API channel.
 - Support channel cooling: When an API channel response fails, the channel will automatically be excluded and cooled for a period of time, and requests to the channel will be stopped. After the cooling period ends, the model will automatically be restored until it fails again, at which point it will be cooled again.
 - Support fine-grained model timeout settings, allowing different timeout durations for each model.
@@ -48,7 +48,7 @@ You must fill in the configuration file in advance to start `uni-api`, and you m
 
 ```yaml
 providers:
-  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, can be any name, required
+  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, can be any name, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required, automatically uses base_url and api to get all available models through the /v1/models endpoint.
   # Multiple providers can be configured here, each provider can configure multiple API Keys, and each API Key can configure multiple models.
@@ -61,7 +61,7 @@ Detailed advanced configuration of `api.yaml`:
 
 ```yaml
 providers:
-  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, deepbricks, can be any name, required
+  - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, can be any name, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required
     model: # Optional, if model is not configured, all available models will be automatically obtained through base_url and api via the /v1/models endpoint.
@@ -96,6 +96,7 @@ providers:
       #   gemini-1.5-flash: 2/min
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
+      api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing.
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud project ID. Format: String, usually composed of lowercase letters, numbers, and hyphens. How to obtain: You can find your project ID in the project selector of the Google Cloud Console.

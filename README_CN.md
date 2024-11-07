@@ -13,12 +13,12 @@
 
 ## 介绍
 
-如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，有想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型API的项目，可以通过一个统一的API接口调用多个后端服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Cohere、Groq、Cloudflare、DeepBricks、OpenRouter 等。
+如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，又想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型 API 的项目，可以通过一个统一的API 接口调用多种不同提供商的服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Cohere、Groq、Cloudflare、OpenRouter 等。
 
 ## ✨ 特性
 
 - 无前端，纯配置文件配置 API 渠道。只要写一个文件就能运行起一个属于自己的 API 站，文档有详细的配置指南，小白友好。
-- 统一管理多个后端服务，支持 OpenAI、Deepseek、DeepBricks、OpenRouter 等其他 API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
+- 统一管理多个后端服务，支持 OpenAI、Deepseek、OpenRouter 等其他 API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
 - 同时支持 Anthropic、Gemini、Vertex AI、Cohere、Groq、Cloudflare。Vertex 同时支持 Claude 和 Gemini API。
 - 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
 - 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
@@ -48,7 +48,7 @@
 
 ```yaml
 providers:
-  - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
+  - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter，随便取名字，必填
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填，自动使用 base_url 和 api 通过 /v1/models 端点获取可用的所有模型。
   # 这里可以配置多个提供商，每个提供商可以配置多个 API Key，每个 API Key 可以配置多个模型。
@@ -61,7 +61,7 @@ api_keys:
 
 ```yaml
 providers:
-  - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter、deepbricks，随便取名字，必填
+  - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter，随便取名字，必填
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
     model: # 选填，如果不配置 model，会自动通过 base_url 和 api 通过 /v1/models 端点获取可用的所有模型。
@@ -96,6 +96,7 @@ providers:
       #   gemini-1.5-flash: 2/min
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
+      api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡。
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
