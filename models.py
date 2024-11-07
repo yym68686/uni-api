@@ -115,6 +115,8 @@ class EmbeddingRequest(BaseRequest):
     input: Union[str, List[Union[str, int, List[int]]]]  # 支持字符串或数组
     model: str
     encoding_format: Optional[str] = "float"
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
     stream: bool = False
 
 class AudioTranscriptionRequest(BaseRequest):
@@ -130,7 +132,7 @@ class AudioTranscriptionRequest(BaseRequest):
         arbitrary_types_allowed = True
 
 class ModerationRequest(BaseRequest):
-    input: str
+    input: Union[str, List[str]]
     model: Optional[str] = "text-moderation-latest"
     stream: bool = False
 
@@ -150,12 +152,12 @@ class UnifiedRequest(BaseModel):
             elif "file" in values:
                 values["data"] = AudioTranscriptionRequest(**values)
                 values["data"].request_type = "audio"
+            elif "text-embedding" in values.get("model", ""):
+                values["data"] = EmbeddingRequest(**values)
+                values["data"].request_type = "embedding"
             elif "input" in values:
                 values["data"] = ModerationRequest(**values)
                 values["data"].request_type = "moderation"
-            elif "input" in values:
-                values["data"] = EmbeddingRequest(**values)
-                values["data"].request_type = "embedding"
             else:
                 raise ValueError("无法确定请求类型")
         return values
