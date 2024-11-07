@@ -397,6 +397,8 @@ api_keys:
 
 渠道级别的超时设置优先级高于全局模型超时设置。优先级顺序：渠道级别模型超时设置 > 渠道级别默认超时设置 > 全局模型超时设置 > 全局默认超时设置 > 环境变量 TIMEOUT。
 
+通过调整模型超时时间，可以避免出现某些渠道请求超时报错的情况。如果你遇到 `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}` 错误，请尝试增加模型超时时间。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">

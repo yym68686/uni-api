@@ -397,6 +397,8 @@ Except for some special channels shown in the advanced configuration, all OpenAI
 
 The channel-level timeout setting has higher priority than the global model timeout setting. The priority order is: channel-level model timeout setting > channel-level default timeout setting > global model timeout setting > global default timeout setting > environment variable TIMEOUT.
 
+By adjusting the model timeout time, you can avoid the error of some channels timing out. If you encounter the error `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}`, please try to increase the model timeout time.
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
