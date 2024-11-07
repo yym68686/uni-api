@@ -405,7 +405,7 @@ def ensure_string(item):
 
 import asyncio
 import time as time_module
-async def error_handling_wrapper(generator):
+async def error_handling_wrapper(generator, channel_id):
     start_time = time_module.time()
     try:
         first_item = await generator.__anext__()
@@ -418,18 +418,18 @@ async def error_handling_wrapper(generator):
             if first_item_str.startswith("data:"):
                 first_item_str = first_item_str.lstrip("data: ")
             if first_item_str.startswith("[DONE]"):
-                logger.error("error_handling_wrapper [DONE]!")
+                logger.error(f"provider: {channel_id:<11} error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration
             if "The bot's usage is covered by the developer" in first_item_str:
-                logger.error("error const string: %s", first_item_str)
+                logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration
             if "process this request due to overload or policy" in first_item_str:
-                logger.error("error const string: %s", first_item_str)
+                logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration
             try:
                 first_item_str = json.loads(first_item_str)
             except json.JSONDecodeError:
-                logger.error("error_handling_wrapper JSONDecodeError!" + repr(first_item_str))
+                logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(first_item_str)}")
                 raise StopAsyncIteration
         if isinstance(first_item_str, dict) and 'error' in first_item_str:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
@@ -445,11 +445,11 @@ async def error_handling_wrapper(generator):
                     yield ensure_string(item)
             except asyncio.CancelledError:
                 # 客户端断开连接是正常行为，不需要记录错误日志
-                logger.debug("Stream cancelled by client")
+                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
                 return
             except (httpx.ReadError, httpx.RemoteProtocolError) as e:
                 # 只记录真正的网络错误
-                logger.error(f"Network error in new_generator: {e}")
+                logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
                 raise
 
         return new_generator(), first_response_time

@@ -706,7 +706,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if provider.get("engine"):
         engine = provider["engine"]
 
-    logger.info(f"provider: {provider['provider']:<11} model: {request.model:<22} engine: {engine}")
+    channel_id = f"{provider['provider']}"
+    logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
     if is_debug:
@@ -738,11 +739,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         async with app.state.client_manager.get_client(timeout_value) as client:
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             else:
                 generator = fetch_response(client, url, headers, payload, engine, original_model)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
                 first_element = await anext(wrapped_generator)
                 first_element = first_element.lstrip("data: ")
                 # print("first_element", first_element)
@@ -751,14 +752,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
                 # response = JSONResponse(first_element)
 
             # 更新成功计数和首次响应时间
-            await update_channel_stats(current_info["request_id"], provider['provider'], request.model, current_info["api_key"], success=True)
+            await update_channel_stats(current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True)
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
-            current_info["provider"] = provider['provider']
+            current_info["provider"] = channel_id
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
-        await update_channel_stats(current_info["request_id"], provider['provider'], request.model, current_info["api_key"], success=False)
+        await update_channel_stats(current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False)
         raise e
 
 def weighted_round_robin(weights):
