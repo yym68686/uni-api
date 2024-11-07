@@ -80,8 +80,16 @@ async def get_user_rate_limit(app, api_index: int = None):
 import asyncio
 
 class ThreadSafeCircularList:
-    def __init__(self, items = [], rate_limit={"default": "999999/min"}):
-        self.items = items
+    def __init__(self, items = [], rate_limit={"default": "999999/min"}, schedule_algorithm="round_robin"):
+        if schedule_algorithm == "random":
+            import random
+            self.items = random.sample(items, len(items))
+        elif schedule_algorithm == "round_robin":
+            self.items = items
+        else:
+            self.items = items
+            logger.warning(f"Unknown schedule algorithm: {schedule_algorithm}, use (round_robin, random) instead")
+
         self.index = 0
         self.lock = asyncio.Lock()
         # 修改为二级字典，第一级是item，第二级是model
@@ -260,12 +268,14 @@ def update_config(config_data, use_config_url=False):
             if isinstance(provider_api, str):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     [provider_api],
-                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"})
+                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
+                    safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin")
                 )
             if isinstance(provider_api, list):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     provider_api,
-                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"})
+                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
+                    safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin")
                 )
 
         if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
