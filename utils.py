@@ -573,23 +573,21 @@ class BaseAPI:
         self.source_api_url: str = api_url
         from urllib.parse import urlparse, urlunparse
         parsed_url = urlparse(self.source_api_url)
+        # print("parsed_url", parsed_url)
         if parsed_url.scheme == "":
             raise Exception("Error: API_URL is not set")
         if parsed_url.path != '/':
-            before_v1 = parsed_url.path.split("/v1")[0]
+            before_v1 = parsed_url.path.split("chat/completions")[0]
         else:
             before_v1 = ""
-        self.base_url: str = urlunparse(parsed_url[:2] + (before_v1,) + ("",) * 3)
-        self.v1_url: str = urlunparse(parsed_url[:2]+ (before_v1 + "/v1",) + ("",) * 3)
-        self.v1_models: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/models",) + ("",) * 3)
-        if parsed_url.netloc == "api.deepseek.com":
-            self.chat_url: str = urlunparse(parsed_url[:2] + ("/chat/completions",) + ("",) * 3)
-        else:
-            self.chat_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/chat/completions",) + ("",) * 3)
-        self.image_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/images/generations",) + ("",) * 3)
-        self.audio_transcriptions: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/audio/transcriptions",) + ("",) * 3)
-        self.moderations: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/moderations",) + ("",) * 3)
-        self.embeddings: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/embeddings",) + ("",) * 3)
+        self.base_url: str = urlunparse(parsed_url[:2] + ("",) + ("",) * 3)
+        self.v1_url: str = urlunparse(parsed_url[:2]+ (before_v1,) + ("",) * 3)
+        self.v1_models: str = urlunparse(parsed_url[:2] + (before_v1 + "models",) + ("",) * 3)
+        self.chat_url: str = urlunparse(parsed_url[:2] + (before_v1 + "chat/completions",) + ("",) * 3)
+        self.image_url: str = urlunparse(parsed_url[:2] + (before_v1 + "images/generations",) + ("",) * 3)
+        self.audio_transcriptions: str = urlunparse(parsed_url[:2] + (before_v1 + "audio/transcriptions",) + ("",) * 3)
+        self.moderations: str = urlunparse(parsed_url[:2] + (before_v1 + "moderations",) + ("",) * 3)
+        self.embeddings: str = urlunparse(parsed_url[:2] + (before_v1 + "embeddings",) + ("",) * 3)
 
 def safe_get(data, *keys, default=None):
     for key in keys:
