@@ -250,6 +250,9 @@ def update_config(config_data, use_config_url=False):
         if provider.get('cf_account_id'):
             provider['base_url'] = 'https://api.cloudflare.com/'
 
+        if isinstance(provider['provider'], int):
+            provider['provider'] = str(provider['provider'])
+
         provider_api = provider.get('api', None)
         if provider_api:
             if isinstance(provider_api, int):
@@ -440,7 +443,12 @@ async def error_handling_wrapper(generator):
             try:
                 async for item in generator:
                     yield ensure_string(item)
-            except (httpx.ReadError, asyncio.CancelledError, httpx.RemoteProtocolError) as e:
+            except asyncio.CancelledError:
+                # 客户端断开连接是正常行为，不需要记录错误日志
+                logger.debug("Stream cancelled by client")
+                return
+            except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+                # 只记录真正的网络错误
                 logger.error(f"Network error in new_generator: {e}")
                 raise
 

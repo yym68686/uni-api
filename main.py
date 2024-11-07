@@ -799,7 +799,7 @@ def lottery_scheduling(weights):
 def get_provider_rules(model_rule, config, request_model):
     provider_rules = []
     if model_rule == "all":
-        # 如���模型名为 all，则返回所有模型
+        # 如模型名为 all，则返回所有模型
         for provider in config["providers"]:
             model_dict = get_model_dict(provider)
             for model in model_dict.keys():
