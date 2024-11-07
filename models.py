@@ -112,7 +112,7 @@ class ImageGenerationRequest(BaseRequest):
     stream: bool = False
 
 class EmbeddingRequest(BaseRequest):
-    input: str
+    input: Union[str, List[Union[str, int, List[int]]]]  # 支持字符串或数组
     model: str
     encoding_format: Optional[str] = "float"
     stream: bool = False
