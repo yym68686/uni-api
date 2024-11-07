@@ -470,13 +470,23 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 model = request_model.model
                 current_info["model"] = model
 
+                moderated_content = None
                 if request_model.request_type == "chat":
                     moderated_content = request_model.get_last_text_message()
                 elif request_model.request_type == "image":
                     moderated_content = request_model.prompt
+                elif request_model.request_type == "moderation":
+                    pass
+                elif request_model.request_type == "embedding":
+                    if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
+                        moderated_content = "\n".join(request_model.input)
+                    else:
+                        moderated_content = request_model.input
+                else:
+                    logger.error(f"Unknown request type: {request_model.request_type}")
+
                 if moderated_content:
                     current_info["text"] = moderated_content
-
 
                 if enable_moderation and moderated_content:
                     moderation_response = await self.moderate_content(moderated_content, api_index)
