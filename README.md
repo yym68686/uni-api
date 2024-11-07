@@ -97,6 +97,10 @@ providers:
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
       api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing.
+      model_timeout: # Model timeout, in seconds, default 100 seconds, optional
+        gemini-1.5-pro: 10 # Model gemini-1.5-pro timeout is 10 seconds
+        gemini-1.5-flash: 10 # Model gemini-1.5-flash timeout is 10 seconds
+        default: 10 # Model does not have a timeout set, use the default timeout of 10 seconds, when requesting a model not in model_timeout, the timeout is also 10 seconds, if default is not set, uni-api will use the default timeout set by the environment variable TIMEOUT, the default timeout is 100 seconds
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud project ID. Format: String, usually composed of lowercase letters, numbers, and hyphens. How to obtain: You can find your project ID in the project selector of the Google Cloud Console.
@@ -388,6 +392,10 @@ All scheduling algorithms need to be enabled by setting api_keys.(api).preferenc
 - How should the base_url be filled in correctly?
 
 Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completion, not Azure's URL.
+
+- How does the model timeout time work? What is the priority of the channel-level timeout setting and the global model timeout setting?
+
+The channel-level timeout setting has higher priority than the global model timeout setting. The priority order is: channel-level model timeout setting > channel-level default timeout setting > global model timeout setting > global default timeout setting > environment variable TIMEOUT.
 
 ## ⭐ Star History
 

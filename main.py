@@ -39,7 +39,7 @@ import os
 import string
 import json
 
-DEFAULT_TIMEOUT = float(os.getenv("TIMEOUT", 100))
+DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
 is_debug = bool(os.getenv("DEBUG", False))
 # is_debug = False
 
@@ -643,7 +643,22 @@ async def ensure_config(request: Request, call_next):
             if "default" not in app.state.config['preferences'].get('model_timeout', {}):
                 app.state.timeouts["default"] = DEFAULT_TIMEOUT
 
-        # print("app.state.timeouts", app.state.timeouts)
+        app.state.provider_timeouts = defaultdict(lambda: defaultdict(lambda: DEFAULT_TIMEOUT))
+        for provider in app.state.config["providers"]:
+            # print("provider", provider)
+            provider_timeout_settings = safe_get(provider, "preferences", "model_timeout", default={})
+            # print("provider_timeout_settings", provider_timeout_settings)
+            if provider_timeout_settings:
+                for model_name, timeout_value in provider_timeout_settings.items():
+                    app.state.provider_timeouts[provider['provider']][model_name] = timeout_value
+
+        # app.state.provider_timeouts["global_time_out"] = app.state.timeouts
+        # provider_timeouts_dict = {
+        #     provider: dict(timeouts)
+        #     for provider, timeouts in app.state.provider_timeouts.items()
+        # }
+        # print("app.state.provider_timeouts", provider_timeouts_dict)
+        # print("ai" in app.state.provider_timeouts)
 
     if app and not hasattr(app.state, "channel_manager"):
         if app.state.config and 'preferences' in app.state.config:
@@ -654,6 +669,21 @@ async def ensure_config(request: Request, call_next):
         app.state.channel_manager = ChannelManager(cooldown_period=COOLDOWN_PERIOD)
 
     return await call_next(request)
+
+def get_timeout_value(provider_timeouts, original_model):
+    timeout_value = None
+    if original_model in provider_timeouts:
+        timeout_value = provider_timeouts[original_model]
+    else:
+        # 尝试模糊匹配模型
+        for timeout_model in provider_timeouts:
+            if timeout_model != "default" and timeout_model in original_model:
+                timeout_value = provider_timeouts[timeout_model]
+                break
+        else:
+            # 如果模糊匹配失败，使用渠道的默认值
+            timeout_value = provider_timeouts.get("default")
+    return timeout_value
 
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None):
@@ -729,21 +759,13 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     current_info = request_info.get()
 
-    timeout_value = None
-    # 先尝试精确匹配
-
-    if original_model in app.state.timeouts:
-        timeout_value = app.state.timeouts[original_model]
-    else:
-        # 如果没有精确匹配，尝试模糊匹配
-        for timeout_model in app.state.timeouts:
-            if timeout_model in original_model:
-                timeout_value = app.state.timeouts[timeout_model]
-                break
-
-    # 如果都没匹配到，使用默认值
+    provider_timeouts = safe_get(app.state.provider_timeouts, channel_id, default=app.state.provider_timeouts["global_time_out"])
+    timeout_value = get_timeout_value(provider_timeouts, original_model)
+    if timeout_value is None:
+        timeout_value = get_timeout_value(app.state.provider_timeouts["global_time_out"], original_model)
     if timeout_value is None:
         timeout_value = app.state.timeouts.get("default", DEFAULT_TIMEOUT)
+    print("timeout_value", timeout_value)
 
     try:
         async with app.state.client_manager.get_client(timeout_value) as client:

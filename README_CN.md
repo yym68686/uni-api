@@ -97,6 +97,10 @@ providers:
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
       api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡。
+      model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
+        gemini-1.5-pro: 10 # 模型 gemini-1.5-pro 的超时时间为 10 秒
+        gemini-1.5-flash: 10 # 模型 gemini-1.5-flash 的超时时间为 10 秒
+        default: 10 # 模型没有设置超时时间，使用默认的超时时间 10 秒，当请求的不在 model_timeout 里面的模型时，超时时间默认是 10 秒，不设置 default，uni-api 会使用全局配置的模型超时时间。
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
@@ -388,6 +392,10 @@ api_keys:
 - 应该怎么正确填写 base_url？
 
 除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completion，而不是 Azure 的 URL。
+
+- 模型超时时间是如何确认的？渠道级别的超时设置和全局模型超时设置的优先级是什么？
+
+渠道级别的超时设置优先级高于全局模型超时设置。优先级顺序：渠道级别模型超时设置 > 渠道级别默认超时设置 > 全局模型超时设置 > 全局默认超时设置 > 环境变量 TIMEOUT。
 
 ## ⭐ Star 历史
 
