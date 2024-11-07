@@ -63,7 +63,7 @@ class InMemoryRateLimiter:
 
 rate_limiter = InMemoryRateLimiter()
 
-async def get_user_rate_limit(app, api_index: str = None):
+async def get_user_rate_limit(app, api_index: int = None):
     # 这里应该实现根据 token 获取用户速率限制的逻辑
     # 示例： 返回 (次数， 秒数)
     config = app.state.config
@@ -457,13 +457,10 @@ async def error_handling_wrapper(generator):
     except StopAsyncIteration:
         raise HTTPException(status_code=400, detail="data: {'error': 'No data returned'}")
 
-def post_all_models(token, config, api_list):
+def post_all_models(api_index, config):
     all_models = []
     unique_models = set()
 
-    if token not in api_list:
-        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-    api_index = api_list.index(token)
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
             if model == "all":
