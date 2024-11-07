@@ -418,14 +418,20 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 )
         else:
             token = None
+
+        api_index = None
         if token:
             try:
                 api_list = app.state.api_list
                 api_index = api_list.index(token)
-                enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
             except ValueError:
+                # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
+                api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
                 # token不在api_list中，使用默认值（不开启）
                 pass
+
+            if api_index is not None:
+                enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
         else:
             # 如果token为None，检查全局设置
             enable_moderation = config.get('ENABLE_MODERATION', False)
@@ -473,7 +479,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
 
                 if enable_moderation and moderated_content:
-                    moderation_response = await self.moderate_content(moderated_content, token)
+                    moderation_response = await self.moderate_content(moderated_content, api_index)
                     is_flagged = moderation_response.get('results', [{}])[0].get('flagged', False)
 
                     if is_flagged:
@@ -518,11 +524,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
             # print("current_request_info", current_request_info)
             request_info.reset(current_request_info)
 
-    async def moderate_content(self, content, token):
+    async def moderate_content(self, content, api_index):
         moderation_request = ModerationRequest(input=content)
 
         # 直接调用 moderations 函数
-        response = await moderations(moderation_request, token)
+        response = await moderations(moderation_request, api_index)
 
         # 读取流式响应的内容
         moderation_result = b""
@@ -640,7 +646,7 @@ async def ensure_config(request: Request, call_next):
     return await call_next(request)
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, token=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
@@ -745,17 +751,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
                 # response = JSONResponse(first_element)
 
             # 更新成功计数和首次响应时间
-            await update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
-            # await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=True)
+            await update_channel_stats(current_info["request_id"], provider['provider'], request.model, current_info["api_key"], success=True)
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
             current_info["provider"] = provider['provider']
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
-        await update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=False)
-        # await app.middleware_stack.app.update_channel_stats(current_info["request_id"], provider['provider'], request.model, token, success=False)
-
+        await update_channel_stats(current_info["request_id"], provider['provider'], request.model, current_info["api_key"], success=False)
         raise e
 
 def weighted_round_robin(weights):
@@ -950,11 +953,8 @@ class ModelRequestHandler:
         self.last_provider_indices = defaultdict(lambda: -1)
         self.locks = defaultdict(asyncio.Lock)
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], token: str, endpoint=None):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], api_index: int = None, endpoint=None):
         config = app.state.config
-        api_list = app.state.api_list
-        api_index = api_list.index(token)
-
         request_model = request.model
         if not safe_get(config, 'api_keys', api_index, 'model'):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
@@ -988,7 +988,7 @@ class ModelRequestHandler:
             index += 1
             provider = matching_providers[current_index]
             try:
-                response = await process_request(request, provider, endpoint, token)
+                response = await process_request(request, provider, endpoint)
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
 
@@ -1058,9 +1058,12 @@ async def rate_limit_dependency(request: Request, credentials: HTTPAuthorization
     try:
         api_index = api_list.index(token)
     except ValueError:
-        print("error: Invalid or missing API Key:", token)
-        api_index = None
-        token = None
+        # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
+        api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+        if api_index is None:
+            print("error: Invalid or missing API Key:", token)
+            api_index = None
+            token = None
 
     # 使用 IP 地址和 token（如果有）作为限制键
     client_ip = request.client.host
@@ -1073,32 +1076,44 @@ async def rate_limit_dependency(request: Request, credentials: HTTPAuthorization
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
     token = credentials.credentials
-    if token not in api_list:
+    api_index = None
+    try:
+        api_index = api_list.index(token)
+    except ValueError:
+        # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
+        api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+    if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-    return token
+    return api_index
 
 def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
     token = credentials.credentials
-    if token not in api_list:
+    api_index = None
+    try:
+        api_index = api_list.index(token)
+    except ValueError:
+        # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
+        api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+    if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-    for api_key in app.state.api_keys_db:
-        if api_key['api'] == token:
-            if api_key.get('role') != "admin":
-                raise HTTPException(status_code=403, detail="Permission denied")
+    # for api_key in app.state.api_keys_db:
+    #     if token.startswith(api_key['api']):
+    if app.state.api_keys_db[api_index].get('role') != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: RequestModel, token: str = Depends(verify_api_key)):
-    return await model_handler.request_model(request, token)
+async def request_model(request: RequestModel, api_index: int = Depends(verify_api_key)):
+    return await model_handler.request_model(request, api_index)
 
 @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
 @app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
-async def list_models(token: str = Depends(verify_api_key)):
-    models = post_all_models(token, app.state.config, app.state.api_list)
+async def list_models(api_index: int = Depends(verify_api_key)):
+    models = post_all_models(api_index, app.state.config)
     return JSONResponse(content={
         "object": "list",
         "data": models
@@ -1107,23 +1122,23 @@ async def list_models(token: str = Depends(verify_api_key)):
 @app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
 async def images_generations(
     request: ImageGenerationRequest,
-    token: str = Depends(verify_api_key)
+    api_index: int = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
+    return await model_handler.request_model(request, api_index, endpoint="/v1/images/generations")
 
 @app.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
 async def embeddings(
     request: EmbeddingRequest,
-    token: str = Depends(verify_api_key)
+    api_index: int = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, token, endpoint="/v1/embeddings")
+    return await model_handler.request_model(request, api_index, endpoint="/v1/embeddings")
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(
     request: ModerationRequest,
-    token: str = Depends(verify_api_key)
+    api_index: int = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, token, endpoint="/v1/moderations")
+    return await model_handler.request_model(request, api_index, endpoint="/v1/moderations")
 
 from fastapi import UploadFile, File, Form, HTTPException
 import io
@@ -1131,7 +1146,7 @@ import io
 async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str = Form(...),
-    token: str = Depends(verify_api_key)
+    api_index: int = Depends(verify_api_key)
 ):
     try:
         # 读取上传的文件内容
@@ -1144,7 +1159,7 @@ async def audio_transcriptions(
             model=model
         )
 
-        return await model_handler.request_model(request, token, endpoint="/v1/audio/transcriptions")
+        return await model_handler.request_model(request, api_index, endpoint="/v1/audio/transcriptions")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Invalid audio file encoding")
     except Exception as e:
