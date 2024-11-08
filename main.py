@@ -765,7 +765,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         timeout_value = get_timeout_value(app.state.provider_timeouts["global_time_out"], original_model)
     if timeout_value is None:
         timeout_value = app.state.timeouts.get("default", DEFAULT_TIMEOUT)
-    print("timeout_value", timeout_value)
+    # print("timeout_value", timeout_value)
 
     try:
         async with app.state.client_manager.get_client(timeout_value) as client:

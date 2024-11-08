@@ -77,7 +77,7 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
     return json_data
 
 async def check_response(response, error_log):
-    if response and response.status_code != 200:
+    if response and not (200 <= response.status_code < 300):
         error_message = await response.aread()
         error_str = error_message.decode('utf-8', errors='replace')
         try:
