@@ -652,7 +652,8 @@ async def ensure_config(request: Request, call_next):
                 for model_name, timeout_value in provider_timeout_settings.items():
                     app.state.provider_timeouts[provider['provider']][model_name] = timeout_value
 
-        # app.state.provider_timeouts["global_time_out"] = app.state.timeouts
+        app.state.provider_timeouts["global_time_out"] = app.state.timeouts
+
         # provider_timeouts_dict = {
         #     provider: dict(timeouts)
         #     for provider, timeouts in app.state.provider_timeouts.items()
