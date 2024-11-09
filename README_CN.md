@@ -399,6 +399,27 @@ api_keys:
 
 通过调整模型超时时间，可以避免出现某些渠道请求超时报错的情况。如果你遇到 `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}` 错误，请尝试增加模型超时时间。
 
+- api_key_rate_limit 是怎么工作的？我如何给多个模型设置相同的频率限制？
+
+如果你想同时给 gemini-1.5-pro-latest，gemini-1.5-pro，gemini-1.5-pro-001，gemini-1.5-pro-002 这四个模型设置相同的频率限制，可以这样设置：
+
+```yaml
+api_key_rate_limit:
+  gemini-1.5-pro: 1000/min
+```
+
+这会匹配所有含有 gemini-1.5-pro 字符串的模型。gemini-1.5-pro-latest，gemini-1.5-pro，gemini-1.5-pro-001，gemini-1.5-pro-002 这四个模型频率限制都会设置为 1000/min。api_key_rate_limit 字段配置的逻辑如下，这是一个示例配置文件：
+
+```yaml
+api_key_rate_limit:
+  gemini-1.5-pro: 1000/min
+  gemini-1.5-pro-002: 500/min
+```
+
+此时如果有一个使用模型 gemini-1.5-pro-002 的请求。
+
+首先，uni-api 会尝试精确匹配 api_key_rate_limit 的模型。如果刚好设置了 gemini-1.5-pro-002 的频率限制，则 gemini-1.5-pro-002 的频率限制则为 500/min，如果此时请求的模型不是 gemini-1.5-pro-002，而是 gemini-1.5-pro-latest，由于 api_key_rate_limit 没有设置 gemini-1.5-pro-latest 的频率限制，因此会寻找有没有前缀和 gemini-1.5-pro-latest 相同的模型被设置了，因此 gemini-1.5-pro-latest 的频率限制会被设置为 1000/min。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">

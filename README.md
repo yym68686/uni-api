@@ -399,6 +399,27 @@ The channel-level timeout setting has higher priority than the global model time
 
 By adjusting the model timeout time, you can avoid the error of some channels timing out. If you encounter the error `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}`, please try to increase the model timeout time.
 
+- How does api_key_rate_limit work? How do I set the same rate limit for multiple models?
+
+If you want to set the same frequency limit for the four models gemini-1.5-pro-latest, gemini-1.5-pro, gemini-1.5-pro-001, gemini-1.5-pro-002 simultaneously, you can set it like this:
+
+```yaml
+api_key_rate_limit:
+  gemini-1.5-pro: 1000/min
+```
+
+This will match all models containing the gemini-1.5-pro string. The frequency limit for these four models, gemini-1.5-pro-latest, gemini-1.5-pro, gemini-1.5-pro-001, gemini-1.5-pro-002, will all be set to 1000/min. The logic for configuring the api_key_rate_limit field is as follows, here is a sample configuration file:
+
+```yaml
+api_key_rate_limit:
+  gemini-1.5-pro: 1000/min
+  gemini-1.5-pro-002: 500/min
+```
+
+At this time, if there is a request using the model gemini-1.5-pro-002.
+
+First, the uni-api will attempt to precisely match the model in the api_key_rate_limit. If the rate limit for gemini-1.5-pro-002 is set, then the rate limit for gemini-1.5-pro-002 is 500/min. If the requested model at this time is not gemini-1.5-pro-002, but gemini-1.5-pro-latest, since the api_key_rate_limit does not have a rate limit set for gemini-1.5-pro-latest, it will look for any model with the same prefix as gemini-1.5-pro-latest that has been set, thus the rate limit for gemini-1.5-pro-latest will be set to 1000/min.
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
