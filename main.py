@@ -282,40 +282,67 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal
     # 返回精确到15位小数的结果
     return total_cost.quantize(Decimal('0.000000000000001'))
 
+from asyncio import Semaphore
+
+# 创建一个信号量来控制数据库访问
+db_semaphore = Semaphore(1)  # 限制同时只有1个写入操作
+
 async def update_stats(current_info):
     if DISABLE_DATABASE:
         return
-    # 这里添加更新数据库的逻辑
-    async with async_session() as session:
-        async with session.begin():
-            try:
-                columns = [column.key for column in RequestStat.__table__.columns]
-                filtered_info = {k: v for k, v in current_info.items() if k in columns}
-                new_request_stat = RequestStat(**filtered_info)
-                session.add(new_request_stat)
-                await session.commit()
-            except Exception as e:
-                await session.rollback()
-                logger.error(f"Error updating stats: {str(e)}")
+
+    try:
+        # 等待获取数据库访问权限
+        async with db_semaphore:
+            async with async_session() as session:
+                async with session.begin():
+                    try:
+                        columns = [column.key for column in RequestStat.__table__.columns]
+                        filtered_info = {k: v for k, v in current_info.items() if k in columns}
+                        new_request_stat = RequestStat(**filtered_info)
+                        session.add(new_request_stat)
+                        await session.commit()
+                    except Exception as e:
+                        await session.rollback()
+                        logger.error(f"Error updating stats: {str(e)}")
+                        if is_debug:
+                            import traceback
+                            traceback.print_exc()
+    except Exception as e:
+        logger.error(f"Error acquiring database lock: {str(e)}")
+        if is_debug:
+            import traceback
+            traceback.print_exc()
 
 async def update_channel_stats(request_id, provider, model, api_key, success):
     if DISABLE_DATABASE:
         return
-    async with async_session() as session:
-        async with session.begin():
-            try:
-                channel_stat = ChannelStat(
-                    request_id=request_id,
-                    provider=provider,
-                    model=model,
-                    api_key=api_key,
-                    success=success,
-                )
-                session.add(channel_stat)
-                await session.commit()
-            except Exception as e:
-                await session.rollback()
-                logger.error(f"Error updating channel stats: {str(e)}")
+
+    try:
+        async with db_semaphore:
+            async with async_session() as session:
+                async with session.begin():
+                    try:
+                        channel_stat = ChannelStat(
+                            request_id=request_id,
+                            provider=provider,
+                            model=model,
+                            api_key=api_key,
+                            success=success,
+                        )
+                        session.add(channel_stat)
+                        await session.commit()
+                    except Exception as e:
+                        await session.rollback()
+                        logger.error(f"Error updating channel stats: {str(e)}")
+                        if is_debug:
+                            import traceback
+                            traceback.print_exc()
+    except Exception as e:
+        logger.error(f"Error acquiring database lock: {str(e)}")
+        if is_debug:
+            import traceback
+            traceback.print_exc()
 
 class LoggingStreamingResponse(Response):
     def __init__(self, content, status_code=200, headers=None, media_type=None, current_info=None):
