@@ -186,6 +186,9 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         yield "data: [DONE]" + end_of_line
 
 async def fetch_gpt_response_stream(client, url, headers, payload):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    random.seed(timestamp)
+    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_gpt_response_stream")
         if error_message:
@@ -199,7 +202,9 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                 line, buffer = buffer.split("\n", 1)
                 # logger.info("line: %s", repr(line))
                 if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                    yield line.strip() + end_of_line
+                    line = json.loads(line.lstrip("data: "))
+                    line['id'] = f"chatcmpl-{random_str}"
+                    yield "data: " + json.dumps(line).strip() + end_of_line
 
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
