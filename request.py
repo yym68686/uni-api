@@ -316,7 +316,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
     location = gem
-    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(LOCATION=location.next(), PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
+    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(LOCATION=await location.next(), PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
 
     messages = []
     systemInstruction = None
