@@ -1,5 +1,7 @@
 import json
 import httpx
+import random
+import string
 from datetime import datetime
 
 from log_config import logger
@@ -14,8 +16,10 @@ end_of_line = "\n\n"
 # end_of_line = "\n"
 
 async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
+    random.seed(timestamp)
+    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     sample_data = {
-        "id": "chatcmpl-9ijPeRHa0wtyA2G8wq5z8FC3wGMzc",
+        "id": f"chatcmpl-{random_str}",
         "object": "chat.completion.chunk",
         "created": timestamp,
         "model": model,
@@ -49,8 +53,10 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     return sse_response
 
 async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
+    random.seed(timestamp)
+    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     sample_data = {
-        "id": "chatcmpl-ALGS9hpJBb8xVAe62DRriY2SpoT4L",
+        "id": f"chatcmpl-{random_str}",
         "object": "chat.completion",
         "created": timestamp,
         "model": model,
