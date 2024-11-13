@@ -332,7 +332,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 我们感谢以下赞助商的支持：
 <!-- ¥1000 -->
-- @PowerHunter：¥1000
+- @PowerHunter：¥1400
 
 ## 如何赞助我们
 

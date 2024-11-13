@@ -818,7 +818,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             current_info["provider"] = channel_id
             return response
 
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
         await update_channel_stats(current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False)
         raise e
 
@@ -1051,12 +1051,15 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request, provider, endpoint)
                 return response
-            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
 
                 # 根据异常类型设置状态码和错误消息
                 if isinstance(e, httpx.ReadTimeout):
                     status_code = 504  # Gateway Timeout
                     error_message = "Request timed out"
+                elif isinstance(e, httpx.ConnectError):
+                    status_code = 503  # Service Unavailable
+                    error_message = "Unable to connect to service"
                 elif isinstance(e, httpx.ReadError):
                     status_code = 502  # Bad Gateway
                     error_message = "Network read error"
