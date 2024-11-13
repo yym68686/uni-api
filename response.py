@@ -364,28 +364,28 @@ async def fetch_response(client, url, headers, payload, engine, model):
         yield response_json
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):
-    try:
-        if engine == "gemini" or engine == "vertex-gemini":
-            async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
-                yield chunk
-        elif engine == "claude" or engine == "vertex-claude":
-            async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
-                yield chunk
-        elif engine == "gpt":
-            async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-                yield chunk
-        elif engine == "openrouter":
-            async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
-                yield chunk
-        elif engine == "cloudflare":
-            async for chunk in fetch_cloudflare_response_stream(client, url, headers, payload, model):
-                yield chunk
-        elif engine == "cohere":
-            async for chunk in fetch_cohere_response_stream(client, url, headers, payload, model):
-                yield chunk
-        else:
-            raise ValueError("Unknown response")
-    except httpx.ConnectError as e:
-        yield {"error": f"500", "details": "fetch_response_stream Connect Error"}
-    except httpx.ReadTimeout as e:
-        yield {"error": f"500", "details": "fetch_response_stream Read Response Timeout"}
+    # try:
+    if engine == "gemini" or engine == "vertex-gemini":
+        async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model):
+            yield chunk
+    elif engine == "claude" or engine == "vertex-claude":
+        async for chunk in fetch_claude_response_stream(client, url, headers, payload, model):
+            yield chunk
+    elif engine == "gpt":
+        async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+            yield chunk
+    elif engine == "openrouter":
+        async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+            yield chunk
+    elif engine == "cloudflare":
+        async for chunk in fetch_cloudflare_response_stream(client, url, headers, payload, model):
+            yield chunk
+    elif engine == "cohere":
+        async for chunk in fetch_cohere_response_stream(client, url, headers, payload, model):
+            yield chunk
+    else:
+        raise ValueError("Unknown response")
+    # except httpx.ConnectError as e:
+    #     yield {"error": f"500", "details": "fetch_response_stream Connect Error"}
+    # except httpx.ReadTimeout as e:
+    #     yield {"error": f"500", "details": "fetch_response_stream Read Response Timeout"}
