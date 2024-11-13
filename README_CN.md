@@ -101,6 +101,7 @@ providers:
         gemini-1.5-pro: 10 # 模型 gemini-1.5-pro 的超时时间为 10 秒
         gemini-1.5-flash: 10 # 模型 gemini-1.5-flash 的超时时间为 10 秒
         default: 10 # 模型没有设置超时时间，使用默认的超时时间 10 秒，当请求的不在 model_timeout 里面的模型时，超时时间默认是 10 秒，不设置 default，uni-api 会使用全局配置的模型超时时间。
+      proxy: socks5://[用户名]:[密码]@[IP地址]:[端口] # 代理地址，选填。支持 socks5 和 http 代理，默认不使用代理。
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。

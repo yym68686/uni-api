@@ -9,5 +9,6 @@ sqlalchemy
 watchfiles
 ruamel.yaml
 httpx[http2]
+httpx-socks
 cryptography
 python-multipart

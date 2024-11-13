@@ -600,7 +600,7 @@ class ClientManager:
         self.default_config = default_config
 
     @asynccontextmanager
-    async def get_client(self, timeout_value):
+    async def get_client(self, timeout_value, proxy=None):
         # 直接获取或创建客户端,不使用锁
         timeout_value = int(timeout_value)
         if timeout_value not in self.clients:
@@ -610,11 +610,42 @@ class ClientManager:
                 write=30.0,
                 pool=self.pool_size
             )
-            self.clients[timeout_value] = httpx.AsyncClient(
-                timeout=timeout,
-                limits=httpx.Limits(max_connections=self.pool_size),
-                **self.default_config
-            )
+            limits = httpx.Limits(max_connections=self.pool_size)
+
+            client_config = {
+                **self.default_config,
+                "timeout": timeout,
+                "limits": limits
+            }
+
+            if proxy:
+                # 解析代理URL
+                from urllib.parse import urlparse
+                parsed = urlparse(proxy)
+
+                # 修改这里: 将 socks5h 转换为 socks5
+                scheme = parsed.scheme.rstrip('h')
+                # print("scheme", scheme)
+
+                if scheme == 'socks5':
+                    try:
+                        from httpx_socks import AsyncProxyTransport
+                        # 使用修改后的scheme创建代理URL
+                        proxy = proxy.replace('socks5h://', 'socks5://')
+                        # 创建SOCKS5代理传输
+                        transport = AsyncProxyTransport.from_url(proxy)
+                        client_config["transport"] = transport
+                    except ImportError:
+                        logger.error("httpx-socks package is required for SOCKS proxy support")
+                        raise ImportError("Please install httpx-socks package for SOCKS proxy support: pip install httpx-socks")
+                else:
+                    # 对于HTTP/HTTPS代理使用原有方式
+                    client_config["proxies"] = {
+                        "http://": proxy,
+                        "https://": proxy
+                    }
+
+            self.clients[timeout_value] = httpx.AsyncClient(**client_config)
 
         try:
             yield self.clients[timeout_value]
@@ -795,8 +826,24 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         timeout_value = app.state.timeouts.get("default", DEFAULT_TIMEOUT)
     # print("timeout_value", timeout_value)
 
+    proxy = safe_get(provider, "preferences", "proxy", default=None)
+    # print("proxy", proxy)
+
     try:
-        async with app.state.client_manager.get_client(timeout_value) as client:
+        async with app.state.client_manager.get_client(timeout_value, proxy) as client:
+            # 打印client配置信息
+            # logger.info(f"Client config - Timeout: {client.timeout}")
+            # logger.info(f"Client config - Headers: {client.headers}")
+            # if hasattr(client, '_transport'):
+            #     if hasattr(client._transport, 'proxy_url'):
+            #         logger.info(f"Client config - Proxy: {client._transport.proxy_url}")
+            #     elif hasattr(client._transport, 'proxies'):
+            #         logger.info(f"Client config - Proxies: {client._transport.proxies}")
+            #     else:
+            #         logger.info("Client config - No proxy configured")
+            # else:
+            #     logger.info("Client config - No transport configured")
+            # logger.info(f"Client config - Follow Redirects: {client.follow_redirects}")
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
