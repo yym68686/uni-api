@@ -333,7 +333,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 We thank the following sponsors for their support:
 <!-- ¥1000 -->
-- @PowerHunter: ¥1400
+- @PowerHunter: ¥1800
 
 ## How to sponsor us
 
