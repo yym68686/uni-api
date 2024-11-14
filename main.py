@@ -48,6 +48,8 @@ from sqlalchemy.sql import sqltypes
 
 # 添加新的环境变量检查
 DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
+IS_VERCEL = os.path.dirname(os.path.abspath(__file__)).startswith('/var/task')
+logger.info("IS_VERCEL: %s", IS_VERCEL)
 
 async def create_tables():
     if DISABLE_DATABASE:
@@ -594,16 +596,28 @@ app.add_middleware(StatsMiddleware)
 class ClientManager:
     def __init__(self, pool_size=100):
         self.pool_size = pool_size
-        self.clients = {}  # {timeout_value: AsyncClient}
+        self.clients = {}  # {host_timeout_proxy: AsyncClient}
 
     async def init(self, default_config):
         self.default_config = default_config
 
     @asynccontextmanager
-    async def get_client(self, timeout_value, proxy=None):
+    async def get_client(self, timeout_value, base_url, proxy=None):
         # 直接获取或创建客户端,不使用锁
         timeout_value = int(timeout_value)
-        if timeout_value not in self.clients:
+
+        # 从base_url中提取主机名
+        parsed_url = urlparse(base_url)
+        host = parsed_url.netloc
+
+        # 创建唯一的客户端键
+        client_key = f"{host}_{timeout_value}"
+        if proxy:
+            # 对代理URL进行规范化处理
+            proxy_normalized = proxy.replace('socks5h://', 'socks5://')
+            client_key += f"_{proxy_normalized}"
+
+        if client_key not in self.clients or IS_VERCEL:
             timeout = httpx.Timeout(
                 connect=15.0,
                 read=timeout_value,
@@ -620,39 +634,32 @@ class ClientManager:
 
             if proxy:
                 # 解析代理URL
-                from urllib.parse import urlparse
                 parsed = urlparse(proxy)
-
-                # 修改这里: 将 socks5h 转换为 socks5
                 scheme = parsed.scheme.rstrip('h')
-                # print("scheme", scheme)
 
                 if scheme == 'socks5':
                     try:
                         from httpx_socks import AsyncProxyTransport
-                        # 使用修改后的scheme创建代理URL
                         proxy = proxy.replace('socks5h://', 'socks5://')
-                        # 创建SOCKS5代理传输
                         transport = AsyncProxyTransport.from_url(proxy)
                         client_config["transport"] = transport
                     except ImportError:
                         logger.error("httpx-socks package is required for SOCKS proxy support")
                         raise ImportError("Please install httpx-socks package for SOCKS proxy support: pip install httpx-socks")
                 else:
-                    # 对于HTTP/HTTPS代理使用原有方式
                     client_config["proxies"] = {
                         "http://": proxy,
                         "https://": proxy
                     }
 
-            self.clients[timeout_value] = httpx.AsyncClient(**client_config)
+            self.clients[client_key] = httpx.AsyncClient(**client_config)
 
         try:
-            yield self.clients[timeout_value]
+            yield self.clients[client_key]
         except Exception as e:
-            if timeout_value in self.clients:
-                tmp_client = self.clients[timeout_value]
-                del self.clients[timeout_value]  # 先删除引用
+            if client_key in self.clients:
+                tmp_client = self.clients[client_key]
+                del self.clients[client_key]  # 先删除引用
                 await tmp_client.aclose()  # 然后关闭客户端
             raise e
 
@@ -830,7 +837,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     # print("proxy", proxy)
 
     try:
-        async with app.state.client_manager.get_client(timeout_value, proxy) as client:
+        async with app.state.client_manager.get_client(timeout_value, url, proxy) as client:
             # 打印client配置信息
             # logger.info(f"Client config - Timeout: {client.timeout}")
             # logger.info(f"Client config - Headers: {client.headers}")
