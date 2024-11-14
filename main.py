@@ -1036,6 +1036,8 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
             # 步骤 3: 计算交集
             intersection = all_providers.intersection(weight_keys)
             # print("intersection", intersection)
+            if len(intersection) == 1:
+                intersection = None
 
         if intersection:
             filtered_weights = {k.split("/")[0]: v for k, v in weights.items() if k in intersection}
@@ -1097,6 +1099,10 @@ class ModelRequestHandler:
             retry_count = 0
 
         while True:
+            # print("start_index", start_index)
+            # print("index", index)
+            # print("num_matching_providers", num_matching_providers)
+            # print("retry_count", retry_count)
             if index >= num_matching_providers + retry_count:
                 break
             current_index = (start_index + index) % num_matching_providers
@@ -1136,8 +1142,10 @@ class ModelRequestHandler:
                     # source_model = list(provider['model'][0].keys())[0]
                     await app.state.channel_manager.exclude_model(channel_id, request_model)
                     matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
+                    last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
-                    index = 0
+                    if num_matching_providers != last_num_matching_providers:
+                        index = 0
 
                 cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
                 api_key_count = provider_api_circular_list[channel_id].get_items_count()
