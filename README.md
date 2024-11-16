@@ -64,6 +64,7 @@ providers:
   - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, can be any name, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required
+    disabled: false  # Set to true to disable this provider
     model: # Optional, if model is not configured, all available models will be automatically obtained through base_url and api via the /v1/models endpoint.
       - gpt-4o # Usable model name, required
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a simple name to replace the original complex name, optional
@@ -142,6 +143,7 @@ api_keys:
     role: admin
 
   - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
+    disabled: true # Set to true to disable this API Key
     model:
       - anthropic/claude-3-5-sonnet # Usable model name, can only use the claude-3-5-sonnet model provided by the provider named anthropic. Models with the same name from other providers cannot be used. This syntax will not match the model named anthropic/claude-3-5-sonnet provided by other-provider.
       - <anthropic/claude-3-5-sonnet> # By adding angle brackets on both sides of the model name, it will not search for the claude-3-5-sonnet model under the channel named anthropic, but will take the entire anthropic/claude-3-5-sonnet as the model name. This syntax can match the model named anthropic/claude-3-5-sonnet provided by other-provider. But it will not match the claude-3-5-sonnet model under anthropic.

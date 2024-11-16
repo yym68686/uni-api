@@ -253,6 +253,7 @@ def save_api_yaml(config_data):
 
 def update_config(config_data, use_config_url=False):
     for index, provider in enumerate(config_data['providers']):
+        provider['disabled'] = provider.get('disabled', False)
         if provider.get('project_id'):
             provider['base_url'] = 'https://aiplatform.googleapis.com/'
         if provider.get('cf_account_id'):
@@ -305,6 +306,7 @@ def update_config(config_data, use_config_url=False):
     for index, api_key in enumerate(config_data['api_keys']):
         weights_dict = {}
         models = []
+        api_key['disabled'] = api_key.get('disabled', False)
         if api_key.get('model'):
             for model in api_key.get('model'):
                 if isinstance(model, dict):
@@ -333,7 +335,7 @@ def update_config(config_data, use_config_url=False):
             config_data['api_keys'][index]['model'] = ["all"]
             api_keys_db[index]['model'] = ["all"]
 
-    api_list = [item["api"] for item in api_keys_db]
+    api_list = [item["api"] for item in api_keys_db if not item.get('disabled', False)] # 只包含启用了的 key
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
     return config_data, api_keys_db, api_list
 
@@ -474,16 +476,13 @@ def post_all_models(api_index, config):
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
             if model == "all":
-                # 如果模型名为 all，则返回所有模型
+                # 如果模型名为 all，则返回所有未禁用的模型
                 all_models = get_all_models(config)
                 return all_models
             if "/" in model:
-                provider = model.split("/")[0]
-                model = model.split("/")[1]
+                provider, model = model.split("/")
                 if model == "*":
-                    for provider_item in config["providers"]:
-                        if provider_item['provider'] != provider:
-                            continue
+                    for provider_item in get_enabled_providers(config, provider_name=provider):
                         model_dict = get_model_dict(provider_item)
                         for model_item in model_dict.keys():
                             if model_item not in unique_models:
@@ -493,13 +492,10 @@ def post_all_models(api_index, config):
                                     "object": "model",
                                     "created": 1720524448858,
                                     "owned_by": "uni-api"
-                                    # "owned_by": provider_item['provider']
                                 }
                                 all_models.append(model_info)
                 else:
-                    for provider_item in config["providers"]:
-                        if provider_item['provider'] != provider:
-                            continue
+                    for provider_item in get_enabled_providers(config, provider_name=provider):
                         model_dict = get_model_dict(provider_item)
                         for model_item in model_dict.keys() :
                             if model_item not in unique_models and model_item == model:
@@ -529,7 +525,7 @@ def get_all_models(config):
     all_models = []
     unique_models = set()
 
-    for provider in config["providers"]:
+    for provider in get_enabled_providers(config):
         model_dict = get_model_dict(provider)
         for model in model_dict.keys():
             if model not in unique_models:
@@ -543,6 +539,24 @@ def get_all_models(config):
                 all_models.append(model_info)
 
     return all_models
+
+def get_enabled_providers(config, provider_name=None, model_name=None):
+    """
+    获取启用的 providers。
+    如果指定了 provider_name，则只返回该 provider。
+    如果指定了 model_name，则只返回包含该模型的 providers。
+    """
+    enabled_providers = []
+    for provider in config["providers"]:
+        if provider.get('disabled', True):
+            continue
+        if provider_name and provider['provider'] != provider_name:
+            continue
+        if model_name:
+            if model_name not in provider['model']:
+                continue
+        enabled_providers.append(provider)
+    return enabled_providers
 
 # 【GCP-Vertex AI 目前有這些區域可用】 https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude?hl=zh_cn
 # c3.5s

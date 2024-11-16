@@ -64,6 +64,7 @@ providers:
   - provider: provider_name # 服务提供商名称, 如 openai、anthropic、gemini、openrouter，随便取名字，必填
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
+    disabled: false  # 设置为 true 以禁用此提供商
     model: # 选填，如果不配置 model，会自动通过 base_url 和 api 通过 /v1/models 端点获取可用的所有模型。
       - gpt-4o # 可以使用的模型名称，必填
       - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
@@ -142,6 +143,7 @@ api_keys:
     role: admin
 
   - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
+    disabled: true # 设置为 true 以禁用此提供商
     model:
       - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。这种写法不会匹配到other-provider提供的名为anthropic/claude-3-5-sonnet的模型。
       - <anthropic/claude-3-5-sonnet> # 通过在模型名两侧加上尖括号，这样就不会去名为anthropic的渠道下去寻找claude-3-5-sonnet模型，而是将整个 anthropic/claude-3-5-sonnet 作为模型名称。这种写法可以匹配到other-provider提供的名为 anthropic/claude-3-5-sonnet 的模型。但不会匹配到anthropic下面的claude-3-5-sonnet模型。
