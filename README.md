@@ -206,7 +206,17 @@ yym68686/uni-api:latest
 
 After clicking the one-click deploy button above, set the environment variable `CONFIG_URL` to the direct link of the configuration file, `DISABLE_DATABASE` to true, and then click Create to create the project. After deployment, you need to manually set the Function Max Duration to 60 seconds in the Vercel project panel under Settings -> Functions, and then click the Deployments menu and click Redeploy to redeploy, which will set the timeout to 60 seconds. If you do not redeploy, the default timeout will remain at the original 10 seconds. Note that you should not delete the Vercel project and recreate it; instead, click redeploy in the Deployments menu within the currently deployed Vercel project to make the Function Max Duration modification take effect.
 
-## Serv00 remote deployment
+## Ubuntu deployment
+
+In the warehouse Releases, find the latest version of the corresponding binary file, for example, a file named uni-api-linux-x86_64-0.0.99.pex. Download the binary file on the server and run it:
+
+```bash
+wget https://github.com/yym68686/uni-api/releases/download/v0.0.99/uni-api-linux-x86_64-0.0.99.pex
+chmod +x uni-api-linux-x86_64-0.0.99.pex
+./uni-api-linux-x86_64-0.0.99.pex
+```
+
+## Serv00 Remote Deployment (FreeBSD 14.0)
 
 First, log in to the panel, in Additional services click on the tab Run your own applications to enable the option to run your own programs, then go to the panel Port reservation to randomly open a port.
 
@@ -327,6 +337,29 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer ${API}" \
 -d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
+```
+
+pex linux packaging:
+
+```bash
+VERSION=$(cat VERSION)
+pex -D . -r requirements.txt \
+    -c uvicorn \
+    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    --platform linux_x86_64-cp-3.10.12-cp310 \
+    --interpreter-constraint '==3.10.*' \
+    --no-strip-pex-env \
+    -o uni-api-linux-x86_64-${VERSION}.pex
+```
+
+macOS packaging:
+
+```bash
+VERSION=$(cat VERSION)
+pex -r requirements.txt \
+    -c uvicorn \
+    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    -o uni-api-macos-arm64-${VERSION}.pex
 ```
 
 ## Sponsors

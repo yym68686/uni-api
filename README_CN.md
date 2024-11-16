@@ -206,7 +206,17 @@ yym68686/uni-api:latest
 
 点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链， `DISABLE_DATABASE` 为 true，然后点击 Create 创建项目。部署完之后需要手动在 vercel 项目面板的 Settings -> Funcitons -> Function Max Duration 设置为 60 秒，然后点击 Deployments 菜单点击 Redeploy 重新部署，即可将超时时间设置为 60 秒，如果不重新部署，默认超时时间将是原来的 10 秒。注意不是删掉 vercel 项目重建，而是在当前部署好的 vercel 项目里面的 Deployments 菜单里面点 redeploy，这样才能让 Function Max Duration 的修改生效。
 
-## serv00 远程部署
+## Ubuntu 部署
+
+在仓库 Releases 找到对应的二进制文件最新版本，例如名为 uni-api-linux-x86_64-0.0.99.pex 的文件。在服务器下载二进制文件并运行：
+
+```bash
+wget https://github.com/yym68686/uni-api/releases/download/v0.0.99/uni-api-linux-x86_64-0.0.99.pex
+chmod +x uni-api-linux-x86_64-0.0.99.pex
+./uni-api-linux-x86_64-0.0.99.pex
+```
+
+## serv00 远程部署（FreeBSD 14.0）
 
 首先登录面板，Additional services 里面点击选项卡 Run your own applications 开启允许运行自己的程序，然后到面板 Port reservation 去随便开一个端口。
 
@@ -327,6 +337,29 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer ${API}" \
 -d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
+```
+
+pex linux 打包：
+
+```bash
+VERSION=$(cat VERSION)
+pex -D . -r requirements.txt \
+    -c uvicorn \
+    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    --platform linux_x86_64-cp-3.10.12-cp310 \
+    --interpreter-constraint '==3.10.*' \
+    --no-strip-pex-env \
+    -o uni-api-linux-x86_64-${VERSION}.pex
+```
+
+macos 打包：
+
+```bash
+VERSION=$(cat VERSION)
+pex -r requirements.txt \
+    -c uvicorn \
+    --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    -o uni-api-macos-arm64-${VERSION}.pex
 ```
 
 ## 赞助商
