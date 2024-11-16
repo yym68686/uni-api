@@ -1040,7 +1040,7 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
                 intersection = None
 
         if intersection:
-            filtered_weights = {k.split("/")[0]: v for k, v in weights.items() if k in intersection}
+            filtered_weights = {k.split("/")[0]: v for k, v in weights.items() if k.split("/")[0] + "/" + request_model in intersection}
             # print("filtered_weights", filtered_weights)
 
             if scheduling_algorithm == "weighted_round_robin":
