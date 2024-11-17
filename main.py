@@ -261,29 +261,6 @@ if not DISABLE_DATABASE:
 from starlette.types import Scope, Receive, Send
 from starlette.responses import Response
 
-from decimal import Decimal, getcontext
-
-# 设置全局精度
-getcontext().prec = 17  # 设置为17是为了确保15位小数的精度
-
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal:
-    costs = {
-        "gpt-4": {"input": Decimal('5.0') / Decimal('1000000'), "output": Decimal('15.0') / Decimal('1000000')},
-        "claude-3-sonnet": {"input": Decimal('3.0') / Decimal('1000000'), "output": Decimal('15.0') / Decimal('1000000')}
-    }
-
-    if model not in costs:
-        logger.error(f"Unknown model: {model}")
-        return 0
-
-    model_costs = costs[model]
-    input_cost = Decimal(input_tokens) * model_costs["input"]
-    output_cost = Decimal(output_tokens) * model_costs["output"]
-    total_cost = input_cost + output_cost
-
-    # 返回精确到15位小数的结果
-    return total_cost.quantize(Decimal('0.000000000000001'))
-
 from asyncio import Semaphore
 
 # 创建一个信号量来控制数据库访问
@@ -383,9 +360,9 @@ class LoggingStreamingResponse(Response):
                 await self.body_iterator.aclose()
                 self._closed = True
 
-        process_time = time() - self.current_info["start_time"]
-        self.current_info["process_time"] = process_time
-        await update_stats(self.current_info)
+            process_time = time() - self.current_info["start_time"]
+            self.current_info["process_time"] = process_time
+            await update_stats(self.current_info)
 
     async def _logging_iterator(self):
         try:
