@@ -246,6 +246,7 @@ yaml.preserve_quotes = True
 yaml.indent(mapping=2, sequence=4, offset=2)
 
 API_YAML_PATH = "./api.yaml"
+yaml_error_message = None
 
 def save_api_yaml(config_data):
     with open(API_YAML_PATH, "w", encoding="utf-8") as f:
@@ -355,6 +356,8 @@ async def load_config(app=None):
         config, api_keys_db, api_list = {}, {}, []
     except YAMLError as e:
         logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。%s", e)
+        global yaml_error_message
+        yaml_error_message = "配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。"
         config, api_keys_db, api_list = {}, {}, []
     except OSError as e:
         logger.error(f"open 'api.yaml' failed: {e}")
