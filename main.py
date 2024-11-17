@@ -27,6 +27,7 @@ from utils import (
     get_user_rate_limit,
     circular_list_encoder,
     error_handling_wrapper,
+    get_enabled_providers,
     rate_limiter,
     provider_api_circular_list,
 )
@@ -927,7 +928,7 @@ def get_provider_rules(model_rule, config, request_model):
     provider_rules = []
     if model_rule == "all":
         # 如模型名为 all，则返回所有模型
-        for provider in config["providers"]:
+        for provider in get_enabled_providers(config):
             model_dict = get_model_dict(provider)
             for model in model_dict.keys():
                 provider_rules.append(provider["provider"] + "/" + model)
@@ -936,7 +937,7 @@ def get_provider_rules(model_rule, config, request_model):
         if model_rule.startswith("<") and model_rule.endswith(">"):
             model_rule = model_rule[1:-1]
             # 处理带斜杠的模型名
-            for provider in config['providers']:
+            for provider in get_enabled_providers(config):
                 model_dict = get_model_dict(provider)
                 if model_rule in model_dict.keys():
                     provider_rules.append(provider['provider'] + "/" + model_rule)
@@ -944,7 +945,7 @@ def get_provider_rules(model_rule, config, request_model):
             provider_name = model_rule.split("/")[0]
             model_name_split = "/".join(model_rule.split("/")[1:])
             models_list = []
-            for provider in config['providers']:
+            for provider in get_enabled_providers(config):
                 model_dict = get_model_dict(provider)
                 if provider['provider'] == provider_name:
                     models_list.extend(list(model_dict.keys()))
@@ -970,7 +971,7 @@ def get_provider_rules(model_rule, config, request_model):
                     provider_rules.append(provider_name + "/" + model_name_split)
 
     else:
-        for provider in config["providers"]:
+        for provider in get_enabled_providers(config):
             model_dict = get_model_dict(provider)
             if model_rule in model_dict.keys():
                 provider_rules.append(provider["provider"] + "/" + model_rule)
@@ -981,7 +982,7 @@ def get_provider_list(provider_rules, config, request_model):
     provider_list = []
     # print("provider_rules", provider_rules)
     for item in provider_rules:
-        for provider in config['providers']:
+        for provider in get_enabled_providers(config):
             model_dict = get_model_dict(provider)
             model_name_split = "/".join(item.split("/")[1:])
             if "/" in item and provider['provider'] == item.split("/")[0] and model_name_split in model_dict.keys():
@@ -1520,6 +1521,7 @@ data_table_columns = [
     {"label": "Base url", "value": "base_url", "sortable": True},
     # {"label": "Engine", "value": "engine", "sortable": True},
     {"label": "Tools", "value": "tools", "sortable": True},
+    {"label": "Disabled", "value": "disabled", "sortable": True},
 ]
 
 @frontend_router.get("/login", response_class=HTMLResponse, dependencies=[Depends(frontend_rate_limit_dependency)])
@@ -1975,6 +1977,10 @@ async def get_add_provider_sheet():
                             hx_target="#models-container",
                             hx_swap="beforeend"
                         ),
+                        class_="mb-4"
+                    ),
+                    Div(
+                        checkbox.checkbox("disabled", "Disable Provider", name="disabled"),
                         class_="mb-4"
                     ),
                     Div(
