@@ -1105,7 +1105,7 @@ class ModelRequestHandler:
         if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
             retry_count = count
         else:
-            retry_count = 0
+            retry_count = int(auto_retry)
 
         while True:
             # print("start_index", start_index)
