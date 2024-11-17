@@ -1145,6 +1145,33 @@ async def get_embedding_payload(request, engine, provider):
 
     return url, headers, payload
 
+async def get_tts_payload(request, engine, provider):
+    model_dict = get_model_dict(provider)
+    model = model_dict[request.model]
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
+    url = provider['base_url']
+    url = BaseAPI(url).audio_speech
+
+    payload = {
+        "model": model,
+        "input": request.input,
+        "voice": request.voice,
+    }
+
+    if request.response_format:
+        payload["response_format"] = request.response_format
+    if request.speed:
+        payload["speed"] = request.speed
+    if request.stream is not None:
+        payload["stream"] = request.stream
+
+    return url, headers, payload
+
+
 async def get_payload(request: RequestModel, engine, provider):
     if engine == "gemini":
         return await get_gemini_payload(request, engine, provider)
@@ -1168,6 +1195,8 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_dalle_payload(request, engine, provider)
     elif engine == "whisper":
         return await get_whisper_payload(request, engine, provider)
+    elif engine == "tts":
+        return await get_tts_payload(request, engine, provider)
     elif engine == "moderation":
         return await get_moderation_payload(request, engine, provider)
     elif engine == "embedding":

@@ -136,8 +136,16 @@ class ModerationRequest(BaseRequest):
     model: Optional[str] = "text-moderation-latest"
     stream: bool = False
 
+class TextToSpeechRequest(BaseRequest):
+    model: str
+    input: str
+    voice: str
+    response_format: Optional[str] = "mp3"
+    speed: Optional[float] = 1.0
+    stream: Optional[bool] = False  # Add this line
+
 class UnifiedRequest(BaseModel):
-    data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest]
+    data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest, TextToSpeechRequest]
 
     @model_validator(mode='before')
     @classmethod
@@ -152,6 +160,10 @@ class UnifiedRequest(BaseModel):
             elif "file" in values:
                 values["data"] = AudioTranscriptionRequest(**values)
                 values["data"].request_type = "audio"
+            elif "tts" in values.get("model", ""):
+                logger.info(f"TextToSpeechRequest: {values}")
+                values["data"] = TextToSpeechRequest(**values)
+                values["data"].request_type = "tts"
             elif "text-embedding" in values.get("model", ""):
                 values["data"] = EmbeddingRequest(**values)
                 values["data"].request_type = "embedding"

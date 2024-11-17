@@ -326,8 +326,12 @@ async def fetch_response(client, url, headers, payload, engine, model):
     if error_message:
         yield error_message
         return
-    response_json = response.json()
-    if engine == "gemini" or engine == "vertex-gemini":
+
+    if engine == "tts":
+        yield response.read()
+
+    elif engine == "gemini" or engine == "vertex-gemini":
+        response_json = response.json()
 
         if isinstance(response_json, str):
             import ast
@@ -361,6 +365,7 @@ async def fetch_response(client, url, headers, payload, engine, model):
         yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens)
 
     else:
+        response_json = response.json()
         yield response_json
 
 async def fetch_response_stream(client, url, headers, payload, engine, model):

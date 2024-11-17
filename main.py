@@ -15,7 +15,7 @@ from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, UnifiedRequest, EmbeddingRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import (
@@ -392,6 +392,9 @@ class LoggingStreamingResponse(Response):
             async for chunk in self.body_iterator:
                 if isinstance(chunk, str):
                     chunk = chunk.encode('utf-8')
+                if isinstance(chunk, bytes):
+                    yield chunk
+                    continue
                 line = chunk.decode('utf-8')
                 if is_debug:
                     logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
@@ -504,6 +507,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     moderated_content = request_model.get_last_text_message()
                 elif request_model.request_type == "image":
                     moderated_content = request_model.prompt
+                elif request_model.request_type == "tts":
+                    moderated_content = request_model.input
                 elif request_model.request_type == "moderation":
                     pass
                 elif request_model.request_type == "embedding":
@@ -817,6 +822,9 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     if endpoint == "/v1/embeddings":
         engine = "embedding"
+
+    if endpoint == "/v1/audio/speech":
+        engine = "tts"
         request.stream = False
 
     if provider.get("engine"):
@@ -848,19 +856,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     try:
         async with app.state.client_manager.get_client(timeout_value, url, proxy) as client:
-            # 打印client配置信息
-            # logger.info(f"Client config - Timeout: {client.timeout}")
-            # logger.info(f"Client config - Headers: {client.headers}")
-            # if hasattr(client, '_transport'):
-            #     if hasattr(client._transport, 'proxy_url'):
-            #         logger.info(f"Client config - Proxy: {client._transport.proxy_url}")
-            #     elif hasattr(client._transport, 'proxies'):
-            #         logger.info(f"Client config - Proxies: {client._transport.proxies}")
-            #     else:
-            #         logger.info("Client config - No proxy configured")
-            # else:
-            #     logger.info("Client config - No transport configured")
-            # logger.info(f"Client config - Follow Redirects: {client.follow_redirects}")
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
@@ -868,12 +863,16 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             else:
                 generator = fetch_response(client, url, headers, payload, engine, original_model)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
-                first_element = await anext(wrapped_generator)
-                first_element = first_element.lstrip("data: ")
-                # print("first_element", first_element)
-                first_element = json.loads(first_element)
-                response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
-                # response = JSONResponse(first_element)
+
+                # 处理音频和其他二进制响应
+                if endpoint == "/v1/audio/speech":
+                    if isinstance(wrapped_generator, bytes):
+                        response = Response(content=wrapped_generator, media_type="audio/mpeg")
+                else:
+                    first_element = await anext(wrapped_generator)
+                    first_element = first_element.lstrip("data: ")
+                    first_element = json.loads(first_element)
+                    response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
 
             # 更新成功计数和首次响应时间
             await update_channel_stats(current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True)
@@ -1268,6 +1267,13 @@ async def embeddings(
     api_index: int = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, api_index, endpoint="/v1/embeddings")
+
+@app.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
+async def audio_speech(
+    request: TextToSpeechRequest,
+    api_index: str = Depends(verify_api_key)
+):
+    return await model_handler.request_model(request, api_index, endpoint="/v1/audio/speech")
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(
