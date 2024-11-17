@@ -416,6 +416,24 @@ def ensure_string(item):
     else:
         return str(item)
 
+def identify_audio_format(file_bytes):
+    # 读取开头的字节
+    if file_bytes.startswith(b'\xFF\xFB') or file_bytes.startswith(b'\xFF\xF3'):
+        return "MP3"
+    elif file_bytes.startswith(b'ID3'):
+        return "MP3 with ID3"
+    elif file_bytes.startswith(b'OpusHead'):
+        return "OPUS"
+    elif file_bytes.startswith(b'ADIF'):
+        return "AAC (ADIF)"
+    elif file_bytes.startswith(b'\xFF\xF1') or file_bytes.startswith(b'\xFF\xF9'):
+        return "AAC (ADTS)"
+    elif file_bytes.startswith(b'fLaC'):
+        return "FLAC"
+    elif file_bytes.startswith(b'RIFF') and file_bytes[8:12] == b'WAVE':
+        return "WAV"
+    return "Unknown/PCM"
+
 import asyncio
 import time as time_module
 async def error_handling_wrapper(generator, channel_id):
@@ -426,7 +444,10 @@ async def error_handling_wrapper(generator, channel_id):
         first_item_str = first_item
         # logger.info("first_item_str: %s", first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
-            first_item_str = first_item_str.decode("utf-8")
+            if identify_audio_format(first_item_str) in ["MP3", "MP3 with ID3", "OPUS", "AAC (ADIF)", "AAC (ADTS)", "FLAC", "WAV"]:
+                return first_item, first_response_time
+            else:
+                first_item_str = first_item_str.decode("utf-8")
         if isinstance(first_item_str, str):
             if first_item_str.startswith("data:"):
                 first_item_str = first_item_str.lstrip("data: ")
@@ -598,6 +619,7 @@ class BaseAPI:
         self.audio_transcriptions: str = urlunparse(parsed_url[:2] + (before_v1 + "audio/transcriptions",) + ("",) * 3)
         self.moderations: str = urlunparse(parsed_url[:2] + (before_v1 + "moderations",) + ("",) * 3)
         self.embeddings: str = urlunparse(parsed_url[:2] + (before_v1 + "embeddings",) + ("",) * 3)
+        self.audio_speech: str = urlunparse(parsed_url[:2] + (before_v1 + "audio/speech",) + ("",) * 3)
 
 def safe_get(data, *keys, default=None):
     for key in keys:
