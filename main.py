@@ -682,7 +682,17 @@ async def ensure_config(request: Request, call_next):
             if len(app.state.api_keys_db) >= 1:
                 app.state.admin_api_key = app.state.api_keys_db[0].get("api")
             else:
-                raise Exception("No admin API key found")
+                from utils import yaml_error_message
+                if yaml_error_message:
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": yaml_error_message}
+                    )
+                else:
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": "No admin API key found"}
+                    )
 
     if app and not hasattr(app.state, 'client_manager'):
 
