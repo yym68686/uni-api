@@ -367,6 +367,7 @@ pex -r requirements.txt \
 我们感谢以下赞助商的支持：
 <!-- ¥1000 -->
 - @PowerHunter：¥1800
+- @ioi：¥50
 
 ## 如何赞助我们
 

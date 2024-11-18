@@ -124,10 +124,13 @@ async def get_gemini_payload(request, engine, provider):
     model = model_dict[request.model]
     gemini_stream = "streamGenerateContent"
     url = provider['base_url']
-    if url.endswith("v1beta"):
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=await provider_api_circular_list[provider['provider']].next(model))
-    if url.endswith("v1"):
-        url = "https://generativelanguage.googleapis.com/v1/models/{model}:{stream}?key={api_key}".format(model=model, stream=gemini_stream, api_key=await provider_api_circular_list[provider['provider']].next(model))
+    parsed_url = urllib.parse.urlparse(url)
+    if parsed_url.path.startswith("/v1beta") or parsed_url.path.startswith("/v1"):
+        api_version = parsed_url.path.split('/')[-1]  # 获取 v1 或 v1beta
+    else:
+        api_version = "v1beta"
+    # https://generativelanguage.googleapis.com/v1beta/models/
+    url = f"{parsed_url.scheme}://{parsed_url.netloc}/{api_version}/models/{model}:{gemini_stream}?key={await provider_api_circular_list[provider['provider']].next(model)}"
 
     messages = []
     systemInstruction = None
