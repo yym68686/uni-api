@@ -367,6 +367,7 @@ pex -r requirements.txt \
 We thank the following sponsors for their support:
 <!-- ¥1000 -->
 - @PowerHunter: ¥1800
+- @ioi：¥50
 
 ## How to sponsor us
 
