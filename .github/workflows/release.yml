@@ -1,0 +1,69 @@
+name: Build and Release PEX
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10.12'
+
+      - name: Install pex
+        run: pip install pex
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Get Version
+        id: get_version
+        run: echo "VERSION=$(cat VERSION)" >> $GITHUB_ENV
+
+      - name: Build Linux PEX
+        if: matrix.platform == 'linux'
+        run: |
+          pex -D . -r requirements.txt \
+          -c uvicorn \
+          --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+          --platform linux_x86_64-cp-3.10.12-cp310 \
+          --interpreter-constraint '==3.10.*' \
+          --no-strip-pex-env \
+          -o uni-api-linux-x86_64-${VERSION}.pex
+
+      - name: Build MacOS PEX
+        if: matrix.platform == 'macos'
+        run: |
+          pex -r requirements.txt \
+          -c uvicorn \
+          --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+          -o uni-api-macos-arm64-${VERSION}.pex
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Release ${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex

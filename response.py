@@ -202,7 +202,11 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                 line, buffer = buffer.split("\n", 1)
                 # logger.info("line: %s", repr(line))
                 if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                    line = json.loads(line.lstrip("data: "))
+                    result = line.lstrip("data: ")
+                    if result.strip() == "[DONE]":
+                        yield "data: [DONE]" + end_of_line
+                        return
+                    line = json.loads(result)
                     line['id'] = f"chatcmpl-{random_str}"
                     yield "data: " + json.dumps(line).strip() + end_of_line
 
