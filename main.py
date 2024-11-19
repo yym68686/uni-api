@@ -835,11 +835,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         async with app.state.client_manager.get_client(timeout_value, url, proxy) as client:
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             else:
                 generator = fetch_response(client, url, headers, payload, engine, original_model)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream)
 
                 # 处理音频和其他二进制响应
                 if endpoint == "/v1/audio/speech":

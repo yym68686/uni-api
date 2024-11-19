@@ -436,7 +436,7 @@ def identify_audio_format(file_bytes):
 
 import asyncio
 import time as time_module
-async def error_handling_wrapper(generator, channel_id):
+async def error_handling_wrapper(generator, channel_id, engine, stream):
     start_time = time_module.time()
     try:
         first_item = await generator.__anext__()
@@ -470,7 +470,8 @@ async def error_handling_wrapper(generator, channel_id):
             status_code = first_item_str.get('status_code', 500)
             detail = first_item_str.get('details', f"{first_item_str}")
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
-        if isinstance(first_item_str, dict):
+
+        if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
             content = safe_get(first_item_str, "choices", 0, "message", "content", default=None)
             if content == "" or content is None:
                 raise StopAsyncIteration
