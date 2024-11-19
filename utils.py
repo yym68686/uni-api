@@ -442,7 +442,7 @@ async def error_handling_wrapper(generator, channel_id):
         first_item = await generator.__anext__()
         first_response_time = time_module.time() - start_time
         first_item_str = first_item
-        # logger.info("first_item_str: %s", first_item_str)
+        # logger.info("first_item_str: %s :%s", type(first_item_str), first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
             if identify_audio_format(first_item_str) in ["MP3", "MP3 with ID3", "OPUS", "AAC (ADIF)", "AAC (ADTS)", "FLAC", "WAV"]:
                 return first_item, first_response_time
@@ -470,6 +470,10 @@ async def error_handling_wrapper(generator, channel_id):
             status_code = first_item_str.get('status_code', 500)
             detail = first_item_str.get('details', f"{first_item_str}")
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
+        if isinstance(first_item_str, dict):
+            content = safe_get(first_item_str, "choices", 0, "message", "content", default=None)
+            if content == "" or content is None:
+                raise StopAsyncIteration
 
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
         async def new_generator():
