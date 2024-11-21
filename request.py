@@ -6,7 +6,7 @@ import base64
 import urllib.parse
 
 from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, gem, BaseAPI, get_model_dict, provider_api_circular_list
+from utils import c35s, c3s, c3o, c3h, gem, BaseAPI, get_model_dict, provider_api_circular_list, safe_get
 
 import imghdr
 
@@ -213,7 +213,13 @@ async def get_gemini_payload(request, engine, provider):
         ]
     }
     if systemInstruction:
-        payload["systemInstruction"] = systemInstruction
+        if api_version == "v1beta":
+            payload["systemInstruction"] = systemInstruction
+        if api_version == "v1":
+            first_message = safe_get(payload, "contents", 0, "parts", 0, "text", default=None)
+            system_instruction = safe_get(systemInstruction, "parts", 0, "text", default=None)
+            if first_message and system_instruction:
+                payload["contents"][0]["parts"][0]["text"] = system_instruction + "\n" + first_message
 
     miss_fields = [
         'model',
