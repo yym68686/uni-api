@@ -50,6 +50,15 @@ from sqlalchemy.sql import sqltypes
 DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
 IS_VERCEL = os.path.dirname(os.path.abspath(__file__)).startswith('/var/task')
 logger.info("IS_VERCEL: %s", IS_VERCEL)
+logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
+
+# 读取VERSION文件内容
+try:
+    with open('VERSION', 'r') as f:
+        VERSION = f.read().strip()
+except:
+    VERSION = 'unknown'
+logger.info("VERSION: %s", VERSION)
 
 async def create_tables():
     if DISABLE_DATABASE:
