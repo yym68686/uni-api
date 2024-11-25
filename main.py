@@ -24,7 +24,6 @@ from utils import (
     save_api_yaml,
     get_model_dict,
     post_all_models,
-    get_user_rate_limit,
     circular_list_encoder,
     error_handling_wrapper,
     rate_limiter,
@@ -1199,27 +1198,6 @@ model_handler = ModelRequestHandler()
 
 security = HTTPBearer()
 
-async def rate_limit_dependency(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials if credentials else None
-    api_list = app.state.api_list
-    try:
-        api_index = api_list.index(token)
-    except ValueError:
-        # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
-        api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
-        if api_index is None:
-            print("error: Invalid or missing API Key:", token)
-            api_index = None
-            token = None
-
-    # 使用 IP 地址和 token（如果有）作为限制键
-    client_ip = request.client.host
-    rate_limit_key = f"{client_ip}:{token}" if token else client_ip
-
-    limits = await get_user_rate_limit(app, api_index)
-    if await rate_limiter.is_rate_limited(rate_limit_key, limits):
-        raise HTTPException(status_code=429, detail="Too many requests")
-
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
     token = credentials.credentials
@@ -1250,15 +1228,15 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
         raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
-@app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/v1/chat/completions")
 async def request_model(request: RequestModel, api_index: int = Depends(verify_api_key)):
     return await model_handler.request_model(request, api_index)
 
-@app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
+@app.options("/v1/chat/completions")
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
-@app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
+@app.get("/v1/models")
 async def list_models(api_index: int = Depends(verify_api_key)):
     models = post_all_models(api_index, app.state.config)
     return JSONResponse(content={
@@ -1266,28 +1244,28 @@ async def list_models(api_index: int = Depends(verify_api_key)):
         "data": models
     })
 
-@app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/v1/images/generations")
 async def images_generations(
     request: ImageGenerationRequest,
     api_index: int = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, api_index, endpoint="/v1/images/generations")
 
-@app.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/v1/embeddings")
 async def embeddings(
     request: EmbeddingRequest,
     api_index: int = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, api_index, endpoint="/v1/embeddings")
 
-@app.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/v1/audio/speech")
 async def audio_speech(
     request: TextToSpeechRequest,
     api_index: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, api_index, endpoint="/v1/audio/speech")
 
-@app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/v1/moderations")
 async def moderations(
     request: ModerationRequest,
     api_index: int = Depends(verify_api_key)
@@ -1296,7 +1274,7 @@ async def moderations(
 
 from fastapi import UploadFile, File, Form, HTTPException
 import io
-@app.post("/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/v1/audio/transcriptions")
 async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str = Form(...),
@@ -1322,7 +1300,7 @@ async def audio_transcriptions(
             traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing audio file: {str(e)}")
 
-@app.get("/v1/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
+@app.get("/v1/generate-api-key")
 def generate_api_key():
     # Define the character set (only alphanumeric)
     chars = string.ascii_letters + string.digits
@@ -1336,7 +1314,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, desc, case
 from fastapi import Query
 
-@app.get("/v1/stats", dependencies=[Depends(rate_limit_dependency)])
+@app.get("/v1/stats")
 async def get_stats(
     request: Request,
     token: str = Depends(verify_admin_api_key),
