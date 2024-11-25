@@ -110,6 +110,7 @@ providers:
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash
+      - gemini-1.5-pro: gemini-1.5-pro-search # Only supports using the gemini-1.5-pro-search model to request uni-api when using the Vertex Gemini API, to automatically use the Google official search tool.
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
