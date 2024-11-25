@@ -151,8 +151,11 @@ api_keys:
       # When SCHEDULING_ALGORITHM is random, use random polling load balancing, randomly request the channel of the model with a request.
       # When SCHEDULING_ALGORITHM is round_robin, use polling load balancing, request the channel of the model used by the user in order.
       AUTO_RETRY: true # Whether to automatically retry, automatically retry the next provider, true for automatic retry, false for no automatic retry, default is true. Also supports setting a number, indicating the number of retries.
-      RATE_LIMIT: 2/min # Supports rate limiting, maximum number of requests per minute, can be set to an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min, optional
-      # RATE_LIMIT: 2/min,10/day # Supports multiple frequency constraints
+      rate_limit: 15/min # Supports rate limiting, each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
+      # rate_limit: # You can set different frequency limits for each model
+      #   gemini-1.5-pro: 3/min
+      #   gemini-1.5-flash: 2/min
+      #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       ENABLE_MODERATION: true # Whether to enable message moderation, true for enable, false for disable, default is false, when enabled, it will moderate the user's message, if inappropriate messages are found, an error message will be returned.
 
   # Channel-level weighted load balancing configuration example

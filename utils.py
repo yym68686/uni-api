@@ -67,7 +67,7 @@ async def get_user_rate_limit(app, api_index: int = None):
     # 这里应该实现根据 token 获取用户速率限制的逻辑
     # 示例： 返回 (次数， 秒数)
     config = app.state.config
-    raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
+    raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "rate_limit")
     # print("raw_rate_limit", raw_rate_limit)
     # print("not api_index or not raw_rate_limit", api_index == None, not raw_rate_limit, api_index == None or not raw_rate_limit, api_index, raw_rate_limit)
 
