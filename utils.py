@@ -436,7 +436,7 @@ def identify_audio_format(file_bytes):
 
 import asyncio
 import time as time_module
-async def error_handling_wrapper(generator, channel_id, engine, stream):
+async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers):
     start_time = time_module.time()
     try:
         first_item = await generator.__anext__()
@@ -454,10 +454,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream):
             if first_item_str.startswith("[DONE]"):
                 logger.error(f"provider: {channel_id:<11} error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration
-            if "The bot's usage is covered by the developer" in first_item_str:
-                logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
-                raise StopAsyncIteration
-            if "process this request due to overload or policy" in first_item_str:
+            if all(x not in first_item_str for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration
             try:
