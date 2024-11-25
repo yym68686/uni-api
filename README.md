@@ -174,6 +174,9 @@ preferences: # Global configuration
     o1-mini: 30 # Model o1-mini timeout is 30 seconds, when requesting models starting with o1-mini, the timeout is 30 seconds
     o1-preview: 100 # Model o1-preview timeout is 100 seconds, when requesting models starting with o1-preview, the timeout is 100 seconds
   cooldown_period: 300 # Channel cooldown time, in seconds, default 300 seconds, optional. When a model request fails, the channel will be automatically excluded and cooled down for a period of time, and will not request the channel again. After the cooldown time ends, the model will be automatically restored until the request fails again, and it will be cooled down again. When cooldown_period is set to 0, the cooling mechanism is not enabled.
+  error_triggers: # Error triggers, when the message returned by the model contains any of the strings in the error_triggers, the channel will return an error. Optional
+    - The bot's usage is covered by the developer
+    - process this request due to overload or policy
 ```
 
 Mount the configuration file and start the uni-api docker container:

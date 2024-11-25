@@ -174,6 +174,9 @@ preferences: # 全局配置
     o1-mini: 30 # 模型 o1-mini 的超时时间为 30 秒，当请求名字是 o1-mini 开头的模型时，超时时间是 30 秒
     o1-preview: 100 # 模型 o1-preview 的超时时间为 100 秒，当请求名字是 o1-preview 开头的模型时，超时时间是 100 秒
   cooldown_period: 300 # 渠道冷却时间，单位为秒，默认 300 秒，选填。当模型请求失败时，会自动将该渠道排除冷却一段时间，不再请求该渠道，冷却时间结束后，会自动将该模型恢复，直到再次请求失败，会重新冷却。当 cooldown_period 设置为 0 时，不启用冷却机制。
+  error_triggers: # 错误触发器，当模型返回的消息包含错误触发器中的任意一个字符串时，该渠道会自动返回报错。选填
+    - The bot's usage is covered by the developer
+    - process this request due to overload or policy
 ```
 
 挂载配置文件并启动 uni-api docker 容器：
