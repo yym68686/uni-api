@@ -151,8 +151,11 @@ api_keys:
       # 当 SCHEDULING_ALGORITHM 为 random 时，使用随机轮训负载均衡，随机请求拥有请求的模型的渠道。
       # 当 SCHEDULING_ALGORITHM 为 round_robin 时，使用轮训负载均衡，按照顺序请求用户使用的模型的渠道。
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true。也可以设置为数字，表示重试次数。
-      RATE_LIMIT: 2/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min，选填
-      # RATE_LIMIT: 2/min,10/day 支持多个频率约束条件
+      rate_limit: 15/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认999999/min，选填。支持多个频率约束条件：15/min,10/day
+      # rate_limit: # 可以为每个模型设置不同的频率限制
+      #   gemini-1.5-pro: 3/min
+      #   gemini-1.5-flash: 2/min
+      #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       ENABLE_MODERATION: true # 是否开启消息道德审查，true 为开启，false 为不开启，默认为 false，当开启后，会对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。
 
   # 渠道级加权负载均衡配置示例
