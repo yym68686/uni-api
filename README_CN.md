@@ -110,6 +110,7 @@ providers:
     model:
       - gemini-1.5-pro
       - gemini-1.5-flash
+      - gemini-1.5-pro: gemini-1.5-pro-search # 仅支持在 vertex Gemini API 中，以 -search 后缀重命名模型后，使用 gemini-1.5-pro-search 模型请求 uni-api 时，表示 gemini-1.5-pro 模型自动使用 Google 官方搜索工具。
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
