@@ -760,6 +760,35 @@ async def ensure_config(request: Request, call_next):
             ERROR_TRIGGERS = []
         app.state.error_triggers = ERROR_TRIGGERS
 
+    if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
+        app.state.models_list = {}
+        for item in app.state.api_keys_db:
+            api_key_model_list = item.get("model", [])
+            for provider_rule in api_key_model_list:
+                provider_name = provider_rule.split("/")[0]
+                if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+                    models_list = []
+                    try:
+                        # 构建请求头
+                        headers = {
+                            "Authorization": f"Bearer {provider_name}"
+                        }
+                        # 发送GET请求获取模型列表
+                        base_url = "http://127.0.0.1:8000/v1/models"
+                        async with app.state.client_manager.get_client(100, base_url) as client:
+                            response = await client.get(
+                                base_url,
+                                headers=headers
+                            )
+                            if response.status_code == 200:
+                                models_data = response.json()
+                                # 将获取到的模型添加到models_list
+                                for model in models_data.get("data", []):
+                                    models_list.append(model["id"])
+                    except Exception as e:
+                        logger.error(f"获取模型列表失败: {str(e)}")
+                    app.state.models_list[provider_name] = models_list
+
     return await call_next(request)
 
 def get_timeout_value(provider_timeouts, original_model):
@@ -934,7 +963,7 @@ def lottery_scheduling(weights):
                 break
     return selections
 
-def get_provider_rules(model_rule, config, request_model):
+async def get_provider_rules(model_rule, config, request_model):
     provider_rules = []
     if model_rule == "all":
         # 如模型名为 all，则返回所有模型
@@ -955,10 +984,19 @@ def get_provider_rules(model_rule, config, request_model):
             provider_name = model_rule.split("/")[0]
             model_name_split = "/".join(model_rule.split("/")[1:])
             models_list = []
-            for provider in config['providers']:
-                model_dict = get_model_dict(provider)
-                if provider['provider'] == provider_name:
-                    models_list.extend(list(model_dict.keys()))
+
+            # api_keys 中 api 为 sk- 时，表示继承 api_keys，将 api_keys 中的 api key 当作 渠道
+            if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+                if app.state.models_list.get(provider_name):
+                    models_list = app.state.models_list[provider_name]
+                else:
+                    models_list = []
+            else:
+                for provider in config['providers']:
+                    model_dict = get_model_dict(provider)
+                    if provider['provider'] == provider_name:
+                        models_list.extend(list(model_dict.keys()))
+
             # print("models_list", models_list)
             # print("model_name", model_name)
             # print("model_name_split", model_name_split)
@@ -992,29 +1030,33 @@ def get_provider_list(provider_rules, config, request_model):
     provider_list = []
     # print("provider_rules", provider_rules)
     for item in provider_rules:
-        for provider in config['providers']:
-            model_dict = get_model_dict(provider)
-            model_name_split = "/".join(item.split("/")[1:])
-            if "/" in item and provider['provider'] == item.split("/")[0] and model_name_split in model_dict.keys():
-                new_provider = copy.deepcopy(provider)
-                # old: new
-                # print("item", item)
-                # print("model_dict", model_dict)
-                # print("model_name_split", model_name_split)
-                # print("request_model", request_model)
-                new_provider["model"] = [{model_dict[model_name_split]: request_model}]
-                if request_model in model_dict.keys() and model_name_split == request_model:
-                    provider_list.append(new_provider)
+        provider_name = item.split("/")[0]
+        if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+            provider_list.append({"provider": provider_name, "base_url": "http://127.0.0.1:8000/v1/chat/completions", "model": [{request_model: request_model}], "engine": "gpt", "tools": True})
+        else:
+            for provider in config['providers']:
+                model_dict = get_model_dict(provider)
+                model_name_split = "/".join(item.split("/")[1:])
+                if "/" in item and provider['provider'] == provider_name and model_name_split in model_dict.keys():
+                    new_provider = copy.deepcopy(provider)
+                    # old: new
+                    # print("item", item)
+                    # print("model_dict", model_dict)
+                    # print("model_name_split", model_name_split)
+                    # print("request_model", request_model)
+                    new_provider["model"] = [{model_dict[model_name_split]: request_model}]
+                    if request_model in model_dict.keys() and model_name_split == request_model:
+                        provider_list.append(new_provider)
 
-                elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
-                    provider_list.append(new_provider)
+                    elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
+                        provider_list.append(new_provider)
     return provider_list
 
-def get_matching_providers(request_model, config, api_index):
+async def get_matching_providers(request_model, config, api_index):
     provider_rules = []
 
     for model_rule in config['api_keys'][api_index]['model']:
-        provider_rules.extend(get_provider_rules(model_rule, config, request_model))
+        provider_rules.extend(await get_provider_rules(model_rule, config, request_model))
 
     provider_list = get_provider_list(provider_rules, config, request_model)
 
@@ -1022,7 +1064,7 @@ def get_matching_providers(request_model, config, api_index):
     return provider_list
 
 async def get_right_order_providers(request_model, config, api_index, scheduling_algorithm):
-    matching_providers = get_matching_providers(request_model, config, api_index)
+    matching_providers = await get_matching_providers(request_model, config, api_index)
 
     if not matching_providers:
         raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
@@ -1046,7 +1088,7 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
             weight_keys = set(weights.keys())
             provider_rules = []
             for model_rule in weight_keys:
-                provider_rules.extend(get_provider_rules(model_rule, config, request_model))
+                provider_rules.extend(await get_provider_rules(model_rule, config, request_model))
             provider_list = get_provider_list(provider_rules, config, request_model)
             weight_keys = set([provider['provider'] + "/" + request_model for provider in provider_list])
             # print("all_providers", all_providers)
