@@ -2132,6 +2132,16 @@ app.include_router(frontend_router, tags=["frontend"])
 #     import asgi
 #     return await asgi.fetch(app, request, env)
 
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# 添加静态文件挂载
+app.mount("/", StaticFiles(directory="./static", html=True), name="static")
+
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    return FileResponse('favicon.ico')
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(
