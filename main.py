@@ -1033,7 +1033,7 @@ def get_provider_list(provider_rules, config, request_model):
     for item in provider_rules:
         provider_name = item.split("/")[0]
         if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-            provider_list.append({"provider": provider_name, "base_url": "http://127.0.0.1:8000/v1/chat/completions", "model": [{request_model: request_model}], "engine": "gpt", "tools": True})
+            provider_list.append({"provider": provider_name, "base_url": "http://127.0.0.1:8000/v1/chat/completions", "model": [{request_model: request_model}], "tools": True})
         else:
             for provider in config['providers']:
                 model_dict = get_model_dict(provider)
