@@ -834,6 +834,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     if "claude" not in original_model \
     and "gpt" not in original_model \
+    and "o1" not in original_model \
     and "gemini" not in original_model \
     and parsed_url.netloc != 'api.cloudflare.com' \
     and parsed_url.netloc != 'api.cohere.com':
@@ -844,10 +845,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     if "gemini" in original_model and engine == "vertex":
         engine = "vertex-gemini"
-
-    if "o1-preview" in original_model or "o1-mini" in original_model:
-        engine = "o1"
-        request.stream = False
 
     if endpoint == "/v1/images/generations":
         engine = "dalle"
