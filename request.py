@@ -618,7 +618,11 @@ async def get_gpt_payload(request, engine, provider):
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
     if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
+        if provider['base_url'] == "https://api-ext.felo.ai/one-ai/completions":
+            headers['Authorization'] = f"{await provider_api_circular_list[provider['provider']].next(model)}"
+        else:
+            headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
+
     elif provider['provider'].startswith("sk-"):
         headers['Authorization'] = f"Bearer {provider['provider']}"
 

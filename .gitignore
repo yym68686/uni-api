@@ -9,7 +9,7 @@ node_modules
 *.jpg
 *.json
 !vercel.json
-*.png
+# *.png
 *.db
 .aider*
 .idea
