@@ -775,7 +775,7 @@ async def ensure_config(request: Request, call_next):
                         }
                         # 发送GET请求获取模型列表
                         base_url = "http://127.0.0.1:8000/v1/models"
-                        async with app.state.client_manager.get_client(100, base_url) as client:
+                        async with app.state.client_manager.get_client(1, base_url) as client:
                             response = await client.get(
                                 base_url,
                                 headers=headers
@@ -786,7 +786,8 @@ async def ensure_config(request: Request, call_next):
                                 for model in models_data.get("data", []):
                                     models_list.append(model["id"])
                     except Exception as e:
-                        logger.error(f"获取模型列表失败: {str(e)}")
+                        if str(e):
+                            logger.error(f"获取模型列表失败: {str(e)}")
                     app.state.models_list[provider_name] = models_list
 
     return await call_next(request)
@@ -1280,7 +1281,7 @@ async def options_handler():
 
 @app.get("/v1/models")
 async def list_models(api_index: int = Depends(verify_api_key)):
-    models = post_all_models(api_index, app.state.config)
+    models = post_all_models(api_index, app.state.config, app.state.api_list, app.state.models_list)
     return JSONResponse(content={
         "object": "list",
         "data": models

@@ -479,7 +479,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
     except StopAsyncIteration:
         raise HTTPException(status_code=400, detail="data: {'error': 'No data returned'}")
 
-def post_all_models(api_index, config):
+def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
 
@@ -493,11 +493,8 @@ def post_all_models(api_index, config):
                 provider = model.split("/")[0]
                 model = model.split("/")[1]
                 if model == "*":
-                    for provider_item in config["providers"]:
-                        if provider_item['provider'] != provider:
-                            continue
-                        model_dict = get_model_dict(provider_item)
-                        for model_item in model_dict.keys():
+                    if provider.startswith("sk-") and provider in api_list:
+                        for model_item in models_list[provider]:
                             if model_item not in unique_models:
                                 unique_models.add(model_item)
                                 model_info = {
@@ -505,24 +502,53 @@ def post_all_models(api_index, config):
                                     "object": "model",
                                     "created": 1720524448858,
                                     "owned_by": "uni-api"
-                                    # "owned_by": provider_item['provider']
                                 }
                                 all_models.append(model_info)
+                    else:
+                        for provider_item in config["providers"]:
+                            if provider_item['provider'] != provider:
+                                continue
+                            model_dict = get_model_dict(provider_item)
+                            for model_item in model_dict.keys():
+                                if model_item not in unique_models:
+                                    unique_models.add(model_item)
+                                    model_info = {
+                                        "id": model_item,
+                                        "object": "model",
+                                        "created": 1720524448858,
+                                        "owned_by": "uni-api"
+                                        # "owned_by": provider_item['provider']
+                                    }
+                                    all_models.append(model_info)
                 else:
-                    for provider_item in config["providers"]:
-                        if provider_item['provider'] != provider:
-                            continue
-                        model_dict = get_model_dict(provider_item)
-                        for model_item in model_dict.keys() :
-                            if model_item not in unique_models and model_item == model:
-                                unique_models.add(model_item)
-                                model_info = {
-                                    "id": model_item,
-                                    "object": "model",
-                                    "created": 1720524448858,
-                                    "owned_by": "uni-api"
-                                }
-                                all_models.append(model_info)
+                    if provider.startswith("sk-") and provider in api_list:
+                        if model in models_list[provider] and model not in unique_models:
+                            unique_models.add(model)
+                            model_info = {
+                                "id": model,
+                                "object": "model",
+                                "created": 1720524448858,
+                                "owned_by": "uni-api"
+                            }
+                            all_models.append(model_info)
+                    else:
+                        for provider_item in config["providers"]:
+                            if provider_item['provider'] != provider:
+                                continue
+                            model_dict = get_model_dict(provider_item)
+                            for model_item in model_dict.keys():
+                                if model_item not in unique_models and model_item == model:
+                                    unique_models.add(model_item)
+                                    model_info = {
+                                        "id": model_item,
+                                        "object": "model",
+                                        "created": 1720524448858,
+                                        "owned_by": "uni-api"
+                                    }
+                                    all_models.append(model_info)
+                continue
+
+            if model.startswith("sk-") and model in api_list:
                 continue
 
             if model not in unique_models:
