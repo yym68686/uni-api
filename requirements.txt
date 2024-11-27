@@ -1,5 +1,6 @@
 xue
 pytest
+pillow
 uvicorn
 fastapi
 aiofiles

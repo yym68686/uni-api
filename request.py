@@ -4,6 +4,8 @@ import json
 import httpx
 import base64
 import urllib.parse
+from PIL import Image
+import io
 
 from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gem, BaseAPI, get_model_dict, provider_api_circular_list, safe_get
@@ -77,6 +79,24 @@ async def get_image_message(base64_image, engine = None):
     colon_index = base64_image.index(":")
     semicolon_index = base64_image.index(";")
     image_type = base64_image[colon_index + 1:semicolon_index]
+
+    if image_type == "image/webp":
+        # 将webp转换为png
+
+        # 解码base64获取图片数据
+        image_data = base64.b64decode(base64_image.split(",")[1])
+
+        # 使用PIL打开webp图片
+        image = Image.open(io.BytesIO(image_data))
+
+        # 转换为PNG格式
+        png_buffer = io.BytesIO()
+        image.save(png_buffer, format="PNG")
+        png_base64 = base64.b64encode(png_buffer.getvalue()).decode('utf-8')
+
+        # 返回PNG格式的base64
+        base64_image = f"data:image/png;base64,{png_base64}"
+        image_type = "image/png"
 
     if "gpt" == engine or "openrouter" == engine:
         return {
