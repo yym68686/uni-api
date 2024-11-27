@@ -836,6 +836,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     and "gpt" not in original_model \
     and "o1" not in original_model \
     and "gemini" not in original_model \
+    and "grok" not in original_model \
     and parsed_url.netloc != 'api.cloudflare.com' \
     and parsed_url.netloc != 'api.cohere.com':
         engine = "openrouter"

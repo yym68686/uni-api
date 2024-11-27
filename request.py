@@ -78,7 +78,7 @@ async def get_image_message(base64_image, engine = None):
     semicolon_index = base64_image.index(";")
     image_type = base64_image[colon_index + 1:semicolon_index]
 
-    if "gpt" == engine:
+    if "gpt" == engine or "openrouter" == engine:
         return {
             "type": "image_url",
             "image_url": {
