@@ -434,7 +434,7 @@ All scheduling algorithms need to be enabled by setting api_keys.(api).preferenc
 
 - How should the base_url be filled in correctly?
 
-Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completion, not Azure's URL.
+Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completions, not Azure's URL.
 
 - How does the model timeout time work? What is the priority of the channel-level timeout setting and the global model timeout setting?
 

@@ -434,7 +434,7 @@ api_keys:
 
 - 应该怎么正确填写 base_url？
 
-除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completion，而不是 Azure 的 URL。
+除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completions，而不是 Azure 的 URL。
 
 - 模型超时时间是如何确认的？渠道级别的超时设置和全局模型超时设置的优先级是什么？
 
