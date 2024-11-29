@@ -96,7 +96,7 @@ providers:
       #   gemini-1.5-pro: 2/min,50/day
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
-      api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing.
+      api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random, fixed_priority. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing. fixed_priority is fixed priority scheduling, always use the first available API key.
       model_timeout: # Model timeout, in seconds, default 100 seconds, optional
         gemini-1.5-pro: 10 # Model gemini-1.5-pro timeout is 10 seconds
         gemini-1.5-flash: 10 # Model gemini-1.5-flash timeout is 10 seconds

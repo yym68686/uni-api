@@ -70,12 +70,17 @@ class ThreadSafeCircularList:
         if schedule_algorithm == "random":
             import random
             self.items = random.sample(items, len(items))
+            self.schedule_algorithm = "random"
         elif schedule_algorithm == "round_robin":
             self.items = items
+            self.schedule_algorithm = "round_robin"
+        elif schedule_algorithm == "fixed_priority":
+            self.items = items
+            self.schedule_algorithm = "fixed_priority"
         else:
             self.items = items
-            logger.warning(f"Unknown schedule algorithm: {schedule_algorithm}, use (round_robin, random) instead")
-
+            logger.warning(f"Unknown schedule algorithm: {schedule_algorithm}, use (round_robin, random, fixed_priority) instead")
+            self.schedule_algorithm = "round_robin"
         self.index = 0
         self.lock = asyncio.Lock()
         # 修改为二级字典，第一级是item，第二级是model
@@ -152,6 +157,8 @@ class ThreadSafeCircularList:
 
     async def next(self, model: str = None):
         async with self.lock:
+            if self.schedule_algorithm == "fixed_priority":
+                self.index = 0
             start_index = self.index
             while True:
                 item = self.items[self.index]

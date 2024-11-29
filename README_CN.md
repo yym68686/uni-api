@@ -96,7 +96,7 @@ providers:
       #   gemini-1.5-pro: 2/min,50/day
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
-      api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡。
+      api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。
       model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
         gemini-1.5-pro: 10 # 模型 gemini-1.5-pro 的超时时间为 10 秒
         gemini-1.5-flash: 10 # 模型 gemini-1.5-flash 的超时时间为 10 秒

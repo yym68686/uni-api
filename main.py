@@ -808,7 +808,7 @@ def get_timeout_value(provider_timeouts, original_model):
     return timeout_value
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
@@ -870,7 +870,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         engine = provider["engine"]
 
     channel_id = f"{provider['provider']}"
-    logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine}")
+    if engine != "moderation":
+        logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine} role: {role}")
 
     url, headers, payload = await get_payload(request, engine, provider)
     if is_debug:
@@ -1152,6 +1153,7 @@ class ModelRequestHandler:
                 start_index = self.last_provider_indices[request_model]
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
+        role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
 
         index = 0
         if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
@@ -1170,7 +1172,7 @@ class ModelRequestHandler:
             index += 1
             provider = matching_providers[current_index]
             try:
-                response = await process_request(request, provider, endpoint)
+                response = await process_request(request, provider, endpoint, role)
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
 
