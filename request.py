@@ -702,7 +702,7 @@ async def get_gpt_payload(request, engine, provider):
             else:
                 payload[field] = value
 
-    if provider.get("tools") == False or "o1" in model:
+    if provider.get("tools") == False or "o1" in model or "chatgpt-4o-latest" in model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
     if "o1" in model and "models.inference.ai.azure.com" in url:
