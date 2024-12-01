@@ -692,16 +692,23 @@ async def get_gpt_payload(request, engine, provider):
 
     miss_fields = [
         'model',
-        'messages'
+        'messages',
     ]
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
-            payload[field] = value
+            if field == "max_tokens" and "o1" in model:
+                payload["max_completion_tokens"] = value
+            else:
+                payload[field] = value
 
     if provider.get("tools") == False or "o1" in model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
+    if "o1" in model and "models.inference.ai.azure.com" in url:
+        payload["stream"] = False
+        # request.stream = False
+        payload.pop("stream_options", None)
 
     return url, headers, payload
 

@@ -874,6 +874,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine} role: {role}")
 
     url, headers, payload = await get_payload(request, engine, provider)
+    # print("url", url)
     if is_debug:
         logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
         if payload.get("file"):

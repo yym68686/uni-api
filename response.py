@@ -6,81 +6,7 @@ from datetime import datetime
 
 from log_config import logger
 
-from utils import safe_get
-
-# end_of_line = "\n\r\n"
-# end_of_line = "\r\n"
-# end_of_line = "\n\r"
-end_of_line = "\n\n"
-# end_of_line = "\r"
-# end_of_line = "\n"
-
-async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
-    random.seed(timestamp)
-    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-    sample_data = {
-        "id": f"chatcmpl-{random_str}",
-        "object": "chat.completion.chunk",
-        "created": timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"content": content},
-                "logprobs": None,
-                "finish_reason": None
-            }
-        ],
-        "usage": None,
-        "system_fingerprint": "fp_d576307f90",
-    }
-    if function_call_content:
-        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"arguments": function_call_content}}]}
-    if tools_id and function_call_name:
-        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"id": tools_id,"type":"function","function":{"name": function_call_name, "arguments":""}}]}
-        # sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"id": tools_id, "name": function_call_name}}]}
-    if role:
-        sample_data["choices"][0]["delta"] = {"role": role, "content": ""}
-    if total_tokens:
-        total_tokens = prompt_tokens + completion_tokens
-        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
-        sample_data["choices"] = []
-    json_data = json.dumps(sample_data, ensure_ascii=False)
-
-    # 构建SSE响应
-    sse_response = f"data: {json_data}" + end_of_line
-
-    return sse_response
-
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
-    random.seed(timestamp)
-    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-    sample_data = {
-        "id": f"chatcmpl-{random_str}",
-        "object": "chat.completion",
-        "created": timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": role,
-                    "content": content,
-                    "refusal": None
-                },
-                "logprobs": None,
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": None,
-        "system_fingerprint": "fp_a7d06e42a7"
-    }
-    if total_tokens:
-        total_tokens = prompt_tokens + completion_tokens
-        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
-    json_data = json.dumps(sample_data, ensure_ascii=False)
-
-    return json_data
+from utils import safe_get, generate_sse_response, generate_no_stream_response, end_of_line
 
 async def check_response(response, error_log):
     if response and not (200 <= response.status_code < 300):
@@ -208,7 +134,12 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                         return
                     line = json.loads(result)
                     line['id'] = f"chatcmpl-{random_str}"
-                    yield "data: " + json.dumps(line).strip() + end_of_line
+                    no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
+                    if no_stream_content:
+                        sse_string = await generate_sse_response(safe_get(line, "created", default=None), safe_get(line, "model", default=None), content=no_stream_content)
+                        yield sse_string
+                    else:
+                        yield "data: " + json.dumps(line).strip() + end_of_line
 
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
