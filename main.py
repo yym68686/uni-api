@@ -821,8 +821,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         engine = "cloudflare"
     elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
         engine = "claude"
-    elif parsed_url.netloc == 'openrouter.ai':
-        engine = "openrouter"
     elif parsed_url.netloc == 'api.cohere.com':
         engine = "cohere"
         request.stream = True
