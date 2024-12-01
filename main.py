@@ -450,6 +450,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
             if api_index is not None:
                 enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
+            else:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Invalid or missing API Key"}
+                )
         else:
             # 如果token为None，检查全局设置
             enable_moderation = config.get('ENABLE_MODERATION', False)
@@ -643,6 +648,7 @@ class ClientManager:
                         proxy = proxy.replace('socks5h://', 'socks5://')
                         transport = AsyncProxyTransport.from_url(proxy)
                         client_config["transport"] = transport
+                        # print("proxy", proxy)
                     except ImportError:
                         logger.error("httpx-socks package is required for SOCKS proxy support")
                         raise ImportError("Please install httpx-socks package for SOCKS proxy support: pip install httpx-socks")
