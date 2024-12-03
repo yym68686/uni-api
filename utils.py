@@ -447,8 +447,13 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             if first_item_str.startswith("[DONE]"):
                 logger.error(f"provider: {channel_id:<11} error_handling_wrapper [DONE]!")
                 raise StopAsyncIteration
-            if any(x in first_item_str for x in error_triggers):
-                logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
+            try:
+                encode_first_item_str = first_item_str.encode().decode('unicode-escape')
+            except UnicodeDecodeError:
+                encode_first_item_str = first_item_str
+                logger.error(f"provider: {channel_id:<11} error UnicodeDecodeError: %s", first_item_str)
+            if any(x in encode_first_item_str for x in error_triggers):
+                logger.error(f"provider: {channel_id:<11} error const string: %s", encode_first_item_str)
                 raise StopAsyncIteration
             try:
                 first_item_str = json.loads(first_item_str)
