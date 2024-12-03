@@ -462,6 +462,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
 
         if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
+            if any(x in str(first_item_str) for x in error_triggers):
+                logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
+                raise StopAsyncIteration
             content = safe_get(first_item_str, "choices", 0, "message", "content", default=None)
             if content == "" or content is None:
                 raise StopAsyncIteration

@@ -1,4 +1,5 @@
 import os
+import json
 import pytest
 from fastapi.testclient import TestClient
 import sys
@@ -81,7 +82,15 @@ def test_request_model(test_client, api_key, get_model):
 
     response = test_client.post("/v1/chat/completions", json=request_data, headers=headers)
     for line in response.iter_lines():
-        print(line.lstrip("data: "))
+        line = line.lstrip("data: ")
+        if line == "[DONE]":
+            print("DONE")
+            break
+        try:
+            data = json.loads(line)
+            print(data)
+        except json.JSONDecodeError:
+            print(line)
     assert 200 <= response.status_code < 300
 
 if __name__ == "__main__":
