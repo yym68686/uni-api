@@ -1071,6 +1071,7 @@ async def get_dalle_payload(request, engine, provider):
         "model": model,
         "prompt": request.prompt,
         "n": request.n,
+        "response_format": request.response_format,
         "size": request.size
     }
 

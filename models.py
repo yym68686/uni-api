@@ -109,6 +109,7 @@ class ImageGenerationRequest(BaseRequest):
     prompt: str
     model: Optional[str] = "dall-e-3"
     n:  Optional[int] = 1
+    response_format: Optional[str] = "url"
     size: Optional[str] = "1024x1024"
     stream: bool = False
 
