@@ -713,7 +713,7 @@ async def ensure_config(request: Request, call_next):
 
         default_config = {
             "headers": {
-                "User-Agent": "OpenAI/Python 1.55.3",
+                "User-Agent": "curl/7.68.0",
                 "Accept": "*/*",
             },
             "http2": True,

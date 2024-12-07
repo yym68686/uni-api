@@ -658,7 +658,7 @@ async def get_gpt_payload(request, engine, provider):
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
                     content.append(text_message)
-                elif item.type == "image_url" and provider.get("image", True):
+                elif item.type == "image_url" and provider.get("image", True) and "o1-mini" not in model:
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
