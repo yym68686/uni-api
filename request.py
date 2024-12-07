@@ -1138,7 +1138,10 @@ async def get_embedding_payload(request, engine, provider):
     }
 
     if request.encoding_format:
-        payload["encoding_format"] = request.encoding_format
+        if url.startswith("https://api.jina.ai"):
+            payload["embedding_type"] = request.encoding_format
+        else:
+            payload["encoding_format"] = request.encoding_format
 
     return url, headers, payload
 
