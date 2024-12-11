@@ -261,9 +261,25 @@ async def get_gemini_payload(request, engine, provider):
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
             if field == "tools":
+                # 处理每个工具的 function 定义
+                processed_tools = []
+                for tool in value:
+                    function_def = tool["function"]
+                    # 处理 parameters.properties 中的 default 字段
+                    if safe_get(function_def, "parameters", "properties", default=None):
+                        for prop_value in function_def["parameters"]["properties"].values():
+                            if "default" in prop_value:
+                                # 将 default 值添加到 description 中
+                                default_value = prop_value["default"]
+                                description = prop_value.get("description", "")
+                                prop_value["description"] = f"{description}\nDefault: {default_value}"
+                                # 删除 default 字段
+                                del prop_value["default"]
+                    processed_tools.append({"function": function_def})
+
                 payload.update({
                     "tools": [{
-                        "function_declarations": [tool["function"] for tool in value]
+                        "function_declarations": [tool["function"] for tool in processed_tools]
                     }],
                     "tool_config": {
                         "function_calling_config": {
