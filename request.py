@@ -212,7 +212,7 @@ async def get_gemini_payload(request, engine, provider):
 
 
     payload = {
-        "contents": messages,
+        "contents": messages or [{"role": "user", "parts": [{"text": "No messages"}]}],
         "safetySettings": [
             {
                 "category": "HARM_CATEGORY_HARASSMENT",
