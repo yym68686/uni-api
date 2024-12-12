@@ -290,6 +290,16 @@ async def get_gemini_payload(request, engine, provider):
             else:
                 payload[field] = value
 
+    if request.model.endswith("-search"):
+        if "tools" not in payload:
+            payload["tools"] = [{
+                "googleSearch": {}
+            }]
+        else:
+            payload["tools"].append({
+                "googleSearch": {}
+            })
+
     return url, headers, payload
 
 import time
