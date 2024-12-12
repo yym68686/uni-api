@@ -490,6 +490,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
         if parsed_body:
             try:
                 request_model = UnifiedRequest.model_validate(parsed_body).data
+                if is_debug:
+                    logger.info("request_model: %s", json.dumps(request_model.model_dump(exclude_unset=True), indent=2, ensure_ascii=False))
                 model = request_model.model
                 current_info["model"] = model
 
