@@ -145,12 +145,13 @@ async def get_gemini_payload(request, engine, provider):
     gemini_stream = "streamGenerateContent"
     url = provider['base_url']
     parsed_url = urllib.parse.urlparse(url)
-    if parsed_url.path.startswith("/v1beta") or parsed_url.path.startswith("/v1"):
+    # print("parsed_url", parsed_url)
+    if parsed_url.path.endswith("/v1beta") or parsed_url.path.endswith("/v1"):
         api_version = parsed_url.path.split('/')[-1]  # 获取 v1 或 v1beta
     else:
         api_version = "v1beta"
     # https://generativelanguage.googleapis.com/v1beta/models/
-    url = f"{parsed_url.scheme}://{parsed_url.netloc}/{api_version}/models/{model}:{gemini_stream}?key={await provider_api_circular_list[provider['provider']].next(model)}"
+    url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}/models/{model}:{gemini_stream}?key={await provider_api_circular_list[provider['provider']].next(model)}"
 
     messages = []
     systemInstruction = None
