@@ -821,7 +821,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
     engine = None
-    if parsed_url.path.startswith("/v1beta") or parsed_url.path.endswith("/v1"):
+    if parsed_url.path.endswith("/v1beta") or parsed_url.path.endswith("/v1"):
         engine = "gemini"
     elif parsed_url.netloc == 'aiplatform.googleapis.com':
         engine = "vertex"
