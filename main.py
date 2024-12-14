@@ -551,7 +551,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
 
-            if request.url.path.startswith("/v1"):
+            if request.url.path.startswith("/v1") and not DISABLE_DATABASE:
                 if isinstance(response, (FastAPIStreamingResponse, StarletteStreamingResponse)) or type(response).__name__ == '_StreamingResponse':
                     response = LoggingStreamingResponse(
                         content=response.body_iterator,
