@@ -681,9 +681,9 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
         "choices": [
             {
                 "index": 0,
-                "delta": {"content": content},
+                "delta": {"content": content} if content else {},
                 "logprobs": None,
-                "finish_reason": None
+                "finish_reason": None if content else "stop"
             }
         ],
         "usage": None,

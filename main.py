@@ -825,6 +825,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         engine = "gemini"
     elif parsed_url.netloc == 'aiplatform.googleapis.com':
         engine = "vertex"
+    elif parsed_url.netloc.rstrip('/').endswith('openai.azure.com'):
+        engine = "azure"
     elif parsed_url.netloc == 'api.cloudflare.com':
         engine = "cloudflare"
     elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
