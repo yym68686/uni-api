@@ -13,15 +13,15 @@
 
 ## Introduction
 
-For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Cohere, Groq, Cloudflare, OpenRouter, and more.
+For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Azure, Cohere, Groq, Cloudflare, OpenRouter, and more.
 
 ## ✨ Features
 
 - No front-end, pure configuration file to configure API channels. You can run your own API station just by writing a file, and the documentation has a detailed configuration guide, beginner-friendly.
 - Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, OpenRouter, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
-- Simultaneously supports Anthropic, Gemini, Vertex AI, Cohere, Groq, Cloudflare. Vertex simultaneously supports Claude and Gemini API.
-- Support OpenAI, Anthropic, Gemini, Vertex native tool use function calls.
-- Support OpenAI, Anthropic, Gemini, Vertex native image recognition API.
+- Simultaneously supports Anthropic, Gemini, Vertex AI, Azure, Cohere, Groq, Cloudflare. Vertex simultaneously supports Claude and Gemini API.
+- Support OpenAI, Anthropic, Gemini, Vertex, Azure native tool use function calls.
+- Support OpenAI, Anthropic, Gemini, Vertex, Azure native image recognition API.
 - Support four types of load balancing.
   1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
   2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
@@ -124,6 +124,12 @@ providers:
     model:
       - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # Rename model, @cf/meta/llama-3.1-8b-instruct is the provider's original model name, must be enclosed in quotes, otherwise yaml syntax error, llama-3.1-8b is the renamed name, you can use a simple name to replace the original complex name, optional
       - '@cf/meta/llama-3.1-8b-instruct' # Must be enclosed in quotes, otherwise yaml syntax error
+
+  - provider: azure
+    base_url: https://your-endpoint.openai.azure.com
+    api: your-api-key
+    model:
+      - gpt-4o
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages

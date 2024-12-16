@@ -13,15 +13,15 @@
 
 ## 介绍
 
-如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，又想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型 API 的项目，可以通过一个统一的API 接口调用多种不同提供商的服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Cohere、Groq、Cloudflare、OpenRouter 等。
+如果个人使用的话，one/new-api 过于复杂，有很多个人不需要使用的商用功能，如果你不想要复杂的前端界面，又想要支持的模型多一点，可以试试 uni-api。这是一个统一管理大模型 API 的项目，可以通过一个统一的API 接口调用多种不同提供商的服务，统一转换为 OpenAI 格式，支持负载均衡。目前支持的后端服务有：OpenAI、Anthropic、Gemini、Vertex、Azure、Cohere、Groq、Cloudflare、OpenRouter 等。
 
 ## ✨ 特性
 
 - 无前端，纯配置文件配置 API 渠道。只要写一个文件就能运行起一个属于自己的 API 站，文档有详细的配置指南，小白友好。
 - 统一管理多个后端服务，支持 OpenAI、Deepseek、OpenRouter 等其他 API 是 OpenAI 格式的提供商。支持 OpenAI Dalle-3 图像生成。
-- 同时支持 Anthropic、Gemini、Vertex AI、Cohere、Groq、Cloudflare。Vertex 同时支持 Claude 和 Gemini API。
-- 支持 OpenAI、 Anthropic、Gemini、Vertex 原生 tool use 函数调用。
-- 支持 OpenAI、Anthropic、Gemini、Vertex 原生识图 API。
+- 同时支持 Anthropic、Gemini、Vertex AI、Azure、Cohere、Groq、Cloudflare。Vertex 同时支持 Claude 和 Gemini API。
+- 支持 OpenAI、 Anthropic、Gemini、Vertex、Azure 原生 tool use 函数调用。
+- 支持 OpenAI、Anthropic、Gemini、Vertex、Azure 原生识图 API。
 - 支持四种负载均衡。
   1. 支持渠道级加权负载均衡，可以根据不同的渠道权重分配请求。默认不开启，需要配置渠道权重。
   2. 支持 Vertex 区域级负载均衡，支持 Vertex 高并发，最高可将 Gemini，Claude 并发提高 （API数量 * 区域数量） 倍。自动开启不需要额外配置。
@@ -124,6 +124,12 @@ providers:
     model:
       - '@cf/meta/llama-3.1-8b-instruct': llama-3.1-8b # 重命名模型，@cf/meta/llama-3.1-8b-instruct 是服务商的原始的模型名称，必须使用引号包裹模型名，否则yaml语法错误，llama-3.1-8b 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
       - '@cf/meta/llama-3.1-8b-instruct' # 必须使用引号包裹模型名，否则yaml语法错误
+
+  - provider: azure
+    base_url: https://your-endpoint.openai.azure.com
+    api: your-api-key
+    model:
+      - gpt-4o
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages

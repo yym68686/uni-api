@@ -98,7 +98,7 @@ async def get_image_message(base64_image, engine = None):
         base64_image = f"data:image/png;base64,{png_base64}"
         image_type = "image/png"
 
-    if "gpt" == engine or "openrouter" == engine:
+    if "gpt" == engine or "openrouter" == engine or "azure" == engine:
         return {
             "type": "image_url",
             "image_url": {
@@ -126,7 +126,7 @@ async def get_image_message(base64_image, engine = None):
     raise ValueError("Unknown engine")
 
 async def get_text_message(role, message, engine = None):
-    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine or "o1" == engine:
+    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine or "o1" == engine or "azure" == engine:
         return {"type": "text", "text": message}
     if "gemini" == engine or "vertex-gemini" == engine:
         return {"text": message}
@@ -739,6 +739,94 @@ async def get_gpt_payload(request, engine, provider):
 
     return url, headers, payload
 
+def build_azure_endpoint(base_url, deployment_id, api_version="2024-10-21"):
+    # 移除base_url末尾的斜杠(如果有)
+    base_url = base_url.rstrip('/')
+
+    # 构建路径
+    path = f"/openai/deployments/{deployment_id}/chat/completions"
+
+    # 使用urljoin拼接base_url和path
+    full_url = urllib.parse.urljoin(base_url, path)
+
+    # 添加api-version查询参数
+    final_url = f"{full_url}?api-version={api_version}"
+
+    return final_url
+
+async def get_azure_payload(request, engine, provider):
+    headers = {
+        'Content-Type': 'application/json',
+    }
+    model_dict = get_model_dict(provider)
+    model = model_dict[request.model]
+    headers['api-key'] = f"{provider['api']}"
+
+    url = build_azure_endpoint(
+        base_url=provider['base_url'],
+        deployment_id=model,
+    )
+
+    messages = []
+    for msg in request.messages:
+        tool_calls = None
+        tool_call_id = None
+        if isinstance(msg.content, list):
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    text_message = await get_text_message(msg.role, item.text, engine)
+                    content.append(text_message)
+                elif item.type == "image_url" and provider.get("image", True) and "o1-mini" not in model:
+                    image_message = await get_image_message(item.image_url.url, engine)
+                    content.append(image_message)
+        else:
+            content = msg.content
+            tool_calls = msg.tool_calls
+            tool_call_id = msg.tool_call_id
+
+        if tool_calls:
+            tool_calls_list = []
+            for tool_call in tool_calls:
+                tool_calls_list.append({
+                    "id": tool_call.id,
+                    "type": tool_call.type,
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments
+                    }
+                })
+                if provider.get("tools"):
+                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+        elif tool_call_id:
+            if provider.get("tools"):
+                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
+        else:
+            messages.append({"role": msg.role, "content": content})
+
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+
+    miss_fields = [
+        'model',
+        'messages',
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            if field == "max_tokens" and "o1" in model:
+                payload["max_completion_tokens"] = value
+            else:
+                payload[field] = value
+
+    if provider.get("tools") == False or "o1" in model or "chatgpt-4o-latest" in model or "grok" in model:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
+    return url, headers, payload
+
 async def get_openrouter_payload(request, engine, provider):
     headers = {
         'Content-Type': 'application/json'
@@ -1206,6 +1294,8 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_vertex_gemini_payload(request, engine, provider)
     elif engine == "vertex-claude":
         return await get_vertex_claude_payload(request, engine, provider)
+    elif engine == "azure":
+        return await get_azure_payload(request, engine, provider)
     elif engine == "claude":
         return await get_claude_payload(request, engine, provider)
     elif engine == "gpt":

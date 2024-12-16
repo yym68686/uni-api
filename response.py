@@ -141,10 +141,40 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                     else:
                         yield "data: " + json.dumps(line).strip() + end_of_line
 
+async def fetch_azure_response_stream(client, url, headers, payload):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_azure_response_stream")
+        if error_message:
+            yield error_message
+            return
+
+        buffer = ""
+        sse_string = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                if line and line != "data: " and line != "data:" and not line.startswith(": "):
+                    result = line.lstrip("data: ")
+                    if result.strip() == "[DONE]":
+                        yield "data: [DONE]" + end_of_line
+                        return
+                    line = json.loads(result)
+                    no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
+                    stream_content = safe_get(line, "choices", 0, "delta", "content", default=None)
+                    if no_stream_content or stream_content or sse_string:
+                        sse_string = await generate_sse_response(timestamp, safe_get(line, "model", default=None), content=no_stream_content or stream_content)
+                        yield sse_string
+                    if no_stream_content:
+                        yield "data: [DONE]" + end_of_line
+                        return
+
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
-        error_message = await check_response(response, "fetch_gpt_response_stream")
+        error_message = await check_response(response, "fetch_cloudflare_response_stream")
         if error_message:
             yield error_message
             return
@@ -299,6 +329,20 @@ async def fetch_response(client, url, headers, payload, engine, model):
         timestamp = int(datetime.timestamp(datetime.now()))
         yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens)
 
+    elif engine == "azure":
+        response_json = response.json()
+        # 删除 content_filter_results
+        if "choices" in response_json:
+            for choice in response_json["choices"]:
+                if "content_filter_results" in choice:
+                    del choice["content_filter_results"]
+
+        # 删除 prompt_filter_results
+        if "prompt_filter_results" in response_json:
+            del response_json["prompt_filter_results"]
+
+        yield response_json
+
     else:
         response_json = response.json()
         yield response_json
@@ -313,6 +357,9 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
             yield chunk
     elif engine == "gpt":
         async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+            yield chunk
+    elif engine == "azure":
+        async for chunk in fetch_azure_response_stream(client, url, headers, payload):
             yield chunk
     elif engine == "openrouter":
         async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
