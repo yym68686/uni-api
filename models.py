@@ -61,16 +61,15 @@ class ToolChoice(BaseModel):
 class BaseRequest(BaseModel):
     request_type: Optional[Literal["chat", "image", "audio", "moderation"]] = Field(default=None, exclude=True)
 
-def create_json_schema_class():
-    class JsonSchema(BaseModel):
-        name: str
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*shadows an attribute.*")
 
-        model_config = ConfigDict(protected_namespaces=())
+class JsonSchema(BaseModel):
+    name: str
+    schema: Dict[str, Any] = Field(validation_alias='schema')
 
-    JsonSchema.__annotations__['schema'] = Dict[str, Any]
-    return JsonSchema
+    model_config = ConfigDict(protected_namespaces=())
 
-JsonSchema = create_json_schema_class()
 class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"]
     json_schema: Optional[JsonSchema] = None
