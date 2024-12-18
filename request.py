@@ -862,7 +862,7 @@ async def get_openrouter_payload(request, engine, provider):
                     if item["type"] == "text":
                         messages.append({"role": msg.role, "content": item["text"]})
                     elif item["type"] == "image_url":
-                        messages.append({"role": msg.role, "content": item["url"]})
+                        messages.append({"role": msg.role, "content": [await get_image_message(item["image_url"]["url"], engine)]})
             else:
                 messages.append({"role": msg.role, "content": content})
 
