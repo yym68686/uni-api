@@ -30,20 +30,26 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
         revicing_function_call = False
         function_full_response = "{"
         need_function_call = False
+        line_index = 0
+        last_text_line = 0
         async for chunk in response.aiter_text():
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
+                line_index += 1
                 # print(line)
                 if line and '\"text\": \"' in line:
                     try:
                         json_data = json.loads( "{" + line + "}")
                         content = json_data.get('text', '')
                         content = "\n".join(content.split("\\n"))
+                        if last_text_line == line_index - 3:
+                            content = "\n\n" + content.lstrip()
                         sse_string = await generate_sse_response(timestamp, model, content=content)
                         yield sse_string
                     except json.JSONDecodeError:
                         logger.error(f"无法解析JSON: {line}")
+                    last_text_line = line_index
 
                 if line and ('\"functionCall\": {' in line or revicing_function_call):
                     revicing_function_call = True
