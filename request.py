@@ -737,6 +737,25 @@ async def get_gpt_payload(request, engine, provider):
         # request.stream = False
         payload.pop("stream_options", None)
 
+    if request.model.endswith("-search") and "gemini" in request.model:
+        if "tools" not in payload:
+            payload["tools"] = [{
+                "type": "function",
+                "function": {
+                    "name": "googleSearch",
+                    "description": "googleSearch"
+                }
+            }]
+        else:
+            if not any(tool["function"]["name"] == "googleSearch" for tool in payload["tools"]):
+                payload["tools"].append({
+                    "type": "function",
+                    "function": {
+                        "name": "googleSearch",
+                        "description": "googleSearch"
+                    }
+                })
+
     return url, headers, payload
 
 def build_azure_endpoint(base_url, deployment_id, api_version="2024-10-21"):
