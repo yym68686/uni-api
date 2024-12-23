@@ -730,10 +730,13 @@ async def ensure_config(request: Request, call_next):
         # 存储超时配置
         app.state.timeouts = {}
         if app.state.config and 'preferences' in app.state.config:
-            for model_name, timeout_value in app.state.config['preferences'].get('model_timeout', {}).items():
-                app.state.timeouts[model_name] = timeout_value
-            if "default" not in app.state.config['preferences'].get('model_timeout', {}):
-                app.state.timeouts["default"] = DEFAULT_TIMEOUT
+            if isinstance(app.state.config['preferences'].get('model_timeout'), int):
+                app.state.timeouts["default"] = app.state.config['preferences'].get('model_timeout')
+            else:
+                for model_name, timeout_value in app.state.config['preferences'].get('model_timeout', {"default": DEFAULT_TIMEOUT}).items():
+                    app.state.timeouts[model_name] = timeout_value
+                if "default" not in app.state.config['preferences'].get('model_timeout', {}):
+                    app.state.timeouts["default"] = DEFAULT_TIMEOUT
 
         app.state.provider_timeouts = defaultdict(lambda: defaultdict(lambda: DEFAULT_TIMEOUT))
         for provider in app.state.config["providers"]:
@@ -1358,7 +1361,7 @@ def generate_api_key():
     # Define the character set (only alphanumeric)
     chars = string.ascii_letters + string.digits
     # Generate a random string of 36 characters
-    random_string = ''.join(secrets.choice(chars) for _ in range(36))
+    random_string = ''.join(secrets.choice(chars) for _ in range(48))
     api_key = "sk-" + random_string
     return JSONResponse(content={"api_key": api_key})
 
