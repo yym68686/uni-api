@@ -32,6 +32,10 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
         need_function_call = False
         line_index = 0
         last_text_line = 0
+        if "thinking" in model:
+            is_thinking = True
+        else:
+            is_thinking = False
         async for chunk in response.aiter_text():
             buffer += chunk
             while "\n" in buffer:
@@ -43,8 +47,13 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                         json_data = json.loads( "{" + line + "}")
                         content = json_data.get('text', '')
                         content = "\n".join(content.split("\\n"))
+                        if last_text_line == 0 and is_thinking:
+                            content = "> " + content.lstrip()
+                        if is_thinking:
+                            content = content.replace("\n", "\n> ")
                         if last_text_line == line_index - 3:
-                            content = "\n\n" + content.lstrip()
+                            is_thinking = False
+                            content = "\n\n\n" + content.lstrip()
                         sse_string = await generate_sse_response(timestamp, model, content=content)
                         yield sse_string
                     except json.JSONDecodeError:
