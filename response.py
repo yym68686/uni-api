@@ -47,6 +47,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                         json_data = json.loads( "{" + line + "}")
                         content = json_data.get('text', '')
                         content = "\n".join(content.split("\\n"))
+                        # content = content.replace("\n", "\n\n")
                         if last_text_line == 0 and is_thinking:
                             content = "> " + content.lstrip()
                         if is_thinking:
