@@ -256,7 +256,8 @@ async def get_gemini_payload(request, engine, provider):
         'user',
         'include_usage',
         'logprobs',
-        'top_logprobs'
+        'top_logprobs',
+        'response_format'
     ]
 
     for field, value in request.model_dump(exclude_unset=True).items():
