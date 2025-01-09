@@ -600,6 +600,8 @@ def get_all_models(config):
     return all_models
 
 # 【GCP-Vertex AI 目前有這些區域可用】 https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude?hl=zh_cn
+# https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations?hl=zh-cn#available-regions
+
 # c3.5s
 # us-east5
 # europe-west1
@@ -623,7 +625,8 @@ c35s = ThreadSafeCircularList(["us-east5", "europe-west1"])
 c3s = ThreadSafeCircularList(["us-east5", "us-central1", "asia-southeast1"])
 c3o = ThreadSafeCircularList(["us-east5"])
 c3h = ThreadSafeCircularList(["us-east5", "us-central1", "europe-west1", "europe-west4"])
-gem = ThreadSafeCircularList(["us-central1", "us-east4", "us-west1", "us-west4", "europe-west1", "europe-west2"])
+gemini1 = ThreadSafeCircularList(["us-central1", "us-east4", "us-west1", "us-west4", "europe-west1", "europe-west2"])
+gemini2 = ThreadSafeCircularList(["us-central1"])
 
 class BaseAPI:
     def __init__(
