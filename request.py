@@ -715,7 +715,7 @@ async def get_gpt_payload(request, engine, provider):
         else:
             messages.append({"role": msg.role, "content": content})
 
-    if "o1-mini" in model or "o1-preview" in model and len(messages) > 1 and messages[0]["role"] == "system":
+    if ("o1-mini" in model or "o1-preview" in model) and len(messages) > 1 and messages[0]["role"] == "system":
         system_msg = messages.pop(0)
         messages[0]["content"] = system_msg["content"] + messages[0]["content"]
 
