@@ -8,7 +8,7 @@ from PIL import Image
 import io
 
 from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, gem, BaseAPI, get_model_dict, provider_api_circular_list, safe_get
+from utils import c35s, c3s, c3o, c3h, gemini1, gemini2, BaseAPI, get_model_dict, provider_api_circular_list, safe_get
 
 import imghdr
 
@@ -372,7 +372,12 @@ async def get_vertex_gemini_payload(request, engine, provider):
     gemini_stream = "streamGenerateContent"
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
-    location = gem
+
+    if "gemini-2.0" in model or "gemini-exp" in model:
+        location = gemini2
+    else:
+        location = gemini1
+
     url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(LOCATION=await location.next(), PROJECT_ID=project_id, MODEL_ID=model, stream=gemini_stream)
 
     messages = []
