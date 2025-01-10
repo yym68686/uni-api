@@ -2153,7 +2153,7 @@ app.mount("/", StaticFiles(directory="./static", html=True), name="static")
 if __name__ == '__main__':
     import uvicorn
     import os
-    PORT = os.getenv("PORT", 8000)
+    PORT = int(os.getenv("PORT", "8000"))
     uvicorn.run(
         "__main__:app",
         host="0.0.0.0",
