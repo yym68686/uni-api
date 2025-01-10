@@ -51,7 +51,7 @@ providers:
   - provider: provider_name # Service provider name, such as openai, anthropic, gemini, openrouter, can be any name, required
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required, automatically uses base_url and api to get all available models through the /v1/models endpoint.
-  # Multiple providers can be configured here, each provider can configure multiple API Keys, and each API Key can configure multiple models.
+  # Multiple providers can be configured here, each provider can configure multiple API Keys, and each provider can configure multiple models.
 api_keys:
   - api: sk-Pkj60Yf8JFWxfgRmXQFWyGtWUddGZnmi3KlvowmRWpWpQxx # API Key, user request uni-api requires API key, required
   # This API Key can use all models, that is, it can use all models in all channels set under providers, without needing to add available channels one by one.
