@@ -211,25 +211,29 @@ async def get_gemini_payload(request, engine, provider):
             content[0]["text"] = re.sub(r"_+", "_", content[0]["text"])
             systemInstruction = {"parts": content}
 
+    if "gemini-2.0-flash-exp" in model or "gemini-1.5" in model:
+        safety_settings = "OFF"
+    else:
+        safety_settings = "BLOCK_NONE"
 
     payload = {
         "contents": messages or [{"role": "user", "parts": [{"text": "No messages"}]}],
         "safetySettings": [
             {
                 "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": "OFF"
+                "threshold": safety_settings
             },
             {
                 "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "OFF"
+                "threshold": safety_settings
             },
             {
                 "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "OFF"
+                "threshold": safety_settings
             },
             {
                 "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "OFF"
+                "threshold": safety_settings
             }
         ]
     }
