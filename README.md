@@ -242,7 +242,7 @@ ssh login to the serv00 server, execute the following command:
 git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
 cd uni-api
 python -m venv uni-api
-tmux new -s uni-api
+tmux new -A -s uni-api
 source uni-api/bin/activate
 export CFLAGS="-I/usr/local/include"
 export CXXFLAGS="-I/usr/local/include"
@@ -258,7 +258,7 @@ cpuset -l 0 pip install -r -vv requirements.txt
 ctrl+b d to exit tmux, wait a few hours for the installation to complete, and after the installation is complete, execute the following command:
 
 ```bash
-tmux attach -t uni-api
+tmux new -A -s uni-api
 source uni-api/bin/activate
 export CONFIG_URL=http://file_url/api.yaml
 export DISABLE_DATABASE=true
