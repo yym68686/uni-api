@@ -146,7 +146,7 @@ api_keys:
       - gpt-4o # Usable model name, can use all gpt-4o models provided by providers
       - claude-3-5-sonnet # Usable model name, can use all claude-3-5-sonnet models provided by providers
       - gemini/* # Usable model name, can only use all models provided by providers named gemini, where gemini is the provider name, * represents all models
-    role: admin
+    role: admin # Set the alias of the API key, optional. The request log will display the alias of the API key. If role is admin, only this API key can request the v1/stats,/v1/generate-api-key endpoints. If all API keys do not have role set to admin, the first API key is set as admin and has permission to request the v1/stats,/v1/generate-api-key endpoints.
 
   - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
