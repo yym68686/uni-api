@@ -508,11 +508,11 @@ async def get_vertex_gemini_payload(request, engine, provider):
     if request.model.endswith("-search"):
         if "tools" not in payload:
             payload["tools"] = [{
-                "googleSearchRetrieval": {}
+                "googleSearch": {}
             }]
         else:
             payload["tools"].append({
-                "googleSearchRetrieval": {}
+                "googleSearch": {}
             })
 
     return url, headers, payload
