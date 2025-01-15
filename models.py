@@ -10,7 +10,7 @@ class FunctionParameter(BaseModel):
 
 class Function(BaseModel):
     name: str
-    description: str
+    description: str = Field(default=None)
     parameters: Optional[FunctionParameter] = Field(default=None, exclude=None)
 
 class Tool(BaseModel):
