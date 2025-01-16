@@ -8,7 +8,7 @@ from PIL import Image
 import io
 
 from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, gemini1, gemini2, BaseAPI, get_model_dict, provider_api_circular_list, safe_get
+from utils import c35s, c3s, c3o, c3h, gemini1, gemini2, BaseAPI, get_model_dict, provider_api_circular_list, safe_get, ThreadSafeCircularList
 
 import imghdr
 
@@ -491,13 +491,12 @@ async def get_vertex_gemini_payload(request, engine, provider):
         'logprobs',
         'top_logprobs'
     ]
-
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
             if field == "tools":
                 payload.update({
                     "tools": [{
-                        "function_declarations": [tool.model_dump(exclude_unset=True)["function"] for tool in value]
+                        "function_declarations": [tool["function"] for tool in value]
                     }],
                     "tool_config": {
                         "function_calling_config": {
