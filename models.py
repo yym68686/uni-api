@@ -22,16 +22,6 @@ class Tool(BaseModel):
         """从JSON字符串解析Tool对象"""
         return cls.model_validate_json(json_str)
 
-    def model_dump(self, **kwargs):
-        data = super().model_dump(**kwargs)
-        function_data = data['function']
-        if 'parameters' in function_data and (
-            function_data['parameters'] is None or
-            not function_data['parameters'].get('properties')
-        ):
-            function_data.pop('parameters', None)
-        return data
-
 class FunctionCall(BaseModel):
     name: str
     arguments: str
@@ -118,6 +108,23 @@ class RequestModel(BaseRequest):
                         if item.type == "text" and item.text:
                             return item.text
         return ""
+
+    def model_dump(self, **kwargs):
+        data = super().model_dump(**kwargs)
+
+        # 检查并处理 tools 字段
+        if 'tools' in data and data['tools']:
+            for tool in data['tools']:
+                if 'function' in tool:
+                    function_data = tool['function']
+                    # 如果 parameters 为空或没有 properties，则移除
+                    if 'parameters' in function_data and (
+                        function_data['parameters'] is None or
+                        not function_data['parameters'].get('properties')
+                    ):
+                        function_data.pop('parameters', None)
+
+        return data
 
 class ImageGenerationRequest(BaseRequest):
     prompt: str
