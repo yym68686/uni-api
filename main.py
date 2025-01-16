@@ -859,7 +859,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if "gemini" in original_model and engine == "vertex":
         engine = "vertex-gemini"
 
-    if endpoint == "/v1/images/generations":
+    if endpoint == "/v1/images/generations" or "stable-diffusion" in original_model:
         engine = "dalle"
         request.stream = False
 
