@@ -17,6 +17,16 @@ class Tool(BaseModel):
     type: str
     function: Function
 
+    def model_dump(self, **kwargs):
+        data = super().model_dump(**kwargs)
+        function_data = data['function']
+        if 'parameters' in function_data and (
+            function_data['parameters'] is None or
+            not function_data['parameters'].get('properties')
+        ):
+            function_data.pop('parameters', None)
+        return data
+
 class FunctionCall(BaseModel):
     name: str
     arguments: str
@@ -174,3 +184,19 @@ class UnifiedRequest(BaseModel):
             else:
                 raise ValueError("无法确定请求类型")
         return values
+
+if __name__ == "__main__":
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="clock-time____getCurrentTime____standalone",
+            description="获取当前时间",
+            parameters=FunctionParameter(
+                type="object",
+                properties={}  # 空字典
+            )
+        )
+    )
+
+    # parameters 字段将被自动排除
+    print(tool.model_dump(exclude_unset=True))
