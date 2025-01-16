@@ -497,7 +497,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
             if field == "tools":
                 payload.update({
                     "tools": [{
-                        "function_declarations": [tool["function"] for tool in value]
+                        "function_declarations": [tool.model_dump(exclude_unset=True)["function"] for tool in value]
                     }],
                     "tool_config": {
                         "function_calling_config": {

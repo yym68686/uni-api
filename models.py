@@ -17,6 +17,11 @@ class Tool(BaseModel):
     type: str
     function: Function
 
+    @classmethod
+    def parse_raw(cls, json_str: str) -> 'Tool':
+        """从JSON字符串解析Tool对象"""
+        return cls.model_validate_json(json_str)
+
     def model_dump(self, **kwargs):
         data = super().model_dump(**kwargs)
         function_data = data['function']
@@ -186,17 +191,23 @@ class UnifiedRequest(BaseModel):
         return values
 
 if __name__ == "__main__":
-    tool = Tool(
-        type="function",
-        function=Function(
-            name="clock-time____getCurrentTime____standalone",
-            description="获取当前时间",
-            parameters=FunctionParameter(
-                type="object",
-                properties={}  # 空字典
-            )
-        )
-    )
+    # 示例JSON字符串
+    json_str = '''
+    {
+        "type": "function",
+        "function": {
+            "name": "clock-time____getCurrentTime____standalone",
+            "description": "获取当前时间",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }
+    '''
+
+    # 解析JSON字符串为Tool对象
+    tool = Tool.parse_raw(json_str)
 
     # parameters 字段将被自动排除
     print(tool.model_dump(exclude_unset=True))
