@@ -6,7 +6,7 @@ from log_config import logger
 class FunctionParameter(BaseModel):
     type: str
     properties: Dict[str, Dict[str, Any]]
-    required: List[str]
+    required: List[str] = None
 
 class Function(BaseModel):
     name: str
