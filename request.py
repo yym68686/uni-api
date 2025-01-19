@@ -475,12 +475,6 @@ async def get_vertex_gemini_payload(request, engine, provider):
         #         "threshold": "BLOCK_NONE"
         #     }
         # ]
-        "generationConfig": {
-            "temperature": 0.5,
-            "max_output_tokens": 8192,
-            "top_k": 40,
-            "top_p": 0.95
-        },
     }
     if systemInstruction:
         payload["system_instruction"] = systemInstruction
@@ -490,9 +484,6 @@ async def get_vertex_gemini_payload(request, engine, provider):
         'messages',
         'stream',
         'tool_choice',
-        'temperature',
-        'top_p',
-        'max_tokens',
         'presence_penalty',
         'frequency_penalty',
         'n',
@@ -501,6 +492,8 @@ async def get_vertex_gemini_payload(request, engine, provider):
         'logprobs',
         'top_logprobs'
     ]
+    generation_config = None
+
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
             if field == "tools":
@@ -514,8 +507,19 @@ async def get_vertex_gemini_payload(request, engine, provider):
                         }
                     }
                 })
+            elif field == "temperature":
+                generation_config["temperature"] = value
+            elif field == "max_tokens":
+                generation_config["max_output_tokens"] = value
+            elif field == "top_p":
+                generation_config["top_p"] = value
             else:
                 payload[field] = value
+
+    if generation_config:
+        payload["generationConfig"] = generation_config
+        if "max_output_tokens" not in generation_config:
+            payload["generationConfig"]["max_output_tokens"] = 8192
 
     if request.model.endswith("-search"):
         if "tools" not in payload:
