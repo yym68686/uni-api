@@ -261,7 +261,7 @@ async def get_gemini_payload(request, engine, provider):
         'top_logprobs',
         'response_format'
     ]
-    generation_config = None
+    generation_config = {}
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
@@ -492,7 +492,7 @@ async def get_vertex_gemini_payload(request, engine, provider):
         'logprobs',
         'top_logprobs'
     ]
-    generation_config = None
+    generation_config = {}
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
