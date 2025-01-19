@@ -237,6 +237,7 @@ async def get_gemini_payload(request, engine, provider):
             }
         ]
     }
+
     if systemInstruction:
         if api_version == "v1beta":
             payload["systemInstruction"] = systemInstruction
@@ -251,9 +252,6 @@ async def get_gemini_payload(request, engine, provider):
         'messages',
         'stream',
         'tool_choice',
-        'temperature',
-        'top_p',
-        'max_tokens',
         'presence_penalty',
         'frequency_penalty',
         'n',
@@ -263,6 +261,7 @@ async def get_gemini_payload(request, engine, provider):
         'top_logprobs',
         'response_format'
     ]
+    generation_config = None
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
@@ -293,8 +292,19 @@ async def get_gemini_payload(request, engine, provider):
                         }
                     }
                 })
+            elif field == "temperature":
+                generation_config["temperature"] = value
+            elif field == "max_tokens":
+                generation_config["maxOutputTokens"] = value
+            elif field == "top_p":
+                generation_config["topP"] = value
             else:
                 payload[field] = value
+
+    if generation_config:
+        payload["generationConfig"] = generation_config
+        if "maxOutputTokens" not in generation_config:
+            payload["generationConfig"]["maxOutputTokens"] = 8192
 
     if request.model.endswith("-search"):
         if "tools" not in payload:
