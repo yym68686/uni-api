@@ -805,6 +805,7 @@ async def ensure_config(request: Request, call_next):
 
 def get_timeout_value(provider_timeouts, original_model):
     timeout_value = None
+    original_model = original_model.lower()
     if original_model in provider_timeouts:
         timeout_value = provider_timeouts[original_model]
     else:
