@@ -10,20 +10,27 @@ import io
 from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gemini1, gemini2, BaseAPI, get_model_dict, provider_api_circular_list, safe_get, ThreadSafeCircularList
 
-import imghdr
+def get_image_format(file_content):
+    try:
+        img = Image.open(io.BytesIO(file_content))
+        return img.format.lower()
+    except:
+        return None
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         file_content = image_file.read()
-        file_type = imghdr.what(None, file_content)
+        img_format = get_image_format(file_content)
+        if not img_format:
+            raise ValueError("无法识别的图片格式")
         base64_encoded = base64.b64encode(file_content).decode('utf-8')
 
-        if file_type == 'png':
+        if img_format == 'png':
             return f"data:image/png;base64,{base64_encoded}"
-        elif file_type in ['jpeg', 'jpg']:
+        elif img_format in ['jpg', 'jpeg']:
             return f"data:image/jpeg;base64,{base64_encoded}"
         else:
-            raise ValueError(f"不支持的图片格式: {file_type}")
+            raise ValueError(f"不支持的图片格式: {img_format}")
 
 async def get_doc_from_url(url):
     filename = urllib.parse.unquote(url.split("/")[-1])
