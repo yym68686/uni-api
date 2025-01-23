@@ -574,7 +574,7 @@ def post_all_models(api_index, config, api_list, models_list):
                     "id": model,
                     "object": "model",
                     "created": 1720524448858,
-                    "owned_by": model
+                    "owned_by": "uni-api"
                 }
                 all_models.append(model_info)
 
