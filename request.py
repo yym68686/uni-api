@@ -1292,7 +1292,7 @@ async def get_embedding_payload(request, engine, provider):
         "Content-Type": "application/json",
     }
     url = provider['base_url']
-    is_azure = "openai.azure.com" in url
+    is_azure = url.endswith(".azure.com")
     if provider.get("api"):
         if is_azure:
             headers['api-key'] = f"{await provider_api_circular_list[provider['provider']].next(model)}"
