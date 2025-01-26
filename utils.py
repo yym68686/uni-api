@@ -466,6 +466,12 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             detail = first_item_str.get('details', f"{first_item_str}")
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
 
+        if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "error", default=None):
+            # 如果第一个 yield 的项是错误信息，抛出 HTTPException
+            status_code = safe_get(first_item_str, "choices", 0, "error", "code", default=500)
+            detail = safe_get(first_item_str, "choices", 0, "error", "message", default=f"{first_item_str}")
+            raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
+
         if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
             if any(x in str(first_item_str) for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
@@ -488,8 +494,8 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 return
             except (httpx.ReadError, httpx.RemoteProtocolError) as e:
                 # 只记录真正的网络错误
-                logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
-                raise
+                # logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
+                raise HTTPException(status_code=502, detail=f"Network error in new_generator: {e}")
 
         return new_generator(), first_response_time
 
