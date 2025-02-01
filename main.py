@@ -848,6 +848,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     and "gpt" not in original_model \
     and "deepseek" not in original_model \
     and "o1" not in original_model \
+    and "o3" not in original_model \
     and "gemini" not in original_model \
     and "learnlm" not in original_model \
     and "grok" not in original_model \
