@@ -287,18 +287,20 @@ async def get_gemini_payload(request, engine, provider):
                                 prop_value["description"] = f"{description}\nDefault: {default_value}"
                                 # 删除 default 字段
                                 del prop_value["default"]
-                    processed_tools.append({"function": function_def})
+                    if function_def["name"] != "googleSearch" and function_def["name"] != "googleSearch":
+                        processed_tools.append({"function": function_def})
 
-                payload.update({
-                    "tools": [{
-                        "function_declarations": [tool["function"] for tool in processed_tools]
-                    }],
-                    "tool_config": {
-                        "function_calling_config": {
-                            "mode": "AUTO"
+                if processed_tools:
+                    payload.update({
+                        "tools": [{
+                            "function_declarations": [tool["function"] for tool in processed_tools]
+                        }],
+                        "tool_config": {
+                            "function_calling_config": {
+                                "mode": "AUTO"
+                            }
                         }
-                    }
-                })
+                    })
             elif field == "temperature":
                 generation_config["temperature"] = value
             elif field == "max_tokens":
