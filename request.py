@@ -767,6 +767,14 @@ async def get_gpt_payload(request, engine, provider):
         # request.stream = False
         payload.pop("stream_options", None)
 
+    if "o3-mini" in model:
+        if request.model.endswith("high"):
+            payload["reasoning_effort"] = "high"
+        elif request.model.endswith("low"):
+            payload["reasoning_effort"] = "low"
+        else:
+            payload["reasoning_effort"] = "medium"
+
     if request.model.endswith("-search") and "gemini" in request.model:
         if "tools" not in payload:
             payload["tools"] = [{
