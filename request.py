@@ -895,6 +895,9 @@ async def get_openrouter_payload(request, engine, provider):
     if provider.get("api"):
         headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
 
+    elif provider['provider'].startswith("sk-"):
+        headers['Authorization'] = f"Bearer {provider['provider']}"
+
     url = provider['base_url']
 
     messages = []
