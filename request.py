@@ -776,6 +776,8 @@ async def get_gpt_payload(request, engine, provider):
             payload["reasoning_effort"] = "low"
         else:
             payload["reasoning_effort"] = "medium"
+        if "temperature" in payload:
+            payload.pop("temperature")
 
     if request.model.endswith("-search") and "gemini" in request.model:
         if "tools" not in payload:
