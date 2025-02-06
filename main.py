@@ -1237,7 +1237,7 @@ class ModelRequestHandler:
                 if is_debug:
                     import traceback
                     traceback.print_exc()
-                if auto_retry:
+                if auto_retry and status_code != 413:
                     continue
                 else:
                     return JSONResponse(
