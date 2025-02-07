@@ -353,6 +353,20 @@ async def fetch_response(client, url, headers, payload, engine, model):
         timestamp = int(datetime.timestamp(datetime.now()))
         yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens)
 
+    elif engine == "claude":
+        response_json = response.json()
+
+        content = safe_get(response_json, "content", 0, "text")
+
+        prompt_tokens = safe_get(response_json, "usage", "input_tokens")
+        output_tokens = safe_get(response_json, "usage", "output_tokens")
+        total_tokens = prompt_tokens + output_tokens
+
+        role = safe_get(response_json, "role")
+
+        timestamp = int(datetime.timestamp(datetime.now()))
+        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens)
+
     elif engine == "azure":
         response_json = response.json()
         # 删除 content_filter_results
