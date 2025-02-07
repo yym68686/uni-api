@@ -1,6 +1,7 @@
 import json
 from fastapi import HTTPException
 import httpx
+from urllib.parse import urlparse
 
 from log_config import logger
 
@@ -204,20 +205,43 @@ def get_model_dict(provider):
             model_dict.update({new: old for old, new in model.items()})
     return model_dict
 
-def update_initial_model(api_url, api):
+def update_initial_model(provider):
     try:
-        endpoint = BaseAPI(api_url=api_url)
-        endpoint_models_url = endpoint.v1_models
-        if isinstance(api, list):
-            api = api[0]
-        headers = {"Authorization": f"Bearer {api}"}
-        response = httpx.get(
-            endpoint_models_url,
-            headers=headers,
-        )
-        models = response.json()
-        if models.get("error"):
-            raise Exception({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
+        engine, stream_mode = get_engine(provider, endpoint=None, original_model="")
+        # print("engine", engine, provider)
+        api_url = provider['base_url']
+        api = provider['api']
+
+        if engine == "gemini":
+            url = "https://generativelanguage.googleapis.com/v1beta/models"
+            params = {"key": api}
+
+            with httpx.Client() as client:
+                response = client.get(url, params=params)
+
+            original_models = response.json()
+            if original_models.get("error"):
+                raise Exception({"error": original_models.get("error"), "endpoint": url, "api": api})
+
+            models = {"data": []}
+            for model in original_models["models"]:
+                models["data"].append({
+                    "id": model["name"].split("models/")[-1],
+                })
+        else:
+            endpoint = BaseAPI(api_url=api_url)
+            endpoint_models_url = endpoint.v1_models
+            if isinstance(api, list):
+                api = api[0]
+            headers = {"Authorization": f"Bearer {api}"}
+            response = httpx.get(
+                endpoint_models_url,
+                headers=headers,
+            )
+            models = response.json()
+            if models.get("error"):
+                raise Exception({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
+
         # print(models)
         models_list = models["data"]
         models_id = [model["id"] for model in models_list]
@@ -283,7 +307,7 @@ def update_config(config_data, use_config_url=False):
             ]
 
         if not provider.get("model"):
-            model_list = update_initial_model(provider['base_url'], provider['api'])
+            model_list = update_initial_model(provider)
             if model_list:
                 provider["model"] = model_list
                 if not use_config_url:
@@ -745,3 +769,67 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     return json_data
+
+def get_engine(provider, endpoint=None, original_model=""):
+    parsed_url = urlparse(provider['base_url'])
+    # print("parsed_url", parsed_url)
+    engine = None
+    stream = None
+    if parsed_url.path.endswith("/v1beta") or parsed_url.path.endswith("/v1"):
+        engine = "gemini"
+    elif parsed_url.netloc == 'aiplatform.googleapis.com':
+        engine = "vertex"
+    elif parsed_url.netloc.rstrip('/').endswith('openai.azure.com'):
+        engine = "azure"
+    elif parsed_url.netloc == 'api.cloudflare.com':
+        engine = "cloudflare"
+    elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
+        engine = "claude"
+    elif parsed_url.netloc == 'api.cohere.com':
+        engine = "cohere"
+        stream = True
+    else:
+        engine = "gpt"
+
+    if original_model \
+    and "claude" not in original_model \
+    and "gpt" not in original_model \
+    and "deepseek" not in original_model \
+    and "o1" not in original_model \
+    and "o3" not in original_model \
+    and "gemini" not in original_model \
+    and "learnlm" not in original_model \
+    and "grok" not in original_model \
+    and parsed_url.netloc != 'api.cloudflare.com' \
+    and parsed_url.netloc != 'api.cohere.com':
+        engine = "openrouter"
+
+    if "claude" in original_model and engine == "vertex":
+        engine = "vertex-claude"
+
+    if "gemini" in original_model and engine == "vertex":
+        engine = "vertex-gemini"
+
+    if provider.get("engine"):
+        engine = provider["engine"]
+
+    if endpoint == "/v1/images/generations" or "stable-diffusion" in original_model:
+        engine = "dalle"
+        stream = False
+
+    if endpoint == "/v1/audio/transcriptions":
+        engine = "whisper"
+        stream = False
+
+    if endpoint == "/v1/moderations":
+        engine = "moderation"
+        stream = False
+
+    if endpoint == "/v1/embeddings":
+        engine = "embedding"
+
+    if endpoint == "/v1/audio/speech":
+        engine = "tts"
+        stream = False
+
+    return engine, stream
