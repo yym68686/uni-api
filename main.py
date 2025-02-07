@@ -20,6 +20,7 @@ from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import (
     safe_get,
+    get_engine,
     load_config,
     save_api_yaml,
     get_model_dict,
@@ -821,68 +822,13 @@ def get_timeout_value(provider_timeouts, original_model):
 
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, num_matching_providers=1):
-    url = provider['base_url']
-    parsed_url = urlparse(url)
-    # print("parsed_url", parsed_url)
-    engine = None
-    if parsed_url.path.endswith("/v1beta") or parsed_url.path.endswith("/v1"):
-        engine = "gemini"
-    elif parsed_url.netloc == 'aiplatform.googleapis.com':
-        engine = "vertex"
-    elif parsed_url.netloc.rstrip('/').endswith('openai.azure.com'):
-        engine = "azure"
-    elif parsed_url.netloc == 'api.cloudflare.com':
-        engine = "cloudflare"
-    elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
-        engine = "claude"
-    elif parsed_url.netloc == 'api.cohere.com':
-        engine = "cohere"
-        request.stream = True
-    else:
-        engine = "gpt"
-
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
 
-    if "claude" not in original_model \
-    and "gpt" not in original_model \
-    and "deepseek" not in original_model \
-    and "o1" not in original_model \
-    and "o3" not in original_model \
-    and "gemini" not in original_model \
-    and "learnlm" not in original_model \
-    and "grok" not in original_model \
-    and parsed_url.netloc != 'api.cloudflare.com' \
-    and parsed_url.netloc != 'api.cohere.com':
-        engine = "openrouter"
+    engine, stream_mode = get_engine(provider, endpoint, original_model)
 
-    if "claude" in original_model and engine == "vertex":
-        engine = "vertex-claude"
-
-    if "gemini" in original_model and engine == "vertex":
-        engine = "vertex-gemini"
-
-    if provider.get("engine"):
-        engine = provider["engine"]
-
-    if endpoint == "/v1/images/generations" or "stable-diffusion" in original_model:
-        engine = "dalle"
-        request.stream = False
-
-    if endpoint == "/v1/audio/transcriptions":
-        engine = "whisper"
-        request.stream = False
-
-    if endpoint == "/v1/moderations":
-        engine = "moderation"
-        request.stream = False
-
-    if endpoint == "/v1/embeddings":
-        engine = "embedding"
-
-    if endpoint == "/v1/audio/speech":
-        engine = "tts"
-        request.stream = False
+    if stream_mode != None:
+        request.stream = stream_mode
 
     channel_id = f"{provider['provider']}"
     if engine != "moderation":
