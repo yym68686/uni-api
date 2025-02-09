@@ -802,12 +802,12 @@ async def get_gpt_payload(request, engine, provider):
 
     return url, headers, payload
 
-def build_azure_endpoint(base_url, deployment_id, api_version="2024-10-21"):
+def build_azure_endpoint(base_url, deployment_id, function="chat/completions", api_version="2024-10-21"):
     # 移除base_url末尾的斜杠(如果有)
     base_url = base_url.rstrip('/')
 
     # 构建路径
-    path = f"/openai/deployments/{deployment_id}/chat/completions"
+    path = f"/openai/deployments/{deployment_id}/{function}"
 
     # 使用urljoin拼接base_url和path
     full_url = urllib.parse.urljoin(base_url, path)
@@ -1308,10 +1308,18 @@ async def get_embedding_payload(request, engine, provider):
     headers = {
         "Content-Type": "application/json",
     }
-    if provider.get("api"):
-        headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
     url = provider['base_url']
-    url = BaseAPI(url).embeddings
+    is_azure = url.endswith(".azure.com")
+    if provider.get("api"):
+        if is_azure:
+            headers['api-key'] = f"{await provider_api_circular_list[provider['provider']].next(model)}"
+        else:
+            headers['Authorization'] = f"Bearer {await provider_api_circular_list[provider['provider']].next(model)}"
+
+    if is_azure:
+        url = build_azure_endpoint(url, model, function="embeddings")
+    else:
+        url = BaseAPI(url).embeddings
 
     payload = {
         "input": request.input,
