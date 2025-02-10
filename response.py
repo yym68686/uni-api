@@ -164,20 +164,19 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                     content = safe_get(line, "choices", 0, "delta", "content", default="")
                     if "<think>" in content:
                         is_thinking = True
+                        content = content.replace("<think>", "")
                     if "</think>" in content:
                         is_thinking = False
-
-                    content = content.replace("<think>", "").replace("</think>", "")
-                    if not has_send_thinking:
-                        content = content.replace("\n\n", "")
-                    reasoning_content = safe_get(line, "choices", 0, "delta", "reasoning_content", default="")
-                    if not content and not reasoning_content:
-                        continue
-
-                    if is_thinking and content:
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                        yield sse_string
-                        has_send_thinking = True
+                        content = content.replace("</think>", "")
+                        if not content:
+                            continue
+                    if is_thinking:
+                        if not has_send_thinking:
+                            content = content.replace("\n\n", "")
+                        if content:
+                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+                            yield sse_string
+                            has_send_thinking = True
                         continue
 
                     no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
