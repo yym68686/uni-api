@@ -796,6 +796,7 @@ def get_engine(provider, endpoint=None, original_model=""):
     else:
         engine = "gpt"
 
+    original_model = original_model.lower()
     if original_model \
     and "claude" not in original_model \
     and "gpt" not in original_model \
