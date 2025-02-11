@@ -691,6 +691,8 @@ def safe_get(data, *keys, default=None):
             data = data[key] if isinstance(data, (dict, list)) else data.get(key)
         except (KeyError, IndexError, AttributeError, TypeError):
             return default
+    if not data:
+        return default
     return data
 
 
