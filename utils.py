@@ -501,7 +501,8 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration
             content = safe_get(first_item_str, "choices", 0, "message", "content", default=None)
-            if content == "" or content is None:
+            tool_calls = safe_get(first_item_str, "choices", 0, "message", "tool_calls", default=None)
+            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None):
                 raise StopAsyncIteration
 
         # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
@@ -770,9 +771,46 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
         "usage": None,
         "system_fingerprint": "fp_a7d06e42a7"
     }
+
+    if function_call_name:
+        if not tools_id:
+            tools_id = f"call_{random_str}"
+        sample_data = {
+            "id": f"chatcmpl-{random_str}",
+            "object": "chat.completion",
+            "created": timestamp,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tools_id,
+                            "type": "function",
+                            "function": {
+                                "name": function_call_name,
+                                "arguments": f"{function_call_content}"
+                            }
+                        }
+                    ],
+                    "refusal": None
+                    },
+                    "logprobs": None,
+                    "finish_reason": "tool_calls"
+                }
+            ],
+            "usage": None,
+            "service_tier": "default",
+            "system_fingerprint": "fp_4691090a87"
+        }
+
     if total_tokens:
         total_tokens = prompt_tokens + completion_tokens
         sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     return json_data

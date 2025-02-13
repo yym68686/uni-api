@@ -370,7 +370,7 @@ async def fetch_response(client, url, headers, payload, engine, model):
         else:
             logger.error(f"error fetch_response: Unknown response_json type: {type(response_json)}")
             parsed_data = response_json
-
+        # print("parsed_data", json.dumps(parsed_data, indent=4, ensure_ascii=False))
         content = ""
         for item in parsed_data:
             chunk = safe_get(item, "candidates", 0, "content", "parts", 0, "text")
@@ -390,8 +390,11 @@ async def fetch_response(client, url, headers, payload, engine, model):
             logger.error(f"Unknown role: {role}")
             role = "assistant"
 
+        function_call_name = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", 0, "functionCall", "name", default=None)
+        function_call_content = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", 0, "functionCall", "args", default=None)
+
         timestamp = int(datetime.timestamp(datetime.now()))
-        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens)
+        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=function_call_name, function_call_content=function_call_content, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens)
 
     elif engine == "claude":
         response_json = response.json()
