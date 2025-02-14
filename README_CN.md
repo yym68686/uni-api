@@ -442,6 +442,8 @@ api_keys:
 
 除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completions，而不是 Azure 的 URL。
 
+对于 Azure 渠道，base_url 兼容以下几种写法：https://your-endpoint.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview 和 https://your-endpoint.services.ai.azure.com/models/chat/completions，https://your-endpoint.openai.azure.com，推荐使用第一种写法。如果不显式指定 api-version，默认使用 2024-10-21 版本。
+
 - 模型超时时间是如何确认的？渠道级别的超时设置和全局模型超时设置的优先级是什么？
 
 渠道级别的超时设置优先级高于全局模型超时设置。优先级顺序：渠道级别模型超时设置 > 渠道级别默认超时设置 > 全局模型超时设置 > 全局默认超时设置 > 环境变量 TIMEOUT。

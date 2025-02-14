@@ -442,6 +442,8 @@ All scheduling algorithms need to be enabled by setting api_keys.(api).preferenc
 
 Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completions, not Azure's URL.
 
+For Azure channels, the base_url is compatible with the following formats: https://your-endpoint.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview and https://your-endpoint.services.ai.azure.com/models/chat/completions, https://your-endpoint.openai.azure.com, it is recommended to use the first format. If api-version is not explicitly specified, the default is 2024-10-21.
+
 - How does the model timeout time work? What is the priority of the channel-level timeout setting and the global model timeout setting?
 
 The channel-level timeout setting has higher priority than the global model timeout setting. The priority order is: channel-level model timeout setting > channel-level default timeout setting > global model timeout setting > global default timeout setting > environment variable TIMEOUT.
