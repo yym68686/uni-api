@@ -781,6 +781,10 @@ async def get_gpt_payload(request, engine, provider):
         if "temperature" in payload:
             payload.pop("temperature")
 
+    if "deepseek-r" in model.lower():
+        if "temperature" not in payload:
+            payload["temperature"] = 0.6
+
     if request.model.endswith("-search") and "gemini" in request.model:
         if "tools" not in payload:
             payload["tools"] = [{
