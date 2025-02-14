@@ -805,15 +805,17 @@ async def get_gpt_payload(request, engine, provider):
 def build_azure_endpoint(base_url, deployment_id, api_version="2024-10-21"):
     # 移除base_url末尾的斜杠(如果有)
     base_url = base_url.rstrip('/')
+    final_url = base_url
 
-    # 构建路径
-    path = f"/openai/deployments/{deployment_id}/chat/completions"
+    if "models/chat/completions" not in final_url:
+        # 构建路径
+        path = f"/openai/deployments/{deployment_id}/chat/completions"
+        # 使用urljoin拼接base_url和path
+        final_url = urllib.parse.urljoin(base_url, path)
 
-    # 使用urljoin拼接base_url和path
-    full_url = urllib.parse.urljoin(base_url, path)
-
-    # 添加api-version查询参数
-    final_url = f"{full_url}?api-version={api_version}"
+    if "?api-version=" not in final_url:
+        # 添加api-version查询参数
+        final_url = f"{final_url}?api-version={api_version}"
 
     return final_url
 
