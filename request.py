@@ -712,14 +712,14 @@ async def get_gpt_payload(request, engine, provider):
             for item in msg.content:
                 if item.type == "text":
                     text_message = await get_text_message(msg.role, item.text, engine)
-                    if msg.role == "system" and "o3-mini" in model and not text_message.startswith("Formatting re-enabled"):
-                        text_message = "Formatting re-enabled. " + text_message
                     content.append(text_message)
                 elif item.type == "image_url" and provider.get("image", True) and "o1-mini" not in model:
                     image_message = await get_image_message(item.image_url.url, engine)
                     content.append(image_message)
         else:
             content = msg.content
+            if msg.role == "system" and "o3-mini" in model and not content.startswith("Formatting re-enabled"):
+                content = "Formatting re-enabled. " + content
             tool_calls = msg.tool_calls
             tool_call_id = msg.tool_call_id
 
