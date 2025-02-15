@@ -421,6 +421,7 @@ async def fetch_response(client, url, headers, payload, engine, model):
 
     elif engine == "claude":
         response_json = response.json()
+        # print("response_json", json.dumps(response_json, indent=4, ensure_ascii=False))
 
         content = safe_get(response_json, "content", 0, "text")
 
@@ -430,8 +431,12 @@ async def fetch_response(client, url, headers, payload, engine, model):
 
         role = safe_get(response_json, "role")
 
+        function_call_name = safe_get(response_json, "content", 1, "name", default=None)
+        function_call_content = safe_get(response_json, "content", 1, "input", default=None)
+        tools_id = safe_get(response_json, "content", 1, "id", default=None)
+
         timestamp = int(datetime.timestamp(datetime.now()))
-        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens)
+        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=tools_id, function_call_name=function_call_name, function_call_content=function_call_content, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens)
 
     elif engine == "azure":
         response_json = response.json()
