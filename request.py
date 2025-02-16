@@ -831,7 +831,7 @@ async def get_azure_payload(request, engine, provider):
     }
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
-    headers['api-key'] = f"{provider['api']}"
+    headers['api-key'] = f"{await provider_api_circular_list[provider['provider']].next(model)}"
 
     url = build_azure_endpoint(
         base_url=provider['base_url'],
