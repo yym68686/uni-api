@@ -792,7 +792,7 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
                             "type": "function",
                             "function": {
                                 "name": function_call_name,
-                                "arguments": f"{function_call_content}"
+                                "arguments": json.dumps(function_call_content, ensure_ascii=False)
                             }
                         }
                     ],
