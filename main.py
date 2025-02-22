@@ -1001,17 +1001,14 @@ def get_provider_list(provider_rules, config, request_model):
                 model_dict = get_model_dict(provider)
                 model_name_split = "/".join(item.split("/")[1:])
                 if "/" in item and provider['provider'] == provider_name and model_name_split in model_dict.keys():
-                    new_provider = copy.deepcopy(provider)
-                    # old: new
-                    # print("item", item)
-                    # print("model_dict", model_dict)
-                    # print("model_name_split", model_name_split)
-                    # print("request_model", request_model)
-                    new_provider["model"] = [{model_dict[model_name_split]: request_model}]
                     if request_model in model_dict.keys() and model_name_split == request_model:
+                        new_provider = copy.deepcopy(provider)
+                        new_provider["model"] = [{model_dict[model_name_split]: request_model}]
                         provider_list.append(new_provider)
 
                     elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
+                        new_provider = copy.deepcopy(provider)
+                        new_provider["model"] = [{model_dict[model_name_split]: request_model}]
                         provider_list.append(new_provider)
     return provider_list
 
