@@ -5,6 +5,7 @@ import string
 from datetime import datetime
 
 from log_config import logger
+from config import THINK_PHASE_ACTIVE
 
 from utils import safe_get, generate_sse_response, generate_no_stream_response, end_of_line
 
@@ -164,39 +165,40 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
 
                     # 处理 <think> 标签
                     content = safe_get(line, "choices", 0, "delta", "content", default="")
-                    if "<think>" in content:
-                        is_thinking = True
-                        ark_tag = True
-                        content = content.replace("<think>", "")
-                    if "</think>" in content:
-                        is_thinking = False
-                        content = content.replace("</think>", "")
-                        if not content:
+                    if THINK_PHASE_ACTIVE:
+                        if "<think>" in content:
+                            is_thinking = True
+                            ark_tag = True
+                            content = content.replace("<think>", "")
+                        if "</think>" in content:
+                            is_thinking = False
+                            content = content.replace("</think>", "")
+                            if not content:
+                                continue
+                        if is_thinking and ark_tag:
+                            if not has_send_thinking:
+                                content = content.replace("\n\n", "")
+                            if content:
+                                sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+                                yield sse_string
+                                has_send_thinking = True
                             continue
-                    if is_thinking and ark_tag:
-                        if not has_send_thinking:
-                            content = content.replace("\n\n", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                            yield sse_string
-                            has_send_thinking = True
-                        continue
 
-                    # 处理 poe thinking 标签
-                    if "Thinking..." in content and "\n> " in content:
-                        is_thinking = True
-                        content = content.replace("Thinking...", "").replace("\n> ", "")
-                    if is_thinking and "\n\n" in content and not ark_tag:
-                        is_thinking = False
-                    if is_thinking and not ark_tag:
-                        content = content.replace("\n> ", "")
-                        if not has_send_thinking:
-                            content = content.replace("\n", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                            yield sse_string
-                            has_send_thinking = True
-                        continue
+                        # 处理 poe thinking 标签
+                        if "Thinking..." in content and "\n> " in content:
+                            is_thinking = True
+                            content = content.replace("Thinking...", "").replace("\n> ", "")
+                        if is_thinking and "\n\n" in content and not ark_tag:
+                            is_thinking = False
+                        if is_thinking and not ark_tag:
+                            content = content.replace("\n> ", "")
+                            if not has_send_thinking:
+                                content = content.replace("\n", "")
+                            if content:
+                                sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+                                yield sse_string
+                                has_send_thinking = True
+                            continue
 
                     no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
                     if no_stream_content:
@@ -233,23 +235,24 @@ async def fetch_azure_response_stream(client, url, headers, payload):
                     content = safe_get(line, "choices", 0, "delta", "content", default="")
 
                     # 处理 <think> 标签
-                    if "<think>" in content:
-                        is_thinking = True
-                        ark_tag = True
-                        content = content.replace("<think>", "")
-                    if "</think>" in content:
-                        is_thinking = False
-                        content = content.replace("</think>", "")
-                        if not content:
+                    if THINK_PHASE_ACTIVE:
+                        if "<think>" in content:
+                            is_thinking = True
+                            ark_tag = True
+                            content = content.replace("<think>", "")
+                        if "</think>" in content:
+                            is_thinking = False
+                            content = content.replace("</think>", "")
+                            if not content:
+                                continue
+                        if is_thinking and ark_tag:
+                            if not has_send_thinking:
+                                content = content.replace("\n\n", "")
+                            if content:
+                                sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+                                yield sse_string
+                                has_send_thinking = True
                             continue
-                    if is_thinking and ark_tag:
-                        if not has_send_thinking:
-                            content = content.replace("\n\n", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                            yield sse_string
-                            has_send_thinking = True
-                        continue
 
                     if no_stream_content or content or sse_string:
                         sse_string = await generate_sse_response(timestamp, safe_get(line, "model", default=None), content=no_stream_content or content)
