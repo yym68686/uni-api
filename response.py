@@ -364,6 +364,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         content = delta["text"]
                         sse_string = await generate_sse_response(timestamp, model, content, None, None)
                         yield sse_string
+                    if "thinking" in delta and delta["thinking"]:
+                        content = delta["thinking"]
+                        sse_string = await generate_sse_response(timestamp, model, reasoning_content=content)
+                        yield sse_string
                     if "partial_json" in delta:
                         # {"type":"input_json_delta","partial_json":""}
                         function_call_content = delta["partial_json"]
