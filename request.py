@@ -1221,12 +1221,6 @@ async def get_claude_payload(request, engine, provider):
         "max_tokens": max_tokens,
     }
 
-    if "think" in request.model:
-        payload["thinking"] = {
-            "budget_tokens": 4096,
-            "type": "enabled"
-        }
-
     if request.max_tokens:
         payload["max_tokens"] = int(request.max_tokens)
 
@@ -1271,6 +1265,15 @@ async def get_claude_payload(request, engine, provider):
     if provider.get("tools") == False:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
+
+    if "think" in request.model:
+        payload["thinking"] = {
+            "budget_tokens": 4096,
+            "type": "enabled"
+        }
+        payload["temperature"] = 1
+        payload.pop("top_p", None)
+        payload.pop("top_k", None)
 
     # print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
 
