@@ -1096,6 +1096,44 @@ async def get_cloudflare_payload(request, engine, provider):
 async def gpt2claude_tools_json(json_dict):
     import copy
     json_dict = copy.deepcopy(json_dict)
+
+    # 处理 $ref 引用
+    def resolve_refs(obj, defs):
+        if isinstance(obj, dict):
+            # 如果有 $ref 引用，替换为实际定义
+            if "$ref" in obj and obj["$ref"].startswith("#/$defs/"):
+                ref_name = obj["$ref"].split("/")[-1]
+                if ref_name in defs:
+                    # 完全替换为引用的对象
+                    ref_obj = copy.deepcopy(defs[ref_name])
+                    # 保留原始对象中的其他属性
+                    for k, v in obj.items():
+                        if k != "$ref":
+                            ref_obj[k] = v
+                    return ref_obj
+
+            # 递归处理所有属性
+            for key, value in list(obj.items()):
+                obj[key] = resolve_refs(value, defs)
+
+        elif isinstance(obj, list):
+            # 递归处理列表中的每个元素
+            for i, item in enumerate(obj):
+                obj[i] = resolve_refs(item, defs)
+
+        return obj
+
+    # 提取 $defs 定义
+    defs = {}
+    if "parameters" in json_dict and "defs" in json_dict["parameters"]:
+        defs = json_dict["parameters"]["defs"]
+        # 从参数中删除 $defs，因为 Claude 不需要它
+        del json_dict["parameters"]["defs"]
+
+    # 解析所有引用
+    json_dict = resolve_refs(json_dict, defs)
+
+    # 继续原有的键名转换逻辑
     keys_to_change = {
         "parameters": "input_schema",
     }
