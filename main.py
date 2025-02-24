@@ -159,6 +159,35 @@ async def get_markdown_docs():
         media_type="text/markdown"
     )
 
+# @app.exception_handler(RequestValidationError)
+# async def validation_exception_handler(request: Request, exc: RequestValidationError):
+#     error_messages = []
+#     for error in exc.errors():
+#         # 将字段路径转换为点分隔格式（例如 body.model -> model）
+#         field = ".".join(str(loc) for loc in error["loc"] if loc not in ("body", "query", "path"))
+#         error_type = error["type"]
+
+#         # 生成更友好的错误消息
+#         if error_type == "value_error.missing":
+#             msg = f"字段 '{field}' 是必填项"
+#         elif error_type == "type_error.integer":
+#             msg = f"字段 '{field}' 必须是整数类型"
+#         elif error_type == "type_error.str":
+#             msg = f"字段 '{field}' 必须是字符串类型"
+#         else:
+#             msg = error["msg"]
+
+#         error_messages.append({
+#             "field": field,
+#             "message": msg,
+#             "type": error_type
+#         })
+
+#     return JSONResponse(
+#         status_code=422,
+#         content={"detail": error_messages},
+#     )
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:

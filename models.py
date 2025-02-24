@@ -7,6 +7,10 @@ class FunctionParameter(BaseModel):
     type: str
     properties: Dict[str, Dict[str, Any]]
     required: List[str] = None
+    defs: Dict[str, Any] = Field(default=None, alias="$defs")
+
+    class Config:
+        allow_population_by_field_name = True
 
 class Function(BaseModel):
     name: str
