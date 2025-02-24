@@ -835,6 +835,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine} role: {role}")
 
     url, headers, payload = await get_payload(request, engine, provider)
+    headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if is_debug:
         logger.info(url)
         logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
