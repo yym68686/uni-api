@@ -75,7 +75,8 @@ providers:
       - sk-ant-api03-bNnAOJyA-xQw_twAA
       - sk-ant-api02-bNnxxxx
     model:
-      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+      - claude-3-7-sonnet-20240620: claude-3-7-sonnet # 重命名模型，claude-3-7-sonnet-20240620 是服务商的模型名称，claude-3-7-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+      - claude-3-7-sonnet-20250219: claude-3-7-sonnet-think # 重命名模型，claude-3-7-sonnet-20250219 是服务商的模型名称，claude-3-7-sonnet-think 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，如果重命名后的名字里面有think，则自动转换为 claude 思考模型，默认思考 token 限制为 4096。选填
     tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
 
   - provider: gemini

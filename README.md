@@ -75,7 +75,8 @@ providers:
       - sk-ant-api03-bNnAOJyA-xQw_twAA
       - sk-ant-api02-bNnxxxx
     model:
-      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a simple name to replace the original complex name, optional
+      - claude-3-7-sonnet-20240620: claude-3-7-sonnet # Rename model, claude-3-7-sonnet-20240620 is the provider's model name, claude-3-7-sonnet is the renamed name, you can use a simple name to replace the original complex name, optional
+      - claude-3-7-sonnet-20250219: claude-3-7-sonnet-think # Rename model, claude-3-7-sonnet-20250219 is the provider's model name, claude-3-7-sonnet-think is the renamed name, if "think" is in the renamed name, it will be automatically converted to claude think model, default think token limit is 4096. Optional
     tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
 
   - provider: gemini

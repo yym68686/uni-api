@@ -550,7 +550,7 @@ async def get_vertex_claude_payload(request, engine, provider):
 
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
-    if "claude-3-5-sonnet" in model:
+    if "claude-3-5-sonnet" in model or "claude-3-7-sonnet" in model:
         location = c35s
     elif "claude-3-opus" in model:
         location = c3o
@@ -636,11 +636,19 @@ async def get_vertex_claude_payload(request, engine, provider):
 
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
+
+    if "claude-3-7-sonnet" in model:
+        max_tokens = 20000
+    elif "claude-3-5-sonnet" in model:
+        max_tokens = 8192
+    else:
+        max_tokens = 4096
+
     payload = {
         "anthropic_version": "vertex-2023-10-16",
         "messages": messages,
         "system": system_prompt or "You are Claude, a large language model trained by Anthropic.",
-        "max_tokens": 8192 if "claude-3-5-sonnet" in model else 4096,
+        "max_tokens": max_tokens,
     }
 
     if request.max_tokens:
@@ -1107,11 +1115,19 @@ async def gpt2claude_tools_json(json_dict):
 async def get_claude_payload(request, engine, provider):
     model_dict = get_model_dict(provider)
     model = model_dict[request.model]
+
+    if "claude-3-7-sonnet" in model:
+        anthropic_beta = "output-128k-2025-02-19"
+    elif "claude-3-5-sonnet" in model:
+        anthropic_beta = "max-tokens-3-5-sonnet-2024-07-15"
+    else:
+        anthropic_beta = "tools-2024-05-16"
+
     headers = {
         "content-type": "application/json",
         "x-api-key": f"{await provider_api_circular_list[provider['provider']].next(model)}",
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15" if "claude-3-5-sonnet" in model else "tools-2024-05-16",
+        "anthropic-beta": anthropic_beta,
     }
     url = provider['base_url']
 
@@ -1188,13 +1204,28 @@ async def get_claude_payload(request, engine, provider):
             message_index = message_index + 1
 
     model_dict = get_model_dict(provider)
+
     model = model_dict[request.model]
+
+    if "claude-3-7-sonnet" in model:
+        max_tokens = 20000
+    elif "claude-3-5-sonnet" in model:
+        max_tokens = 8192
+    else:
+        max_tokens = 4096
+
     payload = {
         "model": model,
         "messages": messages,
         "system": system_prompt or "You are Claude, a large language model trained by Anthropic.",
-        "max_tokens": 8192 if "claude-3-5-sonnet" in model else 4096,
+        "max_tokens": max_tokens,
     }
+
+    if "think" in request.model:
+        payload["thinking"] = {
+            "budget_tokens": 4096,
+            "type": "enabled"
+        }
 
     if request.max_tokens:
         payload["max_tokens"] = int(request.max_tokens)
