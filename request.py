@@ -1312,7 +1312,22 @@ async def get_claude_payload(request, engine, provider):
         payload["temperature"] = 1
         payload.pop("top_p", None)
         payload.pop("top_k", None)
+        if request.model.split("-")[-1].isdigit():
+            think_tokens = int(request.model.split("-")[-1])
+            if think_tokens < max_tokens:
+                payload["thinking"] = {
+                    "budget_tokens": think_tokens,
+                    "type": "enabled"
+                }
 
+    if request.thinking:
+        payload["thinking"] = {
+            "budget_tokens": request.thinking.budget_tokens,
+            "type": request.thinking.type
+        }
+        payload["temperature"] = 1
+        payload.pop("top_p", None)
+        payload.pop("top_k", None)
     # print("payload", json.dumps(payload, indent=2, ensure_ascii=False))
 
     return url, headers, payload

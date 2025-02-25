@@ -83,6 +83,10 @@ class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"]
     json_schema: Optional[JsonSchema] = None
 
+class Thinking(BaseModel):
+    budget_tokens: Optional[int] = None
+    type: Optional[Literal["enabled", "disabled"]] = None
+
 class RequestModel(BaseRequest):
     model: str
     messages: List[Message]
@@ -101,6 +105,7 @@ class RequestModel(BaseRequest):
     tool_choice: Optional[Union[str, ToolChoice]] = None
     tools: Optional[List[Tool]] = None
     response_format: Optional[ResponseFormat] = None  # 新增字段
+    thinking: Optional[Thinking] = None
 
     def get_last_text_message(self) -> Optional[str]:
         for message in reversed(self.messages):
