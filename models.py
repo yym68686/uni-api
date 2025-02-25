@@ -10,7 +10,7 @@ class FunctionParameter(BaseModel):
     defs: Dict[str, Any] = Field(default=None, alias="$defs")
 
     class Config:
-        allow_population_by_field_name = True
+        population_by_name = True
 
 class Function(BaseModel):
     name: str
