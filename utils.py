@@ -39,32 +39,8 @@ def parse_rate_limit(limit_string):
 
     return limits
 
-from collections import defaultdict
-class InMemoryRateLimiter:
-    def __init__(self):
-        self.requests = defaultdict(list)
-
-    async def is_rate_limited(self, key: str, limits) -> bool:
-        now = time()
-
-        # 检查所有速率限制条件
-        for limit, period in limits:
-            # 计算在当前时间窗口内的请求数量
-            recent_requests = sum(1 for req in self.requests[key] if req > now - period)
-            if recent_requests >= limit:
-                return True
-
-        # 清理太旧的请求记录（比最长时间窗口还要老的记录）
-        max_period = max(period for _, period in limits)
-        self.requests[key] = [req for req in self.requests[key] if req > now - max_period]
-
-        # 记录新的请求
-        self.requests[key].append(now)
-        return False
-
-rate_limiter = InMemoryRateLimiter()
-
 import asyncio
+from collections import defaultdict
 
 class ThreadSafeCircularList:
     def __init__(self, items = [], rate_limit={"default": "999999/min"}, schedule_algorithm="round_robin"):
@@ -189,6 +165,29 @@ class ThreadSafeCircularList:
         """
         return len(self.items)
 
+def get_proxy(proxy, client_config = {}):
+    if proxy:
+        # 解析代理URL
+        parsed = urlparse(proxy)
+        scheme = parsed.scheme.rstrip('h')
+
+        if scheme == 'socks5':
+            try:
+                from httpx_socks import AsyncProxyTransport
+                proxy = proxy.replace('socks5h://', 'socks5://')
+                transport = AsyncProxyTransport.from_url(proxy)
+                client_config["transport"] = transport
+                # print("proxy", proxy)
+            except ImportError:
+                logger.error("httpx-socks package is required for SOCKS proxy support")
+                raise ImportError("Please install httpx-socks package for SOCKS proxy support: pip install httpx-socks")
+        else:
+            client_config["proxies"] = {
+                "http://": proxy,
+                "https://": proxy
+            }
+    return client_config
+
 def circular_list_encoder(obj):
     if isinstance(obj, ThreadSafeCircularList):
         return obj.to_dict()
@@ -211,12 +210,13 @@ def update_initial_model(provider):
         # print("engine", engine, provider)
         api_url = provider['base_url']
         api = provider['api']
-
+        proxy = safe_get(provider, "preferences", "proxy", default=None)
+        client_config = get_proxy(proxy)
         if engine == "gemini":
             url = "https://generativelanguage.googleapis.com/v1beta/models"
             params = {"key": api}
 
-            with httpx.Client() as client:
+            with httpx.Client(**client_config) as client:
                 response = client.get(url, params=params)
 
             original_models = response.json()
@@ -237,6 +237,7 @@ def update_initial_model(provider):
             response = httpx.get(
                 endpoint_models_url,
                 headers=headers,
+                **client_config
             )
             models = response.json()
             if models.get("error"):

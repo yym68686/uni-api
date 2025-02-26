@@ -1,4 +1,3 @@
-xue
 pytest
 pillow
 uvicorn
