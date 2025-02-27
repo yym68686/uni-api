@@ -1034,6 +1034,7 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
     num_matching_providers = len(matching_providers)
     if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
         matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
+        num_matching_providers = len(matching_providers)
         if not matching_providers:
             raise HTTPException(status_code=503, detail="No available providers at the moment")
 
