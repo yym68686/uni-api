@@ -1193,7 +1193,7 @@ class ModelRequestHandler:
                 if is_debug:
                     import traceback
                     traceback.print_exc()
-                if auto_retry and status_code != 413:
+                if auto_retry and (status_code != 413 or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):
                     continue
                 else:
                     return JSONResponse(
