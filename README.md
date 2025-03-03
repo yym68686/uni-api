@@ -192,6 +192,7 @@ preferences: # Global configuration
   error_triggers: # Error triggers, when the message returned by the model contains any of the strings in the error_triggers, the channel will return an error. Optional
     - The bot's usage is covered by the developer
     - process this request due to overload or policy
+  proxy: socks5://[username]:[password]@[ip]:[port] # Proxy address, optional.
 ```
 
 Mount the configuration file and start the uni-api docker container:
