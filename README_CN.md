@@ -192,6 +192,7 @@ preferences: # 全局配置
   error_triggers: # 错误触发器，当模型返回的消息包含错误触发器中的任意一个字符串时，该渠道会自动返回报错。选填
     - The bot's usage is covered by the developer
     - process this request due to overload or policy
+  proxy: socks5://[username]:[password]@[ip]:[port] # 全局代理地址，选填。
 ```
 
 挂载配置文件并启动 uni-api docker 容器：

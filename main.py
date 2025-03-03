@@ -856,7 +856,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     timeout_value = timeout_value * num_matching_providers
     # print("timeout_value", channel_id, timeout_value)
 
-    proxy = safe_get(provider, "preferences", "proxy", default=None)
+    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
+    proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
     # print("proxy", proxy)
 
     try:
