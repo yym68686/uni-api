@@ -241,7 +241,8 @@ def update_initial_model(provider):
             )
             models = response.json()
             if models.get("error"):
-                raise Exception({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
+                logger.error({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
+                return []
 
         # print(models)
         models_list = models["data"]
