@@ -200,7 +200,11 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                         continue
 
                     no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
-                    if no_stream_content and has_send_thinking == False:
+                    openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
+                    if openrouter_reasoning:
+                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=openrouter_reasoning)
+                        yield sse_string
+                    elif no_stream_content and has_send_thinking == False:
                         sse_string = await generate_sse_response(safe_get(line, "created", default=None), safe_get(line, "model", default=None), content=no_stream_content)
                         yield sse_string
                     else:
