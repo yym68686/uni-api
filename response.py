@@ -202,22 +202,24 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
 
                     no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
                     openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
+                    # print("openrouter_reasoning", repr(openrouter_reasoning), openrouter_reasoning.endswith("\\\\"), openrouter_reasoning.endswith("\\"))
                     if openrouter_reasoning:
-                        if openrouter_reasoning.endswith("\\\\"):
+                        if openrouter_reasoning.endswith("\\"):
                             enter_buffer += openrouter_reasoning
                             continue
-                        elif enter_buffer.endswith("\\\\") and openrouter_reasoning == 'n':
+                        elif enter_buffer.endswith("\\") and openrouter_reasoning == 'n':
                             enter_buffer += "n"
                             continue
-                        elif enter_buffer.endswith("\\\\n") and openrouter_reasoning == '\\\\n':
-                            enter_buffer += "\\\\n"
+                        elif enter_buffer.endswith("\\n") and openrouter_reasoning == '\\n':
+                            enter_buffer += "\\n"
                             continue
-                        elif enter_buffer.endswith("\\\\n\\\\n"):
+                        elif enter_buffer.endswith("\\n\\n"):
                             openrouter_reasoning = '\n\n' + openrouter_reasoning
                             enter_buffer = ""
                         elif enter_buffer:
                             openrouter_reasoning = enter_buffer + openrouter_reasoning
                             enter_buffer = ''
+                        openrouter_reasoning = openrouter_reasoning.replace("\\n", "\n")
 
                         sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=openrouter_reasoning)
                         yield sse_string
