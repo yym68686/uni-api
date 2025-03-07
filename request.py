@@ -956,16 +956,9 @@ async def get_openrouter_payload(request, engine, provider):
     miss_fields = [
         'model',
         'messages',
-        'tools',
-        'tool_choice',
-        'top_p',
-        'presence_penalty',
-        'frequency_penalty',
         'n',
         'user',
         'include_usage',
-        'logprobs',
-        'top_logprobs'
     ]
 
     for field, value in request.model_dump(exclude_unset=True).items():
