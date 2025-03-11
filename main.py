@@ -9,7 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, Request, Body
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -1454,7 +1454,7 @@ async def get_stats(
 
 @app.get("/")
 async def root():
-    return JSONResponse(content={"message": "Hello, World!"})
+    return RedirectResponse(url="https://uni-api-web.pages.dev", status_code=302)
 
 # async def on_fetch(request, env):
 #     import asgi
