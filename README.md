@@ -89,6 +89,7 @@ providers:
       - gemini-1.5-pro
       - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
       - gemini-1.5-flash-exp-0827 # Add this line, both gemini-1.5-flash-exp-0827 and gemini-1.5-flash can be requested
+      - gemini-1.5-pro: gemini-1.5-pro-search # Support to rename models with -search suffix to enable search, use gemini-1.5-pro-search model to request uni-api, it means gemini-1.5-pro model automatically uses Google official search tool, supports all 1.5/2.0 series models.
     tools: true
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day

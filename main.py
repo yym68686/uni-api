@@ -1460,6 +1460,11 @@ async def root():
 #     import asgi
 #     return await asgi.fetch(app, request, env)
 
+@app.get("/v1/api_config")
+async def api_config(api_index: int = Depends(verify_api_key)):
+    return JSONResponse(content={"api_config": app.state.config})
+
+
 from fastapi.staticfiles import StaticFiles
 # 添加静态文件挂载
 app.mount("/", StaticFiles(directory="./static", html=True), name="static")

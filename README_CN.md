@@ -89,6 +89,7 @@ providers:
       - gemini-1.5-pro
       - gemini-1.5-flash-exp-0827: gemini-1.5-flash # 重命名后，原来的模型名字 gemini-1.5-flash-exp-0827 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
       - gemini-1.5-flash-exp-0827 # 加上这一行，gemini-1.5-flash-exp-0827 和 gemini-1.5-flash 都可以被请求
+      - gemini-1.5-pro: gemini-1.5-pro-search # 支持以 -search 后缀重命名模型启用搜索，使用 gemini-1.5-pro-search 模型请求 uni-api 时，表示 gemini-1.5-pro 模型自动使用 Google 官方搜索工具，支持全部 1.5/2.0 系列模型。
     tools: true
     preferences:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day

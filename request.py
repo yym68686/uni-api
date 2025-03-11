@@ -1,14 +1,14 @@
 import os
 import re
+import io
 import json
 import httpx
 import base64
 import urllib.parse
 from PIL import Image
-import io
 
 from models import RequestModel
-from utils import c35s, c3s, c3o, c3h, gemini1, gemini2, BaseAPI, get_model_dict, provider_api_circular_list, safe_get, ThreadSafeCircularList
+from utils import c35s, c3s, c3o, c3h, gemini1, gemini2, BaseAPI, get_model_dict, provider_api_circular_list, safe_get
 
 def get_image_format(file_content):
     try:
