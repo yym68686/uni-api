@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Body
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
@@ -508,7 +508,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
         current_info = request_info.get()
 
         parsed_body = await parse_request_body(request)
-        if parsed_body:
+        if parsed_body and not request.url.path.startswith("/v1/api_config"):
             try:
                 request_model = UnifiedRequest.model_validate(parsed_body).data
                 if is_debug:
@@ -1464,6 +1464,11 @@ async def root():
 async def api_config(api_index: int = Depends(verify_api_key)):
     return JSONResponse(content={"api_config": app.state.config})
 
+@app.post("/v1/api_config/update")
+async def api_config_update(api_index: int = Depends(verify_api_key), config: dict = Body(...)):
+    if "providers" in config:
+        app.state.config["providers"] = config["providers"]
+    return JSONResponse(content={"message": "API config updated"})
 
 from fastapi.staticfiles import StaticFiles
 # 添加静态文件挂载
