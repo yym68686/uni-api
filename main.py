@@ -1190,6 +1190,8 @@ class ModelRequestHandler:
                 if cooling_time > 0 and api_key_count > 1:
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
 
+                if "string_above_max_length" in error_message:
+                    status_code = 413
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
                 if is_debug:
                     import traceback
