@@ -15,22 +15,25 @@ from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
-from request import get_payload
+from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
+from core.request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import (
     safe_get,
     get_proxy,
-    get_engine,
     load_config,
     get_model_dict,
     post_all_models,
-    parse_rate_limit,
     InMemoryRateLimiter,
-    circular_list_encoder,
     error_handling_wrapper,
-    provider_api_circular_list,
+)
+
+from core.utils import (
+    get_engine,
+    parse_rate_limit,
+    circular_list_encoder,
     ThreadSafeCircularList,
+    provider_api_circular_list,
 )
 
 from collections import defaultdict
@@ -834,6 +837,7 @@ def get_timeout_value(provider_timeouts, original_model):
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, num_matching_providers=1):
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
+    api_key = await provider_api_circular_list[provider['provider']].next(original_model)
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
 
@@ -844,7 +848,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if engine != "moderation":
         logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine} role: {role}")
 
-    url, headers, payload = await get_payload(request, engine, provider)
+    url, headers, payload = await get_payload(request, engine, provider, api_key)
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if is_debug:
         logger.info(url)

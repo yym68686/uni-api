@@ -2,8 +2,8 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import RequestModel
-from request import get_payload
+from core.models import RequestModel
+from core.request import get_payload
 import json
 
 async def test_gemini_payload():
