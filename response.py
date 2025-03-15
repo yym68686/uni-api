@@ -168,10 +168,23 @@ async def fetch_gpt_response_stream(client, url, headers, payload):
                         ark_tag = True
                         content = content.replace("<think>", "")
                     if "</think>" in content:
+                        end_think_reasoning_content = ""
+                        end_think_content = ""
                         is_thinking = False
-                        content = content.replace("</think>", "")
-                        if content:
-                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
+
+                        if content.rstrip('\n').endswith("</think>"):
+                            end_think_reasoning_content = content.replace("</think>", "").rstrip('\n')
+                        elif content.lstrip('\n').startswith("</think>"):
+                            end_think_content = content.replace("</think>", "").lstrip('\n')
+                        else:
+                            end_think_reasoning_content = content.split("</think>")[0]
+                            end_think_content = content.split("</think>")[1]
+
+                        if end_think_reasoning_content:
+                            sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=end_think_reasoning_content)
+                            yield sse_string
+                        if end_think_content:
+                            sse_string = await generate_sse_response(timestamp, payload["model"], content=end_think_content)
                             yield sse_string
                         continue
                     if is_thinking and ark_tag:
