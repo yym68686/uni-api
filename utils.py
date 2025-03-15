@@ -39,6 +39,28 @@ def parse_rate_limit(limit_string):
 
     return limits
 
+class InMemoryRateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+
+    async def is_rate_limited(self, key: str, limits) -> bool:
+        now = time()
+
+        # 检查所有速率限制条件
+        for limit, period in limits:
+            # 计算在当前时间窗口内的请求数量
+            recent_requests = sum(1 for req in self.requests[key] if req > now - period)
+            if recent_requests >= limit:
+                return True
+
+        # 清理太旧的请求记录（比最长时间窗口还要老的记录）
+        max_period = max(period for _, period in limits)
+        self.requests[key] = [req for req in self.requests[key] if req > now - max_period]
+
+        # 记录新的请求
+        self.requests[key].append(now)
+        return False
+
 import asyncio
 from collections import defaultdict
 
