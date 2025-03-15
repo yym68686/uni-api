@@ -389,6 +389,7 @@ We thank the following sponsors for their support:
 <!-- ¥2050 -->
 - @PowerHunter: ¥2000
 - @ioi：¥50
+- @IM4O4: ¥50
 
 ## How to sponsor us
 
@@ -477,6 +478,27 @@ api_key_rate_limit:
 At this time, if there is a request using the model gemini-1.5-pro-002.
 
 First, the uni-api will attempt to precisely match the model in the api_key_rate_limit. If the rate limit for gemini-1.5-pro-002 is set, then the rate limit for gemini-1.5-pro-002 is 500/min. If the requested model at this time is not gemini-1.5-pro-002, but gemini-1.5-pro-latest, since the api_key_rate_limit does not have a rate limit set for gemini-1.5-pro-latest, it will look for any model with the same prefix as gemini-1.5-pro-latest that has been set, thus the rate limit for gemini-1.5-pro-latest will be set to 1000/min.
+
+- I want to set channel 1 and channel 2 to random round-robin, and uni-api will request channel 3 after channel 1 and channel 2 failure. How do I set it?
+
+uni-api supports api key as a channel, and can use this feature to manage channels by grouping them.
+
+```yaml
+api_keys:
+  - api: sk-xxx1
+    model:
+      - sk-xxx2/* # channel 1 2 use random round-robin, request channel 3 after failure
+      - aws/* # channel 3
+    preferences:
+      SCHEDULING_ALGORITHM: fixed_priority # always request api key: sk-xxx2 first, then request channel 3 after failure
+
+  - api: sk-xxx2
+    model:
+      - anthropic/claude-3-7-sonnet # channel 1
+      - openrouter/claude-3-7-sonnet # channel 2
+    preferences:
+      SCHEDULING_ALGORITHM: random # channel 1 2 use random round-robin
+```
 
 ## ⭐ Star History
 

@@ -389,6 +389,7 @@ pex -r requirements.txt \
 <!-- ¥2050 -->
 - @PowerHunter：¥2000
 - @ioi：¥50
+- @IM4O4: ¥50
 
 ## 如何赞助我们
 
@@ -477,6 +478,27 @@ api_key_rate_limit:
 此时如果有一个使用模型 gemini-1.5-pro-002 的请求。
 
 首先，uni-api 会尝试精确匹配 api_key_rate_limit 的模型。如果刚好设置了 gemini-1.5-pro-002 的频率限制，则 gemini-1.5-pro-002 的频率限制则为 500/min，如果此时请求的模型不是 gemini-1.5-pro-002，而是 gemini-1.5-pro-latest，由于 api_key_rate_limit 没有设置 gemini-1.5-pro-latest 的频率限制，因此会寻找有没有前缀和 gemini-1.5-pro-latest 相同的模型被设置了，因此 gemini-1.5-pro-latest 的频率限制会被设置为 1000/min。
+
+- 我想设置渠道1和渠道2为随机轮训，uni-api 在渠道1和渠道2请求失败后才自动重试渠道3，怎么设置？
+
+uni-api 支持将 api key 本身作为渠道，可以通过这一特性对渠道进行分组管理。
+
+```yaml
+api_keys:
+  - api: sk-xxx1
+    model:
+      - sk-xxx2/* # 渠道 1 2 采用随机轮训，失败后请求渠道3
+      - aws/* # 渠道3
+    preferences:
+      SCHEDULING_ALGORITHM: fixed_priority # 表示始终优先请求 api key：sk-xxx2 里面的渠道 1 2，失败后自动请求渠道 3
+
+  - api: sk-xxx2
+    model:
+      - anthropic/claude-3-7-sonnet # 渠道1
+      - openrouter/claude-3-7-sonnet # 渠道2
+    preferences:
+      SCHEDULING_ALGORITHM: random # 渠道 1 2 采用随机轮训
+```
 
 ## ⭐ Star 历史
 
