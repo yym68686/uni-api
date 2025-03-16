@@ -16,6 +16,7 @@ on:
       - requirements.txt
       - docker-compose.yml
       - .github/workflows/main.yml
+      - .gitmodules
   workflow_dispatch:
 
 jobs:
