@@ -388,8 +388,8 @@ pex -r requirements.txt \
 We thank the following sponsors for their support:
 <!-- ¥2050 -->
 - @PowerHunter: ¥2000
+- @IM4O4: ¥100
 - @ioi：¥50
-- @IM4O4: ¥50
 
 ## How to sponsor us
 

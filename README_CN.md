@@ -388,8 +388,8 @@ pex -r requirements.txt \
 我们感谢以下赞助商的支持：
 <!-- ¥2050 -->
 - @PowerHunter：¥2000
+- @IM4O4: ¥100
 - @ioi：¥50
-- @IM4O4: ¥50
 
 ## 如何赞助我们
 

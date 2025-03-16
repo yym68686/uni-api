@@ -837,7 +837,12 @@ def get_timeout_value(provider_timeouts, original_model):
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, num_matching_providers=1):
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
-    api_key = await provider_api_circular_list[provider['provider']].next(original_model)
+    if provider['provider'].startswith("sk-"):
+        api_key = provider['provider']
+    elif provider.get("api"):
+        api_key = await provider_api_circular_list[provider['provider']].next(original_model)
+    else:
+        api_key = None
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
 
