@@ -292,9 +292,11 @@ async def fetch_azure_response_stream(client, url, headers, payload):
                     if no_stream_content or content or sse_string:
                         sse_string = await generate_sse_response(timestamp, safe_get(line, "model", default=None), content=no_stream_content or content)
                         yield sse_string
-                    if no_stream_content:
-                        yield "data: [DONE]" + end_of_line
-                        return
+                    else:
+                        if no_stream_content:
+                            del line["choices"][0]["message"]
+                        yield "data: " + json.dumps(line).strip() + end_of_line
+        yield "data: [DONE]" + end_of_line
 
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
     timestamp = int(datetime.timestamp(datetime.now()))
