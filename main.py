@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 
 from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.request import get_payload
-from response import fetch_response, fetch_response_stream
+from core.response import fetch_response, fetch_response_stream
 from utils import (
     safe_get,
     get_proxy,
