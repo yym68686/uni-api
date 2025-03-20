@@ -10,5 +10,6 @@
       "src": "/(.*)",
       "dest": "main.py"
     }
-  ]
+  ],
+  "installCommand": "git submodule update --init --recursive && pip install -r requirements.txt"
 }
