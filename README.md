@@ -221,11 +221,13 @@ yym68686/uni-api:latest
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
 - DISABLE_DATABASE: Whether to disable the database, default is false, optional
 
-## Vercel remote deployment
+## Koyeb remote deployment
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+Click the button below to automatically use the built uni-api docker image to deploy:
 
-After clicking the one-click deploy button above, set the environment variable `CONFIG_URL` to the direct link of the configuration file, `DISABLE_DATABASE` to true, and then click Create to create the project. After deployment, you need to manually set the Function Max Duration to 60 seconds in the Vercel project panel under Settings -> Functions, and then click the Deployments menu and click Redeploy to redeploy, which will set the timeout to 60 seconds. If you do not redeploy, the default timeout will remain at the original 10 seconds. Note that you should not delete the Vercel project and recreate it; instead, click redeploy in the Deployments menu within the currently deployed Vercel project to make the Function Max Duration modification take effect.
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=uni-api&type=docker&image=docker.io%2Fyym68686%2Funi-api%3Alatest&instance_type=free&regions=was&instances_min=0&env%5BCONFIG_URL%5D=)
+
+Fill in the environment variable `CONFIG_URL` with the direct link of the configuration file, or paste the api.yaml file content, and then click Deploy to deploy.
 
 ## Ubuntu deployment
 

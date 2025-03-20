@@ -1,8 +1,0 @@
-{
-  "functions": {
-    "main.py": {
-      "runtime": "python3.12"
-    }
-  },
-  "installCommand": "git submodule update --init --recursive && pip install -r requirements.txt"
-}

@@ -221,11 +221,13 @@ yym68686/uni-api:latest
 - TIMEOUT: 请求超时时间，默认为 100 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间。选填
 - DISABLE_DATABASE: 是否禁用数据库，默认为 false，选填
 
-## Vercel 部署
+## Koyeb 远程部署
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api%2Ftree%2Fmain&env=CONFIG_URL,DISABLE_DATABASE&project-name=uni-api-vercel&repository-name=uni-api-vercel)
+点击下面的按钮可以自动使用构建好的 uni-api docker 镜像一键部署：
 
-点击上面的一键部署按钮后，设置环境变量 `CONFIG_URL` 为配置文件的直链， `DISABLE_DATABASE` 为 true，然后点击 Create 创建项目。部署完之后需要手动在 vercel 项目面板的 Settings -> Funcitons -> Function Max Duration 设置为 60 秒，然后点击 Deployments 菜单点击 Redeploy 重新部署，即可将超时时间设置为 60 秒，如果不重新部署，默认超时时间将是原来的 10 秒。注意不是删掉 vercel 项目重建，而是在当前部署好的 vercel 项目里面的 Deployments 菜单里面点 redeploy，这样才能让 Function Max Duration 的修改生效。
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=uni-api&type=docker&image=docker.io%2Fyym68686%2Funi-api%3Alatest&instance_type=free&regions=was&instances_min=0&env%5BCONFIG_URL%5D=)
+
+填写环境变量 `CONFIG_URL` 为配置文件的直链，或者直接粘贴 api.yaml 文件内容，然后点击 Deploy 部署。
 
 ## Ubuntu 部署
 
