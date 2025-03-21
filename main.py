@@ -21,6 +21,7 @@ from core.response import fetch_response, fetch_response_stream
 from utils import (
     safe_get,
     load_config,
+    update_config,
     get_model_dict,
     post_all_models,
     InMemoryRateLimiter,
@@ -1487,6 +1488,7 @@ async def api_config(api_index: int = Depends(verify_api_key)):
 async def api_config_update(api_index: int = Depends(verify_api_key), config: dict = Body(...)):
     if "providers" in config:
         app.state.config["providers"] = config["providers"]
+        app.state.config, app.state.api_keys_db, app.state.api_list = update_config(app.state.config, use_config_url=False)
     return JSONResponse(content={"message": "API config updated"})
 
 from fastapi.staticfiles import StaticFiles
