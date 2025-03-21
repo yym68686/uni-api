@@ -20,7 +20,6 @@ from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream
 from utils import (
     safe_get,
-    get_proxy,
     load_config,
     get_model_dict,
     post_all_models,
@@ -29,6 +28,7 @@ from utils import (
 )
 
 from core.utils import (
+    get_proxy,
     get_engine,
     parse_rate_limit,
     circular_list_encoder,

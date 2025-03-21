@@ -3,15 +3,13 @@ import httpx
 import asyncio
 from time import time
 from log_config import logger
-from urllib.parse import urlparse
 from fastapi import HTTPException
 from collections import defaultdict
 
 from core.utils import (
-    BaseAPI,
     safe_get,
-    get_engine,
     get_model_dict,
+    update_initial_model,
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
@@ -37,84 +35,6 @@ class InMemoryRateLimiter:
         # 记录新的请求
         self.requests[key].append(now)
         return False
-
-def get_proxy(proxy, client_config = {}):
-    if proxy:
-        # 解析代理URL
-        parsed = urlparse(proxy)
-        scheme = parsed.scheme.rstrip('h')
-
-        if scheme == 'socks5':
-            try:
-                from httpx_socks import AsyncProxyTransport
-                proxy = proxy.replace('socks5h://', 'socks5://')
-                transport = AsyncProxyTransport.from_url(proxy)
-                client_config["transport"] = transport
-                # print("proxy", proxy)
-            except ImportError:
-                logger.error("httpx-socks package is required for SOCKS proxy support")
-                raise ImportError("Please install httpx-socks package for SOCKS proxy support: pip install httpx-socks")
-        else:
-            client_config["proxies"] = {
-                "http://": proxy,
-                "https://": proxy
-            }
-    return client_config
-
-def update_initial_model(provider):
-    try:
-        engine, stream_mode = get_engine(provider, endpoint=None, original_model="")
-        # print("engine", engine, provider)
-        api_url = provider['base_url']
-        api = provider['api']
-        proxy = safe_get(provider, "preferences", "proxy", default=None)
-        client_config = get_proxy(proxy)
-        if engine == "gemini":
-            url = "https://generativelanguage.googleapis.com/v1beta/models"
-            params = {"key": api}
-
-            with httpx.Client(**client_config) as client:
-                response = client.get(url, params=params)
-
-            original_models = response.json()
-            if original_models.get("error"):
-                raise Exception({"error": original_models.get("error"), "endpoint": url, "api": api})
-
-            models = {"data": []}
-            for model in original_models["models"]:
-                models["data"].append({
-                    "id": model["name"].split("models/")[-1],
-                })
-        else:
-            endpoint = BaseAPI(api_url=api_url)
-            endpoint_models_url = endpoint.v1_models
-            if isinstance(api, list):
-                api = api[0]
-            headers = {"Authorization": f"Bearer {api}"}
-            response = httpx.get(
-                endpoint_models_url,
-                headers=headers,
-                **client_config
-            )
-            models = response.json()
-            if models.get("error"):
-                logger.error({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
-                return []
-
-        # print(models)
-        models_list = models["data"]
-        models_id = [model["id"] for model in models_list]
-        set_models = set()
-        for model_item in models_id:
-            set_models.add(model_item)
-        models_id = list(set_models)
-        # print(models_id)
-        return models_id
-    except Exception as e:
-        # print("error:", e)
-        import traceback
-        traceback.print_exc()
-        return []
 
 from ruamel.yaml import YAML, YAMLError
 yaml = YAML()
