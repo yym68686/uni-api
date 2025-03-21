@@ -97,11 +97,20 @@ def update_config(config_data, use_config_url=False):
 
         config_data['providers'][index] = provider
 
+    for index, api_key in enumerate(config_data['api_keys']):
+        if "api" in api_key:
+            config_data['api_keys'][index]["api"] = str(api_key["api"])
+
     api_keys_db = config_data['api_keys']
 
     for index, api_key in enumerate(config_data['api_keys']):
         weights_dict = {}
         models = []
+
+        # 确保api字段为字符串类型
+        if "api" in api_key:
+            config_data['api_keys'][index]["api"] = str(api_key["api"])
+
         if api_key.get('model'):
             for model in api_key.get('model'):
                 if isinstance(model, dict):

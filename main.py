@@ -472,7 +472,6 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
                 api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
                 # token不在api_list中，使用默认值（不开启）
-                pass
 
             if api_index is not None:
                 enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
