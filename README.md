@@ -227,7 +227,13 @@ Click the button below to automatically use the built uni-api docker image to de
 
 [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=uni-api&type=docker&image=docker.io%2Fyym68686%2Funi-api%3Alatest&instance_type=free&regions=was&instances_min=0&env%5BCONFIG_URL%5D=)
 
-Fill in the environment variable `CONFIG_URL` with the direct link of the configuration file, or paste the api.yaml file content, and then click Deploy to deploy.
+There are two ways to let Koyeb read the configuration file, choose one of them:
+
+1. Fill in the environment variable `CONFIG_URL` with the direct link of the configuration file
+
+2. Paste the api.yaml file content, if you paste the api.yaml file content directly into the Koyeb environment variable setting file, after pasting the text in the text box, enter the api.yaml path as `/home/api.yaml` in the path field.
+
+Then click the Deploy button.
 
 ## Ubuntu deployment
 

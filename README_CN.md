@@ -227,7 +227,13 @@ yym68686/uni-api:latest
 
 [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=uni-api&type=docker&image=docker.io%2Fyym68686%2Funi-api%3Alatest&instance_type=free&regions=was&instances_min=0&env%5BCONFIG_URL%5D=)
 
-填写环境变量 `CONFIG_URL` 为配置文件的直链，或者直接粘贴 api.yaml 文件内容，然后点击 Deploy 部署。
+让 Koyeb 读取配置文件有两种方法，选一种即可：
+
+1. 填写环境变量 `CONFIG_URL` 为配置文件的直链
+
+2. 直接粘贴 api.yaml 文件内容，如果直接把 api.yaml 文件内容粘贴到 Koyeb 环境变量设置的 file 里面，其中粘贴到文本框后，在下方 path 输入 api.yaml 路径为 `/home/api.yaml`。
+
+最后点击 Deploy 部署按钮。
 
 ## Ubuntu 部署
 
