@@ -1210,6 +1210,9 @@ class ModelRequestHandler:
 
                 if "string_above_max_length" in error_message:
                     status_code = 413
+                if "must be less than max_seq_len" in error_message:
+                    status_code = 413
+
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
                 if is_debug:
                     import traceback
