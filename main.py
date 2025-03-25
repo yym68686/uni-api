@@ -825,7 +825,7 @@ def get_timeout_value(provider_timeouts, original_model):
     else:
         # 尝试模糊匹配模型
         for timeout_model in provider_timeouts:
-            if timeout_model != "default" and timeout_model in original_model:
+            if timeout_model != "default" and timeout_model.lower() in original_model.lower():
                 timeout_value = provider_timeouts[timeout_model]
                 break
         else:
