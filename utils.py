@@ -310,7 +310,8 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 # logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
                 raise HTTPException(status_code=502, detail=f"Network error in new_generator: {e}")
             except httpx.ReadTimeout as e:
-                raise HTTPException(status_code=504, detail=f"Read timeout in new_generator: {e}")
+                logger.error(f"provider: {channel_id:<11} Read timeout in new_generator: {e}")
+                yield "data: [DONE]\n\n"
 
         return new_generator(), first_response_time
 
