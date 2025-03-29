@@ -7,10 +7,11 @@ on:
     paths:
       - main.py
       - utils.py
-      - models.py
-      - request.py
+      - core/utils.py
+      - core/models.py
+      - core/request.py
+      - core/response.py
       - Dockerfile
-      - response.py
       - .dockerignore
       - requirements.txt
       - docker-compose.yml
