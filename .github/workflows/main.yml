@@ -7,10 +7,7 @@ on:
     paths:
       - main.py
       - utils.py
-      - core/utils.py
-      - core/models.py
-      - core/request.py
-      - core/response.py
+      - core/**
       - Dockerfile
       - .dockerignore
       - requirements.txt
