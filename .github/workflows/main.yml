@@ -8,6 +8,7 @@ on:
       - main.py
       - utils.py
       - core/**
+      - core
       - Dockerfile
       - .dockerignore
       - requirements.txt
