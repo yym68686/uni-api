@@ -853,6 +853,9 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if engine != "moderation":
         logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine} role: {role}")
 
+    # if api_key == 'REDACTED':
+    #     raise HTTPException(status_code=429, detail="test error")
+
     url, headers, payload = await get_payload(request, engine, provider, api_key)
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if is_debug:
@@ -1047,15 +1050,42 @@ async def get_matching_providers(request_model, config, api_index):
 async def get_right_order_providers(request_model, config, api_index, scheduling_algorithm):
     matching_providers = await get_matching_providers(request_model, config, api_index)
 
+    # # 检查是否所有key都被速率限制
+    # available_providers = []
+    # for provider in matching_providers:
+    #     model_dict = get_model_dict(provider)
+    #     original_model = model_dict[request_model]
+    #     provider_name = provider['provider']
+    #     # 如果是本地API密钥（以sk-开头）
+    #     if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+    #         # 本地API密钥直接添加到可用列表中，因为它们的限制已在其他地方处理
+    #         available_providers.append(provider)
+    #     # 检查provider对应的API密钥列表是否都被速率限制
+    #     elif not await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+    #         # 如果provider没有API密钥或至少有一个API密钥未被速率限制，则添加到可用列表
+    #         available_providers.append(provider)
+    #     else:
+    #         logger.warning(f"Provider {provider_name}: all API keys are rate limited!")
+
+    # # 使用筛选后的provider列表替换原始列表
+    # matching_providers = available_providers
+
+    # for provider in matching_providers:
+    #     print(provider['provider'])
+
     if not matching_providers:
-        raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
+        raise HTTPException(status_code=404, detail=f"No available providers at the moment: {request_model}")
 
     num_matching_providers = len(matching_providers)
+    # 如果某个渠道的一个模型报错，这个渠道会被排除
     if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
         matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
         num_matching_providers = len(matching_providers)
         if not matching_providers:
             raise HTTPException(status_code=503, detail="No available providers at the moment")
+
+    # for provider in matching_providers:
+    #     print(provider['provider'])
 
     # 检查是否启用轮询
     if scheduling_algorithm == "random":
@@ -1141,21 +1171,40 @@ class ModelRequestHandler:
         if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
             retry_count = count
         else:
-            retry_count = int(auto_retry)
+            tmp_retry_count = sum(provider_api_circular_list[provider['provider']].get_items_count() for provider in matching_providers) * 2
+            if tmp_retry_count < 10:
+                retry_count = tmp_retry_count
+            else:
+                retry_count = 10
 
         while True:
             # print("start_index", start_index)
             # print("index", index)
             # print("num_matching_providers", num_matching_providers)
             # print("retry_count", retry_count)
-            if index >= num_matching_providers + retry_count:
+            if index > num_matching_providers + retry_count:
                 break
             current_index = (start_index + index) % num_matching_providers
             index += 1
             provider = matching_providers[current_index]
 
-            if provider['provider'].startswith("sk-") and provider['provider'] in app.state.api_list:
-                local_provider_api_index = app.state.api_list.index(provider['provider'])
+            provider_name = provider['provider']
+            # print("current_index", current_index)
+            # print("provider_name", provider_name)
+
+            # 检查是否所有API密钥都被速率限制,如果被速率限制，则跳出循环
+            model_dict = get_model_dict(provider)
+            original_model = model_dict[request_model]
+            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+                # logger.warning(f"Provider {provider_name}: All API keys are rate limited and stop auto retry!")
+                error_message = f"All API keys are rate limited and stop auto retry!"
+                if num_matching_providers == 1:
+                    break
+                else:
+                    continue
+
+            if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+                local_provider_api_index = app.state.api_list.index(provider_name)
                 local_provider_scheduling_algorithm = safe_get(config, 'api_keys', local_provider_api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
                 local_provider_matching_providers = await get_right_order_providers(request_model, config, local_provider_api_index, local_provider_scheduling_algorithm)
                 local_provider_num_matching_providers = len(local_provider_matching_providers)
@@ -1191,8 +1240,19 @@ class ModelRequestHandler:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
+                exclude_error_rate_limit = [
+                    "Unable to connect to service",
+                    "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
+                    "Connection closed unexpectedly",
+                    "Proxy connection timed out",
+                    "Unknown error: EndOfStream",
+                    # "Internal Server Error",
+                ]
+
                 channel_id = f"{provider['provider']}"
-                if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
+
+                if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1 \
+                and all(error not in error_message for error in exclude_error_rate_limit):
                     # 获取源模型名称（实际配置的模型名）
                     # source_model = list(provider['model'][0].keys())[0]
                     await app.state.channel_manager.exclude_model(channel_id, request_model)
@@ -1205,8 +1265,14 @@ class ModelRequestHandler:
                 cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
                 api_key_count = provider_api_circular_list[channel_id].get_items_count()
                 current_api = await provider_api_circular_list[channel_id].after_next_current()
-                if cooling_time > 0 and api_key_count > 1:
+
+                if cooling_time > 0 and api_key_count > 1 \
+                and all(error not in error_message for error in exclude_error_rate_limit):
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
+
+                # 有些错误并没有请求成功，所以需要删除请求记录
+                if current_api and any(error in error_message for error in exclude_error_rate_limit) and provider_api_circular_list[provider_name].requests[current_api][original_model]:
+                    provider_api_circular_list[provider_name].requests[current_api][original_model].pop()
 
                 if "string_above_max_length" in error_message:
                     status_code = 413
