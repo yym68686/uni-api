@@ -239,13 +239,91 @@ def identify_audio_format(file_bytes):
         return "WAV"
     return "Unknown/PCM"
 
+async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
+    # 创建一个任务来获取第一个响应，但不直接中断生成器
+    if wait_task is None:
+        first_response_task = asyncio.create_task(wait_for_thing.__anext__())
+    else:
+        first_response_task = wait_task
+
+    # 创建一个超时任务
+    timeout_task = asyncio.create_task(asyncio.sleep(timeout))
+
+    # 等待任意一个任务完成
+    done, pending = await asyncio.wait(
+        [first_response_task, timeout_task],
+        return_when=asyncio.FIRST_COMPLETED
+    )
+
+    # 成功返回
+    if first_response_task in done:
+        # 取消超时任务
+        timeout_task.cancel()
+        return first_response_task.result(), "success"
+
+    # 超时返回
+    else:
+        return first_response_task, "timeout"
+
 import asyncio
 import time as time_module
-async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers):
+async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None):
+
+    async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
+        # print("type(first_item)", type(first_item))
+        # print("first_item", ensure_string(first_item))
+        if first_item:
+            yield ensure_string(first_item)
+
+        # 如果需要心跳机制但不使用嵌套生成器方式
+        if with_keepalive:
+            yield f": keepalive\n\n"
+            while True:
+                try:
+                    item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
+                    if status == "timeout":
+                        yield f": keepalive\n\n"
+                    else:
+                        yield ensure_string(item)
+                        wait_task = None
+                except asyncio.CancelledError:
+                    # 处理客户端断开连接
+                    logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
+                    break
+                except Exception as e:
+                    # 捕获任何其他异常
+                    import traceback
+                    error_stack = traceback.format_exc()
+                    error_message = error_stack.split("\n")[-2]
+                    logger.error(f"provider: {channel_id:<11} Unexpected error in keepalive loop: {error_message}")
+                    break
+        else:
+            # 原始的逻辑，当不需要心跳时
+            try:
+                async for item in generator:
+                    yield ensure_string(item)
+            except asyncio.CancelledError:
+                # 客户端断开连接是正常行为，不需要记录错误日志
+                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
+                return
+            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+                # 网络错误
+                logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
+                yield "data: [DONE]\n\n"
+                return
+
     start_time = time_module.time()
     try:
-        first_item = await generator.__anext__()
+        # 创建一个任务来获取第一个响应，但不直接中断生成器
+        if keepalive_interval:
+            first_item, status = await wait_for_timeout(generator, timeout=keepalive_interval)
+            if status == "timeout":
+                return new_generator(None, with_keepalive=True, wait_task=first_item, timeout=keepalive_interval), 3.1415
+        else:
+            first_item = await generator.__anext__()
+
         first_response_time = time_module.time() - start_time
+        # 对第一个响应项进行原有的处理逻辑
         first_item_str = first_item
         # logger.info("first_item_str: %s :%s", type(first_item_str), first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
@@ -293,28 +371,12 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             if (content == "" or content is None) and (tool_calls == "" or tool_calls is None):
                 raise StopAsyncIteration
 
-        # 如果不是错误，创建一个新的生成器，首先yield第一个项，然后yield剩余的项
-        async def new_generator():
-            # print("type(first_item)", type(first_item))
-            # print("first_item", ensure_string(first_item))
-            yield ensure_string(first_item)
-            try:
-                async for item in generator:
-                    yield ensure_string(item)
-            except asyncio.CancelledError:
-                # 客户端断开连接是正常行为，不需要记录错误日志
-                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
-                return
-            except (httpx.ReadError, httpx.RemoteProtocolError) as e:
-                # 只记录真正的网络错误
-                logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
-                yield "data: [DONE]\n\n"
-                # raise HTTPException(status_code=502, detail=f"Network error in new_generator: {e}")
-            except httpx.ReadTimeout as e:
-                logger.error(f"provider: {channel_id:<11} Read timeout in new_generator: {e}")
-                yield "data: [DONE]\n\n"
+        return new_generator(first_item), first_response_time
 
-        return new_generator(), first_response_time
+    # except Exception as e:
+    #     import traceback
+    #     traceback.print_exc()
+    #     raise HTTPException(status_code=500, detail=f"{e}")
 
     except StopAsyncIteration:
         raise HTTPException(status_code=400, detail="data: {'error': 'No data returned'}")

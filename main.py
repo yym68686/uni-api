@@ -1,4 +1,5 @@
 from log_config import logger
+from pprint import pprint
 
 import copy
 import httpx
@@ -109,8 +110,135 @@ def _get_default_sql(default):
         return f" DEFAULT '{default.arg}'"
     return ""
 
+def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT):
+    # 存储超时配置
+    preference_dict = {}
+    preferences = safe_get(all_config, "preferences", default={})
+    providers = safe_get(all_config, "providers", default=[])
+    if preferences:
+        if isinstance(preferences.get(preference_key), int):
+            preference_dict["default"] = preferences.get(preference_key)
+        else:
+            for model_name, timeout_value in preferences.get(preference_key, {"default": default_timeout}).items():
+                preference_dict[model_name] = timeout_value
+            if "default" not in preferences.get(preference_key, {}):
+                preference_dict["default"] = default_timeout
+
+    result = defaultdict(lambda: defaultdict(lambda: default_timeout))
+    for provider in providers:
+        provider_preference_settings = safe_get(provider, "preferences", preference_key, default={})
+        if provider_preference_settings:
+            for model_name, timeout_value in provider_preference_settings.items():
+                result[provider['provider']][model_name] = timeout_value
+
+    result["global"] = preference_dict
+
+    return result
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    if app and not hasattr(app.state, 'config'):
+        # logger.warning("Config not found, attempting to reload")
+        app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
+
+        if app.state.api_list:
+            app.state.user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)
+            for api_index, api_key in enumerate(app.state.api_list):
+                app.state.user_api_keys_rate_limit[api_key] = ThreadSafeCircularList(
+                    [api_key],
+                    safe_get(app.state.config, 'api_keys', api_index, "preferences", "rate_limit", default={"default": "999999/min"}),
+                    "round_robin"
+                )
+        app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
+
+        for item in app.state.api_keys_db:
+            if item.get("role") == "admin":
+                app.state.admin_api_key = item.get("api")
+        if not hasattr(app.state, "admin_api_key"):
+            if len(app.state.api_keys_db) >= 1:
+                app.state.admin_api_key = app.state.api_keys_db[0].get("api")
+            else:
+                from utils import yaml_error_message
+                if yaml_error_message:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"error": yaml_error_message}
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"error": "No API key found in api.yaml"}
+                    )
+
+        app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
+        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 80)
+        # pprint(dict(app.state.provider_timeouts))
+        # pprint(dict(app.state.keepalive_interval))
+        # print("app.state.provider_timeouts", app.state.provider_timeouts)
+        # print("app.state.keepalive_interval", app.state.keepalive_interval)
+
+    if app and not hasattr(app.state, 'client_manager'):
+
+        default_config = {
+            "headers": {
+                "User-Agent": "curl/7.68.0",
+                "Accept": "*/*",
+            },
+            "http2": True,
+            "verify": True,
+            "follow_redirects": True
+        }
+
+        # 初始化客户端管理器
+        app.state.client_manager = ClientManager(pool_size=200)
+        await app.state.client_manager.init(default_config)
+
+
+    if app and not hasattr(app.state, "channel_manager"):
+        if app.state.config and 'preferences' in app.state.config:
+            COOLDOWN_PERIOD = app.state.config['preferences'].get('cooldown_period', 300)
+        else:
+            COOLDOWN_PERIOD = 300
+
+        app.state.channel_manager = ChannelManager(cooldown_period=COOLDOWN_PERIOD)
+
+    if app and not hasattr(app.state, "error_triggers"):
+        if app.state.config and 'preferences' in app.state.config:
+            ERROR_TRIGGERS = app.state.config['preferences'].get('error_triggers', [])
+        else:
+            ERROR_TRIGGERS = []
+        app.state.error_triggers = ERROR_TRIGGERS
+
+    if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
+        app.state.models_list = {}
+        for item in app.state.api_keys_db:
+            api_key_model_list = item.get("model", [])
+            for provider_rule in api_key_model_list:
+                provider_name = provider_rule.split("/")[0]
+                if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+                    models_list = []
+                    try:
+                        # 构建请求头
+                        headers = {
+                            "Authorization": f"Bearer {provider_name}"
+                        }
+                        # 发送GET请求获取模型列表
+                        base_url = "http://127.0.0.1:8000/v1/models"
+                        async with app.state.client_manager.get_client(1, base_url) as client:
+                            response = await client.get(
+                                base_url,
+                                headers=headers
+                            )
+                            if response.status_code == 200:
+                                models_data = response.json()
+                                # 将获取到的模型添加到models_list
+                                for model in models_data.get("data", []):
+                                    models_list.append(model["id"])
+                    except Exception as e:
+                        if str(e):
+                            logger.error(f"获取模型列表失败: {str(e)}")
+                    app.state.models_list[provider_name] = models_list
     # 启动时的代码
     if not DISABLE_DATABASE:
         await create_tables()
@@ -689,135 +817,7 @@ async def rate_limit_dependency():
     if await rate_limiter.is_rate_limited("global", app.state.global_rate_limit):
         raise HTTPException(status_code=429, detail="Too many requests")
 
-@app.middleware("http")
-async def ensure_config(request: Request, call_next):
-
-    if app and not hasattr(app.state, 'config'):
-        # logger.warning("Config not found, attempting to reload")
-        app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
-
-        if app.state.api_list:
-            app.state.user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)
-            for api_index, api_key in enumerate(app.state.api_list):
-                app.state.user_api_keys_rate_limit[api_key] = ThreadSafeCircularList(
-                    [api_key],
-                    safe_get(app.state.config, 'api_keys', api_index, "preferences", "rate_limit", default={"default": "999999/min"}),
-                    "round_robin"
-                )
-        app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
-
-        for item in app.state.api_keys_db:
-            if item.get("role") == "admin":
-                app.state.admin_api_key = item.get("api")
-        if not hasattr(app.state, "admin_api_key"):
-            if len(app.state.api_keys_db) >= 1:
-                app.state.admin_api_key = app.state.api_keys_db[0].get("api")
-            else:
-                from utils import yaml_error_message
-                if yaml_error_message:
-                    return JSONResponse(
-                        status_code=500,
-                        content={"error": yaml_error_message}
-                    )
-                else:
-                    return JSONResponse(
-                        status_code=500,
-                        content={"error": "No admin API key found"}
-                    )
-
-    if app and not hasattr(app.state, 'client_manager'):
-
-        default_config = {
-            "headers": {
-                "User-Agent": "curl/7.68.0",
-                "Accept": "*/*",
-            },
-            "http2": True,
-            "verify": True,
-            "follow_redirects": True
-        }
-
-        # 初始化客户端管理器
-        app.state.client_manager = ClientManager(pool_size=200)
-        await app.state.client_manager.init(default_config)
-
-        # 存储超时配置
-        app.state.timeouts = {}
-        if app.state.config and 'preferences' in app.state.config:
-            if isinstance(app.state.config['preferences'].get('model_timeout'), int):
-                app.state.timeouts["default"] = app.state.config['preferences'].get('model_timeout')
-            else:
-                for model_name, timeout_value in app.state.config['preferences'].get('model_timeout', {"default": DEFAULT_TIMEOUT}).items():
-                    app.state.timeouts[model_name] = timeout_value
-                if "default" not in app.state.config['preferences'].get('model_timeout', {}):
-                    app.state.timeouts["default"] = DEFAULT_TIMEOUT
-
-        app.state.provider_timeouts = defaultdict(lambda: defaultdict(lambda: DEFAULT_TIMEOUT))
-        for provider in app.state.config["providers"]:
-            # print("provider", provider)
-            provider_timeout_settings = safe_get(provider, "preferences", "model_timeout", default={})
-            # print("provider_timeout_settings", provider_timeout_settings)
-            if provider_timeout_settings:
-                for model_name, timeout_value in provider_timeout_settings.items():
-                    app.state.provider_timeouts[provider['provider']][model_name] = timeout_value
-
-        app.state.provider_timeouts["global_time_out"] = app.state.timeouts
-
-        # provider_timeouts_dict = {
-        #     provider: dict(timeouts)
-        #     for provider, timeouts in app.state.provider_timeouts.items()
-        # }
-        # print("app.state.provider_timeouts", provider_timeouts_dict)
-        # print("ai" in app.state.provider_timeouts)
-
-    if app and not hasattr(app.state, "channel_manager"):
-        if app.state.config and 'preferences' in app.state.config:
-            COOLDOWN_PERIOD = app.state.config['preferences'].get('cooldown_period', 300)
-        else:
-            COOLDOWN_PERIOD = 300
-
-        app.state.channel_manager = ChannelManager(cooldown_period=COOLDOWN_PERIOD)
-
-    if app and not hasattr(app.state, "error_triggers"):
-        if app.state.config and 'preferences' in app.state.config:
-            ERROR_TRIGGERS = app.state.config['preferences'].get('error_triggers', [])
-        else:
-            ERROR_TRIGGERS = []
-        app.state.error_triggers = ERROR_TRIGGERS
-
-    if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
-        app.state.models_list = {}
-        for item in app.state.api_keys_db:
-            api_key_model_list = item.get("model", [])
-            for provider_rule in api_key_model_list:
-                provider_name = provider_rule.split("/")[0]
-                if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-                    models_list = []
-                    try:
-                        # 构建请求头
-                        headers = {
-                            "Authorization": f"Bearer {provider_name}"
-                        }
-                        # 发送GET请求获取模型列表
-                        base_url = "http://127.0.0.1:8000/v1/models"
-                        async with app.state.client_manager.get_client(1, base_url) as client:
-                            response = await client.get(
-                                base_url,
-                                headers=headers
-                            )
-                            if response.status_code == 200:
-                                models_data = response.json()
-                                # 将获取到的模型添加到models_list
-                                for model in models_data.get("data", []):
-                                    models_list.append(model["id"])
-                    except Exception as e:
-                        if str(e):
-                            logger.error(f"获取模型列表失败: {str(e)}")
-                    app.state.models_list[provider_name] = models_list
-
-    return await call_next(request)
-
-def get_timeout_value(provider_timeouts, original_model):
+def get_preference_value(provider_timeouts, original_model):
     timeout_value = None
     original_model = original_model.lower()
     if original_model in provider_timeouts:
@@ -831,6 +831,16 @@ def get_timeout_value(provider_timeouts, original_model):
         else:
             # 如果模糊匹配失败，使用渠道的默认值
             timeout_value = provider_timeouts.get("default")
+    return timeout_value
+
+def get_preference(preference_config, channel_id, original_model, default_value):
+    provider_timeouts = safe_get(preference_config, channel_id, default=preference_config["global"])
+    timeout_value = get_preference_value(provider_timeouts, original_model)
+    if timeout_value is None:
+        timeout_value = get_preference_value(preference_config["global"], original_model)
+    if timeout_value is None:
+        timeout_value = preference_config["global"].get("default", default_value)
+    # print("timeout_value", channel_id, timeout_value)
     return timeout_value
 
 # 在 process_request 函数中更新成功和失败计数
@@ -865,14 +875,13 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     current_info = request_info.get()
 
-    provider_timeouts = safe_get(app.state.provider_timeouts, channel_id, default=app.state.provider_timeouts["global_time_out"])
-    timeout_value = get_timeout_value(provider_timeouts, original_model)
-    if timeout_value is None:
-        timeout_value = get_timeout_value(app.state.provider_timeouts["global_time_out"], original_model)
-    if timeout_value is None:
-        timeout_value = app.state.timeouts.get("default", DEFAULT_TIMEOUT)
+    timeout_value = get_preference(app.state.provider_timeouts, channel_id, original_model, DEFAULT_TIMEOUT)
     timeout_value = timeout_value * num_matching_providers
     # print("timeout_value", channel_id, timeout_value)
+    keepalive_interval = get_preference(app.state.keepalive_interval, channel_id, original_model, 80)
+    if keepalive_interval > timeout_value:
+        keepalive_interval = None
+    # print("keepalive_interval", channel_id, keepalive_interval)
 
     proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
     proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
@@ -882,11 +891,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         async with app.state.client_manager.get_client(timeout_value, url, proxy) as client:
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             else:
                 generator = fetch_response(client, url, headers, payload, engine, original_model)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval)
 
                 # 处理音频和其他二进制响应
                 if endpoint == "/v1/audio/speech":

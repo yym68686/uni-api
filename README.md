@@ -103,6 +103,8 @@ providers:
         gemini-1.5-pro: 10 # Model gemini-1.5-pro timeout is 10 seconds
         gemini-1.5-flash: 10 # Model gemini-1.5-flash timeout is 10 seconds
         default: 10 # Model does not have a timeout set, use the default timeout of 10 seconds, when requesting a model not in model_timeout, the timeout is also 10 seconds, if default is not set, uni-api will use the default timeout set by the environment variable TIMEOUT, the default timeout is 100 seconds
+      keepalive_interval: # Heartbeat interval, in seconds, default 80 seconds, optional. Suitable for when uni-api is hosted on cloudflare and uses inference models. Priority is higher than the global configuration keepalive_interval.
+        gemini-2.5-pro: 50 # Model gemini-2.5-pro heartbeat interval is 50 seconds, this value must be less than the model_timeout set timeout, otherwise it will be ignored.
       proxy: socks5://[username]:[password]@[ip]:[port] # Proxy address, optional. Supports socks5 and http proxies, default is not used.
       headers:  # Add custom http request headers, optional
         Custom-Header-1: Value-1
@@ -191,6 +193,8 @@ preferences: # Global configuration
     o1-preview: 100 # Model o1-preview timeout is 100 seconds, when requesting models starting with o1-preview, the timeout is 100 seconds
   cooldown_period: 300 # Channel cooldown time, in seconds, default 300 seconds, optional. When a model request fails, the channel will be automatically excluded and cooled down for a period of time, and will not request the channel again. After the cooldown time ends, the model will be automatically restored until the request fails again, and it will be cooled down again. When cooldown_period is set to 0, the cooling mechanism is not enabled.
   rate_limit: 999999/min # uni-api global rate limit, in times/minute, supports multiple frequency constraints, such as: 15/min,10/day. Default 999999/min, optional.
+  keepalive_interval: # Heartbeat interval, in seconds, default 80 seconds, optional. Suitable for when uni-api is hosted on cloudflare and uses inference models.
+    gemini-2.5-pro: 50 # Model gemini-2.5-pro heartbeat interval is 50 seconds, this value must be less than the model_timeout set timeout, otherwise it will be ignored.
   error_triggers: # Error triggers, when the message returned by the model contains any of the strings in the error_triggers, the channel will return an error. Optional
     - The bot's usage is covered by the developer
     - process this request due to overload or policy

@@ -103,6 +103,8 @@ providers:
         gemini-1.5-pro: 10 # 模型 gemini-1.5-pro 的超时时间为 10 秒
         gemini-1.5-flash: 10 # 模型 gemini-1.5-flash 的超时时间为 10 秒
         default: 10 # 模型没有设置超时时间，使用默认的超时时间 10 秒，当请求的不在 model_timeout 里面的模型时，超时时间默认是 10 秒，不设置 default，uni-api 会使用全局配置的模型超时时间。
+      keepalive_interval: # 心跳间隔，单位为秒，默认 80 秒，选填。适合当 uni-api 域名托管在 cloudflare 并使用推理模型时使用。优先级高于全局配置的 keepalive_interval。
+        gemini-2.5-pro: 50 # 模型 gemini-2.5-pro 的心跳间隔为 50 秒，此数值必须小于 model_timeout 设置的超时时间，否则忽略此设置。
       proxy: socks5://[用户名]:[密码]@[IP地址]:[端口] # 代理地址，选填。支持 socks5 和 http 代理，默认不使用代理。
       headers:  # 额外附加自定义HTTP请求头，选填。
         Custom-Header-1: Value-1
@@ -191,6 +193,8 @@ preferences: # 全局配置
     o1-preview: 100 # 模型 o1-preview 的超时时间为 100 秒，当请求名字是 o1-preview 开头的模型时，超时时间是 100 秒
   cooldown_period: 300 # 渠道冷却时间，单位为秒，默认 300 秒，选填。当模型请求失败时，会自动将该渠道排除冷却一段时间，不再请求该渠道，冷却时间结束后，会自动将该模型恢复，直到再次请求失败，会重新冷却。当 cooldown_period 设置为 0 时，不启用冷却机制。
   rate_limit: 999999/min # uni-api 全局速率限制，单位为次数/分钟，支持多个频率约束条件，例如：15/min,10/day。默认 999999/min，选填。
+  keepalive_interval: # 心跳间隔，单位为秒，默认 80 秒，选填。适合当 uni-api 域名托管在 cloudflare 并使用推理模型时使用。
+    gemini-2.5-pro: 50 # 模型 gemini-2.5-pro 的心跳间隔为 50 秒，此数值必须小于 model_timeout 设置的超时时间，否则忽略此设置。
   error_triggers: # 错误触发器，当模型返回的消息包含错误触发器中的任意一个字符串时，该渠道会自动返回报错。选填
     - The bot's usage is covered by the developer
     - process this request due to overload or policy
