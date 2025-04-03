@@ -1243,6 +1243,7 @@ class ModelRequestHandler:
                     "Connection closed unexpectedly",
                     "Proxy connection timed out",
                     "Unknown error: EndOfStream",
+                    "BrokenResourceError",
                     # "Internal Server Error",
                 ]
 
