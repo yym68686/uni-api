@@ -143,109 +143,6 @@ async def lifespan(app: FastAPI):
 
     yield
     # 关闭时的代码
-
-    if app and not hasattr(app.state, 'config'):
-        # logger.warning("Config not found, attempting to reload")
-        app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
-
-        if app.state.api_list:
-            app.state.user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)
-            for api_index, api_key in enumerate(app.state.api_list):
-                app.state.user_api_keys_rate_limit[api_key] = ThreadSafeCircularList(
-                    [api_key],
-                    safe_get(app.state.config, 'api_keys', api_index, "preferences", "rate_limit", default={"default": "999999/min"}),
-                    "round_robin"
-                )
-        app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
-
-        for item in app.state.api_keys_db:
-            if item.get("role") == "admin":
-                app.state.admin_api_key = item.get("api")
-        if not hasattr(app.state, "admin_api_key"):
-            if len(app.state.api_keys_db) >= 1:
-                app.state.admin_api_key = app.state.api_keys_db[0].get("api")
-            else:
-                from utils import yaml_error_message
-                if yaml_error_message:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": yaml_error_message}
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": "No API key found in api.yaml"}
-                    )
-
-        app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 80)
-        # pprint(dict(app.state.provider_timeouts))
-        # pprint(dict(app.state.keepalive_interval))
-        # print("app.state.provider_timeouts", app.state.provider_timeouts)
-        # print("app.state.keepalive_interval", app.state.keepalive_interval)
-
-    if app and not hasattr(app.state, 'client_manager'):
-
-        default_config = {
-            "headers": {
-                "User-Agent": "curl/7.68.0",
-                "Accept": "*/*",
-            },
-            "http2": True,
-            "verify": True,
-            "follow_redirects": True
-        }
-
-        # 初始化客户端管理器
-        app.state.client_manager = ClientManager(pool_size=200)
-        await app.state.client_manager.init(default_config)
-
-
-    if app and not hasattr(app.state, "channel_manager"):
-        if app.state.config and 'preferences' in app.state.config:
-            COOLDOWN_PERIOD = app.state.config['preferences'].get('cooldown_period', 300)
-        else:
-            COOLDOWN_PERIOD = 300
-
-        app.state.channel_manager = ChannelManager(cooldown_period=COOLDOWN_PERIOD)
-
-    if app and not hasattr(app.state, "error_triggers"):
-        if app.state.config and 'preferences' in app.state.config:
-            ERROR_TRIGGERS = app.state.config['preferences'].get('error_triggers', [])
-        else:
-            ERROR_TRIGGERS = []
-        app.state.error_triggers = ERROR_TRIGGERS
-
-    if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
-        app.state.models_list = {}
-        for item in app.state.api_keys_db:
-            api_key_model_list = item.get("model", [])
-            for provider_rule in api_key_model_list:
-                provider_name = provider_rule.split("/")[0]
-                if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-                    models_list = []
-                    try:
-                        # 构建请求头
-                        headers = {
-                            "Authorization": f"Bearer {provider_name}"
-                        }
-                        # 发送GET请求获取模型列表
-                        base_url = "http://127.0.0.1:8000/v1/models"
-                        async with app.state.client_manager.get_client(1, base_url) as client:
-                            response = await client.get(
-                                base_url,
-                                headers=headers
-                            )
-                            if response.status_code == 200:
-                                models_data = response.json()
-                                # 将获取到的模型添加到models_list
-                                for model in models_data.get("data", []):
-                                    models_list.append(model["id"])
-                    except Exception as e:
-                        if str(e):
-                            logger.error(f"获取模型列表失败: {str(e)}")
-                    app.state.models_list[provider_name] = models_list
-
     # await app.state.client.aclose()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
@@ -370,6 +267,111 @@ class ChannelManager:
                 available_providers.append(provider)
 
         return available_providers
+
+@app.middleware("http")
+async def ensure_config(request: Request, call_next):
+    if app and not hasattr(app.state, 'config'):
+        # logger.warning("Config not found, attempting to reload")
+        app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
+
+        if app.state.api_list:
+            app.state.user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)
+            for api_index, api_key in enumerate(app.state.api_list):
+                app.state.user_api_keys_rate_limit[api_key] = ThreadSafeCircularList(
+                    [api_key],
+                    safe_get(app.state.config, 'api_keys', api_index, "preferences", "rate_limit", default={"default": "999999/min"}),
+                    "round_robin"
+                )
+        app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
+
+        for item in app.state.api_keys_db:
+            if item.get("role") == "admin":
+                app.state.admin_api_key = item.get("api")
+        if not hasattr(app.state, "admin_api_key"):
+            if len(app.state.api_keys_db) >= 1:
+                app.state.admin_api_key = app.state.api_keys_db[0].get("api")
+            else:
+                from utils import yaml_error_message
+                if yaml_error_message:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"error": yaml_error_message}
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"error": "No API key found in api.yaml"}
+                    )
+
+        app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
+        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 80)
+        # pprint(dict(app.state.provider_timeouts))
+        # pprint(dict(app.state.keepalive_interval))
+        # print("app.state.provider_timeouts", app.state.provider_timeouts)
+        # print("app.state.keepalive_interval", app.state.keepalive_interval)
+
+    if app and not hasattr(app.state, 'client_manager'):
+
+        default_config = {
+            "headers": {
+                "User-Agent": "curl/7.68.0",
+                "Accept": "*/*",
+            },
+            "http2": True,
+            "verify": True,
+            "follow_redirects": True
+        }
+
+        # 初始化客户端管理器
+        app.state.client_manager = ClientManager(pool_size=200)
+        await app.state.client_manager.init(default_config)
+
+
+    if app and not hasattr(app.state, "channel_manager"):
+        if app.state.config and 'preferences' in app.state.config:
+            COOLDOWN_PERIOD = app.state.config['preferences'].get('cooldown_period', 300)
+        else:
+            COOLDOWN_PERIOD = 300
+
+        app.state.channel_manager = ChannelManager(cooldown_period=COOLDOWN_PERIOD)
+
+    if app and not hasattr(app.state, "error_triggers"):
+        if app.state.config and 'preferences' in app.state.config:
+            ERROR_TRIGGERS = app.state.config['preferences'].get('error_triggers', [])
+        else:
+            ERROR_TRIGGERS = []
+        app.state.error_triggers = ERROR_TRIGGERS
+
+    if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
+        app.state.models_list = {}
+        for item in app.state.api_keys_db:
+            api_key_model_list = item.get("model", [])
+            for provider_rule in api_key_model_list:
+                provider_name = provider_rule.split("/")[0]
+                if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+                    models_list = []
+                    try:
+                        # 构建请求头
+                        headers = {
+                            "Authorization": f"Bearer {provider_name}"
+                        }
+                        # 发送GET请求获取模型列表
+                        base_url = "http://127.0.0.1:8000/v1/models"
+                        async with app.state.client_manager.get_client(1, base_url) as client:
+                            response = await client.get(
+                                base_url,
+                                headers=headers
+                            )
+                            if response.status_code == 200:
+                                models_data = response.json()
+                                # 将获取到的模型添加到models_list
+                                for model in models_data.get("data", []):
+                                    models_list.append(model["id"])
+                    except Exception as e:
+                        if str(e):
+                            logger.error(f"获取模型列表失败: {str(e)}")
+                    app.state.models_list[provider_name] = models_list
+    return await call_next(request)
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
