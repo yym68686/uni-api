@@ -137,6 +137,12 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动时的代码
+    if not DISABLE_DATABASE:
+        await create_tables()
+
+    yield
+    # 关闭时的代码
 
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
@@ -239,12 +245,7 @@ async def lifespan(app: FastAPI):
                         if str(e):
                             logger.error(f"获取模型列表失败: {str(e)}")
                     app.state.models_list[provider_name] = models_list
-    # 启动时的代码
-    if not DISABLE_DATABASE:
-        await create_tables()
 
-    yield
-    # 关闭时的代码
     # await app.state.client.aclose()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
