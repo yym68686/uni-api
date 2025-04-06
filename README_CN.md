@@ -512,6 +512,12 @@ api_keys:
       SCHEDULING_ALGORITHM: random # 渠道 1 2 采用随机轮训
 ```
 
+- 我想使用 Cloudflare AI Gateway，怎么填写 base_url？
+
+对于 gemini 渠道，Cloudflare AI Gateway 的 base_url 需要填写为 https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}/google-ai-studio/v1beta/openai/chat/completions ，{account_id} 和 {gateway_name} 需要替换为你的 Cloudflare 账户 ID 和 Gateway 名称。
+
+对于 Vertex 渠道，Cloudflare AI Gateway 的 base_url 需要填写为 https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}/google-vertex-ai ，{account_id} 和 {gateway_name} 需要替换为你的 Cloudflare 账户 ID 和 Gateway 名称。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">

@@ -512,6 +512,12 @@ api_keys:
       SCHEDULING_ALGORITHM: random # channel 1 2 use random round-robin
 ```
 
+- I want to use Cloudflare AI Gateway, how should I fill in the base_url?
+
+For gemini channels, the base_url for Cloudflare AI Gateway should be filled in as https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}/google-ai-studio/v1beta/openai/chat/completions , where {account_id} and {gateway_name} need to be replaced with your Cloudflare account ID and Gateway name.
+
+For Vertex channels, the base_url for Cloudflare AI Gateway should be filled in as https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}/google-vertex-ai , where {account_id} and {gateway_name} need to be replaced with your Cloudflare account ID and Gateway name.
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
