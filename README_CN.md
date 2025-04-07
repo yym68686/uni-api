@@ -395,6 +395,97 @@ pex -r requirements.txt \
     -o uni-api-macos-arm64-${VERSION}.pex
 ```
 
+## HuggingFace Space 远程部署
+WARN: 请注意远程部署的密钥泄露风险，请勿滥用服务以避免封号
+Space 仓库需要提供三个文件  `Dockerfile`、`README.md`、`entrypoint.sh`
+运行程序还需要 api.yaml（我以全量放在机密中为例，也可以HTTP下载的方式实现），访问匹配、模型和渠道配置等均在配置文件中
+操作步骤
+1. 访问 https://huggingface.co/new-space 新建一个sapce，要public库，开源协议/名字/描述等随便
+2. 访问你的space的file，URL是 https://huggingface.co/spaces/your-name/your-space-name/tree/main,把下面三个文件上传（`Dockerfile`、`README.md`、`entrypoint.sh`）
+3. 访问你的space的setting，URL是 https://huggingface.co/spaces/your-name/your-space-name/settings 找到 Secrets 新建机密 `API_YAML_CONTENT`（注意大写），把你的api.yaml在本地写好后直接复制进去，UTF-8编码
+4. 继续在设置中，找到 Factory rebuild 让它重新构建，如果你修改机密或者文件或者手动重启Sapce等情况均有可能导致卡住无log，此时就用这个方法解决
+5. 在设置最右上角有三个点的按钮，找到 Embed this Space 获取Space的公网链接，格式 https://(your-name)-(your-space-name).hf.space 去掉括号
+
+相关的文件代码如下
+```Dockerfile
+# Dockerfile,记得删除本行
+# 使用uni-api官方镜像
+FROM yym68686/uni-api:latest
+
+# 创建数据目录并设置权限
+RUN mkdir -p /data && chown -R 1000:1000 /data
+
+# 设置用户和工作目录
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH \
+    DISABLE_DATABASE=true
+
+# 复制入口点脚本
+COPY --chown=user entrypoint.sh /home/user/entrypoint.sh
+RUN chmod +x /home/user/entrypoint.sh
+
+# 确保/home目录可写（这很重要！）
+USER root
+RUN chmod 777 /home
+USER user
+
+# 设置工作目录
+WORKDIR /home/user
+
+# 入口点
+ENTRYPOINT ["/home/user/entrypoint.sh"]
+```
+
+```markdown
+# README.md,覆盖掉默认的,记得删除本行
+---
+title: Uni API 
+emoji: 🌍
+colorFrom: gray
+colorTo: yellow
+sdk: docker
+app_port: 8000
+pinned: false
+license: gpl-3.0
+---
+```
+```shell
+# entrypoint.sh,记得删除本行
+#!/bin/sh
+set -e
+CONFIG_FILE_PATH="/home/api.yaml"  # 注意这里改成/home/api.yaml
+
+echo "DEBUG: Entrypoint script started."
+
+# 检查Secret是否存在
+if [ -z "$API_YAML_CONTENT" ]; then
+  echo "ERROR: Secret 'API_YAML_CONTENT' is不存在或为空。退出。"
+  exit 1
+else
+  echo "DEBUG: API_YAML_CONTENT secret found. Preparing to write..."
+  printf '%s\n' "$API_YAML_CONTENT" > "$CONFIG_FILE_PATH"
+  echo "DEBUG: Attempted to write to $CONFIG_FILE_PATH."
+  
+  if [ -f "$CONFIG_FILE_PATH" ]; then
+    echo "DEBUG: File $CONFIG_FILE_PATH created successfully. Size: $(wc -c < "$CONFIG_FILE_PATH") bytes."
+    # 显示文件的前几行进行调试（注意不要显示敏感信息）
+    echo "DEBUG: First few lines (without sensitive info):"
+    head -n 3 "$CONFIG_FILE_PATH" | grep -v "api:" | grep -v "password"
+  else
+    echo "ERROR: File $CONFIG_FILE_PATH was NOT created."
+    exit 1
+  fi
+fi
+
+echo "DEBUG: About to execute python main.py..."
+# 不需要使用--config参数，因为程序有默认路径
+cd /home
+exec python main.py "$@"
+```
+
+
 ## 赞助商
 
 我们感谢以下赞助商的支持：
