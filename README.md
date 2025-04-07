@@ -395,6 +395,97 @@ pex -r requirements.txt \
     -o uni-api-macos-arm64-${VERSION}.pex
 ```
 
+## HuggingFace Space Remote Deployment
+
+WARNING: Please be aware of the risk of key leakage in remote deployments. Do not abuse the service to avoid account suspension.
+
+The Space repository requires three files: `Dockerfile`, `README.md`, and `entrypoint.sh`.
+To run the program, you also need api.yaml (I'll use the example of storing it entirely in secrets, but you can also implement it via HTTP download). Access matching, model and channel configurations are all in the configuration file.
+
+Operation Steps:
+
+1. Visit https://huggingface.co/new-space to create a new space. It should be a public repository; the open source license/name/description can be filled as desired.
+
+2. Visit your space's files page at https://huggingface.co/spaces/your-name/your-space-name/tree/main and upload the three files (`Dockerfile`, `README.md`, `entrypoint.sh`).
+
+3. Visit your space's settings page at https://huggingface.co/spaces/your-name/your-space-name/settings, find the Secrets section and create a new secret called `API_YAML_CONTENT` (note the uppercase). Write your api.yaml locally, then copy it directly into the secret field using UTF-8 encoding.
+
+4. Still in settings, find Factory rebuild and let it rebuild. If you modify secrets or files, or manually restart the Space, it may get stuck with no logs. Use this method to resolve such issues.
+
+5. In the upper right corner of the settings page, find the three-dot button and select "Embed this Space" to get the public link for your Space. The format is https://(your-name)-(your-space-name).hf.space (remove the parentheses).
+
+Related File Codes:
+
+```Dockerfile
+# Dockerfile,del this line
+# Use the uni-api official image
+FROM yym68686/uni-api:latest
+# Create data directory and set permissions
+RUN mkdir -p /data && chown -R 1000:1000 /data
+# Set up user and working directory
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH \
+    DISABLE_DATABASE=true
+# Copy entrypoint script
+COPY --chown=user entrypoint.sh /home/user/entrypoint.sh
+RUN chmod +x /home/user/entrypoint.sh
+# Ensure /home directory is writable (this is important!)
+USER root
+RUN chmod 777 /home
+USER user
+# Set working directory
+WORKDIR /home/user
+# Entry point
+ENTRYPOINT ["/home/user/entrypoint.sh"]
+```
+
+```markdown
+---
+title: Uni API 
+emoji: 🌍
+colorFrom: gray
+colorTo: yellow
+sdk: docker
+app_port: 8000
+pinned: false
+license: gpl-3.0
+---
+```
+
+```shell
+# entrypoint.sh,del this line
+#!/bin/sh
+set -e
+CONFIG_FILE_PATH="/home/api.yaml"  # Note this is changed to /home/api.yaml
+echo "DEBUG: Entrypoint script started."
+# Check if Secret exists
+if [ -z "$API_YAML_CONTENT" ]; then
+  echo "ERROR: Secret 'API_YAML_CONTENT' does not exist or is empty. Exiting."
+  exit 1
+else
+  echo "DEBUG: API_YAML_CONTENT secret found. Preparing to write..."
+  printf '%s\n' "$API_YAML_CONTENT" > "$CONFIG_FILE_PATH"
+  echo "DEBUG: Attempted to write to $CONFIG_FILE_PATH."
+  
+  if [ -f "$CONFIG_FILE_PATH" ]; then
+    echo "DEBUG: File $CONFIG_FILE_PATH created successfully. Size: $(wc -c < "$CONFIG_FILE_PATH") bytes."
+    # Display the first few lines for debugging (be careful not to display sensitive information)
+    echo "DEBUG: First few lines (without sensitive info):"
+    head -n 3 "$CONFIG_FILE_PATH" | grep -v "api:" | grep -v "password"
+  else
+    echo "ERROR: File $CONFIG_FILE_PATH was NOT created."
+    exit 1
+  fi
+fi
+echo "DEBUG: About to execute python main.py..."
+# No need to use the --config parameter as the program has a default path
+cd /home
+exec python main.py "$@"
+```
+
+
 ## Sponsors
 
 We thank the following sponsors for their support:
