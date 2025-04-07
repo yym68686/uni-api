@@ -396,6 +396,7 @@ pex -r requirements.txt \
 ```
 
 ## HuggingFace Space 远程部署
+
 WARN: 请注意远程部署的密钥泄露风险，请勿滥用服务以避免封号
 Space 仓库需要提供三个文件  `Dockerfile`、`README.md`、`entrypoint.sh`
 运行程序还需要 api.yaml（我以全量放在机密中为例，也可以HTTP下载的方式实现），访问匹配、模型和渠道配置等均在配置文件中
@@ -441,7 +442,7 @@ ENTRYPOINT ["/home/user/entrypoint.sh"]
 ```markdown
 # README.md,覆盖掉默认的,记得删除本行
 ---
-title: Uni API 
+title: Uni API
 emoji: 🌍
 colorFrom: gray
 colorTo: yellow
@@ -467,7 +468,7 @@ else
   echo "DEBUG: API_YAML_CONTENT secret found. Preparing to write..."
   printf '%s\n' "$API_YAML_CONTENT" > "$CONFIG_FILE_PATH"
   echo "DEBUG: Attempted to write to $CONFIG_FILE_PATH."
-  
+
   if [ -f "$CONFIG_FILE_PATH" ]; then
     echo "DEBUG: File $CONFIG_FILE_PATH created successfully. Size: $(wc -c < "$CONFIG_FILE_PATH") bytes."
     # 显示文件的前几行进行调试（注意不要显示敏感信息）
@@ -485,6 +486,11 @@ cd /home
 exec python main.py "$@"
 ```
 
+## uni-api 前端部署
+
+uni-api 的 web 前端可以自行部署，地址：https://github.com/yym68686/uni-api-web
+
+也可以使用我提前部署好的前端，地址：https://uni-api-web.pages.dev/
 
 ## 赞助商
 

@@ -443,7 +443,7 @@ ENTRYPOINT ["/home/user/entrypoint.sh"]
 
 ```markdown
 ---
-title: Uni API 
+title: Uni API
 emoji: 🌍
 colorFrom: gray
 colorTo: yellow
@@ -468,7 +468,7 @@ else
   echo "DEBUG: API_YAML_CONTENT secret found. Preparing to write..."
   printf '%s\n' "$API_YAML_CONTENT" > "$CONFIG_FILE_PATH"
   echo "DEBUG: Attempted to write to $CONFIG_FILE_PATH."
-  
+
   if [ -f "$CONFIG_FILE_PATH" ]; then
     echo "DEBUG: File $CONFIG_FILE_PATH created successfully. Size: $(wc -c < "$CONFIG_FILE_PATH") bytes."
     # Display the first few lines for debugging (be careful not to display sensitive information)
@@ -485,6 +485,11 @@ cd /home
 exec python main.py "$@"
 ```
 
+## uni-api frontend deployment
+
+The frontend of uni-api can be deployed by yourself, address: https://github.com/yym68686/uni-api-web
+
+You can also use the frontend I deployed, address: https://uni-api-web.pages.dev/
 
 ## Sponsors
 
