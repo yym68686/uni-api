@@ -1392,30 +1392,33 @@ async def moderations(
 ):
     return await model_handler.request_model(request, api_index, endpoint="/v1/moderations")
 
-from fastapi import UploadFile, File, Form, HTTPException
+from fastapi import UploadFile, File, Form, HTTPException, Request
 import io
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
 async def audio_transcriptions(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form(...),
     language: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
     response_format: Optional[str] = Form(None),
     temperature: Optional[float] = Form(None),
-    timestamp_granularities: Optional[str] = Form(None, alias="timestamp_granularities[]"),
     api_index: int = Depends(verify_api_key)
 ):
     try:
-        # 读取上传的文件内容
+        # Manually parse form data
+        form_data = await request.form()
+        # Use getlist to handle multiple values for the same key
+        timestamp_granularities = form_data.getlist("timestamp_granularities[]")
+        if not timestamp_granularities: # If list is empty (parameter not sent)
+            timestamp_granularities = None # Set to None to match Optional[List[str]]
+
+        # 读取上传的文件内容 (file is still handled by FastAPI)
         content = await file.read()
         file_obj = io.BytesIO(content)
 
-        # 处理timestamp_granularities参数
-        if timestamp_granularities:
-            timestamp_granularities = [timestamp_granularities]
-
         # 创建AudioTranscriptionRequest对象
-        request = AudioTranscriptionRequest(
+        request_obj = AudioTranscriptionRequest(
             file=(file.filename, file_obj, file.content_type),
             model=model,
             language=language,
@@ -1425,7 +1428,7 @@ async def audio_transcriptions(
             timestamp_granularities=timestamp_granularities
         )
 
-        return await model_handler.request_model(request, api_index, endpoint="/v1/audio/transcriptions")
+        return await model_handler.request_model(request_obj, api_index, endpoint="/v1/audio/transcriptions")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Invalid audio file encoding")
     except Exception as e:
