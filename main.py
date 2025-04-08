@@ -511,7 +511,7 @@ class LoggingStreamingResponse(Response):
                     logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
                 if line.startswith("data:"):
                     line = line.lstrip("data: ")
-                if not line.startswith("[DONE]") and not line.startswith("OK"):
+                if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(": "):
                     try:
                         resp: dict = json.loads(line)
                         input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
@@ -880,6 +880,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     # print("timeout_value", channel_id, timeout_value)
     keepalive_interval = get_preference(app.state.keepalive_interval, channel_id, original_model, 80)
     if keepalive_interval > timeout_value:
+        keepalive_interval = None
+    if channel_id.startswith("sk-"):
         keepalive_interval = None
     # print("keepalive_interval", channel_id, keepalive_interval)
 
