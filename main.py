@@ -39,7 +39,7 @@ from core.utils import (
 )
 
 from collections import defaultdict
-from typing import Dict, Union
+from typing import Dict, Union, Optional
 from urllib.parse import urlparse
 
 import os
@@ -871,10 +871,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if is_debug:
         logger.info(url)
         logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-        if payload.get("file"):
-            pass
-        else:
-            logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+        logger.info(json.dumps({k: v for k, v in payload.items() if k != 'file'}, indent=4, ensure_ascii=False))
 
     current_info = request_info.get()
 
@@ -1399,6 +1396,11 @@ import io
 async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str = Form(...),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    timestamp_granularities: Optional[str] = Form(None, alias="timestamp_granularities[]"),
     api_index: int = Depends(verify_api_key)
 ):
     try:
@@ -1406,10 +1408,19 @@ async def audio_transcriptions(
         content = await file.read()
         file_obj = io.BytesIO(content)
 
+        # 处理timestamp_granularities参数
+        if timestamp_granularities:
+            timestamp_granularities = [timestamp_granularities]
+
         # 创建AudioTranscriptionRequest对象
         request = AudioTranscriptionRequest(
             file=(file.filename, file_obj, file.content_type),
-            model=model
+            model=model,
+            language=language,
+            prompt=prompt,
+            response_format=response_format,
+            temperature=temperature,
+            timestamp_granularities=timestamp_granularities
         )
 
         return await model_handler.request_model(request, api_index, endpoint="/v1/audio/transcriptions")
