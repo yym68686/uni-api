@@ -1606,6 +1606,7 @@ if __name__ == '__main__':
         reload=True,
         reload_dirs=["./"],
         reload_includes=["*.py", "api.yaml"],
+        reload_excludes=["./data"],
         ws="none",
         # log_level="warning"
     )
