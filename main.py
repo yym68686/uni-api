@@ -39,7 +39,7 @@ from core.utils import (
 )
 
 from collections import defaultdict
-from typing import Dict, Union, Optional
+from typing import Dict, Union, Optional, List
 from urllib.parse import urlparse
 
 import os
