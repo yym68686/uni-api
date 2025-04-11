@@ -315,7 +315,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
     start_time = time_module.time()
     try:
         # 创建一个任务来获取第一个响应，但不直接中断生成器
-        if keepalive_interval:
+        if keepalive_interval and stream == True:
             first_item, status = await wait_for_timeout(generator, timeout=keepalive_interval)
             if status == "timeout":
                 return new_generator(None, with_keepalive=True, wait_task=first_item, timeout=keepalive_interval), 3.1415
