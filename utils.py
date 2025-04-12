@@ -51,7 +51,8 @@ def save_api_yaml(config_data):
 def update_config(config_data, use_config_url=False):
     for index, provider in enumerate(config_data['providers']):
         if provider.get('project_id'):
-            provider['base_url'] = 'https://aiplatform.googleapis.com/'
+            if "google-vertex-ai" not in provider.get("base_url", ""):
+                provider['base_url'] = 'https://aiplatform.googleapis.com/'
         if provider.get('cf_account_id'):
             provider['base_url'] = 'https://api.cloudflare.com/'
 
