@@ -26,6 +26,7 @@ from utils import (
     get_model_dict,
     post_all_models,
     InMemoryRateLimiter,
+    calculate_total_cost,
     error_handling_wrapper,
 )
 
@@ -155,12 +156,13 @@ async def lifespan(app: FastAPI):
                 )
         app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
 
+        app.state.admin_api_key = []
         for item in app.state.api_keys_db:
             if item.get("role") == "admin":
-                app.state.admin_api_key = item.get("api")
-        if not hasattr(app.state, "admin_api_key"):
+                app.state.admin_api_key.append(item.get("api"))
+        if app.state.admin_api_key == []:
             if len(app.state.api_keys_db) >= 1:
-                app.state.admin_api_key = app.state.api_keys_db[0].get("api")
+                app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
             else:
                 from utils import yaml_error_message
                 if yaml_error_message:
@@ -180,6 +182,24 @@ async def lifespan(app: FastAPI):
         # pprint(dict(app.state.keepalive_interval))
         # print("app.state.provider_timeouts", app.state.provider_timeouts)
         # print("app.state.keepalive_interval", app.state.keepalive_interval)
+        if not DISABLE_DATABASE:
+            app.state.paid_api_keys_states = {}
+            for check_index, paid_key in enumerate(app.state.api_list):
+                credits = safe_get(app.state.config, 'api_keys', check_index, "preferences", "credits", default=-1)
+                created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
+                model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
+                created_at = created_at.astimezone(timezone.utc)
+                if credits != -1:
+                    all_tokens_info = await get_usage_data(filter_api_key=paid_key, start_dt_obj=created_at)
+                    total_cost = calculate_total_cost(all_tokens_info, model_price)
+                    app.state.paid_api_keys_states[paid_key] = {
+                        "credits": credits,
+                        "created_at": created_at,
+                        "all_tokens_info": all_tokens_info,
+                        "total_cost": total_cost,
+                        "enabled": True if total_cost <= credits else False
+                    }
+                    logger.info(f"app.state.paid_api_keys_states {paid_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[paid_key].items()}, indent=4)}")
 
     if app and not hasattr(app.state, 'client_manager'):
 
@@ -574,6 +594,16 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
             if api_index is not None:
                 enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
+                if not DISABLE_DATABASE:
+                    check_api_key = safe_get(config, 'api_keys', api_index, "api")
+                    # print("check_api_key", check_api_key)
+                    # logger.info(f"app.state.paid_api_keys_states {check_api_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[check_api_key].items()}, indent=4)}")
+                    # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
+                    if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False:
+                        return JSONResponse(
+                            status_code=429,
+                            content={"error": "Balance is insufficient, please check your account."}
+                        )
             else:
                 return JSONResponse(
                     status_code=403,
@@ -1590,6 +1620,231 @@ async def api_config_update(api_index: int = Depends(verify_api_key), config: di
         app.state.config["providers"] = config["providers"]
         app.state.config, app.state.api_keys_db, app.state.api_list = update_config(app.state.config, use_config_url=False)
     return JSONResponse(content={"message": "API config updated"})
+
+from datetime import datetime, timedelta, timezone
+from pydantic import BaseModel
+
+# Pydantic Models for Token Usage Response
+class TokenUsageEntry(BaseModel):
+    api_key_prefix: str
+    model: str
+    total_prompt_tokens: int
+    total_completion_tokens: int
+    total_tokens: int
+    request_count: int
+
+class QueryDetails(BaseModel):
+    model_config = {'protected_namespaces': ()}
+
+    start_datetime: Optional[str] = None # e.g., "2023-10-27T10:00:00Z" or Unix timestamp
+    end_datetime: Optional[str] = None   # e.g., "2023-10-28T12:30:45Z" or Unix timestamp
+    api_key_filter: Optional[str] = None
+    model_filter: Optional[str] = None
+
+class TokenUsageResponse(BaseModel):
+    usage: List[TokenUsageEntry]
+    query_details: QueryDetails
+
+async def query_token_usage(
+    session: AsyncSession,
+    filter_api_key: Optional[str] = None,
+    filter_model: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None
+) -> List[Dict]:
+    """Queries the RequestStat table for aggregated token usage."""
+    query = select(
+        RequestStat.api_key,
+        RequestStat.model,
+        func.sum(RequestStat.prompt_tokens).label("total_prompt_tokens"),
+        func.sum(RequestStat.completion_tokens).label("total_completion_tokens"),
+        func.sum(RequestStat.total_tokens).label("total_tokens"),
+        func.count(RequestStat.id).label("request_count")
+    ).group_by(RequestStat.api_key, RequestStat.model)
+
+    # Apply filters
+    if filter_api_key:
+        query = query.where(RequestStat.api_key == filter_api_key)
+    if filter_model:
+        query = query.where(RequestStat.model == filter_model)
+    if start_dt:
+        query = query.where(RequestStat.timestamp >= start_dt)
+    if end_dt:
+        # Make end_dt inclusive by adding one day
+        query = query.where(RequestStat.timestamp < end_dt + timedelta(days=1))
+
+    # Filter out entries with null or empty model if not specifically requested
+    if not filter_model:
+         query = query.where(RequestStat.model.isnot(None) & (RequestStat.model != ''))
+
+
+    result = await session.execute(query)
+    rows = result.mappings().all()
+
+    # Process results: mask API key
+    processed_usage = []
+    for row in rows:
+        usage_dict = dict(row)
+        api_key = usage_dict.get("api_key", "")
+        # Mask API key (show prefix like sk-...xyz)
+        if api_key and len(api_key) > 7:
+            prefix = api_key[:7]
+            suffix = api_key[-4:]
+            usage_dict["api_key_prefix"] = f"{prefix}...{suffix}"
+        else:
+            usage_dict["api_key_prefix"] = api_key # Show short keys as is or handle None
+        del usage_dict["api_key"] # Remove original full key
+        processed_usage.append(usage_dict)
+
+    return processed_usage
+
+async def get_usage_data(filter_api_key: Optional[str] = None, filter_model: Optional[str] = None,
+                        start_dt_obj: Optional[datetime] = None, end_dt_obj: Optional[datetime] = None) -> List[Dict]:
+    """
+    查询数据库并获取令牌使用数据。
+    这个函数封装了创建会话和查询令牌使用情况的逻辑。
+
+    Args:
+        filter_api_key: 可选的API密钥过滤器
+        filter_model: 可选的模型过滤器
+        start_dt_obj: 开始日期时间
+        end_dt_obj: 结束日期时间
+
+    Returns:
+        包含令牌使用统计数据的列表
+    """
+    async with async_session() as session:
+        usage_data = await query_token_usage(
+            session=session,
+            filter_api_key=filter_api_key,
+            filter_model=filter_model,
+            start_dt=start_dt_obj,
+            end_dt=end_dt_obj
+        )
+    return usage_data
+
+@app.get("/v1/token_usage", response_model=TokenUsageResponse, dependencies=[Depends(rate_limit_dependency)])
+async def get_token_usage(
+    request: Request, # Inject request to access app.state
+    api_key_param: Optional[str] = None, # Query param for admin filtering
+    model: Optional[str] = None,
+    start_datetime: Optional[str] = None, # ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp
+    end_datetime: Optional[str] = None,   # ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp
+    last_n_days: Optional[int] = None,
+    api_index: tuple = Depends(verify_api_key) # Use verify_api_key for auth and getting token/index
+):
+    """
+    Retrieves aggregated token usage statistics based on API key and model,
+    filtered by a specified time range.
+    Admin users can filter by specific API keys.
+    """
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    requesting_token = safe_get(app.state.config, 'api_keys', api_index, "api", default="") # verify_api_key returns the token directly now
+
+    # Determine admin status
+    is_admin = False
+    # print("app.state.admin_api_key", app.state.admin_api_key, requesting_token, requesting_token in app.state.admin_api_key)
+    if hasattr(app.state, "admin_api_key") and requesting_token in app.state.admin_api_key:
+        is_admin = True
+
+    # Determine API key filter
+    filter_api_key = None
+    api_key_filter_detail = "all" # For response details
+    # print("api_key_param", is_admin, api_key_param)
+    if is_admin:
+        if api_key_param:
+            filter_api_key = api_key_param
+            api_key_filter_detail = api_key_param
+        # else: filter_api_key remains None (all users)
+    else:
+        # Non-admin can only see their own stats
+        filter_api_key = requesting_token
+        api_key_filter_detail = "self"
+
+    # Determine time range
+    end_dt_obj = None
+    start_dt_obj = None
+    start_datetime_detail = None
+    end_datetime_detail = None
+
+    now = datetime.now(timezone.utc)
+
+    def parse_datetime_input(dt_input: str) -> datetime:
+        """Parses ISO 8601 string or Unix timestamp."""
+        try:
+            # Try parsing as Unix timestamp first
+            return datetime.fromtimestamp(float(dt_input), tz=timezone.utc)
+        except ValueError:
+            # Try parsing as ISO 8601 format
+            try:
+                # Handle potential 'Z' for UTC timezone explicitly
+                if dt_input.endswith('Z'):
+                    dt_input = dt_input[:-1] + '+00:00'
+                # Use fromisoformat for robust parsing
+                dt_obj = datetime.fromisoformat(dt_input)
+                # Ensure timezone is UTC if naive
+                if dt_obj.tzinfo is None:
+                    dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+                # Convert to UTC if it has another timezone
+                return dt_obj.astimezone(timezone.utc)
+            except ValueError:
+                raise ValueError(f"Invalid datetime format: {dt_input}. Use ISO 8601 (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp.")
+
+
+    if last_n_days is not None:
+        if start_datetime or end_datetime:
+            raise HTTPException(status_code=400, detail="Cannot use last_n_days with start_datetime or end_datetime.")
+        if last_n_days <= 0:
+            raise HTTPException(status_code=400, detail="last_n_days must be positive.")
+        start_dt_obj = now - timedelta(days=last_n_days)
+        end_dt_obj = now # Use current time as end for last_n_days
+        start_datetime_detail = start_dt_obj.isoformat(timespec='seconds')
+        end_datetime_detail = end_dt_obj.isoformat(timespec='seconds')
+    elif start_datetime or end_datetime:
+        try:
+            if start_datetime:
+                start_dt_obj = parse_datetime_input(start_datetime)
+                start_datetime_detail = start_dt_obj.isoformat(timespec='seconds')
+            if end_datetime:
+                end_dt_obj = parse_datetime_input(end_datetime)
+                end_datetime_detail = end_dt_obj.isoformat(timespec='seconds')
+            # Basic validation: end datetime should not be before start datetime
+            if start_dt_obj and end_dt_obj and end_dt_obj < start_dt_obj:
+                 raise HTTPException(status_code=400, detail="end_datetime cannot be before start_datetime.")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        # Default to last 30 days if no range specified
+        start_dt_obj = now - timedelta(days=30)
+        end_dt_obj = now
+        start_datetime_detail = start_dt_obj.isoformat(timespec='seconds')
+        end_datetime_detail = end_dt_obj.isoformat(timespec='seconds')
+
+    # 使用新的get_usage_data函数替代直接的数据库查询代码
+    usage_data = await get_usage_data(
+        filter_api_key=filter_api_key,
+        filter_model=model,
+        start_dt_obj=start_dt_obj,
+        end_dt_obj=end_dt_obj
+    )
+    # print("usage_data", usage_data)
+
+    # Prepare response
+    query_details = QueryDetails(
+        start_datetime=start_datetime_detail,
+        end_datetime=end_datetime_detail,
+        api_key_filter=api_key_filter_detail,
+        model_filter=model if model else "all"
+    )
+
+    response_data = TokenUsageResponse(
+        usage=[TokenUsageEntry(**item) for item in usage_data],
+        query_details=query_details
+    )
+
+    return response_data
 
 from fastapi.staticfiles import StaticFiles
 # 添加静态文件挂载
