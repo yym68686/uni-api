@@ -40,7 +40,7 @@ from core.utils import (
 )
 
 from collections import defaultdict
-from typing import Dict, Union, Optional, List
+from typing import Dict, Union, Optional, List, Any
 from urllib.parse import urlparse
 
 import os
@@ -136,6 +136,31 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
 
     return result
 
+async def update_paid_api_keys_states(app, check_index, paid_key):
+    """
+    更新付费API密钥的状态
+
+    参数:
+    app - FastAPI应用实例
+    check_index - API密钥在配置中的索引
+    paid_key - 需要更新状态的API密钥
+    """
+    credits = safe_get(app.state.config, 'api_keys', check_index, "preferences", "credits", default=-1)
+    created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
+    model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
+    created_at = created_at.astimezone(timezone.utc)
+    if credits != -1:
+        all_tokens_info = await get_usage_data(filter_api_key=paid_key, start_dt_obj=created_at)
+        total_cost = calculate_total_cost(all_tokens_info, model_price)
+        app.state.paid_api_keys_states[paid_key] = {
+            "credits": credits,
+            "created_at": created_at,
+            "all_tokens_info": all_tokens_info,
+            "total_cost": total_cost,
+            "enabled": True if total_cost <= credits else False
+        }
+        # logger.info(f"app.state.paid_api_keys_states {paid_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[paid_key].items()}, indent=4)}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
@@ -185,21 +210,7 @@ async def lifespan(app: FastAPI):
         if not DISABLE_DATABASE:
             app.state.paid_api_keys_states = {}
             for check_index, paid_key in enumerate(app.state.api_list):
-                credits = safe_get(app.state.config, 'api_keys', check_index, "preferences", "credits", default=-1)
-                created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
-                model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
-                created_at = created_at.astimezone(timezone.utc)
-                if credits != -1:
-                    all_tokens_info = await get_usage_data(filter_api_key=paid_key, start_dt_obj=created_at)
-                    total_cost = calculate_total_cost(all_tokens_info, model_price)
-                    app.state.paid_api_keys_states[paid_key] = {
-                        "credits": credits,
-                        "created_at": created_at,
-                        "all_tokens_info": all_tokens_info,
-                        "total_cost": total_cost,
-                        "enabled": True if total_cost <= credits else False
-                    }
-                    logger.info(f"app.state.paid_api_keys_states {paid_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[paid_key].items()}, indent=4)}")
+                await update_paid_api_keys_states(app, check_index, paid_key)
 
     if app and not hasattr(app.state, 'client_manager'):
 
@@ -441,6 +452,10 @@ async def update_stats(current_info):
                         if is_debug:
                             import traceback
                             traceback.print_exc()
+
+        check_key = current_info["api_key"]
+        if check_key and check_key in app.state.paid_api_keys_states and current_info["total_tokens"] > 0:
+            await update_paid_api_keys_states(app, app.state.api_list.index(check_key), check_key)
     except Exception as e:
         logger.error(f"Error acquiring database lock: {str(e)}")
         if is_debug:
@@ -1622,7 +1637,8 @@ async def api_config_update(api_index: int = Depends(verify_api_key), config: di
     return JSONResponse(content={"message": "API config updated"})
 
 from datetime import datetime, timedelta, timezone
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+from typing import Dict, Union, Optional, List, Any
 
 # Pydantic Models for Token Usage Response
 class TokenUsageEntry(BaseModel):
@@ -1845,6 +1861,48 @@ async def get_token_usage(
     )
 
     return response_data
+
+class TokenInfo(BaseModel):
+    api_key_prefix: str
+    model: str
+    total_prompt_tokens: int
+    total_completion_tokens: int
+    total_tokens: int
+    request_count: int
+
+class ApiKeyState(BaseModel):
+    credits: float
+    created_at: datetime
+    all_tokens_info: List[Dict[str, Any]]
+    total_cost: float
+    enabled: bool
+
+    @field_serializer('created_at')
+    def serialize_dt(self, dt: datetime):
+        return dt.isoformat()
+
+class ApiKeysStatesResponse(BaseModel):
+    api_keys_states: Dict[str, ApiKeyState]
+
+@app.get("/v1/api_keys_states", dependencies=[Depends(rate_limit_dependency)])
+async def api_keys_states(token: str = Depends(verify_admin_api_key)):
+    # 转换原始状态数据为Pydantic模型
+    states_dict = {}
+    for key, state in app.state.paid_api_keys_states.items():
+        # 创建ApiKeyState对象
+        states_dict[key] = ApiKeyState(
+            credits=state["credits"],
+            created_at=state["created_at"],
+            all_tokens_info=state["all_tokens_info"],
+            total_cost=state["total_cost"],
+            enabled=state["enabled"]
+        )
+
+    # 创建响应模型
+    response = ApiKeysStatesResponse(api_keys_states=states_dict)
+
+    # 返回JSON序列化结果
+    return response
 
 from fastapi.staticfiles import StaticFiles
 # 添加静态文件挂载
