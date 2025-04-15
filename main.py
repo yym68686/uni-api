@@ -848,7 +848,7 @@ class ClientManager:
         try:
             yield self.clients[client_key]
         except Exception as e:
-            if client_key in self.clients:
+            if client_key in self.clients and "429" not in str(e):
                 tmp_client = self.clients[client_key]
                 del self.clients[client_key]  # 先删除引用
                 await tmp_client.aclose()  # 然后关闭客户端
@@ -1079,13 +1079,25 @@ def get_provider_list(provider_rules, config, request_model):
                 model_name_split = "/".join(item.split("/")[1:])
                 if "/" in item and provider['provider'] == provider_name and model_name_split in model_dict.keys():
                     if request_model in model_dict.keys() and model_name_split == request_model:
-                        new_provider = copy.deepcopy(provider)
-                        new_provider["model"] = [{model_dict[model_name_split]: request_model}]
+                        new_provider = {
+                            "provider": provider["provider"],
+                            "base_url": provider.get("base_url", ""),
+                            "api": provider.get("api", None),
+                            "model": [{model_dict[model_name_split]: request_model}],
+                            "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
+                            "tools": provider.get("tools", False)
+                        }
                         provider_list.append(new_provider)
 
                     elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
-                        new_provider = copy.deepcopy(provider)
-                        new_provider["model"] = [{model_dict[model_name_split]: request_model}]
+                        new_provider = {
+                            "provider": provider["provider"],
+                            "base_url": provider.get("base_url", ""),
+                            "api": provider.get("api", None),
+                            "model": [{model_dict[model_name_split]: request_model}],
+                            "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
+                            "tools": provider.get("tools", False)
+                        }
                         provider_list.append(new_provider)
     return provider_list
 
