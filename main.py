@@ -893,7 +893,7 @@ def get_preference(preference_config, channel_id, original_model, default_value)
 
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, num_matching_providers=1):
-    model_dict = get_model_dict(provider)
+    model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     if provider['provider'].startswith("sk-"):
         api_key = provider['provider']
@@ -1008,7 +1008,7 @@ async def get_provider_rules(model_rule, config, request_model):
     if model_rule == "all":
         # 如模型名为 all，则返回所有模型
         for provider in config["providers"]:
-            model_dict = get_model_dict(provider)
+            model_dict = provider["_model_dict_cache"]
             for model in model_dict.keys():
                 provider_rules.append(provider["provider"] + "/" + model)
 
@@ -1017,7 +1017,7 @@ async def get_provider_rules(model_rule, config, request_model):
             model_rule = model_rule[1:-1]
             # 处理带斜杠的模型名
             for provider in config['providers']:
-                model_dict = get_model_dict(provider)
+                model_dict = provider["_model_dict_cache"]
                 if model_rule in model_dict.keys():
                     provider_rules.append(provider['provider'] + "/" + model_rule)
         else:
@@ -1033,7 +1033,7 @@ async def get_provider_rules(model_rule, config, request_model):
                     models_list = []
             else:
                 for provider in config['providers']:
-                    model_dict = get_model_dict(provider)
+                    model_dict = provider["_model_dict_cache"]
                     if provider['provider'] == provider_name:
                         models_list.extend(list(model_dict.keys()))
 
@@ -1060,7 +1060,7 @@ async def get_provider_rules(model_rule, config, request_model):
 
     else:
         for provider in config["providers"]:
-            model_dict = get_model_dict(provider)
+            model_dict = provider["_model_dict_cache"]
             if model_rule in model_dict.keys():
                 provider_rules.append(provider["provider"] + "/" + model_rule)
 
@@ -1075,7 +1075,7 @@ def get_provider_list(provider_rules, config, request_model):
             provider_list.append({"provider": provider_name, "base_url": "http://127.0.0.1:8000/v1/chat/completions", "model": [{request_model: request_model}], "tools": True})
         else:
             for provider in config['providers']:
-                model_dict = get_model_dict(provider)
+                model_dict = provider["_model_dict_cache"]
                 model_name_split = "/".join(item.split("/")[1:])
                 if "/" in item and provider['provider'] == provider_name and model_name_split in model_dict.keys():
                     if request_model in model_dict.keys() and model_name_split == request_model:
@@ -1085,7 +1085,8 @@ def get_provider_list(provider_rules, config, request_model):
                             "api": provider.get("api", None),
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
-                            "tools": provider.get("tools", False)
+                            "tools": provider.get("tools", False),
+                            "_model_dict_cache": provider["_model_dict_cache"]
                         }
                         provider_list.append(new_provider)
 
@@ -1096,7 +1097,8 @@ def get_provider_list(provider_rules, config, request_model):
                             "api": provider.get("api", None),
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
-                            "tools": provider.get("tools", False)
+                            "tools": provider.get("tools", False),
+                            "_model_dict_cache": provider["_model_dict_cache"]
                         }
                         provider_list.append(new_provider)
     return provider_list
@@ -1258,7 +1260,7 @@ class ModelRequestHandler:
             # print("provider_name", provider_name)
 
             # 检查是否所有API密钥都被速率限制,如果被速率限制，则跳出循环
-            model_dict = get_model_dict(provider)
+            model_dict = provider["_model_dict_cache"]
             original_model = model_dict[request_model]
             if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
                 # logger.warning(f"Provider {provider_name}: All API keys are rate limited and stop auto retry!")

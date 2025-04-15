@@ -96,6 +96,8 @@ def update_config(config_data, use_config_url=False):
         if provider.get("tools") == None:
             provider["tools"] = True
 
+        provider["_model_dict_cache"] = get_model_dict(provider)
+
         config_data['providers'][index] = provider
 
     for index, api_key in enumerate(config_data['api_keys']):
@@ -471,7 +473,7 @@ def get_all_models(config):
     unique_models = set()
 
     for provider in config["providers"]:
-        model_dict = get_model_dict(provider)
+        model_dict = provider["_model_dict_cache"]
         for model in model_dict.keys():
             if model not in unique_models:
                 unique_models.add(model)
