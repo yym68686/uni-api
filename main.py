@@ -1096,7 +1096,9 @@ def get_provider_list(provider_rules, config, request_model):
                             "project_id": provider.get("project_id", None),
                             "private_key": provider.get("private_key", None),
                             "client_email": provider.get("client_email", None),
-                            "cf_account_id": provider.get("cf_account_id", None)
+                            "cf_account_id": provider.get("cf_account_id", None),
+                            "aws_access_key": provider.get("aws_access_key", None),
+                            "aws_secret_key": provider.get("aws_secret_key", None)
                         }
                         provider_list.append(new_provider)
 
@@ -1112,7 +1114,9 @@ def get_provider_list(provider_rules, config, request_model):
                             "project_id": provider.get("project_id", None),
                             "private_key": provider.get("private_key", None),
                             "client_email": provider.get("client_email", None),
-                            "cf_account_id": provider.get("cf_account_id", None)
+                            "cf_account_id": provider.get("cf_account_id", None),
+                            "aws_access_key": provider.get("aws_access_key", None),
+                            "aws_secret_key": provider.get("aws_secret_key", None)
                         }
                         provider_list.append(new_provider)
     return provider_list
