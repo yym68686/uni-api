@@ -1092,7 +1092,11 @@ def get_provider_list(provider_rules, config, request_model):
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
                             "tools": provider.get("tools", False),
-                            "_model_dict_cache": provider["_model_dict_cache"]
+                            "_model_dict_cache": provider["_model_dict_cache"],
+                            "project_id": provider.get("project_id", None),
+                            "private_key": provider.get("private_key", None),
+                            "client_email": provider.get("client_email", None),
+                            "cf_account_id": provider.get("cf_account_id", None)
                         }
                         provider_list.append(new_provider)
 
@@ -1104,7 +1108,11 @@ def get_provider_list(provider_rules, config, request_model):
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
                             "tools": provider.get("tools", False),
-                            "_model_dict_cache": provider["_model_dict_cache"]
+                            "_model_dict_cache": provider["_model_dict_cache"],
+                            "project_id": provider.get("project_id", None),
+                            "private_key": provider.get("private_key", None),
+                            "client_email": provider.get("client_email", None),
+                            "cf_account_id": provider.get("cf_account_id", None)
                         }
                         provider_list.append(new_provider)
     return provider_list
