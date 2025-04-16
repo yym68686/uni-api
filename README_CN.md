@@ -138,6 +138,13 @@ providers:
     model:
       - gpt-4o
 
+  - provider: aws
+    base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+    aws_access_key: xxxxxxxx
+    aws_secret_key: xxxxxxxx
+    model:
+      - anthropic.claude-3-5-sonnet-20240620-v1:0: claude-3-5-sonnet
+
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
     api: sk-bNnAOJyA-xQw_twAA
