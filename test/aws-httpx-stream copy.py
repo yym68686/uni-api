@@ -93,11 +93,10 @@ CONTENT_TYPE = "application/json" # 发送内容仍是 JSON
 ACCEPT_HEADER = "application/vnd.amazon.bedrock.payload+json" # 指定接受 Bedrock 流格式
 
 AWS_REGION = "us-east-1"
-# AWS_REGION = "us-west-2"
 HOST = f"bedrock-runtime.{AWS_REGION}.amazonaws.com"
 # MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-# MODEL_ID = "arn:aws:bedrock:us-east-1:390844780199:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+# MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+MODEL_ID = "arn:aws:bedrock:us-east-1:390844780199:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 # *** 修改点 5: 更新 URL 指向流式端点 ***
 url = f"https://{HOST}/model/{MODEL_ID}/invoke-with-response-stream"
 
@@ -140,7 +139,7 @@ try:
                 json_part = None # 用于存储尝试解析的 JSON 字符串
                 try:
                     # 尝试找到 JSON 的起始位置 '{'
-                    json_start_index = re.search(r'{.*}', line)
+                    json_start_index = re.search(r'{.*?}', line)
                     if json_start_index:
                         # print(f"DEBUG json_start_index: {json_start_index.group(0)!r}")
                         json_part = json_start_index.group(0)
