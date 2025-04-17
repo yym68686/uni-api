@@ -577,6 +577,10 @@ class StatsMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next):
+        # 如果是 OPTIONS 请求，直接放行，由 CORSMiddleware 处理
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         start_time = time()
 
         enable_moderation = False  # 默认不开启道德审查
