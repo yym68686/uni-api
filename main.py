@@ -1434,9 +1434,9 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
 async def request_model(request: RequestModel, api_index: int = Depends(verify_api_key)):
     return await model_handler.request_model(request, api_index)
 
-@app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def options_handler():
-    return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
+# @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
+# async def options_handler():
+#     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
 @app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
 async def list_models(api_index: int = Depends(verify_api_key)):
