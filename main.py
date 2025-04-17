@@ -627,6 +627,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
         else:
             # 如果token为None，检查全局设置
             enable_moderation = config.get('ENABLE_MODERATION', False)
+            if api_index == None:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Invalid or missing API Key"}
+                )
 
         # 在 app.state 中存储此请求的信息
         request_id = str(uuid.uuid4())
