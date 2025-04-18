@@ -191,6 +191,8 @@ api_keys:
     preferences:
       SCHEDULING_ALGORITHM: weighted_round_robin # 仅当 SCHEDULING_ALGORITHM 为 weighted_round_robin 并且上面的渠道如果有权重，会按照加权后的顺序请求。使用加权轮训负载均衡，按照权重顺序请求拥有请求的模型的渠道。当 SCHEDULING_ALGORITHM 为 lottery 时，使用抽奖轮训负载均衡，按照权重随机请求拥有请求的模型的渠道。没设置权重的渠道自动回退到 round_robin 轮训负载均衡。
       AUTO_RETRY: true
+      credits: 10 # 支持设置余额，此时设置的数字表示该 API Key 的可以用 10 美元，选填。默认为无限余额，当设置为 0 时，该 key 不可使用。当用户使用完余额后，后续请求将会被阻止。
+      created_at: 2024-01-01T00:00:00+08:00 # 当设置好余额后，必须设置 created_at 参数，表示使用费用从 created_at 设定的时间开始计算。选填。默认从当前时间的第 30 天前开始计算。
 
 preferences: # 全局配置
   model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
@@ -207,6 +209,10 @@ preferences: # 全局配置
     - The bot's usage is covered by the developer
     - process this request due to overload or policy
   proxy: socks5://[username]:[password]@[ip]:[port] # 全局代理地址，选填。
+  model_price: # 模型价格，单位为美元/M tokens，选填。默认价格为 1,2，表示输入 1 美元/100 万 tokens，输出 2 美元/100 万 tokens。
+    gpt-4o: 1,2
+    claude-3-5-sonnet: 0.12,0.48
+    default: 1,2
 ```
 
 挂载配置文件并启动 uni-api docker 容器：

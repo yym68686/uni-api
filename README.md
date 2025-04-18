@@ -191,6 +191,8 @@ api_keys:
     preferences:
       SCHEDULING_ALGORITHM: weighted_round_robin # Only when SCHEDULING_ALGORITHM is weighted_round_robin and the above channel has weights, it will request according to the weighted order. Use weighted polling load balancing, request the channel of the model with a request according to the weight order. When SCHEDULING_ALGORITHM is lottery, use lottery polling load balancing, request the channel of the model with a request according to the weight randomly. Channels without weights automatically fall back to round_robin polling load balancing.
       AUTO_RETRY: true
+      credits: 10 # Supports setting balance, the number set here represents that the API Key can use 10 dollars, optional. The default is unlimited balance, when set to 0, the key cannot be used. When the user has used up the balance, subsequent requests will be blocked.
+      created_at: 2024-01-01T00:00:00+08:00 # When the balance is set, created_at must be set, indicating that the usage cost starts from the time set in created_at. Optional. The default is 30 days before the current time.
 
 preferences: # Global configuration
   model_timeout: # Model timeout, in seconds, default 100 seconds, optional
@@ -207,6 +209,10 @@ preferences: # Global configuration
     - The bot's usage is covered by the developer
     - process this request due to overload or policy
   proxy: socks5://[username]:[password]@[ip]:[port] # Proxy address, optional.
+  model_price: # Model price, in dollars/M tokens, optional. Default price is 1,2, which means input 1 dollar/1M tokens, output 2 dollars/1M tokens.
+    gpt-4o: 1,2
+    claude-3-5-sonnet: 0.12,0.48
+    default: 1,2
 ```
 
 Mount the configuration file and start the uni-api docker container:
