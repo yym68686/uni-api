@@ -86,22 +86,23 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-1.5-pro
-      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # 重命名后，原来的模型名字 gemini-1.5-flash-exp-0827 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
-      - gemini-1.5-flash-exp-0827 # 加上这一行，gemini-1.5-flash-exp-0827 和 gemini-1.5-flash 都可以被请求
-      - gemini-1.5-pro: gemini-1.5-pro-search # 支持以 -search 后缀重命名模型启用搜索，使用 gemini-1.5-pro-search 模型请求 uni-api 时，表示 gemini-1.5-pro 模型自动使用 Google 官方搜索工具，支持全部 1.5/2.0 系列模型。
+      - gemini-2.5-pro-exp-03-25
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # 重命名后，原来的模型名字 gemini-2.5-flash-preview-04-17 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
+      - gemini-2.5-flash-preview-04-17
+      - gemini-2.5-pro-exp-03-25: gemini-2.5-pro-search # 支持以 -search 后缀重命名模型启用搜索，使用 gemini-2.5-pro-search 模型请求 uni-api 时，表示 gemini-2.5-pro 模型自动使用 Google 官方搜索工具。
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # 支持以 -search 后缀重命名模型启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
     tools: true
     preferences:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day
       # api_key_rate_limit: # 可以为每个模型设置不同的频率限制
-      #   gemini-1.5-flash: 15/min,1500/day
-      #   gemini-1.5-pro: 2/min,50/day
+      #   gemini-2.5-flash: 10/min,500/day
+      #   gemini-2.5-pro: 5/min,25/day
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
       api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。
       model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
-        gemini-1.5-pro: 10 # 模型 gemini-1.5-pro 的超时时间为 10 秒
-        gemini-1.5-flash: 10 # 模型 gemini-1.5-flash 的超时时间为 10 秒
+        gemini-2.5-pro: 10 # 模型 gemini-2.5-pro 的超时时间为 10 秒
+        gemini-2.5-flash: 10 # 模型 gemini-2.5-flash 的超时时间为 10 秒
         default: 10 # 模型没有设置超时时间，使用默认的超时时间 10 秒，当请求的不在 model_timeout 里面的模型时，超时时间默认是 10 秒，不设置 default，uni-api 会使用全局配置的模型超时时间。
       keepalive_interval: # 心跳间隔，单位为秒，默认 80 秒，选填。适合当 uni-api 域名托管在 cloudflare 并使用推理模型时使用。优先级高于全局配置的 keepalive_interval。
         gemini-2.5-pro: 50 # 模型 gemini-2.5-pro 的心跳间隔为 50 秒，此数值必须小于 model_timeout 设置的超时时间，否则忽略此设置。
@@ -115,9 +116,9 @@ providers:
     private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # 描述： Google Cloud Vertex AI服务账号的私钥。格式： 一个 JSON 格式的字符串，包含服务账号的私钥信息。获取方式： 在 Google Cloud Console 中创建服务账号，生成JSON格式的密钥文件，然后将其内容设置为此环境变量的值。
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # 描述： Google Cloud Vertex AI 服务账号的电子邮件地址。格式： 通常是形如 "service-account-name@project-id.iam.gserviceaccount.com" 的字符串。获取方式： 在创建服务账号时生成，也可以在 Google Cloud Console 的"IAM与管理"部分查看服务账号详情获得。
     model:
-      - gemini-1.5-pro
-      - gemini-1.5-flash
-      - gemini-1.5-pro: gemini-1.5-pro-search # 仅支持在 vertex Gemini API 中，以 -search 后缀重命名模型后，使用 gemini-1.5-pro-search 模型请求 uni-api 时，表示 gemini-1.5-pro 模型自动使用 Google 官方搜索工具。
+      - gemini-2.5-flash-preview-04-17
+      - gemini-2.5-pro-preview-03-25
+      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # 仅支持在 vertex Gemini API 中，以 -search 后缀重命名模型后，使用 gemini-2.5-pro-search 模型请求 uni-api 时，表示 gemini-2.5-pro 模型自动使用 Google 官方搜索工具。
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
@@ -175,8 +176,8 @@ api_keys:
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true。也可以设置为数字，表示重试次数。
       rate_limit: 15/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认999999/min，选填。支持多个频率约束条件：15/min,10/day
       # rate_limit: # 可以为每个模型设置不同的频率限制
-      #   gemini-1.5-flash: 15/min,1500/day
-      #   gemini-1.5-pro: 2/min,50/day
+      #   gemini-2.5-flash: 10/min,500/day
+      #   gemini-2.5-pro: 5/min,25/day
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       ENABLE_MODERATION: true # 是否开启消息道德审查，true 为开启，false 为不开启，默认为 false，当开启后，会对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。
 

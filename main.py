@@ -656,17 +656,15 @@ class StatsMiddleware(BaseHTTPMiddleware):
             "text": None,
             "prompt_tokens": 0,
             "completion_tokens": 0,
-            # "cost": 0,
             "total_tokens": 0
         }
 
         # 设置请求信息到上下文
         current_request_info = request_info.set(request_info_data)
         current_info = request_info.get()
-
-        parsed_body = await parse_request_body(request)
-        if parsed_body and not request.url.path.startswith("/v1/api_config"):
-            try:
+        try:
+            parsed_body = await parse_request_body(request)
+            if parsed_body and not request.url.path.startswith("/v1/api_config"):
                 request_model = UnifiedRequest.model_validate(parsed_body).data
                 if is_debug:
                     logger.info("request_model: %s", json.dumps(request_model.model_dump(exclude_unset=True), indent=2, ensure_ascii=False))
@@ -716,17 +714,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                             status_code=400,
                             content={"error": "Content did not pass the moral check, please modify and try again."}
                         )
-            except RequestValidationError:
-                logger.error(f"Invalid request body: {parsed_body}")
-                pass
-            except Exception as e:
-                if is_debug:
-                    import traceback
-                    traceback.print_exc()
 
-                logger.error(f"Error processing request or performing moral check: {str(e)}")
-
-        try:
             response = await call_next(request)
 
             if request.url.path.startswith("/v1") and not DISABLE_DATABASE:
@@ -744,6 +732,15 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     logger.info(f"Response: type={type(response).__name__}, status_code={response.status_code}, headers={response.headers}")
 
             return response
+
+        except RequestValidationError:
+            logger.error(f"Invalid request body: {parsed_body}")
+        except Exception as e:
+            if is_debug:
+                import traceback
+                traceback.print_exc()
+            logger.error(f"Error processing request: {str(e)}")
+
         finally:
             # print("current_request_info", current_request_info)
             request_info.reset(current_request_info)

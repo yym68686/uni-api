@@ -86,22 +86,23 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-1.5-pro
-      - gemini-1.5-flash-exp-0827: gemini-1.5-flash # After renaming, the original model name gemini-1.5-flash-exp-0827 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
-      - gemini-1.5-flash-exp-0827 # Add this line, both gemini-1.5-flash-exp-0827 and gemini-1.5-flash can be requested
-      - gemini-1.5-pro: gemini-1.5-pro-search # Support to rename models with -search suffix to enable search, use gemini-1.5-pro-search model to request uni-api, it means gemini-1.5-pro model automatically uses Google official search tool, supports all 1.5/2.0 series models.
+      - gemini-2.5-pro-exp-03-25
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash-preview-04-17 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
+      - gemini-2.5-flash-preview-04-17
+      - gemini-2.5-pro-exp-03-25: gemini-2.5-pro-search # Support to rename models with -search suffix to enable search, use gemini-2.5-pro-search model to request uni-api, it means gemini-2.5-pro model automatically uses Google official search tool.
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # Support to rename models with -search suffix to enable search, and support customizing the inference budget using `-think-number`, can be enabled simultaneously or individually.
     tools: true
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
       # api_key_rate_limit: # You can set different frequency limits for each model
-      #   gemini-1.5-flash: 15/min,1500/day
-      #   gemini-1.5-pro: 2/min,50/day
+      #   gemini-2.5-flash: 10/min,500/day
+      #   gemini-2.5-pro: 5/min,25/day
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
       api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random, fixed_priority. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing. fixed_priority is fixed priority scheduling, always use the first available API key.
       model_timeout: # Model timeout, in seconds, default 100 seconds, optional
-        gemini-1.5-pro: 10 # Model gemini-1.5-pro timeout is 10 seconds
-        gemini-1.5-flash: 10 # Model gemini-1.5-flash timeout is 10 seconds
+        gemini-2.5-pro: 10 # Model gemini-2.5-pro timeout is 10 seconds
+        gemini-2.5-flash: 10 # Model gemini-2.5-flash timeout is 10 seconds
         default: 10 # Model does not have a timeout set, use the default timeout of 10 seconds, when requesting a model not in model_timeout, the timeout is also 10 seconds, if default is not set, uni-api will use the default timeout set by the environment variable TIMEOUT, the default timeout is 100 seconds
       keepalive_interval: # Heartbeat interval, in seconds, default 80 seconds, optional. Suitable for when uni-api is hosted on cloudflare and uses inference models. Priority is higher than the global configuration keepalive_interval.
         gemini-2.5-pro: 50 # Model gemini-2.5-pro heartbeat interval is 50 seconds, this value must be less than the model_timeout set timeout, otherwise it will be ignored.
@@ -115,9 +116,9 @@ providers:
     private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key for Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to obtain: Create a service account in Google Cloud Console, generate a JSON formatted key file, and then set its content as the value of this environment variable.
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to obtain: Generated when creating a service account, or you can view the service account details in the "IAM and Admin" section of the Google Cloud Console.
     model:
-      - gemini-1.5-pro
-      - gemini-1.5-flash
-      - gemini-1.5-pro: gemini-1.5-pro-search # Only supports using the gemini-1.5-pro-search model to request uni-api when using the Vertex Gemini API, to automatically use the Google official search tool.
+      - gemini-2.5-flash-preview-04-17
+      - gemini-2.5-pro-preview-03-25
+      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # Only supports using the gemini-2.5-pro-search model to request uni-api when using the Vertex Gemini API, to automatically use the Google official search tool.
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
@@ -175,8 +176,8 @@ api_keys:
       AUTO_RETRY: true # Whether to automatically retry, automatically retry the next provider, true for automatic retry, false for no automatic retry, default is true. Also supports setting a number, indicating the number of retries.
       rate_limit: 15/min # Supports rate limiting, each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
       # rate_limit: # You can set different frequency limits for each model
-      #   gemini-1.5-flash: 15/min,1500/day
-      #   gemini-1.5-pro: 2/min,50/day
+      #   gemini-2.5-flash: 10/min,500/day
+      #   gemini-2.5-pro: 5/min,25/day
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       ENABLE_MODERATION: true # Whether to enable message moderation, true for enable, false for disable, default is false, when enabled, it will moderate the user's message, if inappropriate messages are found, an error message will be returned.
 
