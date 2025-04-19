@@ -1664,11 +1664,11 @@ async def root():
 #     return await asgi.fetch(app, request, env)
 
 @app.get("/v1/api_config", dependencies=[Depends(rate_limit_dependency)])
-async def api_config(api_index: int = Depends(verify_api_key)):
+async def api_config(api_index: int = Depends(verify_admin_api_key)):
     return JSONResponse(content={"api_config": app.state.config})
 
 @app.post("/v1/api_config/update", dependencies=[Depends(rate_limit_dependency)])
-async def api_config_update(api_index: int = Depends(verify_api_key), config: dict = Body(...)):
+async def api_config_update(api_index: int = Depends(verify_admin_api_key), config: dict = Body(...)):
     if "providers" in config:
         app.state.config["providers"] = config["providers"]
         app.state.config, app.state.api_keys_db, app.state.api_list = update_config(app.state.config, use_config_url=False)
