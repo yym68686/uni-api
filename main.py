@@ -1,7 +1,5 @@
 from log_config import logger
-from pprint import pprint
 
-import copy
 import httpx
 import secrets
 from time import time
@@ -10,11 +8,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, Request, Body
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.exceptions import RequestValidationError
+
 
 from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.request import get_payload
@@ -1665,7 +1665,8 @@ async def root():
 
 @app.get("/v1/api_config", dependencies=[Depends(rate_limit_dependency)])
 async def api_config(api_index: int = Depends(verify_admin_api_key)):
-    return JSONResponse(content={"api_config": app.state.config})
+    encoded_config = jsonable_encoder(app.state.config)
+    return JSONResponse(content={"api_config": encoded_config})
 
 @app.post("/v1/api_config/update", dependencies=[Depends(rate_limit_dependency)])
 async def api_config_update(api_index: int = Depends(verify_admin_api_key), config: dict = Body(...)):
