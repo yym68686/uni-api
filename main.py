@@ -1427,6 +1427,8 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     # for api_key in app.state.api_keys_db:
     #     if token.startswith(api_key['api']):
+    if len(api_list) == 1:
+        return token
     if app.state.api_keys_db[api_index].get('role') != "admin":
         raise HTTPException(status_code=403, detail="Permission denied")
     return token
