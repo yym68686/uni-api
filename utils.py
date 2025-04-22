@@ -79,9 +79,10 @@ def update_config(config_data, use_config_url=False):
         if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
             provider['model'] = [
                 "gpt-4o",
+                "gpt-4.1",
                 "gpt-4o-mini",
-                "o1-mini",
-                "o1-preview",
+                "o4-mini",
+                "o3",
                 "text-embedding-3-small",
                 "text-embedding-3-large",
             ]
