@@ -91,6 +91,7 @@ providers:
       - gemini-2.5-flash-preview-04-17
       - gemini-2.5-pro-exp-03-25: gemini-2.5-pro-search # 支持以 -search 后缀重命名模型启用搜索，使用 gemini-2.5-pro-search 模型请求 uni-api 时，表示 gemini-2.5-pro 模型自动使用 Google 官方搜索工具。
       - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # 支持以 -search 后缀重命名模型启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # 支持以 -think-数字 自定义推理预算，当数字为 0 时，表示关闭推理。
     tools: true
     preferences:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day

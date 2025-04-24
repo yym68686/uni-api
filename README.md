@@ -91,6 +91,7 @@ providers:
       - gemini-2.5-flash-preview-04-17
       - gemini-2.5-pro-exp-03-25: gemini-2.5-pro-search # Support to rename models with -search suffix to enable search, use gemini-2.5-pro-search model to request uni-api, it means gemini-2.5-pro model automatically uses Google official search tool.
       - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # Support to rename models with -search suffix to enable search, and support customizing the inference budget using `-think-number`, can be enabled simultaneously or individually.
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
     tools: true
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
