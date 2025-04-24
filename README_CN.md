@@ -630,6 +630,11 @@ api_keys:
 
 对于 Vertex 渠道，Cloudflare AI Gateway 的 base_url 需要填写为 https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}/google-vertex-ai ，{account_id} 和 {gateway_name} 需要替换为你的 Cloudflare 账户 ID 和 Gateway 名称。
 
+- 什么时候 api key 的具有管理权限？
+
+1. 当只有一个 key 时，说明是自用，唯一的 key 获得管理权限，可以通过前端看到所有渠道敏感信息。
+2. 当存在两个以上的 key 时，必须指定其中一个或多个 key 的 role 字段为 admin，只有 role 为 admin 的 key 才有权限访问敏感信息。这样设计的原因是为了防止另外一个 key 的用户也能访问敏感信息。因此添加了 强制给 key 设置 role 为 admin 的设计。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
