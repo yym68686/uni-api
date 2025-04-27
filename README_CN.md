@@ -635,6 +635,14 @@ api_keys:
 1. 当只有一个 key 时，说明是自用，唯一的 key 获得管理权限，可以通过前端看到所有渠道敏感信息。
 2. 当存在两个以上的 key 时，必须指定其中一个或多个 key 的 role 字段为 admin，只有 role 为 admin 的 key 才有权限访问敏感信息。这样设计的原因是为了防止另外一个 key 的用户也能访问敏感信息。因此添加了 强制给 key 设置 role 为 admin 的设计。
 
+## 安全
+
+我们非常重视项目的安全性。如果您发现任何安全漏洞，请通过 [yym68686@outlook.com](mailto:yym68686@outlook.com) 与我们联系。
+
+**致谢 (Acknowledgments):**
+
+*   我们特别感谢 **@ryougishiki214** 报告了一个安全问题，该问题已在 [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1) 版本中得到解决。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">

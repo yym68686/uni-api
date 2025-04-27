@@ -634,6 +634,14 @@ For Vertex channels, the base_url for Cloudflare AI Gateway should be filled in 
 1. When there is only one key, it means self-use, the only key has management permissions, and can see all channel sensitive information through the frontend.
 2. When there are two or more keys, you must specify one or more keys to have the role of admin, only the keys with the role of admin have permission to access sensitive information. The reason for this design is to prevent another key user from also accessing sensitive information. Therefore, the design of forcing the key to set the role to admin has been added.
 
+## Security
+
+We take security seriously. If you discover any security issues, please contact us at [yym68686@outlook.com](mailto:yym68686@outlook.com).
+
+**Acknowledgments:**
+
+We would like to thank **@ryougishiki214** for reporting a security issue, which has been resolved in [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1).
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
