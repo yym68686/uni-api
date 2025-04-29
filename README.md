@@ -13,15 +13,15 @@
 
 ## Introduction
 
-For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Azure, xai, Cohere, Groq, Cloudflare, OpenRouter, and more.
+For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai, Cohere, Groq, Cloudflare, OpenRouter, and more.
 
 ## ✨ Features
 
 - No front-end, pure configuration file to configure API channels. You can run your own API station just by writing a file, and the documentation has a detailed configuration guide, beginner-friendly.
 - Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, OpenRouter, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
-- Simultaneously supports Anthropic, Gemini, Vertex AI, Azure, xai, Cohere, Groq, Cloudflare. Vertex simultaneously supports Claude and Gemini API.
-- Support OpenAI, Anthropic, Gemini, Vertex, Azure, xai native tool use function calls.
-- Support OpenAI, Anthropic, Gemini, Vertex, Azure, xai native image recognition API.
+- Simultaneously supports Anthropic, Gemini, Vertex AI, Azure, AWS, xai, Cohere, Groq, Cloudflare. Vertex simultaneously supports Claude and Gemini API.
+- Support OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai native tool use function calls.
+- Support OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai native image recognition API.
 - Support four types of load balancing.
   1. Supports channel-level weighted load balancing, allowing requests to be distributed according to different channel weights. It is not enabled by default and requires configuring channel weights.
   2. Support Vertex regional load balancing and high concurrency, which can increase Gemini and Claude concurrency by up to (number of APIs * number of regions) times. Automatically enabled without additional configuration.
@@ -139,6 +139,12 @@ providers:
     api: your-api-key
     model:
       - gpt-4o
+    preferences:
+      post_body_parameter_overrides: # Support customizing request body parameters
+        key1: value1 # Force the request to add "key1": "value1" parameter
+        key2: value2 # Force the request to add "key2": "value2" parameter
+        stream_options:
+          include_usage: true # Force the request to add "stream_options": {"include_usage": true} parameter
 
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
