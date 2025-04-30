@@ -310,7 +310,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 # 客户端断开连接是正常行为，不需要记录错误日志
                 logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
                 return
-            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.WriteError) as e:
                 # 网络错误
                 logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
                 yield "data: [DONE]\n\n"
