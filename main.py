@@ -740,6 +740,10 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 import traceback
                 traceback.print_exc()
             logger.error(f"Error processing request: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Internal server error: {str(e)}"}
+            )
 
         finally:
             # print("current_request_info", current_request_info)
