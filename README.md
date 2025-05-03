@@ -640,6 +640,10 @@ For Vertex channels, the base_url for Cloudflare AI Gateway should be filled in 
 1. When there is only one key, it means self-use, the only key has management permissions, and can see all channel sensitive information through the frontend.
 2. When there are two or more keys, you must specify one or more keys to have the role of admin, only the keys with the role of admin have permission to access sensitive information. The reason for this design is to prevent another key user from also accessing sensitive information. Therefore, the design of forcing the key to set the role to admin has been added.
 
+- When using koyeb to deploy uni-api, if the configuration file channel does not write the model field, the startup will report an error. How to solve it?
+
+When deploying uni-api on koyeb, if the configuration file channel does not include the model field, it will report an error on startup. This is because the default permission of api.yaml on koyeb is 0644, and uni-api does not have write permission. When uni-api tries to obtain the model field, it will attempt to modify the configuration file, which will result in an error. You can resolve this by entering `chmod 0777 api.yaml` in the console to grant uni-api write permission.
+
 ## Security
 
 We take security seriously. If you discover any security issues, please contact us at [yym68686@outlook.com](mailto:yym68686@outlook.com).

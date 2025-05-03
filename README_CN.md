@@ -641,6 +641,10 @@ api_keys:
 1. 当只有一个 key 时，说明是自用，唯一的 key 获得管理权限，可以通过前端看到所有渠道敏感信息。
 2. 当存在两个以上的 key 时，必须指定其中一个或多个 key 的 role 字段为 admin，只有 role 为 admin 的 key 才有权限访问敏感信息。这样设计的原因是为了防止另外一个 key 的用户也能访问敏感信息。因此添加了 强制给 key 设置 role 为 admin 的设计。
 
+- 配置文件使用 koyeb 文件方式部署后，如果配置文件渠道没有写 model 字段，启动会报错，怎么解决？
+
+koyeb 部署 uni-api 的 api.yaml 默认是 0644 权限，uni-api 没有写权限。当 uni-api 尝试获取 model 字段时，会修改配置文件，此时会报错。控制台输入 chmod 0777 api.yaml 赋予 uni-api 写权限即可。
+
 ## 安全
 
 我们非常重视项目的安全性。如果您发现任何安全漏洞，请通过 [yym68686@outlook.com](mailto:yym68686@outlook.com) 与我们联系。
