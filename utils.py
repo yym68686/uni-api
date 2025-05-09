@@ -299,7 +299,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                     import traceback
                     error_stack = traceback.format_exc()
                     error_message = error_stack.split("\n")[-2]
-                    logger.info(f"provider: {channel_id:<11} Unexpected error in keepalive loop: {error_message}")
+                    logger.info(f"provider: {channel_id:<11} keepalive loop: {error_message}")
                     break
         else:
             # 原始的逻辑，当不需要心跳时
