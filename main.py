@@ -202,7 +202,7 @@ async def lifespan(app: FastAPI):
                     )
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 80)
+        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
         # pprint(dict(app.state.provider_timeouts))
         # pprint(dict(app.state.keepalive_interval))
         # print("app.state.provider_timeouts", app.state.provider_timeouts)
@@ -888,12 +888,15 @@ def get_preference_value(provider_timeouts, original_model):
                 break
         else:
             # 如果模糊匹配失败，使用渠道的默认值
-            timeout_value = provider_timeouts.get("default")
+            timeout_value = provider_timeouts.get("default", None)
     return timeout_value
 
-def get_preference(preference_config, channel_id, original_model, default_value):
+def get_preference(preference_config, channel_id, original_request_model, default_value):
+    original_model, request_model_name = original_request_model
     provider_timeouts = safe_get(preference_config, channel_id, default=preference_config["global"])
-    timeout_value = get_preference_value(provider_timeouts, original_model)
+    timeout_value = get_preference_value(provider_timeouts, request_model_name)
+    if timeout_value is None:
+        timeout_value = get_preference_value(provider_timeouts, original_model)
     if timeout_value is None:
         timeout_value = get_preference_value(preference_config["global"], original_model)
     if timeout_value is None:
@@ -930,10 +933,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     current_info = request_info.get()
 
-    timeout_value = get_preference(app.state.provider_timeouts, channel_id, original_model, DEFAULT_TIMEOUT)
+    original_request_model = (original_model, request.model)
+    timeout_value = get_preference(app.state.provider_timeouts, channel_id, original_request_model, DEFAULT_TIMEOUT)
     timeout_value = timeout_value * num_matching_providers
     # print("timeout_value", channel_id, timeout_value)
-    keepalive_interval = get_preference(app.state.keepalive_interval, channel_id, original_model, 80)
+    keepalive_interval = get_preference(app.state.keepalive_interval, channel_id, original_request_model, 99999)
     if keepalive_interval > timeout_value:
         keepalive_interval = None
     if channel_id.startswith("sk-"):
