@@ -282,20 +282,12 @@ ssh 登陆到 serv00 服务器，执行下面的命令：
 git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
 cd uni-api
 python -m venv uni-api
-tmux new -A -s uni-api
 source uni-api/bin/activate
-export CFLAGS="-I/usr/local/include"
-export CXXFLAGS="-I/usr/local/include"
-export CC=gcc
-export CXX=g++
-export MAX_CONCURRENCY=1
-export CPUCOUNT=1
-export MAKEFLAGS="-j1"
-CMAKE_BUILD_PARALLEL_LEVEL=1 cpuset -l 0 pip install -vv -r requirements.txt
-cpuset -l 0 pip install -r -vv requirements.txt
+pip install --upgrade pip
+cpuset -l 0 pip install -vv -r requirements.txt
 ```
 
-ctrl+b d 退出 tmux 等待几个小时安装完成，安装完成后执行下面的命令：
+从开始安装到安装完成需要等待10分钟，安装完成后执行下面的命令：
 
 ```bash
 tmux new -A -s uni-api
