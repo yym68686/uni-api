@@ -153,6 +153,12 @@ providers:
     model:
       - anthropic.claude-3-5-sonnet-20240620-v1:0: claude-3-5-sonnet
 
+  - provider: vertex-express
+    base_url: https://aiplatform.googleapis.com/
+    api: xx.xxx
+    model:
+      - gemini-2.5-pro-preview-05-06
+
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
     api: sk-bNnAOJyA-xQw_twAA
