@@ -12,3 +12,4 @@ httpx[http2]
 httpx-socks==0.9.2
 cryptography==43.0.3
 python-multipart
+certifi==2025.1.31
