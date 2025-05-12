@@ -23,7 +23,6 @@ from utils import (
     safe_get,
     load_config,
     update_config,
-    get_model_dict,
     post_all_models,
     InMemoryRateLimiter,
     calculate_total_cost,
@@ -136,7 +135,7 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
 
     return result
 
-async def update_paid_api_keys_states(app, check_index, paid_key):
+async def update_paid_api_keys_states(app, paid_key):
     """
     更新付费API密钥的状态
 
@@ -145,6 +144,7 @@ async def update_paid_api_keys_states(app, check_index, paid_key):
     check_index - API密钥在配置中的索引
     paid_key - 需要更新状态的API密钥
     """
+    check_index = app.state.api_list.index(paid_key)
     credits = safe_get(app.state.config, 'api_keys', check_index, "preferences", "credits", default=-1)
     created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
     model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
@@ -159,6 +159,9 @@ async def update_paid_api_keys_states(app, check_index, paid_key):
             "total_cost": total_cost,
             "enabled": True if total_cost <= credits else False
         }
+        return credits, total_cost
+
+    return credits, 0
         # logger.info(f"app.state.paid_api_keys_states {paid_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[paid_key].items()}, indent=4)}")
 
 @asynccontextmanager
@@ -209,8 +212,8 @@ async def lifespan(app: FastAPI):
         # print("app.state.keepalive_interval", app.state.keepalive_interval)
         if not DISABLE_DATABASE:
             app.state.paid_api_keys_states = {}
-            for check_index, paid_key in enumerate(app.state.api_list):
-                await update_paid_api_keys_states(app, check_index, paid_key)
+            for paid_key in app.state.api_list:
+                await update_paid_api_keys_states(app, paid_key)
 
     if app and not hasattr(app.state, 'client_manager'):
 
@@ -455,7 +458,7 @@ async def update_stats(current_info):
 
         check_key = current_info["api_key"]
         if check_key and check_key in app.state.paid_api_keys_states and current_info["total_tokens"] > 0:
-            await update_paid_api_keys_states(app, app.state.api_list.index(check_key), check_key)
+            await update_paid_api_keys_states(app, check_key)
     except Exception as e:
         logger.error(f"Error acquiring database lock: {str(e)}")
         if is_debug:
@@ -618,7 +621,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     # print("check_api_key", check_api_key)
                     # logger.info(f"app.state.paid_api_keys_states {check_api_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[check_api_key].items()}, indent=4)}")
                     # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
-                    if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False:
+                    if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False and \
+                        not request.url.path.startswith("/v1/token_usage"):
                         return JSONResponse(
                             status_code=429,
                             content={"error": "Balance is insufficient, please check your account."}
@@ -1705,6 +1709,9 @@ class QueryDetails(BaseModel):
     end_datetime: Optional[str] = None   # e.g., "2023-10-28T12:30:45Z" or Unix timestamp
     api_key_filter: Optional[str] = None
     model_filter: Optional[str] = None
+    credits: Optional[str] = None
+    total_cost: Optional[str] = None
+    balance: Optional[str] = None
 
 class TokenUsageResponse(BaseModel):
     usage: List[TokenUsageEntry]
@@ -1896,12 +1903,20 @@ async def get_token_usage(
     )
     # print("usage_data", usage_data)
 
+    if filter_api_key:
+        credits, total_cost = await update_paid_api_keys_states(app, filter_api_key)
+    else:
+        credits, total_cost = None, None
+
     # Prepare response
     query_details = QueryDetails(
         start_datetime=start_datetime_detail,
         end_datetime=end_datetime_detail,
         api_key_filter=api_key_filter_detail,
-        model_filter=model if model else "all"
+        model_filter=model if model else "all",
+        credits= "$" + str(credits),
+        total_cost= "$" + str(total_cost),
+        balance= "$" + str(float(credits) - float(total_cost)) if credits and total_cost else None
     )
 
     response_data = TokenUsageResponse(
