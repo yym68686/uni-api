@@ -1361,6 +1361,7 @@ class ModelRequestHandler:
                     "Proxy connection timed out",
                     "Unknown error: EndOfStream",
                     "BrokenResourceError",
+                    "User location is not supported for the API use",
                     # "Internal Server Error",
                 ]
 
