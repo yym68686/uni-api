@@ -145,6 +145,7 @@ providers:
         key2: value2 # Force the request to add "key2": "value2" parameter
         stream_options:
           include_usage: true # Force the request to add "stream_options": {"include_usage": true} parameter
+      cooldown_period: 0 # When cooldown_period is set to 0, the cooling mechanism is not enabled, the priority is higher than the global configuration cooldown_period.
 
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com

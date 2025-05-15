@@ -132,6 +132,7 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
                 result[provider['provider']][model_name] = timeout_value
 
     result["global"] = preference_dict
+    # print("result", json.dumps(result, indent=4))
 
     return result
 
@@ -348,13 +349,13 @@ class ChannelManager:
         model_key = f"{provider}/{model}"
         self._excluded_models[model_key] = datetime.now()
 
-    async def is_model_excluded(self, provider: str, model: str) -> bool:
+    async def is_model_excluded(self, provider: str, model: str, cooldown_period=0) -> bool:
         model_key = f"{provider}/{model}"
         excluded_time = self._excluded_models[model_key]
         if not excluded_time:
             return False
 
-        if datetime.now() - excluded_time > timedelta(seconds=self.cooldown_period):
+        if datetime.now() - excluded_time > timedelta(seconds=cooldown_period):
             del self._excluded_models[model_key]
             return False
         return True
@@ -367,9 +368,10 @@ class ChannelManager:
             model_dict = provider['model'][0]  # 获取唯一的模型字典
             # source_model = list(model_dict.keys())[0]  # 源模型名称
             target_model = list(model_dict.values())[0]  # 目标模型名称
+            cooldown_period = provider.get('preferences', {}).get('cooldown_period', self.cooldown_period)
 
             # 检查该模型是否被排除
-            if not await self.is_model_excluded(provider_name, target_model):
+            if not await self.is_model_excluded(provider_name, target_model, cooldown_period):
                 available_providers.append(provider)
 
         return available_providers
@@ -909,7 +911,7 @@ def get_preference(preference_config, channel_id, original_request_model, defaul
     return timeout_value
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, num_matching_providers=1):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, timeout_value=DEFAULT_TIMEOUT, keepalive_interval=None):
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     if provider['provider'].startswith("sk-"):
@@ -936,17 +938,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         logger.info(json.dumps({k: v for k, v in payload.items() if k != 'file'}, indent=4, ensure_ascii=False))
 
     current_info = request_info.get()
-
-    original_request_model = (original_model, request.model)
-    timeout_value = get_preference(app.state.provider_timeouts, channel_id, original_request_model, DEFAULT_TIMEOUT)
-    timeout_value = timeout_value * num_matching_providers
-    # print("timeout_value", channel_id, timeout_value)
-    keepalive_interval = get_preference(app.state.keepalive_interval, channel_id, original_request_model, 99999)
-    if keepalive_interval > timeout_value:
-        keepalive_interval = None
-    if channel_id.startswith("sk-"):
-        keepalive_interval = None
-    # print("keepalive_interval", channel_id, keepalive_interval)
 
     proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
     proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
@@ -1306,16 +1297,35 @@ class ModelRequestHandler:
                 else:
                     continue
 
+            original_request_model = (original_model, request.model)
             if provider_name.startswith("sk-") and provider_name in app.state.api_list:
                 local_provider_api_index = app.state.api_list.index(provider_name)
                 local_provider_scheduling_algorithm = safe_get(config, 'api_keys', local_provider_api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
                 local_provider_matching_providers = await get_right_order_providers(request_model, config, local_provider_api_index, local_provider_scheduling_algorithm)
+                local_timeout_value = 0
+                for local_provider in local_provider_matching_providers:
+                    local_provider_name = local_provider['provider']
+                    if not local_provider_name.startswith("sk-"):
+                        local_timeout_value += get_preference(app.state.provider_timeouts, local_provider_name, original_request_model, DEFAULT_TIMEOUT)
+                # print("local_timeout_value", provider_name, local_timeout_value)
                 local_provider_num_matching_providers = len(local_provider_matching_providers)
             else:
+                local_timeout_value = get_preference(app.state.provider_timeouts, provider_name, original_request_model, DEFAULT_TIMEOUT)
                 local_provider_num_matching_providers = 1
+                # print("local_timeout_value", provider_name, local_timeout_value)
+
+            local_timeout_value = local_timeout_value * local_provider_num_matching_providers
+            # print("local_timeout_value", provider_name, local_timeout_value)
+
+            keepalive_interval = get_preference(app.state.keepalive_interval, provider_name, original_request_model, 99999)
+            if keepalive_interval > local_timeout_value:
+                keepalive_interval = None
+            if provider_name.startswith("sk-"):
+                keepalive_interval = None
+            # print("keepalive_interval", provider_name, keepalive_interval)
 
             try:
-                response = await process_request(request, provider, endpoint, role, local_provider_num_matching_providers)
+                response = await process_request(request, provider, endpoint, role, local_timeout_value, keepalive_interval)
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
 
@@ -1353,7 +1363,7 @@ class ModelRequestHandler:
                     # "Internal Server Error",
                 ]
 
-                channel_id = f"{provider['provider']}"
+                channel_id = provider['provider']
 
                 if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1 \
                 and all(error not in error_message for error in exclude_error_rate_limit):

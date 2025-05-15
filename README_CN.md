@@ -145,6 +145,7 @@ providers:
         key2: value2 # 强制在请求中添加 "key2": "value2" 参数
         stream_options:
           include_usage: true # 强制在请求中添加 "stream_options": {"include_usage": true} 参数
+      cooldown_period: 0 # 当 cooldown_period 设置为 0 时，表示该渠道不启用冷却机制，优先级高于全局配置的 cooldown_period。
 
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
