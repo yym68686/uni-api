@@ -1047,7 +1047,7 @@ async def get_provider_rules(model_rule, config, request_model):
                         models_list.extend(list(model_dict.keys()))
 
             # print("models_list", models_list)
-            # print("model_name", model_name)
+            # print("request_model", request_model)
             # print("model_name_split", model_name_split)
             # print("model", model)
 
