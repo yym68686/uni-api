@@ -613,7 +613,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 api_index = api_list.index(token)
             except ValueError:
                 # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
-                api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+                # api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+                api_index = None
                 # token不在api_list中，使用默认值（不开启）
 
             if api_index is not None:
@@ -1431,7 +1432,8 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
         api_index = api_list.index(token)
     except ValueError:
         # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
-        api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+        # api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+        api_index = None
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     return api_index
@@ -1444,7 +1446,8 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
         api_index = api_list.index(token)
     except ValueError:
         # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
-        api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+        # api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+        api_index = None
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     # for api_key in app.state.api_keys_db:
