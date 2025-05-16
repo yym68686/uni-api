@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Depends, Request, Body
+from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -55,8 +55,6 @@ from sqlalchemy.sql import sqltypes
 
 # 添加新的环境变量检查
 DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
-IS_VERCEL = os.path.dirname(os.path.abspath(__file__)).startswith('/var/task')
-logger.info("IS_VERCEL: %s", IS_VERCEL)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
 # 读取VERSION文件内容
@@ -380,6 +378,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean, Text
 from sqlalchemy.sql import func
+from sqlalchemy import event # ADDED
+from sqlalchemy.engine import Engine as SQLAlchemyEngine # ADDED for type hinting in event listener
 
 # 定义数据库模型
 Base = declarative_base()
@@ -427,6 +427,38 @@ if not DISABLE_DATABASE:
     # db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=False)
     db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
     async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+
+    # 为 SQLite 设置 WAL 模式和 busy_timeout
+    # 对于 aiosqlite 驱动的异步引擎，事件通常绑定到其 .sync_engine
+    @event.listens_for(db_engine.sync_engine, "connect")
+    def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):
+        """为每个 SQLite 连接开启 WAL 模式并设置 busy_timeout"""
+        # dbapi_connection 在这里是 aiosqlite 的同步连接对象
+        # 或者更准确地说，是 SQLAlchemy 包装过的底层 DBAPI 连接
+        # 执行 PRAGMA 语句
+        # 对于 aiosqlite, PRAGMA 是通过 execute 执行的
+        # 在 SQLAlchemy 的事件回调中，我们通常能直接操作 dbapi_connection
+        cursor = None
+        try:
+            # 在 SQLAlchemy 1.x/2.x 中，dbapi_connection 可能是原始的 DBAPI 连接，也可能是包装过的。
+            # 对于 aiosqlite，它本身是异步的，但 SQLAlchemy 的连接事件通常会处理好这一点。
+            # 我们假设这里可以同步执行 PRAGMA。
+            # 如果直接在 dbapi_connection 上调用 execute 方法（某些DBAPI驱动支持）
+            # 或者获取一个 cursor 来执行。
+            cursor = dbapi_connection.cursor()
+            # logger.info("Setting PRAGMA journal_mode=WAL and busy_timeout=5000 for new SQLite connection.")
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout = 5000;") # 5000毫秒 = 5秒
+            # 可选：可以稍微放宽同步等级以提高性能，尤其是在 WAL 模式下
+            # cursor.execute("PRAGMA synchronous = NORMAL;")
+            # cursor.execute("PRAGMA temp_store = MEMORY;")
+            # cursor.execute("PRAGMA mmap_size = 30000000000;") # 谨慎使用，根据系统内存调整
+            # cursor.execute("PRAGMA page_size = 32768;") # 谨慎使用
+        except Exception as e:
+            logger.error(f"Failed to set PRAGMA for SQLite: {e}")
+        finally:
+            if cursor:
+                cursor.close()
 
 from starlette.types import Scope, Receive, Send
 from starlette.responses import Response
@@ -843,7 +875,7 @@ class ClientManager:
             proxy_normalized = proxy.replace('socks5h://', 'socks5://')
             client_key += f"_{proxy_normalized}"
 
-        if client_key not in self.clients or IS_VERCEL:
+        if client_key not in self.clients:
             timeout = httpx.Timeout(
                 connect=15.0,
                 read=timeout_value,
@@ -912,7 +944,7 @@ def get_preference(preference_config, channel_id, original_request_model, defaul
     return timeout_value
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, endpoint=None, role=None, timeout_value=DEFAULT_TIMEOUT, keepalive_interval=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, background_tasks: BackgroundTasks, endpoint=None, role=None, timeout_value=DEFAULT_TIMEOUT, keepalive_interval=None):
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     if provider['provider'].startswith("sk-"):
@@ -965,14 +997,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
                     response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
 
             # 更新成功计数和首次响应时间
-            await update_channel_stats(current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True)
+            background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True)
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
             current_info["provider"] = channel_id
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-        await update_channel_stats(current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False)
+        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False)
         raise e
 
 def weighted_round_robin(weights):
@@ -1239,15 +1271,15 @@ class ModelRequestHandler:
         self.last_provider_indices = defaultdict(lambda: -1)
         self.locks = defaultdict(asyncio.Lock)
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], api_index: int = None, endpoint=None):
+    async def request_model(self, request_data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], api_index: int, background_tasks: BackgroundTasks, endpoint=None):
         config = app.state.config
-        request_model = request.model
+        request_model_name = request_data.model
         if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
+            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
 
-        matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
+        matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
         num_matching_providers = len(matching_providers)
 
         status_code = 500
@@ -1255,9 +1287,9 @@ class ModelRequestHandler:
 
         start_index = 0
         if scheduling_algorithm != "fixed_priority":
-            async with self.locks[request_model]:
-                self.last_provider_indices[request_model] = (self.last_provider_indices[request_model] + 1) % num_matching_providers
-                start_index = self.last_provider_indices[request_model]
+            async with self.locks[request_model_name]:
+                self.last_provider_indices[request_model_name] = (self.last_provider_indices[request_model_name] + 1) % num_matching_providers
+                start_index = self.last_provider_indices[request_model_name]
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
         role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
@@ -1289,7 +1321,7 @@ class ModelRequestHandler:
 
             # 检查是否所有API密钥都被速率限制,如果被速率限制，则跳出循环
             model_dict = provider["_model_dict_cache"]
-            original_model = model_dict[request_model]
+            original_model = model_dict[request_model_name]
             if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
                 # logger.warning(f"Provider {provider_name}: All API keys are rate limited and stop auto retry!")
                 error_message = f"All API keys are rate limited and stop auto retry!"
@@ -1298,11 +1330,11 @@ class ModelRequestHandler:
                 else:
                     continue
 
-            original_request_model = (original_model, request.model)
+            original_request_model = (original_model, request_data.model)
             if provider_name.startswith("sk-") and provider_name in app.state.api_list:
                 local_provider_api_index = app.state.api_list.index(provider_name)
                 local_provider_scheduling_algorithm = safe_get(config, 'api_keys', local_provider_api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-                local_provider_matching_providers = await get_right_order_providers(request_model, config, local_provider_api_index, local_provider_scheduling_algorithm)
+                local_provider_matching_providers = await get_right_order_providers(request_model_name, config, local_provider_api_index, local_provider_scheduling_algorithm)
                 local_timeout_value = 0
                 for local_provider in local_provider_matching_providers:
                     local_provider_name = local_provider['provider']
@@ -1326,7 +1358,7 @@ class ModelRequestHandler:
             # print("keepalive_interval", provider_name, keepalive_interval)
 
             try:
-                response = await process_request(request, provider, endpoint, role, local_timeout_value, keepalive_interval)
+                response = await process_request(request_data, provider, background_tasks, endpoint, role, local_timeout_value, keepalive_interval)
                 return response
             except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
 
@@ -1371,8 +1403,8 @@ class ModelRequestHandler:
                 and all(error not in error_message for error in exclude_error_rate_limit):
                     # 获取源模型名称（实际配置的模型名）
                     # source_model = list(provider['model'][0].keys())[0]
-                    await app.state.channel_manager.exclude_model(channel_id, request_model)
-                    matching_providers = await get_right_order_providers(request_model, config, api_index, scheduling_algorithm)
+                    await app.state.channel_manager.exclude_model(channel_id, request_model_name)
+                    matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
                     last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
                     if num_matching_providers != last_num_matching_providers:
@@ -1418,7 +1450,7 @@ class ModelRequestHandler:
         current_info["provider"] = None
         return JSONResponse(
             status_code=status_code,
-            content={"error": f"All {request.model} error: {error_message}"}
+            content={"error": f"All {request_data.model} error: {error_message}"}
         )
 
 model_handler = ModelRequestHandler()
@@ -1460,8 +1492,8 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return token
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: RequestModel, api_index: int = Depends(verify_api_key)):
-    return await model_handler.request_model(request, api_index)
+async def chat_completions_route(request: RequestModel, background_tasks: BackgroundTasks, api_index: int = Depends(verify_api_key)):
+    return await model_handler.request_model(request, api_index, background_tasks)
 
 # @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 # async def options_handler():
@@ -1478,36 +1510,41 @@ async def list_models(api_index: int = Depends(verify_api_key)):
 @app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
 async def images_generations(
     request: ImageGenerationRequest,
+    background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, api_index, endpoint="/v1/images/generations")
+    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/generations")
 
 @app.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
 async def embeddings(
     request: EmbeddingRequest,
+    background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, api_index, endpoint="/v1/embeddings")
+    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/embeddings")
 
 @app.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
 async def audio_speech(
     request: TextToSpeechRequest,
+    background_tasks: BackgroundTasks,
     api_index: str = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, api_index, endpoint="/v1/audio/speech")
+    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/audio/speech")
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(
     request: ModerationRequest,
+    background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, api_index, endpoint="/v1/moderations")
+    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/moderations")
 
 from fastapi import UploadFile, File, Form, HTTPException, Request
 import io
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
 async def audio_transcriptions(
-    request: Request,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     model: str = Form(...),
     language: Optional[str] = Form(None),
@@ -1518,7 +1555,7 @@ async def audio_transcriptions(
 ):
     try:
         # Manually parse form data
-        form_data = await request.form()
+        form_data = await http_request.form()
         # Use getlist to handle multiple values for the same key
         timestamp_granularities = form_data.getlist("timestamp_granularities[]")
         if not timestamp_granularities: # If list is empty (parameter not sent)
@@ -1539,7 +1576,7 @@ async def audio_transcriptions(
             timestamp_granularities=timestamp_granularities
         )
 
-        return await model_handler.request_model(request_obj, api_index, endpoint="/v1/audio/transcriptions")
+        return await model_handler.request_model(request_obj, api_index, background_tasks, endpoint="/v1/audio/transcriptions")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Invalid audio file encoding")
     except Exception as e:

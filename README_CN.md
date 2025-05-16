@@ -644,6 +644,30 @@ api_keys:
 
 koyeb 部署 uni-api 的 api.yaml 默认是 0644 权限，uni-api 没有写权限。当 uni-api 尝试获取 model 字段时，会修改配置文件，此时会报错。控制台输入 chmod 0777 api.yaml 赋予 uni-api 写权限即可。
 
+## 压测
+
+压测工具：[locust](https://locust.io/)
+
+压测脚本：[test/locustfile.py](test/locustfile.py)
+
+mock_server：[test/mock_server.go](test/mock_server.go)
+
+启动压测：
+
+```bash
+go run test/mock_server.go
+# 100 10 120s
+locust -f test/locustfile.py
+python main.py
+```
+
+压测结果：
+
+| Type | Name | 50% | 66% | 75% | 80% | 90% | 95% | 98% | 99% | 99.9% | 99.99% | 100% | # reqs |
+|------|------|-----|-----|-----|-----|-----|-----|-----|-----|--------|---------|------|--------|
+| POST | /v1/chat/completions (stream) | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
+| | Aggregated | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
+
 ## 安全
 
 我们非常重视项目的安全性。如果您发现任何安全漏洞，请通过 [yym68686@outlook.com](mailto:yym68686@outlook.com) 与我们联系。

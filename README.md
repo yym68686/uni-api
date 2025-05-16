@@ -643,6 +643,30 @@ For Vertex channels, the base_url for Cloudflare AI Gateway should be filled in 
 
 When deploying uni-api on koyeb, if the configuration file channel does not include the model field, it will report an error on startup. This is because the default permission of api.yaml on koyeb is 0644, and uni-api does not have write permission. When uni-api tries to obtain the model field, it will attempt to modify the configuration file, which will result in an error. You can resolve this by entering `chmod 0777 api.yaml` in the console to grant uni-api write permission.
 
+## Load Testing
+
+Load testing tool: [locust](https://locust.io/)
+
+Load testing script: [test/locustfile.py](test/locustfile.py)
+
+mock_server: [test/mock_server.go](test/mock_server.go)
+
+Start load testing:
+
+```bash
+go run test/mock_server.go
+# 100 10 120s
+locust -f test/locustfile.py
+python main.py
+```
+
+Load testing result:
+
+| Type | Name | 50% | 66% | 75% | 80% | 90% | 95% | 98% | 99% | 99.9% | 99.99% | 100% | # reqs |
+|------|------|-----|-----|-----|-----|-----|-----|-----|-----|--------|---------|------|--------|
+| POST | /v1/chat/completions (stream) | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
+| | Aggregated | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
+
 ## Security
 
 We take security seriously. If you discover any security issues, please contact us at [yym68686@outlook.com](mailto:yym68686@outlook.com).
