@@ -2,10 +2,10 @@ import json
 import httpx
 import asyncio
 from time import time
-from log_config import logger
 from fastapi import HTTPException
 from collections import defaultdict
 
+from core.log_config import logger
 from core.utils import (
     safe_get,
     get_model_dict,

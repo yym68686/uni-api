@@ -1,4 +1,3 @@
-from log_config import logger
 
 import httpx
 import secrets
@@ -16,6 +15,7 @@ from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
 
 
+from core.log_config import logger
 from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream
