@@ -740,7 +740,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     current_info["text"] = moderated_content
 
                 if enable_moderation and moderated_content:
-                    moderation_response = await self.moderate_content(moderated_content, api_index)
+                    background_tasks_for_moderation = BackgroundTasks()
+                    moderation_response = await self.moderate_content(moderated_content, api_index, background_tasks_for_moderation)
                     is_flagged = moderation_response.get('results', [{}])[0].get('flagged', False)
 
                     if is_flagged:
@@ -788,11 +789,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
             # print("current_request_info", current_request_info)
             request_info.reset(current_request_info)
 
-    async def moderate_content(self, content, api_index):
+    async def moderate_content(self, content, api_index, background_tasks: BackgroundTasks):
         moderation_request = ModerationRequest(input=content)
 
         # 直接调用 moderations 函数
-        response = await moderations(moderation_request, api_index)
+        response = await moderations(moderation_request, background_tasks, api_index)
 
         # 读取流式响应的内容
         moderation_result = b""
