@@ -1125,6 +1125,8 @@ def get_provider_list(provider_rules, config, request_model):
         else:
             for provider in config['providers']:
                 model_dict = provider["_model_dict_cache"]
+                if not model_dict:
+                    continue
                 model_name_split = "/".join(item.split("/")[1:])
                 if "/" in item and provider['provider'] == provider_name and model_name_split in model_dict.keys():
                     if request_model in model_dict.keys() and model_name_split == request_model:
