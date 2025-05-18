@@ -319,7 +319,8 @@ async def get_markdown_docs():
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
-        logger.error(f"404 Error: {exc.detail}")
+        token = await get_api_key(request)
+        logger.error(f"404 Error: {exc.detail} api_key: {token}")
     return JSONResponse(
         status_code=exc.status_code,
         content={"message": exc.detail},
@@ -609,6 +610,16 @@ class LoggingStreamingResponse(Response):
             if hasattr(self.body_iterator, 'aclose'):
                 await self.body_iterator.aclose()
 
+async def get_api_key(request: Request):
+    token = None
+    if request.headers.get("x-api-key"):
+        token = request.headers.get("x-api-key")
+    elif request.headers.get("Authorization"):
+        api_split_list = request.headers.get("Authorization").split(" ")
+        if len(api_split_list) > 1:
+            token = api_split_list[1]
+    return token
+
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -620,61 +631,44 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
         start_time = time()
 
-        enable_moderation = False  # 默认不开启道德审查
-
-        config = app.state.config
         # 根据token决定是否启用道德审查
-        if request.headers.get("x-api-key"):
-            token = request.headers.get("x-api-key")
-        elif request.headers.get("Authorization"):
-            api_split_list = request.headers.get("Authorization").split(" ")
-            if len(api_split_list) > 1:
-                token = api_split_list[1]
-            else:
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "Invalid or missing API Key"}
-                )
-        else:
-            token = None
+        token = await get_api_key(request)
+        if not token:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Invalid or missing API Key"}
+            )
 
-        api_index = None
-        if token:
-            try:
-                api_list = app.state.api_list
-                api_index = api_list.index(token)
-            except ValueError:
-                # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
-                # api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
-                api_index = None
-                # token不在api_list中，使用默认值（不开启）
+        enable_moderation = False  # 默认不开启道德审查
+        config = app.state.config
 
-            if api_index is not None:
-                enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
-                if not DISABLE_DATABASE:
-                    check_api_key = safe_get(config, 'api_keys', api_index, "api")
-                    # print("check_api_key", check_api_key)
-                    # logger.info(f"app.state.paid_api_keys_states {check_api_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[check_api_key].items()}, indent=4)}")
-                    # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
-                    if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False and \
-                        not request.url.path.startswith("/v1/token_usage"):
-                        return JSONResponse(
-                            status_code=429,
-                            content={"error": "Balance is insufficient, please check your account."}
-                        )
-            else:
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "Invalid or missing API Key"}
-                )
+        try:
+            api_list = app.state.api_list
+            api_index = api_list.index(token)
+        except ValueError:
+            # 如果 token 不在 api_list 中，检查是否以 api_list 中的任何一个开头
+            # api_index = next((i for i, api in enumerate(api_list) if token.startswith(api)), None)
+            api_index = None
+            # token不在api_list中，使用默认值（不开启）
+
+        if api_index is not None:
+            enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
+            if not DISABLE_DATABASE:
+                check_api_key = safe_get(config, 'api_keys', api_index, "api")
+                # print("check_api_key", check_api_key)
+                # logger.info(f"app.state.paid_api_keys_states {check_api_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[check_api_key].items()}, indent=4)}")
+                # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
+                if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False and \
+                    not request.url.path.startswith("/v1/token_usage"):
+                    return JSONResponse(
+                        status_code=429,
+                        content={"error": "Balance is insufficient, please check your account."}
+                    )
         else:
-            # 如果token为None，检查全局设置
-            enable_moderation = config.get('ENABLE_MODERATION', False)
-            if api_index == None:
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "Invalid or missing API Key"}
-                )
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Invalid or missing API Key"}
+            )
 
         # 在 app.state 中存储此请求的信息
         request_id = str(uuid.uuid4())
