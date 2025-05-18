@@ -956,7 +956,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     channel_id = f"{provider['provider']}"
     if engine != "moderation":
-        logger.info(f"provider: {channel_id:<11} model: {request.model:<22} engine: {engine} role: {role}")
+        logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine:<6} role: {role}")
 
     url, headers, payload = await get_payload(request, engine, provider, api_key)
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
