@@ -296,9 +296,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                     break
                 except Exception as e:
                     # 捕获任何其他异常
-                    import traceback
-                    error_stack = traceback.format_exc()
-                    error_message = error_stack.split("\n")[-2]
+                    # import traceback
+                    # error_stack = traceback.format_exc()
+                    # error_message = error_stack.split("\n")[-2]
                     # logger.info(f"provider: {channel_id:<11} keepalive loop: {error_message}")
                     break
         else:
