@@ -172,6 +172,12 @@ async def lifespan(app: FastAPI):
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
         app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
+        # from ruamel.yaml.timestamp import TimeStamp
+        # def json_default(obj):
+        #     if isinstance(obj, TimeStamp):
+        #         return obj.isoformat()
+        #     raise TypeError
+        # print("app.state.config", json.dumps(app.state.config, indent=4, ensure_ascii=False, default=json_default))
 
         if app.state.api_list:
             app.state.user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)

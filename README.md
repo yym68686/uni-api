@@ -86,11 +86,11 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro-exp-03-25
+      - gemini-2.5-pro-exp-05-06
       - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash-preview-04-17 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
       - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-exp-03-25: gemini-2.5-pro-search # Support to rename models with -search suffix to enable search, use gemini-2.5-pro-search model to request uni-api, it means gemini-2.5-pro model automatically uses Google official search tool.
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # Support to rename models with -search suffix to enable search, and support customizing the inference budget using `-think-number`, can be enabled simultaneously or individually.
+      - gemini-2.5-pro-exp-05-06: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
       - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
     tools: true
     preferences:
@@ -111,6 +111,11 @@ providers:
       headers:  # Add custom http request headers, optional
         Custom-Header-1: Value-1
         Custom-Header-2: Value-2
+      post_body_parameter_overrides: # Support customizing request body parameters
+        gemini-2.5-flash-search: # Add custom request body parameters to the model gemini-2.5-flash-search
+          tools:
+            - google_search: {} # Add google_search tool to the model gemini-2.5-flash-search
+            - url_context: {} # Add url_context tool to the model gemini-2.5-flash-search
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx # Description: Your Google Cloud project ID. Format: String, usually composed of lowercase letters, numbers, and hyphens. How to obtain: You can find your project ID in the project selector of the Google Cloud Console.
@@ -119,13 +124,22 @@ providers:
     model:
       - gemini-2.5-flash-preview-04-17
       - gemini-2.5-pro-preview-03-25
-      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # Only supports using the gemini-2.5-pro-search model to request uni-api when using the Vertex Gemini API, to automatically use the Google official search tool.
+      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
     tools: true
     notes: https://xxxxx.com/ # You can put the provider's website, notes, official documentation, optional
+    preferences:
+      post_body_parameter_overrides: # Support customizing request body parameters
+        gemini-2.5-pro-search: # Add custom request body parameters to the model gemini-2.5-pro-search
+          tools:
+            - google_search: {} # Add google_search tool to the model gemini-2.5-pro-search
+        gemini-2.5-flash-search:
+          tools:
+            - google_search: {}
+            - url_context: {}
 
   - provider: cloudflare
     api: f42b3xxxxxxxxxxq4aoGAh # Cloudflare API Key, required

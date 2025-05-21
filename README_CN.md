@@ -86,11 +86,11 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro-exp-03-25
+      - gemini-2.5-pro-exp-05-06
       - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # 重命名后，原来的模型名字 gemini-2.5-flash-preview-04-17 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
       - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-exp-03-25: gemini-2.5-pro-search # 支持以 -search 后缀重命名模型启用搜索，使用 gemini-2.5-pro-search 模型请求 uni-api 时，表示 gemini-2.5-pro 模型自动使用 Google 官方搜索工具。
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # 支持以 -search 后缀重命名模型启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
+      - gemini-2.5-pro-exp-05-06: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。
+      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
       - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # 支持以 -think-数字 自定义推理预算，当数字为 0 时，表示关闭推理。
     tools: true
     preferences:
@@ -111,6 +111,11 @@ providers:
       headers:  # 额外附加自定义HTTP请求头，选填。
         Custom-Header-1: Value-1
         Custom-Header-2: Value-2
+      post_body_parameter_overrides: # 支持自定义请求体参数
+        gemini-2.5-pro-search: # 给模型 gemini-2.5-pro-search 添加自定义请求体参数
+          tools:
+            - google_search: {} # 给模型 gemini-2.5-pro-search 添加 google_search 工具
+            - url_context: {} # 给模型 gemini-2.5-pro-search 添加 url_context 工具
 
   - provider: vertex
     project_id: gen-lang-client-xxxxxxxxxxxxxx #    描述： 您的Google Cloud项目ID。格式： 字符串，通常由小写字母、数字和连字符组成。获取方式： 在Google Cloud Console的项目选择器中可以找到您的项目ID。
@@ -119,13 +124,22 @@ providers:
     model:
       - gemini-2.5-flash-preview-04-17
       - gemini-2.5-pro-preview-03-25
-      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # 仅支持在 vertex Gemini API 中，以 -search 后缀重命名模型后，使用 gemini-2.5-pro-search 模型请求 uni-api 时，表示 gemini-2.5-pro 模型自动使用 Google 官方搜索工具。
+      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。不设置 post_body_parameter_overrides 参数，则无法启用搜索。
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
     tools: true
     notes: https://xxxxx.com/ # 可以放服务商的网址，备注信息，官方文档，选填
+    preferences:
+      post_body_parameter_overrides: # 支持自定义请求体参数
+        gemini-2.5-pro-search: # 给模型 gemini-2.5-pro-search 添加自定义请求体参数
+          tools:
+            - google_search: {} # 给模型 gemini-2.5-pro-search 添加 google_search 工具
+        gemini-2.5-flash-search:
+          tools:
+            - google_search: {}
+            - url_context: {}
 
   - provider: cloudflare
     api: f42b3xxxxxxxxxxq4aoGAh # Cloudflare API Key，必填
