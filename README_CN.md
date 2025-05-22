@@ -102,8 +102,8 @@ providers:
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
       api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。
       model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
-        gemini-2.5-pro: 10 # 模型 gemini-2.5-pro 的超时时间为 10 秒
-        gemini-2.5-flash: 10 # 模型 gemini-2.5-flash 的超时时间为 10 秒
+        gemini-2.5-pro: 500 # 模型 gemini-2.5-pro 的超时时间为 500 秒
+        gemini-2.5-flash: 500 # 模型 gemini-2.5-flash 的超时时间为 500 秒
         default: 10 # 模型没有设置超时时间，使用默认的超时时间 10 秒，当请求的不在 model_timeout 里面的模型时，超时时间默认是 10 秒，不设置 default，uni-api 会使用全局配置的模型超时时间。
       keepalive_interval: # 心跳间隔，单位为秒，默认 99999 秒，选填。适合当 uni-api 域名托管在 cloudflare 并使用推理模型时使用。优先级高于全局配置的 keepalive_interval。
         gemini-2.5-pro: 50 # 模型 gemini-2.5-pro 的心跳间隔为 50 秒，此数值必须小于 model_timeout 设置的超时时间，否则忽略此设置。

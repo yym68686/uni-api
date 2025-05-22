@@ -102,8 +102,8 @@ providers:
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
       api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random, fixed_priority. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing. fixed_priority is fixed priority scheduling, always use the first available API key.
       model_timeout: # Model timeout, in seconds, default 100 seconds, optional
-        gemini-2.5-pro: 10 # Model gemini-2.5-pro timeout is 10 seconds
-        gemini-2.5-flash: 10 # Model gemini-2.5-flash timeout is 10 seconds
+        gemini-2.5-pro: 500 # Model gemini-2.5-pro timeout is 500 seconds
+        gemini-2.5-flash: 500 # Model gemini-2.5-flash timeout is 500 seconds
         default: 10 # Model does not have a timeout set, use the default timeout of 10 seconds, when requesting a model not in model_timeout, the timeout is also 10 seconds, if default is not set, uni-api will use the default timeout set by the environment variable TIMEOUT, the default timeout is 100 seconds
       keepalive_interval: # Heartbeat interval, in seconds, default 99999 seconds, optional. Suitable for when uni-api is hosted on cloudflare and uses inference models. Priority is higher than the global configuration keepalive_interval.
         gemini-2.5-pro: 50 # Model gemini-2.5-pro heartbeat interval is 50 seconds, this value must be less than the model_timeout set timeout, otherwise it will be ignored.
