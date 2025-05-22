@@ -371,8 +371,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration
             content = safe_get(first_item_str, "choices", 0, "message", "content", default=None)
+            reasoning_content = safe_get(first_item_str, "choices", 0, "message", "reasoning_content", default=None)
             tool_calls = safe_get(first_item_str, "choices", 0, "message", "tool_calls", default=None)
-            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None):
+            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None):
                 raise StopAsyncIteration
 
         return new_generator(first_item), first_response_time
