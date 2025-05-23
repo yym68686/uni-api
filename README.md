@@ -273,6 +273,7 @@ yym68686/uni-api:latest
 ## Environment variable
 
 - CONFIG_URL: The download address of the configuration file, which can be a local file or a remote file, optional
+- DEBUG: Whether to enable debug mode, default is false, optional. When enabled, more logs will be printed, which can be used when submitting issues.
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
 - DISABLE_DATABASE: Whether to disable the database, default is false, optional
 
