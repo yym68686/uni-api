@@ -78,6 +78,15 @@ providers:
       - claude-3-7-sonnet-20240620: claude-3-7-sonnet # 重命名模型，claude-3-7-sonnet-20240620 是服务商的模型名称，claude-3-7-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
       - claude-3-7-sonnet-20250219: claude-3-7-sonnet-think # 重命名模型，claude-3-7-sonnet-20250219 是服务商的模型名称，claude-3-7-sonnet-think 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，如果重命名后的名字里面有think，则自动转换为 claude 思考模型，默认思考 token 限制为 4096。选填
     tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
+    preferences:
+      post_body_parameter_overrides: # 支持自定义请求体参数
+        claude-3-7-sonnet-think: # 给模型 claude-3-7-sonnet-think 添加自定义请求体参数
+          tools:
+            - type: code_execution_20250522 # 给模型 claude-3-7-sonnet-think 添加 code_execution 工具
+              name: code_execution
+            - type: web_search_20250305 # 给模型 claude-3-7-sonnet-think 添加 web_search 工具，max_uses 表示最多使用 5 次
+              name: web_search
+              max_uses: 5
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url 支持 v1beta/v1, 仅供 Gemini 模型使用，必填

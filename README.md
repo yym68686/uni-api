@@ -78,6 +78,15 @@ providers:
       - claude-3-7-sonnet-20240620: claude-3-7-sonnet # Rename model, claude-3-7-sonnet-20240620 is the provider's model name, claude-3-7-sonnet is the renamed name, you can use a simple name to replace the original complex name, optional
       - claude-3-7-sonnet-20250219: claude-3-7-sonnet-think # Rename model, claude-3-7-sonnet-20250219 is the provider's model name, claude-3-7-sonnet-think is the renamed name, if "think" is in the renamed name, it will be automatically converted to claude think model, default think token limit is 4096. Optional
     tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
+    preferences:
+      post_body_parameter_overrides: # Support customizing request body parameters
+        claude-3-7-sonnet-think: # Add custom request body parameters to the model claude-3-7-sonnet-think
+          tools:
+            - type: code_execution_20250522 # Add code_execution tool to the model claude-3-7-sonnet-think
+              name: code_execution
+            - type: web_search_20250305 # Add web_search tool to the model claude-3-7-sonnet-think, max_uses means to use up to 5 times
+              name: web_search
+              max_uses: 5
 
   - provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta # base_url supports v1beta/v1, only for Gemini model use, required
