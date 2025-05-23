@@ -1,4 +1,3 @@
-
 import httpx
 import secrets
 from time import time
@@ -563,6 +562,22 @@ class LoggingStreamingResponse(Response):
                     'body': chunk,
                     'more_body': True,
                 })
+        except Exception as e:
+            # 记录异常但不重新抛出，避免"Task exception was never retrieved"
+            logger.error(f"Error in streaming response: {type(e).__name__}: {str(e)}")
+            if is_debug:
+                import traceback
+                traceback.print_exc()
+            # 发送错误消息给客户端（如果可能）
+            try:
+                error_data = json.dumps({"error": f"Streaming error: {str(e)}"})
+                await send({
+                    'type': 'http.response.body',
+                    'body': f"data: {error_data}\n\n".encode('utf-8'),
+                    'more_body': True,
+                })
+            except:
+                pass  # 如果无法发送错误消息，则忽略
         finally:
             await send({
                 'type': 'http.response.body',
@@ -605,7 +620,13 @@ class LoggingStreamingResponse(Response):
                         logger.error(f"Error parsing response: {str(e)}, line: {repr(line)}")
                         continue
                 yield chunk
+        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError) as e:
+            # 网络相关异常，记录并重新抛出
+            logger.error(f"Network error in _logging_iterator: {type(e).__name__}: {str(e)}")
+            raise
         except Exception as e:
+            # 其他异常也记录并重新抛出
+            logger.error(f"Unexpected error in _logging_iterator: {type(e).__name__}: {str(e)}")
             raise
         finally:
             logger.debug("_logging_iterator finished")
