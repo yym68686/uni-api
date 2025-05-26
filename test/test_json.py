@@ -9,11 +9,16 @@ from utils import safe_get
 # with open('test/states.json', 'r', encoding='utf-8') as file:
 #     content = file.read()
 
-content = '{"parts": [          {            "text": "在不支持 Python"          }        ]      },      "groundingMetadata": {}]}'
+# content = '{"parts": [          {            "text": "在不支持 Python"          }        ]      },      "groundingMetadata": {}]}'
 # content = '{"parts": [          {            "text": "usions, Direction 2 is always opposite to Direction 1.\n\nThe default sketch normal is the same as the face or plane normal where the sketch was placed. To determine this normal vector, see IFace2::Normal and IRefPlane::Transform, respectively.\n\nWhen UseAutoSelect is false, the user must"          }        ]      },      "citationMetadata": {        "citations": [          {            "startIndex": 10420,            "endIndex": 10815,            "title": "Your prompt"}]}'
 # content = '"parts": [          {            "text": "Hello! How can I help you today?"          }        ],'
 # content = '        "parts": [          {            "text": "Hello! How can I help you today?"          }        ]      },'
-parts_json =  "{" + content.split("}        ]      },")[0].strip().rstrip("}], ").replace("\n", "\\n").lstrip("{") + "}]}"
+content = '        "parts": [          {            "inlineData": {              "mimeType": "image/png",              "data": "iVBO"            }          }        ],'
+parts_json =  "{" + content.split("}        ]      },")[0].strip().rstrip("}], ").replace("\n", "\\n").lstrip("{")
+if "inlineData" in parts_json:
+    parts_json = parts_json + "}}]}"
+else:
+    parts_json = parts_json + "}]}"
 # parts_json =  "{" + re.sub(r'\}\s+\]\s+\}.*', '', content).strip().rstrip("}], ").replace("\n", "\\n").lstrip("{") + "}]}"
 # 使用ast.literal_eval解析非标准JSON
 # print(repr(parts_json))
