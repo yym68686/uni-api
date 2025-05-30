@@ -2045,6 +2045,36 @@ async def api_keys_states(token: str = Depends(verify_admin_api_key)):
     # 返回JSON序列化结果
     return response
 
+@app.post("/v1/add_credits", dependencies=[Depends(rate_limit_dependency)])
+async def add_credits_to_api_key(
+    request: Request, # Inject request to access app.state
+    paid_key: str = Query(..., description="The API key to add credits to"),
+    amount: float = Query(..., description="The amount of credits to add. Must be positive.", gt=0),
+    token: str = Depends(verify_admin_api_key)
+):
+    if paid_key not in app.state.paid_api_keys_states:
+        raise HTTPException(status_code=404, detail=f"API key '{paid_key}' not found in paid API keys states.")
+
+    # The validation `amount > 0` is handled by `Query(..., gt=0)`
+
+    # 更新 credits
+    # Ensure 'amount' is treated as float, though Query should handle conversion.
+    app.state.paid_api_keys_states[paid_key]["credits"] += float(amount)
+
+    # 更新 enabled 状态
+    current_credits = app.state.paid_api_keys_states[paid_key]["credits"]
+    total_cost = app.state.paid_api_keys_states[paid_key]["total_cost"]
+    app.state.paid_api_keys_states[paid_key]["enabled"] = current_credits >= total_cost
+
+    logger.info(f"Credits for API key '{paid_key}' updated. Amount added: {amount}, New credits: {current_credits}, Enabled: {app.state.paid_api_keys_states[paid_key]['enabled']}")
+
+    return JSONResponse(content={
+        "message": f"Successfully added {amount} credits to API key '{paid_key}'.",
+        "paid_key": paid_key,
+        "new_credits": current_credits,
+        "enabled": app.state.paid_api_keys_states[paid_key]["enabled"]
+    })
+
 from fastapi.staticfiles import StaticFiles
 # 添加静态文件挂载
 app.mount("/", StaticFiles(directory="./static", html=True), name="static")
