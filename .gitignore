@@ -14,3 +14,4 @@ node_modules
 .aider*
 .idea
 docker-compose-test.yml
+data/
