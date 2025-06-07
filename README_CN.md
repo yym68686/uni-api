@@ -179,6 +179,7 @@ providers:
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
+    project_id: xxx
     api: xx.xxx
     model:
       - gemini-2.5-pro-preview-05-06
