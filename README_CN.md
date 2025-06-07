@@ -179,10 +179,14 @@ providers:
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
-    project_id: xxx
-    api: xx.xxx
+    project_id:
+      - xxx # key1 的 project_id
+      - xxx # key2 的 project_id
+    api:
+      - xx.xxx # key1 的 api
+      - xx.xxx # key2 的 api
     model:
-      - gemini-2.5-pro-preview-05-06
+      - gemini-2.5-pro-preview-06-05
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages

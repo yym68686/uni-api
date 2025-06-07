@@ -179,10 +179,14 @@ providers:
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
-    project_id: xxx
-    api: xx.xxx
+    project_id:
+      - xxx # project_id of key1
+      - xxx # project_id of key2
+    api:
+      - xx.xxx # api of key1
+      - xx.xxx # api of key2
     model:
-      - gemini-2.5-pro-preview-05-06
+      - gemini-2.5-pro-preview-06-05
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
