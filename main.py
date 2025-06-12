@@ -12,6 +12,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
+from pydantic import ValidationError
 
 
 from core.log_config import logger
@@ -794,8 +795,12 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
             return response
 
-        except RequestValidationError:
-            logger.error(f"Invalid request body: {parsed_body}")
+        except ValidationError as e:
+            logger.error(f"Invalid request body: {json.dumps(parsed_body, indent=2, ensure_ascii=False)}, errors: {e.errors()}")
+            return JSONResponse(
+                status_code=422,
+                content=jsonable_encoder({"detail": e.errors()})
+            )
         except Exception as e:
             if is_debug:
                 import traceback
