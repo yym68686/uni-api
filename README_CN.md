@@ -277,10 +277,19 @@ yym68686/uni-api:latest
 
 ## 环境变量
 
-- CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填
+- CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填。
 - DEBUG: 是否开启调试模式，默认为 false，选填，开启后会打印更多日志，用于提交 issue 时使用。
-- TIMEOUT: 请求超时时间，默认为 100 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间。选填
-- DISABLE_DATABASE: 是否禁用数据库，默认为 false，选填
+- TIMEOUT: 请求超时时间，默认为 100 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间，选填。
+- DISABLE_DATABASE: 是否禁用数据库，默认为 false，选填。
+- DB_TYPE: 数据库类型，默认为 sqlite，选填。支持 sqlite 和 postgres。
+
+当 DB_TYPE 为 postgres 时，需要设置以下环境变量：
+
+- DB_USER: 数据库用户名，默认为 postgres，选填。
+- DB_PASSWORD: 数据库密码，默认为 mysecretpassword，选填。
+- DB_HOST: 数据库主机，默认为 localhost，选填。
+- DB_PORT: 数据库端口，默认为 5432，选填。
+- DB_NAME: 数据库名称，默为 postgres，选填。
 
 ## Koyeb 远程部署
 
