@@ -1,24 +1,37 @@
+import os
+import json
 import httpx
+import string
 import secrets
 from time import time
-from contextlib import asynccontextmanager
-from starlette.middleware.base import BaseHTTPMiddleware
-
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks
-from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
-from starlette.responses import StreamingResponse as StarletteStreamingResponse
+from urllib.parse import urlparse
+from collections import defaultdict
 from pydantic import ValidationError
+from contextlib import asynccontextmanager
+from typing import Dict, Union, Optional, List, Any
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import StreamingResponse as StarletteStreamingResponse
 
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
+from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks
 
 from core.log_config import logger
-from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream
+from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
+from core.utils import (
+    get_proxy,
+    get_engine,
+    parse_rate_limit,
+    circular_list_encoder,
+    ThreadSafeCircularList,
+    provider_api_circular_list,
+)
+
 from utils import (
     safe_get,
     load_config,
@@ -29,22 +42,6 @@ from utils import (
     error_handling_wrapper,
 )
 
-from core.utils import (
-    get_proxy,
-    get_engine,
-    parse_rate_limit,
-    circular_list_encoder,
-    ThreadSafeCircularList,
-    provider_api_circular_list,
-)
-
-from collections import defaultdict
-from typing import Dict, Union, Optional, List, Any
-from urllib.parse import urlparse
-
-import os
-import string
-import json
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
 is_debug = bool(os.getenv("DEBUG", False))
@@ -71,20 +68,21 @@ async def create_tables():
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # 检查并添加缺失的列
-        def check_and_add_columns(connection):
-            inspector = inspect(connection)
-            for table in [RequestStat, ChannelStat]:
-                table_name = table.__tablename__
-                existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
+        # 检查并添加缺失的列 - 此简易迁移仅针对 SQLite
+        if os.getenv("DB_TYPE", "sqlite").lower() == "sqlite":
+            def check_and_add_columns(connection):
+                inspector = inspect(connection)
+                for table in [RequestStat, ChannelStat]:
+                    table_name = table.__tablename__
+                    existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
 
-                for column_name, column in table.__table__.columns.items():
-                    if column_name not in existing_columns:
-                        col_type = _map_sa_type_to_sql_type(column.type)
-                        default = _get_default_sql(column.default)
-                        connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {col_type}{default}"))
+                    for column_name, column in table.__table__.columns.items():
+                        if column_name not in existing_columns:
+                            col_type = _map_sa_type_to_sql_type(column.type)
+                            default = _get_default_sql(column.default)
+                            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {col_type}{default}"))
 
-        await conn.run_sync(check_and_add_columns)
+            await conn.run_sync(check_and_add_columns)
 
 def _map_sa_type_to_sql_type(sa_type):
     type_map = {
@@ -423,57 +421,71 @@ class ChannelStat(Base):
 
 
 if not DISABLE_DATABASE:
-    # 获取数据库路径
-    db_path = os.getenv('DB_PATH', './data/stats.db')
+    DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
+    logger.info(f"Using {DB_TYPE} database.")
 
-    # 确保 data 目录存在
-    data_dir = os.path.dirname(db_path)
-    os.makedirs(data_dir, exist_ok=True)
-
-    # 创建异步引擎和会话
-    # db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=False)
-    db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
-    async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
-
-    # 为 SQLite 设置 WAL 模式和 busy_timeout
-    # 对于 aiosqlite 驱动的异步引擎，事件通常绑定到其 .sync_engine
-    @event.listens_for(db_engine.sync_engine, "connect")
-    def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):
-        """为每个 SQLite 连接开启 WAL 模式并设置 busy_timeout"""
-        # dbapi_connection 在这里是 aiosqlite 的同步连接对象
-        # 或者更准确地说，是 SQLAlchemy 包装过的底层 DBAPI 连接
-        # 执行 PRAGMA 语句
-        # 对于 aiosqlite, PRAGMA 是通过 execute 执行的
-        # 在 SQLAlchemy 的事件回调中，我们通常能直接操作 dbapi_connection
-        cursor = None
+    if DB_TYPE == "postgres":
+        # PostgreSQL-specific setup
         try:
-            # 在 SQLAlchemy 1.x/2.x 中，dbapi_connection 可能是原始的 DBAPI 连接，也可能是包装过的。
-            # 对于 aiosqlite，它本身是异步的，但 SQLAlchemy 的连接事件通常会处理好这一点。
-            # 我们假设这里可以同步执行 PRAGMA。
-            # 如果直接在 dbapi_connection 上调用 execute 方法（某些DBAPI驱动支持）
-            # 或者获取一个 cursor 来执行。
-            cursor = dbapi_connection.cursor()
-            # logger.info("Setting PRAGMA journal_mode=WAL and busy_timeout=5000 for new SQLite connection.")
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA busy_timeout = 5000;") # 5000毫秒 = 5秒
-            # 可选：可以稍微放宽同步等级以提高性能，尤其是在 WAL 模式下
-            # cursor.execute("PRAGMA synchronous = NORMAL;")
-            # cursor.execute("PRAGMA temp_store = MEMORY;")
-            # cursor.execute("PRAGMA mmap_size = 30000000000;") # 谨慎使用，根据系统内存调整
-            # cursor.execute("PRAGMA page_size = 32768;") # 谨慎使用
-        except Exception as e:
-            logger.error(f"Failed to set PRAGMA for SQLite: {e}")
-        finally:
-            if cursor:
-                cursor.close()
+            import asyncpg
+        except ImportError:
+            raise ImportError("asyncpg is not installed. Please install it with 'pip install asyncpg' to use PostgreSQL.")
+
+        DB_USER = os.getenv("DB_USER", "postgres")
+        DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
+        DB_HOST = os.getenv("DB_HOST", "localhost")
+        DB_PORT = os.getenv("DB_PORT", "5432")
+        DB_NAME = os.getenv("DB_NAME", "postgres")
+
+        db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        db_engine = create_async_engine(db_url, echo=is_debug)
+
+    elif DB_TYPE == "sqlite":
+        # SQLite-specific setup
+        # 获取数据库路径
+        db_path = os.getenv('DB_PATH', './data/stats.db')
+
+        # 确保 data 目录存在
+        data_dir = os.path.dirname(db_path)
+        os.makedirs(data_dir, exist_ok=True)
+
+        # 创建异步引擎
+        db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
+
+        # 为 SQLite 设置 WAL 模式和 busy_timeout
+        @event.listens_for(db_engine.sync_engine, "connect")
+        def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):
+            """为每个 SQLite 连接开启 WAL 模式并设置 busy_timeout"""
+            cursor = None
+            try:
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                cursor.execute("PRAGMA busy_timeout = 5000;") # 5000毫秒 = 5秒
+            except Exception as e:
+                logger.error(f"Failed to set PRAGMA for SQLite: {e}")
+            finally:
+                if cursor:
+                    cursor.close()
+    else:
+        raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite' or 'postgres'.")
+
+    # 创建会话 Session
+    async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
 
 from starlette.types import Scope, Receive, Send
 from starlette.responses import Response
 
 from asyncio import Semaphore
 
-# 创建一个信号量来控制数据库访问
-db_semaphore = Semaphore(1)  # 限制同时只有1个写入操作
+# 根据数据库类型，动态创建信号量
+# SQLite 需要严格的串行写入，而 PostgreSQL 可以处理高并发
+if os.getenv("DB_TYPE", "sqlite").lower() == 'sqlite':
+    db_semaphore = Semaphore(1)
+    logger.info("Database semaphore configured for SQLite (1 concurrent writer).")
+else: # For postgres
+    # 允许50个并发写入操作，这对于PostgreSQL来说是合理的
+    db_semaphore = Semaphore(50)
+    logger.info("Database semaphore configured for PostgreSQL (50 concurrent writers).")
 
 async def update_stats(current_info):
     if DISABLE_DATABASE:

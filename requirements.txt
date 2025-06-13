@@ -2,6 +2,7 @@ pytest
 pillow
 uvicorn
 fastapi
+asyncpg
 aiofiles
 greenlet
 aiosqlite
