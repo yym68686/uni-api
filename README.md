@@ -170,6 +170,15 @@ providers:
           include_usage: true # Force the request to add "stream_options": {"include_usage": true} parameter
       cooldown_period: 0 # When cooldown_period is set to 0, the cooling mechanism is not enabled, the priority is higher than the global configuration cooldown_period.
 
+  - provider: databricks
+    base_url: https://xxx.azuredatabricks.net
+    api:
+      - xxx
+    model:
+      - databricks-claude-sonnet-4: claude-sonnet-4
+      - databricks-claude-opus-4: claude-opus-4
+      - databricks-claude-3-7-sonnet: claude-3-7-sonnet
+
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
     aws_access_key: xxxxxxxx

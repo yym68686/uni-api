@@ -170,6 +170,15 @@ providers:
           include_usage: true # 强制在请求中添加 "stream_options": {"include_usage": true} 参数
       cooldown_period: 0 # 当 cooldown_period 设置为 0 时，表示该渠道不启用冷却机制，优先级高于全局配置的 cooldown_period。
 
+  - provider: databricks
+    base_url: https://xxx.azuredatabricks.net
+    api:
+      - xxx
+    model:
+      - databricks-claude-sonnet-4: claude-sonnet-4
+      - databricks-claude-opus-4: claude-opus-4
+      - databricks-claude-3-7-sonnet: claude-3-7-sonnet
+
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
     aws_access_key: xxxxxxxx
