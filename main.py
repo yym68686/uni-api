@@ -606,43 +606,32 @@ class LoggingStreamingResponse(Response):
             await update_stats(self.current_info)
 
     async def _logging_iterator(self):
-        try:
-            async for chunk in self.body_iterator:
-                if isinstance(chunk, str):
-                    chunk = chunk.encode('utf-8')
-                if self.current_info.get("endpoint") == "/v1/audio/speech":
-                    yield chunk
-                    continue
-                line = chunk.decode('utf-8')
-                if is_debug:
-                    logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
-                if line.startswith("data:"):
-                    line = line.lstrip("data: ")
-                if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(": "):
-                    try:
-                        resp: dict = json.loads(line)
-                        input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
-                        input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
-                        output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
-                        total_tokens = input_tokens + output_tokens
-
-                        self.current_info["prompt_tokens"] = input_tokens
-                        self.current_info["completion_tokens"] = output_tokens
-                        self.current_info["total_tokens"] = total_tokens
-                    except Exception as e:
-                        logger.error(f"Error parsing response: {str(e)}, line: {repr(line)}")
-                        continue
+        async for chunk in self.body_iterator:
+            if isinstance(chunk, str):
+                chunk = chunk.encode('utf-8')
+            if self.current_info.get("endpoint") == "/v1/audio/speech":
                 yield chunk
-        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError) as e:
-            # 网络相关异常，记录并重新抛出
-            logger.error(f"Network error in _logging_iterator: {type(e).__name__}: {str(e)}")
-            raise
-        except Exception as e:
-            # 其他异常也记录并重新抛出
-            logger.error(f"Unexpected error in _logging_iterator: {type(e).__name__}: {str(e)}")
-            raise
-        finally:
-            logger.debug("_logging_iterator finished")
+                continue
+            line = chunk.decode('utf-8')
+            if is_debug:
+                logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
+            if line.startswith("data:"):
+                line = line.lstrip("data: ")
+            if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(": "):
+                try:
+                    resp: dict = json.loads(line)
+                    input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
+                    input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
+                    output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
+                    total_tokens = input_tokens + output_tokens
+
+                    self.current_info["prompt_tokens"] = input_tokens
+                    self.current_info["completion_tokens"] = output_tokens
+                    self.current_info["total_tokens"] = total_tokens
+                except Exception as e:
+                    logger.error(f"Error parsing response: {str(e)}, line: {repr(line)}")
+                    continue
+            yield chunk
 
     async def close(self):
         if not self._closed:
