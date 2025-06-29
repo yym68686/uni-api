@@ -95,12 +95,12 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro-exp-05-06
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # 重命名后，原来的模型名字 gemini-2.5-flash-preview-04-17 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
-      - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-exp-05-06: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # 支持以 -think-数字 自定义推理预算，当数字为 0 时，表示关闭推理。
+      - gemini-2.5-pro
+      - gemini-2.5-flash: gemini-2.5-flash # 重命名后，原来的模型名字 gemini-2.5-flash 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
+      - gemini-2.5-flash
+      - gemini-2.5-pro: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。
+      - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
+      - gemini-2.5-flash: gemini-2.5-flash-think-0 # 支持以 -think-数字 自定义推理预算，当数字为 0 时，表示关闭推理。
     tools: true
     preferences:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day
@@ -131,9 +131,9 @@ providers:
     private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # 描述： Google Cloud Vertex AI服务账号的私钥。格式： 一个 JSON 格式的字符串，包含服务账号的私钥信息。获取方式： 在 Google Cloud Console 中创建服务账号，生成JSON格式的密钥文件，然后将其内容设置为此环境变量的值。
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # 描述： Google Cloud Vertex AI 服务账号的电子邮件地址。格式： 通常是形如 "service-account-name@project-id.iam.gserviceaccount.com" 的字符串。获取方式： 在创建服务账号时生成，也可以在 Google Cloud Console 的"IAM与管理"部分查看服务账号详情获得。
     model:
-      - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-preview-03-25
-      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。不设置 post_body_parameter_overrides 参数，则无法启用搜索。
+      - gemini-2.5-flash
+      - gemini-2.5-pro
+      - gemini-2.5-pro: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。不设置 post_body_parameter_overrides 参数，则无法启用搜索。
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet

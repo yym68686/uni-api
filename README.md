@@ -95,12 +95,12 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro-exp-05-06
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash-preview-04-17 cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
-      - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-exp-05-06: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
-      - gemini-2.5-flash-preview-04-17: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
+      - gemini-2.5-pro
+      - gemini-2.5-flash: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
+      - gemini-2.5-flash
+      - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
+      - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
+      - gemini-2.5-flash: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
     tools: true
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
@@ -131,9 +131,9 @@ providers:
     private_key: "-----BEGIN PRIVATE KEY-----\nxxxxx\n-----END PRIVATE" # Description: Private key for Google Cloud Vertex AI service account. Format: A JSON formatted string containing the private key information of the service account. How to obtain: Create a service account in Google Cloud Console, generate a JSON formatted key file, and then set its content as the value of this environment variable.
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to obtain: Generated when creating a service account, or you can view the service account details in the "IAM and Admin" section of the Google Cloud Console.
     model:
-      - gemini-2.5-flash-preview-04-17
-      - gemini-2.5-pro-preview-03-25
-      - gemini-2.5-pro-preview-03-25: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
+      - gemini-2.5-flash
+      - gemini-2.5-pro
+      - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
       - claude-3-5-sonnet@20240620: claude-3-5-sonnet
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
