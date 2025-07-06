@@ -1426,6 +1426,7 @@ class ModelRequestHandler:
                     "Unknown error: EndOfStream",
                     "BrokenResourceError",
                     "User location is not supported for the API use",
+                    "'status': 'INVALID_ARGUMENT'",
                     # "Internal Server Error",
                 ]
 
