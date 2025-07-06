@@ -1,0 +1,27 @@
+name: GHCR CI
+permissions: write-all
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: lowercase repository name
+      run: echo "IMAGE_NAME=${GITHUB_REPOSITORY@L}" >> ${GITHUB_ENV}
+      
+    - uses: actions/checkout@v4
+
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag ghcr.io/${{ env.IMAGE_NAME }}:latest
+
+    - name: Push the Docker image
+      run: docker push ghcr.io/${{ env.IMAGE_NAME }}:latest
