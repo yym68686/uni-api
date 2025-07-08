@@ -1464,15 +1464,14 @@ class ModelRequestHandler:
                 # gemini
                 if "exceeds the maximum number of tokens allowed" in error_message:
                     status_code = 413
+                if "'reason': 'API_KEY_INVALID'" in error_message or "API key not valid" in error_message:
+                    status_code = 401
+
 
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()
-                
-                # Add a specific check for API key invalid error to force a retry
-                if status_code == 400 and ("'reason': 'API_KEY_INVALID'" in error_message or "API key not valid" in error_message):
-                    continue
 
                 if auto_retry and (status_code not in [400, 413] or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):
                     continue
