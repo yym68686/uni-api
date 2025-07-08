@@ -1469,6 +1469,11 @@ class ModelRequestHandler:
                 if is_debug:
                     import traceback
                     traceback.print_exc()
+                
+                # Add a specific check for API key invalid error to force a retry
+                if status_code == 400 and ("'reason': 'API_KEY_INVALID'" in error_message or "API key not valid" in error_message):
+                    continue
+
                 if auto_retry and (status_code not in [400, 413] or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):
                     continue
                 else:
