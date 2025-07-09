@@ -1426,6 +1426,7 @@ class ModelRequestHandler:
                     "'status': 'INVALID_ARGUMENT'",
                     "Unable to connect to service",
                     "Connection closed unexpectedly",
+                    "Invalid JSON payload received. Unknown name ",
                     "User location is not supported for the API use",
                     "The model is overloaded. Please try again later.",
                     "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
