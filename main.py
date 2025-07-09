@@ -1419,15 +1419,16 @@ class ModelRequestHandler:
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
                 exclude_error_rate_limit = [
-                    "Unable to connect to service",
-                    "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
-                    "Connection closed unexpectedly",
+                    # "Internal Server Error",
+                    "BrokenResourceError",
                     "Proxy connection timed out",
                     "Unknown error: EndOfStream",
-                    "BrokenResourceError",
-                    "User location is not supported for the API use",
                     "'status': 'INVALID_ARGUMENT'",
-                    # "Internal Server Error",
+                    "Unable to connect to service",
+                    "Connection closed unexpectedly",
+                    "User location is not supported for the API use",
+                    "The model is overloaded. Please try again later.",
+                    "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
                 ]
 
                 channel_id = provider['provider']
