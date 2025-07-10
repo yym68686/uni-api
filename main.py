@@ -1468,6 +1468,8 @@ class ModelRequestHandler:
                     status_code = 413
                 if "'reason': 'API_KEY_INVALID'" in error_message or "API key not valid" in error_message:
                     status_code = 401
+                if "User location is not supported for the API use." in error_message:
+                    status_code = 403
 
 
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
