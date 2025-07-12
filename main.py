@@ -1470,6 +1470,8 @@ class ModelRequestHandler:
                     status_code = 401
                 if "User location is not supported for the API use." in error_message:
                     status_code = 403
+                if "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." in error_message:
+                    status_code = 403
 
 
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
