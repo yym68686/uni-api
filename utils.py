@@ -366,6 +366,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             detail = safe_get(first_item_str, "choices", 0, "error", "message", default=f"{first_item_str}")
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
 
+        if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "finish_reason", default=None) == "PROHIBITED_CONTENT":
+            raise HTTPException(status_code=400, detail=f"PROHIBITED_CONTENT")
+
         if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
             if any(x in str(first_item_str) for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
