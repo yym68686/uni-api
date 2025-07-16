@@ -411,9 +411,12 @@ docker-compose up -d
 Docker build
 
 ```bash
-docker build --no-cache -t uni-api:latest -f Dockerfile --platform linux/amd64 .
-docker tag uni-api:latest yym68686/uni-api:latest
-docker push yym68686/uni-api:latest
+docker buildx build --platform linux/amd64,linux/arm64 -t yym68686/uni-api:latest --push .
+docker pull yym68686/uni-api:latest
+
+# test image
+docker buildx build --platform linux/amd64,linux/arm64 -t yym68686/uni-api:test -f Dockerfile-test --push .
+docker pull yym68686/uni-api:test
 ```
 
 One-Click Restart Docker Image

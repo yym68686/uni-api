@@ -13,5 +13,11 @@ node_modules
 *.db
 .aider*
 .idea
-docker-compose-test.yml
+docker-compose-*.yml
 data/
+*.db-wal
+*.db-shm
+postgres_data/
+uniapi_db/
+alembic/
+alembic.ini
