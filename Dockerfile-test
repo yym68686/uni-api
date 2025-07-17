@@ -1,13 +1,24 @@
 FROM python:3.10.13 AS builder
 COPY ./requirements.txt /home
 RUN pip install -r /home/requirements.txt
-RUN pip install viztracer orjson
 
-FROM python:3.10.13-slim-bookworm
+FROM python:3.10.13-slim-bullseye
 EXPOSE 8000
 WORKDIR /home
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . /home
+ENTRYPOINT ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-ENTRYPOINT ["viztracer", "-o", "/home/data/result.json", "--pid_suffix", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# FROM python:3.10.13 AS builder
+# COPY ./requirements.txt /home
+# RUN pip install -r /home/requirements.txt
+# RUN pip install viztracer orjson
+
+# FROM python:3.10.13-slim-bookworm
+# EXPOSE 8000
+# WORKDIR /home
+# COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+# COPY --from=builder /usr/local/bin /usr/local/bin
+# COPY . /home
+
+# ENTRYPOINT ["viztracer", "-o", "/home/data/result.json", "--pid_suffix", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

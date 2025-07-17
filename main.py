@@ -383,8 +383,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean, Text
 from sqlalchemy.sql import func
-from sqlalchemy import event # ADDED
-from sqlalchemy.engine import Engine as SQLAlchemyEngine # ADDED for type hinting in event listener
+from sqlalchemy import event
 
 # 定义数据库模型
 Base = declarative_base()
@@ -397,27 +396,27 @@ class RequestStat(Base):
     client_ip = Column(String)
     process_time = Column(Float)
     first_response_time = Column(Float)
-    provider = Column(String)
-    model = Column(String)
+    provider = Column(String, index=True)
+    model = Column(String, index=True)
     # success = Column(Boolean, default=False)
-    api_key = Column(String)
+    api_key = Column(String, index=True)
     is_flagged = Column(Boolean, default=False)
     text = Column(Text)
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
     # cost = Column(Float, default=0)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 class ChannelStat(Base):
     __tablename__ = 'channel_stats'
     id = Column(Integer, primary_key=True)
     request_id = Column(String)
-    provider = Column(String)
-    model = Column(String)
+    provider = Column(String, index=True)
+    model = Column(String, index=True)
     api_key = Column(String)
     success = Column(Boolean, default=False)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 if not DISABLE_DATABASE:
