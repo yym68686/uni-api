@@ -498,6 +498,12 @@ async def update_stats(current_info):
                     try:
                         columns = [column.key for column in RequestStat.__table__.columns]
                         filtered_info = {k: v for k, v in current_info.items() if k in columns}
+
+                        # 清洗字符串中的 NUL 字符，防止 PostgreSQL 报错
+                        for key, value in filtered_info.items():
+                            if isinstance(value, str):
+                                filtered_info[key] = value.replace('\x00', '')
+
                         new_request_stat = RequestStat(**filtered_info)
                         session.add(new_request_stat)
                         await session.commit()
