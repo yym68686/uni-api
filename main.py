@@ -622,7 +622,7 @@ class LoggingStreamingResponse(Response):
                 logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
             if line.startswith("data:"):
                 line = line.lstrip("data: ")
-            if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(": "):
+            if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(":"):
                 try:
                     resp: dict = json.loads(line)
                     input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
