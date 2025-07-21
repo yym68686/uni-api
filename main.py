@@ -1468,6 +1468,8 @@ class ModelRequestHandler:
                     status_code = 413
                 if "Please reduce the length of the messages or completion" in error_message:
                     status_code = 413
+                if "Request contains text fields that are too large." in error_message:
+                    status_code = 413
                 # gemini
                 if "exceeds the maximum number of tokens allowed" in error_message:
                     status_code = 413
