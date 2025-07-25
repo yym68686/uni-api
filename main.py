@@ -614,7 +614,7 @@ class LoggingStreamingResponse(Response):
         async for chunk in self.body_iterator:
             if isinstance(chunk, str):
                 chunk = chunk.encode('utf-8')
-            if self.current_info.get("endpoint") == "/v1/audio/speech":
+            if self.current_info.get("endpoint").endswith("/v1/audio/speech"):
                 yield chunk
                 continue
             line = chunk.decode('utf-8')
