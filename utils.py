@@ -354,6 +354,21 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             except json.JSONDecodeError:
                 logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(first_item_str)}")
                 raise StopAsyncIteration
+
+            # minimax
+            status_code = safe_get(first_item_str, 'base_resp', 'status_code', default=200)
+            if status_code != 200:
+                if status_code == 2013:
+                    status_code = 400
+                detail = safe_get(first_item_str, 'base_resp', 'status_msg', default="no error returned")
+                raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
+
+        # minimax
+        if isinstance(first_item_str, dict) and safe_get(first_item_str, "base_resp", "status_msg", default=None) == "success":
+            full_audio_hex = safe_get(first_item_str, "data", "audio", default=None)
+            audio_bytes = bytes.fromhex(full_audio_hex)
+            return audio_bytes, first_response_time
+
         if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             status_code = first_item_str.get('status_code', 500)
