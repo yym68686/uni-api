@@ -360,6 +360,8 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             if status_code != 200:
                 if status_code == 2013:
                     status_code = 400
+                if status_code == 1008:
+                    status_code = 429
                 detail = safe_get(first_item_str, 'base_resp', 'status_msg', default="no error returned")
                 raise HTTPException(status_code=status_code, detail=f"{detail}"[:300])
 
