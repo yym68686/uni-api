@@ -224,6 +224,7 @@ async def lifespan(app: FastAPI):
             "headers": {
                 "User-Agent": "curl/7.68.0",
                 "Accept": "*/*",
+                "Accept-Encoding": "identity",
             },
             "http2": True,
             "verify": True,
