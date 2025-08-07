@@ -387,6 +387,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "finish_reason", default=None) == "PROHIBITED_CONTENT":
             raise HTTPException(status_code=400, detail=f"PROHIBITED_CONTENT")
 
+        if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "finish_reason", default=None) == "stop":
+            raise StopAsyncIteration
+
         if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
             if any(x in str(first_item_str) for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
@@ -400,13 +403,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         return new_generator(first_item), first_response_time
 
-    # except Exception as e:
-    #     import traceback
-    #     traceback.print_exc()
-    #     raise HTTPException(status_code=500, detail=f"{e}")
-
     except StopAsyncIteration:
-        raise HTTPException(status_code=400, detail="data: {'error': 'No data returned'}")
+        # 502 Bad Gateway 是一个更合适的状态码，因为它表明作为代理或网关的服务器从上游服务器收到了无效的响应。
+        raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
 
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []
