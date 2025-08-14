@@ -189,7 +189,7 @@ async def lifespan(app: FastAPI):
 
         app.state.admin_api_key = []
         for item in app.state.api_keys_db:
-            if "admin" in item.get("role"):
+            if "admin" in item.get("role", ""):
                 app.state.admin_api_key.append(item.get("api"))
         if app.state.admin_api_key == []:
             if len(app.state.api_keys_db) >= 1:
