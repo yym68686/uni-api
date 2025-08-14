@@ -189,7 +189,7 @@ async def lifespan(app: FastAPI):
 
         app.state.admin_api_key = []
         for item in app.state.api_keys_db:
-            if item.get("role") == "admin":
+            if "admin" in item.get("role"):
                 app.state.admin_api_key.append(item.get("api"))
         if app.state.admin_api_key == []:
             if len(app.state.api_keys_db) >= 1:
@@ -1331,8 +1331,6 @@ class ModelRequestHandler:
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
         role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
-        if role == "admin":
-            role = role +  "-" + safe_get(config, 'api_keys', api_index, "api", default="None")[3:5]
 
         index = 0
         if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
@@ -1540,7 +1538,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     #     if token.startswith(api_key['api']):
     if len(api_list) == 1:
         return token
-    if app.state.api_keys_db[api_index].get('role') != "admin":
+    if "admin" not in app.state.api_keys_db[api_index].get('role'):
         raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
