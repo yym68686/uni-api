@@ -1331,6 +1331,8 @@ class ModelRequestHandler:
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
         role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
+        if role == "admin":
+            role = role +  "-" + safe_get(config, 'api_keys', api_index, "api", default="None")[3:5]
 
         index = 0
         if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
