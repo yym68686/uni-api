@@ -869,7 +869,7 @@ async def ensure_config(request: Request, call_next):
                         }
                         # 发送GET请求获取模型列表
                         base_url = "http://127.0.0.1:8000/v1/models"
-                        async with app.state.client_manager.get_client(1, base_url) as client:
+                        async with app.state.client_manager.get_client(base_url) as client:
                             response = await client.get(
                                 base_url,
                                 headers=headers
