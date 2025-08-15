@@ -232,7 +232,7 @@ async def lifespan(app: FastAPI):
         }
 
         # 初始化客户端管理器
-        app.state.client_manager = ClientManager(pool_size=200)
+        app.state.client_manager = ClientManager(pool_size=30)
         await app.state.client_manager.init(default_config)
 
 
