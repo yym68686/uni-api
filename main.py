@@ -1507,7 +1507,7 @@ model_handler = ModelRequestHandler()
 
 security = HTTPBearer()
 
-def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
     token = credentials.credentials
     api_index = None
@@ -1521,7 +1521,7 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     return api_index
 
-def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
     token = credentials.credentials
     api_index = None
@@ -1636,7 +1636,7 @@ async def audio_transcriptions(
         raise HTTPException(status_code=500, detail=f"Error processing audio file: {str(e)}")
 
 @app.get("/v1/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
-def generate_api_key():
+async def generate_api_key():
     # Define the character set (only alphanumeric)
     chars = string.ascii_letters + string.digits
     # Generate a random string of 36 characters
