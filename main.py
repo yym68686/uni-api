@@ -625,7 +625,7 @@ class LoggingStreamingResponse(Response):
                 line = line.lstrip("data: ")
             if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(":"):
                 try:
-                    resp: dict = json.loads(line)
+                    resp: dict = await asyncio.to_thread(json.loads, line)
                     input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
                     input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
                     output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
@@ -733,7 +733,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
         try:
             parsed_body = await parse_request_body(request)
             if parsed_body and not request.url.path.startswith("/v1/api_config"):
-                request_model = UnifiedRequest.model_validate(parsed_body).data
+                request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
+                request_model = request_model.data
                 if is_debug:
                     logger.info("request_model: %s", json.dumps(request_model.model_dump(exclude_unset=True), indent=2, ensure_ascii=False))
                 model = request_model.model
@@ -804,9 +805,10 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
         except ValidationError as e:
             logger.error(f"Invalid request body: {json.dumps(parsed_body, indent=2, ensure_ascii=False)}, errors: {e.errors()}")
+            content = await asyncio.to_thread(jsonable_encoder, {"detail": e.errors()})
             return JSONResponse(
                 status_code=422,
-                content=jsonable_encoder({"detail": e.errors()})
+                content=content
             )
         except Exception as e:
             if is_debug:
@@ -1026,8 +1028,9 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
                 else:
                     first_element = await anext(wrapped_generator)
                     first_element = first_element.lstrip("data: ")
-                    first_element = json.loads(first_element)
-                    response = StarletteStreamingResponse(iter([json.dumps(first_element)]), media_type="application/json")
+                    decoded_element = await asyncio.to_thread(json.loads, first_element)
+                    encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
+                    response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json")
 
             # 更新成功计数和首次响应时间
             background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True)
