@@ -894,16 +894,14 @@ class ClientManager:
         self.default_config = default_config
 
     @asynccontextmanager
-    async def get_client(self, timeout_value, base_url, proxy=None):
+    async def get_client(self, base_url, proxy=None):
         # 直接获取或创建客户端,不使用锁
-        timeout_value = int(timeout_value)
-
         # 从base_url中提取主机名
         parsed_url = urlparse(base_url)
         host = parsed_url.netloc
 
         # 创建唯一的客户端键
-        client_key = f"{host}_{timeout_value}"
+        client_key = f"{host}"
         if proxy:
             # 对代理URL进行规范化处理
             proxy_normalized = proxy.replace('socks5h://', 'socks5://')
@@ -912,7 +910,7 @@ class ClientManager:
         if client_key not in self.clients:
             timeout = httpx.Timeout(
                 connect=15.0,
-                read=timeout_value,
+                read=None,  # 为单个请求设置超时
                 write=30.0,
                 pool=self.pool_size
             )
@@ -979,6 +977,7 @@ def get_preference(preference_config, channel_id, original_request_model, defaul
 
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, background_tasks: BackgroundTasks, endpoint=None, role=None, timeout_value=DEFAULT_TIMEOUT, keepalive_interval=None):
+    timeout_value = int(timeout_value)
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     if provider['provider'].startswith("sk-"):
@@ -1011,13 +1010,13 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     # print("proxy", proxy)
 
     try:
-        async with app.state.client_manager.get_client(timeout_value, url, proxy) as client:
+        async with app.state.client_manager.get_client(url, proxy) as client:
             if request.stream:
-                generator = fetch_response_stream(client, url, headers, payload, engine, original_model)
+                generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             else:
-                generator = fetch_response(client, url, headers, payload, engine, original_model)
+                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval)
 
                 # 处理音频和其他二进制响应
