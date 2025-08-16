@@ -931,10 +931,13 @@ class ClientManager:
         try:
             yield self.clients[client_key]
         except Exception as e:
-            if client_key in self.clients and "429" not in str(e):
-                tmp_client = self.clients[client_key]
-                del self.clients[client_key]  # 先删除引用
-                await tmp_client.aclose()  # 然后关闭客户端
+            # if client_key in self.clients and "429" not in str(e):
+            #     tmp_client = self.clients[client_key]
+            #     del self.clients[client_key]  # 先删除引用
+            #     await tmp_client.aclose()  # 然后关闭客户端
+            # 仅在客户端主动关闭等严重错误时才考虑重建，暂时只将异常抛出
+            # httpx的连接池会自动处理单个连接的失败
+            logger.warning(f"Exception with client {client_key}: {type(e).__name__}: {e}")
             raise e
 
     async def close(self):
