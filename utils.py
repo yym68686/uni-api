@@ -351,7 +351,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 logger.error(f"provider: {channel_id:<11} error const string: %s", encode_first_item_str)
                 raise StopAsyncIteration
             try:
-                first_item_str = json.loads(first_item_str)
+                first_item_str = await asyncio.to_thread(json.loads, first_item_str)
             except json.JSONDecodeError:
                 logger.error(f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(first_item_str)}")
                 raise StopAsyncIteration
