@@ -101,6 +101,8 @@ providers:
       - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
       - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
       - gemini-2.5-flash: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
+      - gemini-embedding-001
+      - text-embedding-004
     tools: true
     preferences:
       api_key_rate_limit: 15/min # Each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
@@ -138,6 +140,8 @@ providers:
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
+      - gemini-embedding-001
+      - text-embedding-004
     tools: true
     notes: https://xxxxx.com/ # You can put the provider's website, notes, official documentation, optional
     preferences:

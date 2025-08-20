@@ -101,6 +101,8 @@ providers:
       - gemini-2.5-pro: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。
       - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
       - gemini-2.5-flash: gemini-2.5-flash-think-0 # 支持以 -think-数字 自定义推理预算，当数字为 0 时，表示关闭推理。
+      - gemini-embedding-001
+      - text-embedding-004
     tools: true
     preferences:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day
@@ -138,6 +140,8 @@ providers:
       - claude-3-opus@20240229: claude-3-opus
       - claude-3-sonnet@20240229: claude-3-sonnet
       - claude-3-haiku@20240307: claude-3-haiku
+      - gemini-embedding-001
+      - text-embedding-004
     tools: true
     notes: https://xxxxx.com/ # 可以放服务商的网址，备注信息，官方文档，选填
     preferences:
