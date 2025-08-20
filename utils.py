@@ -216,13 +216,14 @@ async def load_config(app=None):
             config, api_keys_db, api_list = {}, {}, []
     return config, api_keys_db, api_list
 
-def ensure_string(item):
+async def ensure_string(item):
     if isinstance(item, (bytes, bytearray)):
         return item.decode("utf-8")
     elif isinstance(item, str):
         return item
     elif isinstance(item, dict):
-        return f"data: {json.dumps(item)}\n\n"
+        json_str = await asyncio.to_thread(json.dumps, item)
+        return f"data: {json_str}\n\n"
     else:
         return str(item)
 
@@ -306,7 +307,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             # 原始的逻辑，当不需要心跳时
             try:
                 async for item in generator:
-                    yield ensure_string(item)
+                    yield await ensure_string(item)
             except asyncio.CancelledError:
                 # 客户端断开连接是正常行为，不需要记录错误日志
                 logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
