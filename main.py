@@ -339,7 +339,10 @@ request_info = contextvars.ContextVar('request_info', default={})
 async def parse_request_body(request: Request):
     if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
         try:
-            return await request.json()
+            body_bytes = await request.body()
+            if not body_bytes:
+                return None
+            return await asyncio.to_thread(json.loads, body_bytes)
         except json.JSONDecodeError:
             return None
     return None
