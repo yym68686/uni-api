@@ -279,7 +279,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         # print("type(first_item)", type(first_item))
         # print("first_item", ensure_string(first_item))
         if first_item:
-            yield ensure_string(first_item)
+            yield await ensure_string(first_item)
 
         # 如果需要心跳机制但不使用嵌套生成器方式
         if with_keepalive:
@@ -290,7 +290,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                     if status == "timeout":
                         yield f": keepalive\n\n"
                     else:
-                        yield ensure_string(item)
+                        yield await ensure_string(item)
                         wait_task = None
                 except asyncio.CancelledError:
                     # 处理客户端断开连接
