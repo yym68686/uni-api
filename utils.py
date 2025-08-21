@@ -49,7 +49,7 @@ def save_api_yaml(config_data):
     with open(API_YAML_PATH, "w", encoding="utf-8") as f:
         yaml.dump(config_data, f)
 
-def update_config(config_data, use_config_url=False):
+async def update_config(config_data, use_config_url=False):
     for index, provider in enumerate(config_data['providers']):
         if provider.get('project_id'):
             if "google-vertex-ai" not in provider.get("base_url", ""):
@@ -89,7 +89,7 @@ def update_config(config_data, use_config_url=False):
             ]
 
         if not provider.get("model"):
-            model_list = update_initial_model(provider)
+            model_list = await update_initial_model(provider)
             if model_list:
                 provider["model"] = model_list
                 if not use_config_url:
@@ -156,7 +156,7 @@ async def load_config(app=None):
             conf = yaml.load(file)
 
         if conf:
-            config, api_keys_db, api_list = update_config(conf, use_config_url=False)
+            config, api_keys_db, api_list = await update_config(conf, use_config_url=False)
         else:
             logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
             config, api_keys_db, api_list = {}, {}, []
@@ -207,7 +207,7 @@ async def load_config(app=None):
             # 更新配置
             # logger.info(config_data)
             if config_data:
-                config, api_keys_db, api_list = update_config(config_data, use_config_url=True)
+                config, api_keys_db, api_list = await update_config(config_data, use_config_url=True)
             else:
                 logger.error(f"Error fetching or parsing config from {config_url}")
                 config, api_keys_db, api_list = {}, {}, []
