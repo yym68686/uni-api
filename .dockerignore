@@ -31,3 +31,4 @@ Dockerfile
 Dockerfile.debug
 *.md
 *.toml
+!pyproject.toml

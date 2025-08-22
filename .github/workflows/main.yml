@@ -11,7 +11,7 @@ on:
       - core
       - Dockerfile
       - .dockerignore
-      - requirements.txt
+      - pyproject.toml
       - docker-compose.yml
       - .github/workflows/main.yml
       - .gitmodules

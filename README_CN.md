@@ -342,7 +342,7 @@ cd uni-api
 python -m venv uni-api
 source uni-api/bin/activate
 pip install --upgrade pip
-cpuset -l 0 pip install -vv -r requirements.txt
+cpuset -l 0 pip install -vv -r pyproject.toml
 ```
 
 从开始安装到安装完成需要等待10分钟，安装完成后执行下面的命令：
@@ -450,7 +450,7 @@ pex linux 打包：
 
 ```bash
 VERSION=$(cat VERSION)
-pex -D . -r requirements.txt \
+pex -D . -r pyproject.toml \
     -c uvicorn \
     --inject-args 'main:app --host 0.0.0.0 --port 8000' \
     --platform linux_x86_64-cp-3.10.12-cp310 \
@@ -463,7 +463,7 @@ macos 打包：
 
 ```bash
 VERSION=$(cat VERSION)
-pex -r requirements.txt \
+pex -r pyproject.toml \
     -c uvicorn \
     --inject-args 'main:app --host 0.0.0.0 --port 8000' \
     -o uni-api-macos-arm64-${VERSION}.pex

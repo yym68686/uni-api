@@ -31,8 +31,23 @@ jobs:
       - name: Install pex
         run: pip install pex
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies with uv
+        run: uv pip install -r pyproject.toml
+        env:
+          UV_SYSTEM_PYTHON: 1
 
       - name: Get Version
         id: get_version
@@ -41,7 +56,7 @@ jobs:
       - name: Build Linux PEX
         if: matrix.platform == 'linux'
         run: |
-          pex -D . -r requirements.txt \
+          pex -D . -r pyproject.toml \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
           --platform linux_x86_64-cp-3.10.12-cp310 \
@@ -52,7 +67,7 @@ jobs:
       - name: Build MacOS PEX
         if: matrix.platform == 'macos'
         run: |
-          pex -r requirements.txt \
+          pex -r pyproject.toml \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
           -o uni-api-macos-arm64-${VERSION}.pex

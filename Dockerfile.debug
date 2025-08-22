@@ -1,24 +1,31 @@
-FROM ubuntu:22.04 AS base
+# Finale Strategie: Verwendung der gleichen funktionierenden Basis-Images wie für die Produktion
+# Stufe 1: Builder - Installiert Abhängigkeiten in die globalen Site-Packages
+FROM python:3.11 AS builder
+
+# uv installieren
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /home
+COPY pyproject.toml uv.lock ./
+RUN uv pip install -r pyproject.toml --system --no-cache
+
+# Stufe 2: Finales Debug-Image
+FROM python:3.11-slim-bullseye
+
+# Installiert NUR die zusätzlichen Debug-Tools
 ENV DEBIAN_FRONTEND=noninteractive
-ENV LC_ALL=C.UTF-8
-ENV LANG=C.UTF-8
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3-pip \
-    python3.10-dbg \
-    gdb && \
+    apt-get install -y --no-install-recommends gdb python3-dbg && \
     rm -rf /var/lib/apt/lists/*
 
-FROM base AS builder
-WORKDIR /home
-COPY ./requirements.txt /home/
-RUN pip3 install --no-cache-dir -r requirements.txt
-
-FROM base
-WORKDIR /home
-COPY --from=builder /usr/local/lib/python3.10/dist-packages /usr/local/lib/python3.10/dist-packages
-COPY . /home/
-
 EXPOSE 8000
-ENTRYPOINT ["python3.10", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+WORKDIR /home
+
+# Kopiert die installierten Pakete aus dem Builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+
+# Kopiert den Anwendungscode
+COPY . .
+
+# Definiert den Entrypoint
+ENTRYPOINT ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
