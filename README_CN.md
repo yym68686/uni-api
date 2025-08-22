@@ -419,7 +419,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t yym68686/uni-api:lates
 docker pull yym68686/uni-api:latest
 
 # test image
-docker buildx build --platform linux/amd64,linux/arm64 -t yym68686/uni-api:test -f Dockerfile-test --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t yym68686/uni-api:test -f Dockerfile.debug --push .
 docker pull yym68686/uni-api:test
 ```
 

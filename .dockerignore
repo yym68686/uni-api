@@ -28,6 +28,6 @@ test/
 .gitignore
 docker-compose.yml
 Dockerfile
-Dockerfile-test
+Dockerfile.debug
 *.md
 *.toml

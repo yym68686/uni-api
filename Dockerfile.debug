@@ -1,0 +1,24 @@
+FROM ubuntu:22.04 AS base
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3.10-dbg \
+    gdb && \
+    rm -rf /var/lib/apt/lists/*
+
+FROM base AS builder
+WORKDIR /home
+COPY ./requirements.txt /home/
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+FROM base
+WORKDIR /home
+COPY --from=builder /usr/local/lib/python3.10/dist-packages /usr/local/lib/python3.10/dist-packages
+COPY . /home/
+
+EXPOSE 8000
+ENTRYPOINT ["python3.10", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
