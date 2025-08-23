@@ -1045,7 +1045,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
             current_info["provider"] = channel_id
             return response
 
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
         background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False)
         raise e
 
@@ -1406,7 +1406,7 @@ class ModelRequestHandler:
             try:
                 response = await process_request(request_data, provider, background_tasks, endpoint, role, local_timeout_value, keepalive_interval)
                 return response
-            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
 
                 # 根据异常类型设置状态码和错误消息
                 if isinstance(e, httpx.ReadTimeout):
@@ -1422,6 +1422,9 @@ class ModelRequestHandler:
                 elif isinstance(e, httpx.RemoteProtocolError):
                     status_code = 502  # Bad Gateway
                     error_message = "Remote protocol error"
+                elif isinstance(e, httpx.LocalProtocolError):
+                    status_code = 502  # Bad Gateway
+                    error_message = "Local protocol error"
                 elif isinstance(e, asyncio.CancelledError):
                     status_code = 499  # Client Closed Request
                     error_message = "Request was cancelled"
