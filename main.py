@@ -26,6 +26,7 @@ from core.models import RequestModel, ImageGenerationRequest, AudioTranscription
 from core.utils import (
     get_proxy,
     get_engine,
+    get_model_dict,
     parse_rate_limit,
     circular_list_encoder,
     ThreadSafeCircularList,
@@ -1220,7 +1221,7 @@ async def get_matching_providers(request_model, config, api_index):
     # print("provider_list", provider_list)
     return provider_list
 
-async def get_right_order_providers(request_model, config, api_index, scheduling_algorithm):
+async def get_right_order_providers(request_model, config, api_index, scheduling_algorithm, request_total_tokens=None):
     matching_providers = await get_matching_providers(request_model, config, api_index)
 
     # # 检查是否所有key都被速率限制
@@ -1242,6 +1243,30 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
 
     # # 使用筛选后的provider列表替换原始列表
     # matching_providers = available_providers
+
+    # 筛查是否该请求token数量超过渠道tpr
+    if request_total_tokens and matching_providers:
+        available_providers = []
+        for provider in matching_providers:
+            model_dict = get_model_dict(provider)
+            original_model = model_dict[request_model]
+            provider_name = provider['provider']
+            if provider_name.startswith("sk-") and provider_name in app.state.api_list:
+                # Local API keys are added directly as their limits are handled elsewhere
+                available_providers.append(provider)
+                continue
+
+            # First, check TPR limit
+            is_tpr_exceeded = await provider_api_circular_list[provider_name].is_tpr_exceeded(original_model, tokens=request_total_tokens)
+            if is_tpr_exceeded:
+                # logger.warning(f"Provider {provider_name} for model {request_model} is rate limited by TPR.")
+                continue
+            available_providers.append(provider)
+
+        matching_providers = available_providers
+
+        if not matching_providers:
+            raise HTTPException(status_code=413, detail=f"The request body is too long, No available providers at the moment: {request_model}")
 
     # for provider in matching_providers:
     #     print(provider['provider'])
@@ -1325,7 +1350,15 @@ class ModelRequestHandler:
 
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
 
-        matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
+        request_total_tokens = 0
+        if request_data and isinstance(request_data, RequestModel):
+            for message in request_data.messages:
+                if message.content and isinstance(message.content, str):
+                    request_total_tokens += len(message.content)
+        request_total_tokens = int(request_total_tokens / 4)
+        # print("request_total_tokens", request_total_tokens)
+
+        matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm, request_total_tokens=request_total_tokens)
         num_matching_providers = len(matching_providers)
 
         status_code = 500
@@ -1380,7 +1413,7 @@ class ModelRequestHandler:
             if provider_name.startswith("sk-") and provider_name in app.state.api_list:
                 local_provider_api_index = app.state.api_list.index(provider_name)
                 local_provider_scheduling_algorithm = safe_get(config, 'api_keys', local_provider_api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-                local_provider_matching_providers = await get_right_order_providers(request_model_name, config, local_provider_api_index, local_provider_scheduling_algorithm)
+                local_provider_matching_providers = await get_right_order_providers(request_model_name, config, local_provider_api_index, local_provider_scheduling_algorithm, request_total_tokens=request_total_tokens)
                 local_timeout_value = 0
                 for local_provider in local_provider_matching_providers:
                     local_provider_name = local_provider['provider']
@@ -1456,7 +1489,7 @@ class ModelRequestHandler:
                     # 获取源模型名称（实际配置的模型名）
                     # source_model = list(provider['model'][0].keys())[0]
                     await app.state.channel_manager.exclude_model(channel_id, request_model_name)
-                    matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
+                    matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm, request_total_tokens=request_total_tokens)
                     last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
                     if num_matching_providers != last_num_matching_providers:
