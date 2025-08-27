@@ -108,7 +108,7 @@ providers:
       api_key_rate_limit: 15/min # 每个 API Key 每分钟最多请求次数，选填。默认为 999999/min。支持多个频率约束条件：15/min,10/day
       # api_key_rate_limit: # 可以为每个模型设置不同的频率限制
       #   gemini-2.5-flash: 10/min,500/day
-      #   gemini-2.5-pro: 5/min,25/day
+      #   gemini-2.5-pro: 5/min,25/day,1048576/tpr # 1048576/tpr 表示每次请求的 tokens 数量限制为 1048576 个 tokens
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
       api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。
