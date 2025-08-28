@@ -389,7 +389,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         if isinstance(first_item_str, dict) and finish_reason == "PROHIBITED_CONTENT":
             raise HTTPException(status_code=400, detail=f"PROHIBITED_CONTENT")
 
-        if isinstance(first_item_str, dict) and finish_reason == "stop" and not safe_get(first_item_str, "choices", 0, "message", "content", default=None):
+        if isinstance(first_item_str, dict) and finish_reason == "stop" and \
+        not safe_get(first_item_str, "choices", 0, "message", "content", default=None) and \
+        not safe_get(first_item_str, "choices", 0, "delta", "content", default=None):
             raise StopAsyncIteration
 
         if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
