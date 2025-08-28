@@ -1527,6 +1527,8 @@ class ModelRequestHandler:
                     status_code = 403
                 if "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." in error_message:
                     status_code = 403
+                if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
+                    status_code = 429
 
 
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
