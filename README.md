@@ -149,6 +149,12 @@ providers:
         gemini-2.5-pro-search: # Add custom request body parameters to the model gemini-2.5-pro-search
           tools:
             - google_search: {} # Add google_search tool to the model gemini-2.5-pro-search
+        gemini-2.5-flash:
+          generationConfig:
+            thinkingConfig:
+              includeThoughts: True
+              thinkingBudget: 24576
+            maxOutputTokens: 65535
         gemini-2.5-flash-search:
           tools:
             - google_search: {}

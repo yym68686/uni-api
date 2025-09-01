@@ -149,6 +149,12 @@ providers:
         gemini-2.5-pro-search: # 给模型 gemini-2.5-pro-search 添加自定义请求体参数
           tools:
             - google_search: {} # 给模型 gemini-2.5-pro-search 添加 google_search 工具
+        gemini-2.5-flash:
+          generationConfig:
+            thinkingConfig:
+              includeThoughts: True
+              thinkingBudget: 24576
+            maxOutputTokens: 65535
         gemini-2.5-flash-search:
           tools:
             - google_search: {}
