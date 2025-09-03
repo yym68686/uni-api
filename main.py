@@ -1521,7 +1521,9 @@ class ModelRequestHandler:
                 # gemini
                 if "exceeds the maximum number of tokens allowed" in error_message:
                     status_code = 413
-                if "'reason': 'API_KEY_INVALID'" in error_message or "API key not valid" in error_message:
+                if "'reason': 'API_KEY_INVALID'" in error_message or \
+                "API key not valid" in error_message or \
+                "API key expired" in error_message:
                     status_code = 401
                 if "User location is not supported for the API use." in error_message:
                     status_code = 403
