@@ -47,21 +47,16 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.PACK_TOKEN }}
 
-    - name: Get current version
-      id: get_version
-      run: |
-        VERSION=$(cat VERSION || echo "0.0.0")
-        echo "Current version: $VERSION"
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-    - name: Bump version
+    - name: Get and Bump Version
       id: bump_version
       run: |
-        IFS='.' read -ra VERSION_PARTS <<< "${{ steps.get_version.outputs.version }}"
+        VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+        echo "Current version: $VERSION"
+        IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
         PATCH=$((VERSION_PARTS[2] + 1))
         NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
-        echo $NEW_VERSION > VERSION
         echo "New version: $NEW_VERSION"
+        sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
         echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
     - name: Commit version bump
@@ -70,7 +65,7 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add VERSION
+        git add pyproject.toml
         git commit -m "📖 Bump version to ${{ steps.bump_version.outputs.new_version }}"
         git push
 

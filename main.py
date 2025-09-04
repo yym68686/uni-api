@@ -55,11 +55,13 @@ from sqlalchemy.sql import sqltypes
 DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
-# 读取VERSION文件内容
+# 从 pyproject.toml 读取版本号
+import tomllib
 try:
-    with open('VERSION', 'r') as f:
-        VERSION = f.read().strip()
-except:
+    with open('pyproject.toml', 'rb') as f:
+        data = tomllib.load(f)
+        VERSION = data['project']['version']
+except Exception:
     VERSION = 'unknown'
 logger.info("VERSION: %s", VERSION)
 
