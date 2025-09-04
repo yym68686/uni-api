@@ -1005,6 +1005,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if engine != "moderation":
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
 
+    last_message_role = safe_get(request.messages, -1, "role", default=None)
     url, headers, payload = await get_payload(request, engine, provider, api_key)
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if is_debug:
@@ -1022,11 +1023,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         async with app.state.client_manager.get_client(url, proxy) as client:
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             else:
                 generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
 
                 # 处理音频和其他二进制响应
                 if endpoint == "/v1/audio/speech":

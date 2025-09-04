@@ -273,7 +273,7 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
 
 import asyncio
 import time as time_module
-async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None):
+async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None, last_message_role=None):
 
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
         # print("type(first_item)", type(first_item))
@@ -391,7 +391,8 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         if isinstance(first_item_str, dict) and finish_reason == "stop" and \
         not safe_get(first_item_str, "choices", 0, "message", "content", default=None) and \
-        not safe_get(first_item_str, "choices", 0, "delta", "content", default=None):
+        not safe_get(first_item_str, "choices", 0, "delta", "content", default=None) and \
+        last_message_role != "assistant":
             raise StopAsyncIteration
 
         if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
