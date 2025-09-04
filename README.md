@@ -218,7 +218,7 @@ providers:
 
 api_keys:
   - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, required for users to use this service
-    model: # Models that can be used by this API Key, required. Default channel-level polling load balancing is enabled, and each request model is requested in sequence according to the model configuration. It is not related to the original channel order in providers. Therefore, you can set different request sequences for each API key.
+    model: # Models that can be used by this API Key, optional. Default channel-level polling load balancing is enabled, and each request model is requested in sequence according to the model configuration. It is not related to the original channel order in providers. Therefore, you can set different request sequences for each API key.
       - gpt-4o # Usable model name, can use all gpt-4o models provided by providers
       - claude-3-5-sonnet # Usable model name, can use all claude-3-5-sonnet models provided by providers
       - gemini/* # Usable model name, can only use all models provided by providers named gemini, where gemini is the provider name, * represents all models
