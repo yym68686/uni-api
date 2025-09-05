@@ -1483,6 +1483,7 @@ class ModelRequestHandler:
                     "User location is not supported for the API use",
                     "The model is overloaded. Please try again later.",
                     "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
+                    "<title>Worker exceeded resource limits",
                 ]
 
                 channel_id = provider['provider']
