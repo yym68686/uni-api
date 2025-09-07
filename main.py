@@ -1531,6 +1531,8 @@ class ModelRequestHandler:
                     status_code = 401
                 if "User location is not supported for the API use." in error_message:
                     status_code = 403
+                if "<center><h1>400 Bad Request</h1></center>" in error_message:
+                    status_code = 502
                 if "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." in error_message:
                     status_code = 403
                 if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
