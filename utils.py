@@ -130,10 +130,20 @@ async def update_config(config_data, use_config_url=False):
                         if model_name in model_dict.keys():
                             weights_dict.update({provider_name + "/" + model_name: int(value)})
                         elif model_name == "*":
-                            weights_dict.update({provider_name + "/" + model_name: int(value) for model_item in model_dict.keys()})
+                            for model_item in model_dict.keys():
+                                weights_dict.update({provider_name + "/" + model_item: int(value)})
 
                     models.append(key)
-                if isinstance(model, str):
+                elif isinstance(model, str):
+                    # 处理字符串格式的模型配置
+                    if model == "all":
+                        # 如果有权重配置，为所有模型设置默认权重1
+                        if weights_dict or any(isinstance(m, dict) for m in api_key.get('model')):
+                            for provider_item in config_data["providers"]:
+                                model_dict = get_model_dict(provider_item)
+                                for model_item in model_dict.keys():
+                                    if f"{provider_item['provider']}/{model_item}" not in weights_dict:
+                                        weights_dict.update({f"{provider_item['provider']}/{model_item}": 1})
                     models.append(model)
             if weights_dict:
                 config_data['api_keys'][index]['weights'] = weights_dict
