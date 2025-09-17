@@ -772,9 +772,6 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 else:
                     logger.error(f"Unknown request type: {request_model.request_type}")
 
-                if moderated_content:
-                    current_info["text"] = moderated_content
-
                 if enable_moderation and moderated_content:
                     background_tasks_for_moderation = BackgroundTasks()
                     moderation_response = await self.moderate_content(moderated_content, api_index, background_tasks_for_moderation)
@@ -785,6 +782,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                         process_time = time() - start_time
                         current_info["process_time"] = process_time
                         current_info["is_flagged"] = is_flagged
+                        current_info["text"] = moderated_content  # 仅在标记时记录文本
                         await update_stats(current_info)
                         return JSONResponse(
                             status_code=400,
