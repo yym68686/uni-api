@@ -410,6 +410,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
     except StopAsyncIteration:
         # 502 Bad Gateway 是一个更合适的状态码，因为它表明作为代理或网关的服务器从上游服务器收到了无效的响应。
+        logger.warning(f"provider: {channel_id:<11} empty response [{type(first_item_str)}]: {first_item_str}")
         raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
 
 def post_all_models(api_index, config, api_list, models_list):
