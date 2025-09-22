@@ -5,6 +5,7 @@ import h2.exceptions
 from time import time
 from fastapi import HTTPException
 from collections import defaultdict
+from typing import List, Dict, Optional
 
 from core.log_config import logger
 from core.utils import (
@@ -66,15 +67,17 @@ async def update_config(config_data, use_config_url=False):
                 provider_api = str(provider_api)
             if isinstance(provider_api, str):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
-                    [provider_api],
-                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
-                    safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin")
+                    items=[provider_api],
+                    rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
+                    schedule_algorithm=safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin"),
+                    provider_name=provider['provider']
                 )
             if isinstance(provider_api, list):
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
-                    provider_api,
-                    safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
-                    safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin")
+                    items=provider_api,
+                    rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
+                    schedule_algorithm=safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin"),
+                    provider_name=provider['provider']
                 )
 
         if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
@@ -549,3 +552,125 @@ def calculate_total_cost(all_tokens_info, model_price):
         total_cost += model_cost
 
     return total_cost
+
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import select, func, case
+from db import async_session, ChannelStat, DISABLE_DATABASE
+
+
+async def query_channel_key_stats(
+    provider_name: str,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+) -> List[Dict]:
+    """Queries the ChannelStat table for API key success rates."""
+    if DISABLE_DATABASE:
+        return []
+
+    async with async_session() as session:
+        if not start_dt:
+            start_dt = datetime.now(timezone.utc) - timedelta(hours=24)
+
+        query = (
+            select(
+                ChannelStat.provider_api_key,
+                func.count().label("total_requests"),
+                func.sum(case((ChannelStat.success == True, 1), else_=0)).label(
+                    "success_count"
+                ),
+            )
+            .where(ChannelStat.provider == provider_name)
+            .where(ChannelStat.timestamp >= start_dt)
+            .where(ChannelStat.provider_api_key.isnot(None))
+        )
+
+        if end_dt:
+            query = query.where(ChannelStat.timestamp < end_dt)
+
+        query = query.group_by(ChannelStat.provider_api_key)
+
+        result = await session.execute(query)
+        stats_from_db = result.mappings().all()
+
+    key_stats = []
+    for row in stats_from_db:
+        key_stats.append(
+            {
+                "api_key": row.provider_api_key,
+                "success_count": row.success_count,
+                "total_requests": row.total_requests,
+                "success_rate": row.success_count / row.total_requests
+                if row.total_requests > 0
+                else 0,
+            }
+        )
+
+    # Sort the results by success rate and total requests
+    sorted_stats = sorted(
+        key_stats,
+        key=lambda item: (item["success_rate"], item["total_requests"]),
+        reverse=True,
+    )
+
+    return sorted_stats
+
+
+async def get_sorted_api_keys(
+    provider_name: str, all_keys_in_config: list, group_size: int = 100
+):
+    """
+    获取根据成功率和特定分组算法排序的API密钥列表。
+
+    1. 从数据库查询过去24小时内各API key的成功和失败次数。
+    2. 计算成功率，并对所有key（包括未使用的key）进行排序。
+    3. 应用“矩阵转置”分组算法，以平衡负载和探索。
+    """
+    if not all_keys_in_config:
+        return []
+
+    key_stats = {}
+    try:
+        stats_list = await query_channel_key_stats(provider_name)
+        for stat in stats_list:
+            key_stats[stat["api_key"]] = {
+                "success_rate": stat["success_rate"],
+                "total_requests": stat["total_requests"],
+            }
+    except Exception as e:
+        logger.error(
+            f"Error querying key stats from DB for provider '{provider_name}': {e}"
+        )
+        # 在数据库查询失败时，返回原始顺序，确保系统可用性
+        return all_keys_in_config
+
+    # 对所有在配置文件中定义的key进行排序
+    # 排序规则：1. 成功率降序 2. 总尝试次数降序（成功率相同时，尝试多的更可信）
+    # 对于从未用过的key，它们会自然排在最后
+    sorted_keys = sorted(
+        all_keys_in_config,
+        key=lambda k: (
+            key_stats.get(k, {"success_rate": -1})["success_rate"],
+            key_stats.get(k, {"total_requests": 0})["total_requests"],
+        ),
+        reverse=True,
+    )
+
+    # 应用“矩阵转置”分组算法
+    num_keys = len(sorted_keys)
+    if num_keys == 0:
+        return []
+
+    num_groups = (num_keys + group_size - 1) // group_size
+    groups = [[] for _ in range(num_groups)]
+
+    for i, key in enumerate(sorted_keys):
+        groups[i % num_groups].append(key)
+
+    final_sorted_list = []
+    for group in groups:
+        final_sorted_list.extend(group)
+
+    logger.info(
+        f"Successfully sorted {len(final_sorted_list)} keys for provider '{provider_name}' using smart algorithm."
+    )
+    return final_sorted_list

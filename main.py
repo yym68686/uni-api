@@ -41,6 +41,7 @@ from utils import (
     InMemoryRateLimiter,
     calculate_total_cost,
     error_handling_wrapper,
+    query_channel_key_stats,
 )
 
 
@@ -50,9 +51,9 @@ is_debug = bool(os.getenv("DEBUG", False))
 
 from sqlalchemy import inspect, text
 from sqlalchemy.sql import sqltypes
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# 添加新的环境变量检查
-DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
+from db import Base, RequestStat, ChannelStat, db_engine, async_session, DISABLE_DATABASE
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
 # 从 pyproject.toml 读取版本号
@@ -71,19 +72,24 @@ async def create_tables():
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # 检查并添加缺失的列 - 此简易迁移仅针对 SQLite
-        if os.getenv("DB_TYPE", "sqlite").lower() == "sqlite":
+        # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite 和 PostgreSQL
+        db_type = os.getenv("DB_TYPE", "sqlite").lower()
+        if db_type in ["sqlite", "postgres"]:
             def check_and_add_columns(connection):
                 inspector = inspect(connection)
                 for table in [RequestStat, ChannelStat]:
                     table_name = table.__tablename__
-                    existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
+                    existing_columns = {col['name'] for col in inspector.get_columns(table_name)}
 
                     for column_name, column in table.__table__.columns.items():
                         if column_name not in existing_columns:
-                            col_type = _map_sa_type_to_sql_type(column.type)
-                            default = _get_default_sql(column.default)
-                            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {col_type}{default}"))
+                            # 适配 PostgreSQL 和 SQLite 的类型映射
+                            col_type = column.type.compile(connection.dialect)
+                            default = _get_default_sql(column.default) if db_type == "sqlite" else "" # PostgreSQL 的默认值处理更复杂，暂不处理
+
+                            # 使用标准的 ALTER TABLE 语法
+                            connection.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {col_type}{default}'))
+                            logger.info(f"Added column '{column_name}' to table '{table_name}'.")
 
             await conn.run_sync(check_and_add_columns)
 
@@ -386,97 +392,7 @@ class ChannelManager:
 
         return available_providers
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean, Text
-from sqlalchemy.sql import func
-from sqlalchemy import event
-
-# 定义数据库模型
-Base = declarative_base()
-
-class RequestStat(Base):
-    __tablename__ = 'request_stats'
-    id = Column(Integer, primary_key=True)
-    request_id = Column(String)
-    endpoint = Column(String)
-    client_ip = Column(String)
-    process_time = Column(Float)
-    first_response_time = Column(Float)
-    provider = Column(String, index=True)
-    model = Column(String, index=True)
-    # success = Column(Boolean, default=False)
-    api_key = Column(String, index=True)
-    is_flagged = Column(Boolean, default=False)
-    text = Column(Text)
-    prompt_tokens = Column(Integer, default=0)
-    completion_tokens = Column(Integer, default=0)
-    total_tokens = Column(Integer, default=0)
-    # cost = Column(Float, default=0)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
-
-class ChannelStat(Base):
-    __tablename__ = 'channel_stats'
-    id = Column(Integer, primary_key=True)
-    request_id = Column(String)
-    provider = Column(String, index=True)
-    model = Column(String, index=True)
-    api_key = Column(String)
-    success = Column(Boolean, default=False)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
-
-
-if not DISABLE_DATABASE:
-    DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
-    logger.info(f"Using {DB_TYPE} database.")
-
-    if DB_TYPE == "postgres":
-        # PostgreSQL-specific setup
-        try:
-            import asyncpg
-        except ImportError:
-            raise ImportError("asyncpg is not installed. Please install it with 'pip install asyncpg' to use PostgreSQL.")
-
-        DB_USER = os.getenv("DB_USER", "postgres")
-        DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
-        DB_HOST = os.getenv("DB_HOST", "localhost")
-        DB_PORT = os.getenv("DB_PORT", "5432")
-        DB_NAME = os.getenv("DB_NAME", "postgres")
-
-        db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        db_engine = create_async_engine(db_url, echo=is_debug)
-
-    elif DB_TYPE == "sqlite":
-        # SQLite-specific setup
-        # 获取数据库路径
-        db_path = os.getenv('DB_PATH', './data/stats.db')
-
-        # 确保 data 目录存在
-        data_dir = os.path.dirname(db_path)
-        os.makedirs(data_dir, exist_ok=True)
-
-        # 创建异步引擎
-        db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
-
-        # 为 SQLite 设置 WAL 模式和 busy_timeout
-        @event.listens_for(db_engine.sync_engine, "connect")
-        def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):
-            """为每个 SQLite 连接开启 WAL 模式并设置 busy_timeout"""
-            cursor = None
-            try:
-                cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA journal_mode=WAL;")
-                cursor.execute("PRAGMA busy_timeout = 5000;") # 5000毫秒 = 5秒
-            except Exception as e:
-                logger.error(f"Failed to set PRAGMA for SQLite: {e}")
-            finally:
-                if cursor:
-                    cursor.close()
-    else:
-        raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite' or 'postgres'.")
-
-    # 创建会话 Session
-    async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+from sqlalchemy import select, case
 
 from starlette.types import Scope, Receive, Send
 from starlette.responses import Response
@@ -530,7 +446,7 @@ async def update_stats(current_info):
             import traceback
             traceback.print_exc()
 
-async def update_channel_stats(request_id, provider, model, api_key, success):
+async def update_channel_stats(request_id, provider, model, api_key, success, provider_api_key: str = None):
     if DISABLE_DATABASE:
         return
 
@@ -544,6 +460,7 @@ async def update_channel_stats(request_id, provider, model, api_key, success):
                             provider=provider,
                             model=model,
                             api_key=api_key,
+                            provider_api_key=provider_api_key,
                             success=success,
                         )
                         session.add(channel_stat)
@@ -1041,14 +958,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
                     response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json")
 
             # 更新成功计数和首次响应时间
-            background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True)
+            background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True, provider_api_key=api_key)
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
             current_info["provider"] = channel_id
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False)
+        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False, provider_api_key=api_key)
         raise e
 
 def weighted_round_robin(weights):
@@ -1874,6 +1791,19 @@ class TokenUsageResponse(BaseModel):
     usage: List[TokenUsageEntry]
     query_details: QueryDetails
 
+
+class ChannelKeyRanking(BaseModel):
+    api_key: str
+    success_count: int
+    total_requests: int
+    success_rate: float
+
+
+class ChannelKeyRankingsResponse(BaseModel):
+    rankings: List[ChannelKeyRanking]
+    query_details: QueryDetails
+
+
 async def query_token_usage(
     session: AsyncSession,
     filter_api_key: Optional[str] = None,
@@ -2082,6 +2012,104 @@ async def get_token_usage(
     )
 
     return response_data
+
+
+@app.get(
+    "/v1/channel_key_rankings",
+    response_model=ChannelKeyRankingsResponse,
+    dependencies=[Depends(rate_limit_dependency)],
+)
+async def get_channel_key_rankings(
+    request: Request,
+    provider_name: str,
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    last_n_days: Optional[int] = None,
+    token: str = Depends(verify_admin_api_key),
+):
+    """
+    Retrieves the success rate ranking of API keys for a specific channel,
+    filtered by a specified time range.
+    """
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    end_dt_obj = None
+    start_dt_obj = None
+    start_datetime_detail = None
+    end_datetime_detail = None
+
+    now = datetime.now(timezone.utc)
+
+    def parse_datetime_input(dt_input: str) -> datetime:
+        """Parses ISO 8601 string or Unix timestamp."""
+        try:
+            return datetime.fromtimestamp(float(dt_input), tz=timezone.utc)
+        except ValueError:
+            try:
+                if dt_input.endswith("Z"):
+                    dt_input = dt_input[:-1] + "+00:00"
+                dt_obj = datetime.fromisoformat(dt_input)
+                if dt_obj.tzinfo is None:
+                    dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+                return dt_obj.astimezone(timezone.utc)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid datetime format: {dt_input}. Use ISO 8601 (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp."
+                )
+
+    if last_n_days is not None:
+        if start_datetime or end_datetime:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot use last_n_days with start_datetime or end_datetime.",
+            )
+        if last_n_days <= 0:
+            raise HTTPException(
+                status_code=400, detail="last_n_days must be positive."
+            )
+        start_dt_obj = now - timedelta(days=last_n_days)
+        end_dt_obj = now
+        start_datetime_detail = start_dt_obj.isoformat(timespec="seconds")
+        end_datetime_detail = end_dt_obj.isoformat(timespec="seconds")
+    elif start_datetime or end_datetime:
+        try:
+            if start_datetime:
+                start_dt_obj = parse_datetime_input(start_datetime)
+                start_datetime_detail = start_dt_obj.isoformat(timespec="seconds")
+            if end_datetime:
+                end_dt_obj = parse_datetime_input(end_datetime)
+                end_datetime_detail = end_dt_obj.isoformat(timespec="seconds")
+            if start_dt_obj and end_dt_obj and end_dt_obj < start_dt_obj:
+                raise HTTPException(
+                    status_code=400, detail="end_datetime cannot be before start_datetime."
+                )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        # Default to last 24 hours if no range specified
+        start_dt_obj = now - timedelta(days=1)
+        end_dt_obj = now
+        start_datetime_detail = start_dt_obj.isoformat(timespec="seconds")
+        end_datetime_detail = end_dt_obj.isoformat(timespec="seconds")
+
+    rankings_data = await query_channel_key_stats(
+        provider_name=provider_name, start_dt=start_dt_obj, end_dt=end_dt_obj
+    )
+
+    query_details = QueryDetails(
+        start_datetime=start_datetime_detail,
+        end_datetime=end_datetime_detail,
+        api_key_filter=provider_name,
+    )
+
+    response_data = ChannelKeyRankingsResponse(
+        rankings=[ChannelKeyRanking(**item) for item in rankings_data],
+        query_details=query_details,
+    )
+
+    return response_data
+
 
 class TokenInfo(BaseModel):
     api_key_prefix: str
