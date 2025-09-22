@@ -621,7 +621,7 @@ async def get_sorted_api_keys(
     """
     获取根据成功率和特定分组算法排序的API密钥列表。
 
-    1. 从数据库查询过去24小时内各API key的成功和失败次数。
+    1. 从数据库查询过去72小时内各API key的成功和失败次数。
     2. 计算成功率，并对所有key（包括未使用的key）进行排序。
     3. 应用“矩阵转置”分组算法，以平衡负载和探索。
     """
@@ -630,7 +630,8 @@ async def get_sorted_api_keys(
 
     key_stats = {}
     try:
-        stats_list = await query_channel_key_stats(provider_name)
+        start_time = datetime.now(timezone.utc) - timedelta(hours=72)
+        stats_list = await query_channel_key_stats(provider_name, start_dt=start_time)
         for stat in stats_list:
             key_stats[stat["api_key"]] = {
                 "success_rate": stat["success_rate"],

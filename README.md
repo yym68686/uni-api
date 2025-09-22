@@ -111,7 +111,7 @@ providers:
       #   gemini-2.5-pro: 5/min,25/day,1048576/tpr # 1048576/tpr means the token limit per request is 1,048,576 tokens.
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
-      api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random, fixed_priority. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing. fixed_priority is fixed priority scheduling, always use the first available API key.
+      api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random, fixed_priority, smart_round_robin. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing. fixed_priority is fixed priority scheduling, always use the first available API key. `smart_round_robin` is an intelligent scheduling algorithm based on historical success rates, see FAQ for details.
       model_timeout: # Model timeout, in seconds, default 100 seconds, optional
         gemini-2.5-pro: 500 # Model gemini-2.5-pro timeout is 500 seconds
         gemini-2.5-flash: 500 # Model gemini-2.5-flash timeout is 500 seconds
@@ -622,9 +622,9 @@ api_keys:
 
 In this way, request ai2 first, and if it fails, request ai1.
 
-- What is the behavior behind various scheduling algorithms? For example, fixed_priority, weighted_round_robin, lottery, random, round_robin?
+- What is the behavior behind various scheduling algorithms? For example, fixed_priority, weighted_round_robin, lottery, random, round_robin, smart_round_robin?
 
-All scheduling algorithms need to be enabled by setting api_keys.(api).preferences.SCHEDULING_ALGORITHM in the configuration file to any of the values: fixed_priority, weighted_round_robin, lottery, random, round_robin.
+All scheduling algorithms need to be enabled by setting api_keys.(api).preferences.SCHEDULING_ALGORITHM in the configuration file to any of the values: fixed_priority, weighted_round_robin, lottery, random, round_robin, smart_round_robin.
 
 1. fixed_priority: Fixed priority scheduling. All requests are always executed by the channel of the model that first has a user request. In case of an error, it will switch to the next channel. This is the default scheduling algorithm.
 
@@ -633,6 +633,12 @@ All scheduling algorithms need to be enabled by setting api_keys.(api).preferenc
 3. lottery: Draw round-robin load balancing, randomly request the channel of the model with user requests according to the weight set in the configuration file api_keys.(api).model.
 
 4. round_robin: Round-robin load balancing, requests the channel that owns the model requested by the user according to the configuration order in the configuration file api_keys.(api).model. You can check the previous question on how to set the priority of channels.
+
+5. smart_round_robin: Intelligent success rate scheduling. This is an advanced scheduling algorithm designed for channels with a large number of API Keys (hundreds, thousands, or even tens of thousands). Its core mechanism is:
+    - **Sorting based on historical success rate**: The algorithm dynamically sorts API Keys based on their actual request success rate over the past 72 hours.
+    - **Intelligent grouping and load balancing**: To prevent traffic from always concentrating on a few "optimal" keys, the algorithm intelligently divides all keys (including unused ones) into several groups. It distributes the keys with the highest success rates to the beginning of each group, the next highest to the second position, and so on. This ensures that the load is evenly distributed among different tiers of keys and also guarantees that new or historically underperforming keys have a chance to be tried (exploration).
+    - **Periodic automatic updates**: After all keys in a channel have been polled once, the system automatically triggers a re-sorting, pulling the latest success rate data from the database to generate a new, more optimal key sequence. The update frequency is adaptive: the larger the key pool and the lower the request volume, the longer the update cycle; and vice versa.
+    - **Applicable scenarios**: It is highly recommended for users with a large number of API Keys to enable this algorithm to maximize the utilization of the key pool and the success rate of requests.
 
 - How should the base_url be filled in correctly?
 

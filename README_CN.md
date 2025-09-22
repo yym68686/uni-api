@@ -111,7 +111,7 @@ providers:
       #   gemini-2.5-pro: 5/min,25/day,1048576/tpr # 1048576/tpr 表示每次请求的 tokens 数量限制为 1048576 个 tokens
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
-      api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。
+      api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority，smart_round_robin。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。smart_round_robin 是一个基于历史成功率的智能调度算法，详见 FAQ 部分。
       model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
         gemini-2.5-pro: 500 # 模型 gemini-2.5-pro 的超时时间为 500 秒
         gemini-2.5-flash: 500 # 模型 gemini-2.5-flash 的超时时间为 500 秒
@@ -623,9 +623,9 @@ api_keys:
 
 这样设置则先请求 ai2，失败后请求 ai1。
 
-- 各种调度算法背后的行为是怎样的？比如 fixed_priority，weighted_round_robin，lottery，random，round_robin？
+- 各种调度算法背后的行为是怎样的？比如 fixed_priority，weighted_round_robin，lottery，random，round_robin, smart_round_robin？
 
-所有调度算法需要通过在配置文件的 api_keys.(api).preferences.SCHEDULING_ALGORITHM 设置为 fixed_priority，weighted_round_robin，lottery，random，round_robin 中的任意值来开启。
+所有调度算法需要通过在配置文件的 api_keys.(api).preferences.SCHEDULING_ALGORITHM 设置为 fixed_priority，weighted_round_robin，lottery，random，round_robin, smart_round_robin 中的任意值来开启。
 
 1. fixed_priority：固定优先级调度。所有请求永远执行第一个拥有用户请求的模型的渠道。报错时，会切换下一个渠道。这是默认的调度算法。
 
@@ -634,6 +634,12 @@ api_keys:
 3. lottery：抽奖轮训负载均衡，按照配置文件 api_keys.(api).model 设置的权重随机请求拥有用户请求的模型的渠道。
 
 4. round_robin：轮训负载均衡，按照配置文件 api_keys.(api).model 的配置顺序请求拥有用户请求的模型的渠道。可以查看上一个问题，如何设置渠道的优先级。
+
+5. smart_round_robin: 智能成功率调度。这是一个专为拥有大量 API Key（成百上千甚至数万个）的渠道设计的先进调度算法。它的核心机制是：
+    - **基于历史成功率排序**：算法会根据过去72小时内每个 API Key 的实际请求成功率进行动态排序。
+    - **智能分组与负载均衡**：为了避免流量永远只集中在少数几个“最优” Key 上，该算法会将所有 Key（包括从未用过的 Key）智能地分成若干组。它会将成功率最高的 Key 分布到每个组的开头，次高的分布到第二位，以此类推。这确保了负载能被均匀地分配给不同梯队的 Key，同时也保证了新 Key 或历史表现不佳的 Key 也有机会被尝试（探索）。
+    - **周期性自动更新**：当一个渠道的所有 Key 都被轮询过一遍之后，系统会自动触发一次重排序，从数据库中拉取最新的成功率数据，生成一个全新的、更优的 Key 序列。这个更新频率是自适应的：Key 池越大、请求量越小，更新周期就越长；反之则越短。
+    - **适用场景**：强烈建议拥有大量 API Key 的用户启用此算法，以最大化 Key 池的利用率和请求成功率。
 
 - 应该怎么正确填写 base_url？
 
