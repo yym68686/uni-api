@@ -1510,7 +1510,7 @@ async def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depen
     #     if token.startswith(api_key['api']):
     if len(api_list) == 1:
         return token
-    if "admin" not in app.state.api_keys_db[api_index].get('role'):
+    if "admin" not in app.state.api_keys_db[api_index].get('role', ''):
         raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
