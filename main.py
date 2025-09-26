@@ -616,8 +616,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 # print("check_api_key", check_api_key)
                 # logger.info(f"app.state.paid_api_keys_states {check_api_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[check_api_key].items()}, indent=4)}")
                 # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
-                if not safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None) and \
-                not request.url.path.startswith("/v1/token_usage"):
+                if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False and \
+                    not request.url.path.startswith("/v1/token_usage"):
                     return JSONResponse(
                         status_code=429,
                         content={"error": "Balance is insufficient, please check your account."}
