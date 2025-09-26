@@ -3,9 +3,15 @@ import httpx
 import asyncio
 import h2.exceptions
 from time import time
+import time as time_module
 from fastapi import HTTPException
 from collections import defaultdict
 from typing import List, Dict, Optional
+from ruamel.yaml import YAML, YAMLError
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import select, func, case
+from db import async_session, ChannelStat, DISABLE_DATABASE
 
 from core.log_config import logger
 from core.utils import (
@@ -38,7 +44,6 @@ class InMemoryRateLimiter:
         self.requests[key].append(now)
         return False
 
-from ruamel.yaml import YAML, YAMLError
 yaml = YAML()
 yaml.preserve_quotes = True
 yaml.indent(mapping=2, sequence=4, offset=2)
@@ -98,7 +103,7 @@ async def update_config(config_data, use_config_url=False):
                 if not use_config_url:
                     save_api_yaml(config_data)
 
-        if provider.get("tools") == None:
+        if provider.get("tools") is None:
             provider["tools"] = True
 
         provider["_model_dict_cache"] = get_model_dict(provider)
@@ -274,8 +279,6 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     else:
         return first_response_task, "timeout"
 
-import asyncio
-import time as time_module
 async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None, last_message_role=None):
 
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
@@ -286,12 +289,12 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         # 如果需要心跳机制但不使用嵌套生成器方式
         if with_keepalive:
-            yield f": keepalive\n\n"
+            yield ": keepalive\n\n"
             while True:
                 try:
                     item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
                     if status == "timeout":
-                        yield f": keepalive\n\n"
+                        yield ": keepalive\n\n"
                     else:
                         yield await ensure_string(item)
                         wait_task = None
@@ -299,7 +302,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                     # 处理客户端断开连接
                     logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
                     break
-                except Exception as e:
+                except Exception:
                     # 捕获任何其他异常
                     # import traceback
                     # error_stack = traceback.format_exc()
@@ -324,7 +327,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
     start_time = time_module.time()
     try:
         # 创建一个任务来获取第一个响应，但不直接中断生成器
-        if keepalive_interval and stream == True:
+        if keepalive_interval and stream:
             first_item, status = await wait_for_timeout(generator, timeout=keepalive_interval)
             if status == "timeout":
                 return new_generator(None, with_keepalive=True, wait_task=first_item, timeout=keepalive_interval), 3.1415
@@ -390,7 +393,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         finish_reason = safe_get(first_item_str, "choices", 0, "finish_reason", default=None)
         if isinstance(first_item_str, dict) and finish_reason == "PROHIBITED_CONTENT":
-            raise HTTPException(status_code=400, detail=f"PROHIBITED_CONTENT")
+            raise HTTPException(status_code=400, detail="PROHIBITED_CONTENT")
 
         if isinstance(first_item_str, dict) and finish_reason == "stop" and \
         not safe_get(first_item_str, "choices", 0, "message", "content", default=None) and \
@@ -398,7 +401,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         last_message_role != "assistant":
             raise StopAsyncIteration
 
-        if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and stream == False:
+        if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and not stream:
             if any(x in str(first_item_str) for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration
@@ -406,7 +409,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             reasoning_content = safe_get(first_item_str, "choices", 0, "message", "reasoning_content", default=None)
             b64_json = safe_get(first_item_str, "data", 0, "b64_json", default=None)
             tool_calls = safe_get(first_item_str, "choices", 0, "message", "tool_calls", default=None)
-            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None) and b64_json == None:
+            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None) and b64_json is None:
                 raise StopAsyncIteration
 
         return new_generator(first_item), first_response_time
@@ -553,11 +556,6 @@ def calculate_total_cost(all_tokens_info, model_price):
 
     return total_cost
 
-from datetime import datetime, timedelta, timezone
-from sqlalchemy import select, func, case
-from db import async_session, ChannelStat, DISABLE_DATABASE
-
-
 async def query_channel_key_stats(
     provider_name: str,
     start_dt: Optional[datetime] = None,
@@ -575,7 +573,7 @@ async def query_channel_key_stats(
             select(
                 ChannelStat.provider_api_key,
                 func.count().label("total_requests"),
-                func.sum(case((ChannelStat.success == True, 1), else_=0)).label(
+                func.sum(case((ChannelStat.success, 1), else_=0)).label(
                     "success_count"
                 ),
             )

@@ -1,23 +1,35 @@
 import os
+import io
 import json
+import uuid
 import httpx
 import string
+import random
 import secrets
+import tomllib
+import asyncio
+from asyncio import Semaphore
+import contextvars
 from time import time
 from urllib.parse import urlparse
 from collections import defaultdict
-from pydantic import ValidationError
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Union, Optional, List, Any
+from pydantic import ValidationError, BaseModel, field_serializer
+
+from starlette.responses import Response
+from starlette.types import Scope, Receive, Send
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
 
+from fastapi.staticfiles import StaticFiles
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
-from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks, UploadFile, File, Form, Query
 
 from core.log_config import logger
 from core.request import get_payload
@@ -44,20 +56,18 @@ from utils import (
     query_channel_key_stats,
 )
 
-
-DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
-is_debug = bool(os.getenv("DEBUG", False))
-# is_debug = False
-
 from sqlalchemy import inspect, text
 from sqlalchemy.sql import sqltypes
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, case, func, desc
 
 from db import Base, RequestStat, ChannelStat, db_engine, async_session, DISABLE_DATABASE
+
+DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
+is_debug = bool(os.getenv("DEBUG", False))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
 # 从 pyproject.toml 读取版本号
-import tomllib
 try:
     with open('pyproject.toml', 'rb') as f:
         data = tomllib.load(f)
@@ -340,9 +350,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"message": exc.detail},
     )
 
-import uuid
-import asyncio
-import contextvars
 request_info = contextvars.ContextVar('request_info', default={})
 
 async def parse_request_body(request: Request):
@@ -391,13 +398,6 @@ class ChannelManager:
                 available_providers.append(provider)
 
         return available_providers
-
-from sqlalchemy import select, case
-
-from starlette.types import Scope, Receive, Send
-from starlette.responses import Response
-
-from asyncio import Semaphore
 
 # 根据数据库类型，动态创建信号量
 # SQLite 需要严格的串行写入，而 PostgreSQL 可以处理高并发
@@ -518,8 +518,8 @@ class LoggingStreamingResponse(Response):
                     'body': f"data: {error_data}\n\n".encode('utf-8'),
                     'more_body': True,
                 })
-            except:
-                pass  # 如果无法发送错误消息，则忽略
+            except Exception as e:
+                logger.error(f"Error sending error message: {str(e)}")
         finally:
             await send({
                 'type': 'http.response.body',
@@ -616,8 +616,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 # print("check_api_key", check_api_key)
                 # logger.info(f"app.state.paid_api_keys_states {check_api_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[check_api_key].items()}, indent=4)}")
                 # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
-                if safe_get(app.state.paid_api_keys_states, check_api_key, default={}).get("enabled", None) == False and \
-                    not request.url.path.startswith("/v1/token_usage"):
+                if not safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None) and \
+                not request.url.path.startswith("/v1/token_usage"):
                     return JSONResponse(
                         status_code=429,
                         content={"error": "Balance is insufficient, please check your account."}
@@ -666,7 +666,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 final_api_key = app.state.api_list[api_index]
                 try:
                     await app.state.user_api_keys_rate_limit[final_api_key].next(model)
-                except Exception as e:
+                except Exception:
                     return JSONResponse(
                         status_code=429,
                         content={"error": "Too many requests"}
@@ -695,7 +695,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     is_flagged = moderation_response.get('results', [{}])[0].get('flagged', False)
 
                     if is_flagged:
-                        logger.error(f"Content did not pass the moral check: %s", moderated_content)
+                        logger.error(f"Content did not pass the moral check: {moderated_content}")
                         process_time = time() - start_time
                         current_info["process_time"] = process_time
                         current_info["is_flagged"] = is_flagged
@@ -915,7 +915,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
 
-    if stream_mode != None:
+    if stream_mode is not None:
         request.stream = stream_mode
 
     channel_id = f"{provider['provider']}"
@@ -990,8 +990,6 @@ def weighted_round_robin(weights):
         current_weights[selected_letter] -= total_weight
 
     return weighted_provider_list
-
-import random
 
 def lottery_scheduling(weights):
     total_tickets = sum(weights.values())
@@ -1254,7 +1252,6 @@ async def get_right_order_providers(request_model, config, api_index, scheduling
 
     return matching_providers
 
-import asyncio
 class ModelRequestHandler:
     def __init__(self):
         self.last_provider_indices = defaultdict(lambda: -1)
@@ -1321,7 +1318,7 @@ class ModelRequestHandler:
             original_model = model_dict[request_model_name]
             if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
                 # logger.warning(f"Provider {provider_name}: All API keys are rate limited and stop auto retry!")
-                error_message = f"All API keys are rate limited and stop auto retry!"
+                error_message = "All API keys are rate limited and stop auto retry!"
                 if num_matching_providers == 1:
                     break
                 else:
@@ -1562,8 +1559,6 @@ async def moderations(
 ):
     return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/moderations")
 
-from fastapi import UploadFile, File, Form, HTTPException, Request
-import io
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
 async def audio_transcriptions(
     http_request: Request,
@@ -1618,10 +1613,6 @@ async def generate_api_key():
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
-from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, desc, case
-from fastapi import Query
-
 @app.get("/v1/stats", dependencies=[Depends(rate_limit_dependency)])
 async def get_stats(
     request: Request,
@@ -1657,7 +1648,7 @@ async def get_stats(
                 ChannelStat.provider,
                 ChannelStat.model,
                 func.count().label('total'),
-                func.sum(case((ChannelStat.success == True, 1), else_=0)).label('success_count')
+                func.sum(case((ChannelStat.success, 1), else_=0)).label('success_count')
             )
             .where(ChannelStat.timestamp >= start_time)
             .group_by(ChannelStat.provider, ChannelStat.model)
@@ -1669,7 +1660,7 @@ async def get_stats(
             select(
                 ChannelStat.provider,
                 func.count().label('total'),
-                func.sum(case((ChannelStat.success == True, 1), else_=0)).label('success_count')
+                func.sum(case((ChannelStat.success, 1), else_=0)).label('success_count')
             )
             .where(ChannelStat.timestamp >= start_time)
             .group_by(ChannelStat.provider)
@@ -1762,10 +1753,6 @@ async def api_config_update(api_index: int = Depends(verify_admin_api_key), conf
         app.state.config["providers"] = config["providers"]
         app.state.config, app.state.api_keys_db, app.state.api_list = update_config(app.state.config, use_config_url=False)
     return JSONResponse(content={"message": "API config updated"})
-
-from datetime import datetime, timedelta, timezone
-from pydantic import BaseModel, field_serializer
-from typing import Dict, Union, Optional, List, Any
 
 # Pydantic Models for Token Usage Response
 class TokenUsageEntry(BaseModel):
@@ -2183,7 +2170,6 @@ async def add_credits_to_api_key(
         "enabled": app.state.paid_api_keys_states[paid_key]["enabled"]
     })
 
-from fastapi.staticfiles import StaticFiles
 # 添加静态文件挂载
 app.mount("/", StaticFiles(directory="./static", html=True), name="static")
 
