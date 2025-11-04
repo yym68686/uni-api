@@ -26,6 +26,8 @@ class RequestStat(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
+    prompt_price = Column(Float, default=0.0)
+    completion_price = Column(Float, default=0.0)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 class ChannelStat(Base):

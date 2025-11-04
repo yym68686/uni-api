@@ -522,40 +522,6 @@ def get_all_models(config):
 
     return all_models
 
-def calculate_total_cost(all_tokens_info, model_price):
-    """
-    计算所有模型使用的总金额
-
-    参数:
-        all_tokens_info: 列表，包含各模型的代币使用情况
-        model_price: 字典，包含各模型的价格设置，格式为 "prompt_price,completion_price"，单位为 $/M tokens
-
-    返回:
-        float: 总金额（美元）
-    """
-    total_cost = 0.0
-
-    for token_info in all_tokens_info:
-        model_name = token_info["model"]
-        prompt_tokens = token_info["total_prompt_tokens"]
-        completion_tokens = token_info["total_completion_tokens"]
-
-        # 获取模型价格，如果模型不存在则使用默认价格
-        price_str = next((model_price[config_model_name] for config_model_name in model_price.keys() if model_name.startswith(config_model_name)), model_price.get("default", "1,2"))
-        # print("price_str", price_str)
-
-        # 解析价格字符串
-        price_parts = price_str.split(",")
-        prompt_price = float(price_parts[0])
-        completion_price = float(price_parts[1])
-
-        # 计算当前模型的费用 ($/M tokens 转换为 $)
-        model_cost = (prompt_tokens * prompt_price + completion_tokens * completion_price) / 1000000
-
-        total_cost += model_cost
-
-    return total_cost
-
 async def query_channel_key_stats(
     provider_name: str,
     start_dt: Optional[datetime] = None,

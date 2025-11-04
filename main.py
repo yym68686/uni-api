@@ -51,7 +51,6 @@ from utils import (
     update_config,
     post_all_models,
     InMemoryRateLimiter,
-    calculate_total_cost,
     error_handling_wrapper,
     query_channel_key_stats,
 )
@@ -151,6 +150,42 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
 
     return result
 
+def get_current_model_prices(model_name: str):
+    """
+    根据当前配置偏好，返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）
+    """
+    try:
+        model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
+        price_str = next((model_price[k] for k in model_price.keys() if model_name and model_name.startswith(k)), model_price.get("default", "0.3,1"))
+        parts = [p.strip() for p in str(price_str).split(",")]
+        prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.3
+        completion_price = float(parts[1]) if len(parts) > 1 and parts[1] != "" else 1.0
+        return prompt_price, completion_price
+    except Exception:
+        return 0.3, 1.0
+
+async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start_dt_obj: Optional[datetime] = None) -> float:
+    """
+    直接从数据库历史记录累计成本：
+    sum((prompt_tokens*prompt_price + completion_tokens*completion_price)/1e6)
+    """
+    if DISABLE_DATABASE:
+        return 0.0
+    async with async_session() as session:
+        expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.3) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 1.0)) / 1000000.0
+        query = select(func.coalesce(func.sum(expr), 0.0))
+        if filter_api_key:
+            query = query.where(RequestStat.api_key == filter_api_key)
+        if start_dt_obj:
+            query = query.where(RequestStat.timestamp >= start_dt_obj)
+        result = await session.execute(query)
+        total_cost = result.scalar_one() or 0.0
+        try:
+            total_cost = float(total_cost)
+        except Exception:
+            total_cost = 0.0
+        return total_cost
+
 async def update_paid_api_keys_states(app, paid_key):
     """
     更新付费API密钥的状态
@@ -163,11 +198,14 @@ async def update_paid_api_keys_states(app, paid_key):
     check_index = app.state.api_list.index(paid_key)
     credits = safe_get(app.state.config, 'api_keys', check_index, "preferences", "credits", default=-1)
     created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
-    model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
     created_at = created_at.astimezone(timezone.utc)
+
     if credits != -1:
+        # 仍返回聚合的 token 统计，供前端展示
         all_tokens_info = await get_usage_data(filter_api_key=paid_key, start_dt_obj=created_at)
-        total_cost = calculate_total_cost(all_tokens_info, model_price)
+        # 关键修改：总消耗改为从历史数据逐条累计当时价格
+        total_cost = await compute_total_cost_from_db(filter_api_key=paid_key, start_dt_obj=created_at)
+
         app.state.paid_api_keys_states[paid_key] = {
             "credits": credits,
             "created_at": created_at,
@@ -412,6 +450,15 @@ else: # For postgres
 async def update_stats(current_info):
     if DISABLE_DATABASE:
         return
+
+    # 在成功请求时，快照当前价格，写入数据库
+    try:
+        if current_info.get("success") and current_info.get("model"):
+            prompt_price, completion_price = get_current_model_prices(current_info["model"])
+            current_info["prompt_price"] = prompt_price
+            current_info["completion_price"] = completion_price
+    except Exception:
+        pass
 
     try:
         # 等待获取数据库访问权限
