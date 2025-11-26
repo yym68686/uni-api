@@ -710,6 +710,15 @@ api_keys:
 
 koyeb 部署 uni-api 的 api.yaml 默认是 0644 权限，uni-api 没有写权限。当 uni-api 尝试获取 model 字段时，会修改配置文件，此时会报错。控制台输入 chmod 0777 api.yaml 赋予 uni-api 写权限即可。
 
+- nginx代理后无法获取用户真实IP？
+
+nginx添加
+```xml
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Real-IP $remote_addr;
+
+```
+
 ## 压测
 
 压测工具：[locust](https://locust.io/)

@@ -709,6 +709,16 @@ For Vertex channels, the base_url for Cloudflare AI Gateway should be filled in 
 
 When deploying uni-api on koyeb, if the configuration file channel does not include the model field, it will report an error on startup. This is because the default permission of api.yaml on koyeb is 0644, and uni-api does not have write permission. When uni-api tries to obtain the model field, it will attempt to modify the configuration file, which will result in an error. You can resolve this by entering `chmod 0777 api.yaml` in the console to grant uni-api write permission.
 
+
+- Why can't I get the user's real IP after using nginx as a proxy?
+
+Add to
+```xml
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Real-IP $remote_addr;
+
+```
+
 ## Load Testing
 
 Load testing tool: [locust](https://locust.io/)
