@@ -625,6 +625,35 @@ async def get_api_key(request: Request):
             token = api_split_list[1]
     return token
 
+def get_client_ip(request: Request) -> str:
+    """
+    获取客户端真实 IP 地址，支持代理场景
+    优先级：X-Forwarded-For > X-Real-IP > CF-Connecting-IP > True-Client-IP > request.client.host
+    """
+    # 1. X-Forwarded-For: 最常用的代理头，格式为 "client, proxy1, proxy2"
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # 取第一个 IP（真实客户端 IP）
+        return forwarded_for.split(",")[0].strip()
+
+    # 2. X-Real-IP: nginx 常用
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+
+    # 3. CF-Connecting-IP: Cloudflare 使用
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+
+    # 4. True-Client-IP: 部分 CDN 使用
+    true_client_ip = request.headers.get("True-Client-IP")
+    if true_client_ip:
+        return true_client_ip.strip()
+
+    # 5. 回退到直连 IP
+    return request.client.host if request.client else "unknown"
+
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -683,7 +712,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
             "request_id": request_id,
             "start_time": start_time,
             "endpoint": f"{request.method} {request.url.path}",
-            "client_ip": request.client.host,
+            "client_ip": get_client_ip(request),
             "process_time": 0,
             "first_response_time": -1,
             "provider": None,
