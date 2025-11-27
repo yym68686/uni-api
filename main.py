@@ -195,7 +195,13 @@ async def update_paid_api_keys_states(app, paid_key):
     check_index - API密钥在配置中的索引
     paid_key - 需要更新状态的API密钥
     """
-    check_index = app.state.api_list.index(paid_key)
+    try:
+        check_index = app.state.api_list.index(paid_key)
+    except Exception:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "Invalid or missing API Key"}
+        )
     credits = safe_get(app.state.config, 'api_keys', check_index, "preferences", "credits", default=-1)
     created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
     created_at = created_at.astimezone(timezone.utc)
