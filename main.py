@@ -200,11 +200,12 @@ async def update_paid_api_keys_states(app, paid_key):
     created_at = safe_get(app.state.config, 'api_keys', check_index, "preferences", "created_at", default=datetime.now(timezone.utc) - timedelta(days=30))
     created_at = created_at.astimezone(timezone.utc)
 
+    # 关键修改：总消耗改为从历史数据逐条累计当时价格
+    total_cost = await compute_total_cost_from_db(filter_api_key=paid_key, start_dt_obj=created_at)
+
     if credits != -1:
         # 仍返回聚合的 token 统计，供前端展示
         all_tokens_info = await get_usage_data(filter_api_key=paid_key, start_dt_obj=created_at)
-        # 关键修改：总消耗改为从历史数据逐条累计当时价格
-        total_cost = await compute_total_cost_from_db(filter_api_key=paid_key, start_dt_obj=created_at)
 
         app.state.paid_api_keys_states[paid_key] = {
             "credits": credits,
@@ -213,9 +214,8 @@ async def update_paid_api_keys_states(app, paid_key):
             "total_cost": total_cost,
             "enabled": True if total_cost <= credits else False
         }
-        return credits, total_cost
 
-    return credits, 0
+    return credits, total_cost
         # logger.info(f"app.state.paid_api_keys_states {paid_key}: {json.dumps({k: v.isoformat() if k == 'created_at' else v for k, v in app.state.paid_api_keys_states[paid_key].items()}, indent=4)}")
 
 @asynccontextmanager
