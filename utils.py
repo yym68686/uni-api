@@ -397,6 +397,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         if isinstance(first_item_str, dict) and finish_reason == "stop" and \
         not safe_get(first_item_str, "choices", 0, "message", "content", default=None) and \
+        not safe_get(first_item_str, "choices", 0, "message", "tool_calls", default=None) and \
         not safe_get(first_item_str, "choices", 0, "delta", "content", default=None) and \
         last_message_role != "assistant":
             raise StopAsyncIteration
