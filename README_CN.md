@@ -651,7 +651,49 @@ api_keys:
 
 渠道级别的超时设置优先级高于全局模型超时设置。优先级顺序：渠道级别模型超时设置 > 渠道级别默认超时设置 > 全局模型超时设置 > 全局默认超时设置 > 环境变量 TIMEOUT。
 
-通过调整模型超时时间，可以避免出现某些渠道请求超时报错的情况。如果你遇到 `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}` 错误，请尝试增加模型超时时间。
+更细一点，`model_timeout` 和 `keepalive_interval` 的匹配规则是一样的（同时适用于全局 `preferences.model_timeout` / `preferences.keepalive_interval` 和单个渠道 `providers.(provider).preferences.model_timeout` / `providers.(provider).preferences.keepalive_interval`）：
+
+1. 先定义两个名字：
+   - 「请求模型名」：你在请求体 `model` 字段里写的，例如 `gpt-4o`、`claude-3-5-sonnet`。
+   - 「真实上游模型名」：在 `providers.(provider).model` 左边配置的原始 ID，例如：
+     ```yaml
+     providers:
+       - provider: openai
+         model:
+           - gpt-4o-2024-08-06: gpt-4o   # 左边是真实上游模型名，右边是请求里使用的别名
+     ```
+     在这个例子里，请求模型名是 `gpt-4o`，真实上游模型名是 `gpt-4o-2024-08-06`。
+
+2. 在某个具体渠道下（单个 provider 的 `preferences.model_timeout`）确定超时时间时，会按下面 6 层回退顺序依次尝试（前一步命中就不会再往后走）：
+
+   1) 使用「请求模型名」在该渠道的 `model_timeout` 中做精确匹配（大小写不敏感）。
+
+   2) 如果没有精确命中，再用「请求模型名」做模糊匹配：检查 `model_timeout` 下面是否有某个 key 是请求模型名的一部分。
+      比如你只配置了：
+      ```yaml
+      model_timeout:
+        gpt-4o: 20
+      ```
+      那么 `gpt-4o-2024-08-06`、`gpt-4o-mini` 等模型都会命中 20 秒。
+
+   3) 如果请求模型名在这个渠道里完全匹配不到任何 key，再换成「真实上游模型名」在该渠道的 `model_timeout` 中做精确匹配。
+      例如只给上游 ID `gpt-4o-2024-08-06` 配了超时，也能在这一步被命中。
+
+   4) 如果真实上游模型名的精确匹配失败，再用「真实上游模型名」做模糊匹配：检查 `model_timeout` 下面的某个 key 是否是真实上游模型名的一部分。
+
+   5) 如果前四步都没有命中，并且该渠道的 `model_timeout` 里配置了 `default`，则使用该渠道的 `default` 超时时间。
+
+   6) 如果这个渠道完全没有命中（包括没有渠道级 `default`），则回退到全局 `preferences.model_timeout`：
+      - 再用「真实上游模型名」按「精确匹配 → 模糊匹配 → 全局 `default`」的顺序尝试一遍；
+      - 如果全局也没有任何匹配，最后才会退回到环境变量 `TIMEOUT` 的值（默认 100 秒）。
+
+实际配置时，`model_timeout` 下面的模型名可以这样写：
+
+- 写成你请求时用的别名（例如 `gpt-4o`、`claude-3-5-sonnet`），方便按「请求模型名」直接命中；
+- 写成真实上游模型名（例如 `gpt-4o-2024-08-06`），适合只想精确控制某个供应商的某个版本；
+- 或者写一段稳定的公共前缀 / 关键子串（例如只写 `gpt-4o`），用来同时覆盖一批以该前缀开头的模型。
+
+通过合理配置 `model_timeout`，可以避免出现某些渠道请求超时报错的情况。如果你遇到 `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}` 错误，请尝试增加对应模型的超时时间。
 
 - api_key_rate_limit 是怎么工作的？我如何给多个模型设置相同的频率限制？
 

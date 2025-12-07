@@ -1415,6 +1415,7 @@ class ModelRequestHandler:
                 for local_provider in local_provider_matching_providers:
                     local_provider_name = local_provider['provider']
                     if not local_provider_name.startswith("sk-"):
+                        original_request_model = (local_provider["_model_dict_cache"][request_model_name], request_data.model)
                         local_timeout_value += get_preference(app.state.provider_timeouts, local_provider_name, original_request_model, DEFAULT_TIMEOUT)
                 # print("local_timeout_value", provider_name, local_timeout_value)
                 local_provider_num_matching_providers = len(local_provider_matching_providers)

@@ -650,7 +650,48 @@ For Azure channels, the base_url is compatible with the following formats: https
 
 The channel-level timeout setting has higher priority than the global model timeout setting. The priority order is: channel-level model timeout setting > channel-level default timeout setting > global model timeout setting > global default timeout setting > environment variable TIMEOUT.
 
-By adjusting the model timeout time, you can avoid the error of some channels timing out. If you encounter the error `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}`, please try to increase the model timeout time.
+More specifically, `model_timeout` and `keepalive_interval` share the same matching and fallback rules (they are applied in the same way for global `preferences.model_timeout` / `preferences.keepalive_interval` and for each provider's `preferences.model_timeout` / `preferences.keepalive_interval`):
+
+1. Define two names:
+   - **Request model name**: the value you send in the request body `model` field, for example `gpt-4o`, `claude-3-5-sonnet`.
+   - **Upstream model name**: the original model ID on the provider side, i.e. the *left* side of your mapping in `providers.(provider).model`. For example:
+     ```yaml
+     providers:
+       - provider: openai
+         model:
+           - gpt-4o-2024-08-06: gpt-4o   # left = upstream model name, right = request model alias
+     ```
+     In this case, the request model name is `gpt-4o`, and the upstream model name is `gpt-4o-2024-08-06`.
+
+2. When resolving timeout / keepalive for a *specific provider* (its own `preferences.model_timeout` or `preferences.keepalive_interval`), uni-api tries the following 6 steps in order (it stops at the first match):
+
+   1) Use the **request model name** to look for an exact key match in that provider's `model_timeout` / `keepalive_interval`.
+
+   2) If there is no exact hit, try a **fuzzy match** with the request model name: check whether any key in `model_timeout` / `keepalive_interval` is contained as a substring of the request model name.
+      For example, if you only configure:
+      ```yaml
+      model_timeout:
+        gpt-4o: 20
+      ```
+      then models like `gpt-4o-2024-08-06` or `gpt-4o-mini` will also match 20 seconds.
+
+   3) If the request model name did not match anything for this provider, switch to the **upstream model name** and look for an exact key match in the same `model_timeout` / `keepalive_interval`.
+
+   4) If the upstream model name still does not match exactly, try a **fuzzy match** with the upstream model name: check whether any key in `model_timeout` / `keepalive_interval` is a substring of the upstream model name.
+
+   5) If none of the above matched, but the provider-level `model_timeout` / `keepalive_interval` defines a `default`, use this provider-level `default`.
+
+   6) If this provider has no match at all (including no provider-level `default`), uni-api falls back to the **global** `preferences.model_timeout` / `preferences.keepalive_interval`:
+      - It re-tries with the **upstream model name** against the global config using the same sequence: exact match → fuzzy match → global `default`.
+      - If even the global config has no match, the final fallback is the environment variable `TIMEOUT` (default 100 seconds).
+
+In practice, this means that the keys under `model_timeout` / `keepalive_interval` can be:
+
+- The request alias you actually use (e.g. `gpt-4o`, `claude-3-5-sonnet`);
+- The upstream model ID (e.g. `gpt-4o-2024-08-06`);
+- Or a stable prefix / substring that is shared by a family of models (e.g. just `gpt-4o` to cover `gpt-4o-2024-08-06`, `gpt-4o-mini`, etc.).
+
+By tuning `model_timeout` and `keepalive_interval` based on this matching behavior, you can avoid unnecessary timeouts and better control how long uni-api waits on each provider. If you encounter the error `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}`, try increasing the timeout for the corresponding model (or its prefix) instead of only changing the global TIMEOUT.
 
 - How does api_key_rate_limit work? How do I set the same rate limit for multiple models?
 
