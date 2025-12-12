@@ -977,6 +977,8 @@ def get_preference(preference_config, channel_id, original_request_model, defaul
     if timeout_value is None:
         timeout_value = get_preference_value(provider_timeouts, original_model)
     if timeout_value is None:
+        timeout_value = get_preference_value(preference_config["global"], request_model_name)
+    if timeout_value is None:
         timeout_value = get_preference_value(preference_config["global"], original_model)
     if timeout_value is None:
         timeout_value = preference_config["global"].get("default", default_value)

@@ -65,8 +65,8 @@ providers:
     base_url: https://api.your.com/v1/chat/completions # Backend service API address, required
     api: sk-YgS6GTi0b4bEabc4C # Provider's API Key, required
     model: # Optional, if model is not configured, all available models will be automatically obtained through base_url and api via the /v1/models endpoint.
-      - gpt-4o # Usable model name, required
-      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # Rename model, claude-3-5-sonnet-20240620 is the provider's model name, claude-3-5-sonnet is the renamed name, you can use a simple name to replace the original complex name, optional
+      - gpt-5.2 # Usable model name, required
+      - claude-sonnet-4-5-20250929: claude-sonnet-4-5 # Rename model, claude-sonnet-4-5-20250929 is the provider's model name, claude-sonnet-4-5 is the renamed name, you can use a simple name to replace the original complex name, optional
       - dall-e-3
 
   - provider: anthropic
@@ -75,16 +75,16 @@ providers:
       - sk-ant-api03-bNnAOJyA-xQw_twAA
       - sk-ant-api02-bNnxxxx
     model:
-      - claude-3-7-sonnet-20240620: claude-3-7-sonnet # Rename model, claude-3-7-sonnet-20240620 is the provider's model name, claude-3-7-sonnet is the renamed name, you can use a simple name to replace the original complex name, optional
-      - claude-3-7-sonnet-20250219: claude-3-7-sonnet-think # Rename model, claude-3-7-sonnet-20250219 is the provider's model name, claude-3-7-sonnet-think is the renamed name, if "think" is in the renamed name, it will be automatically converted to claude think model, default think token limit is 4096. Optional
+      - claude-sonnet-4-5-20250929: claude-sonnet-4-5 # Rename model, claude-sonnet-4-5-20250929 is the provider's model name, claude-sonnet-4-5 is the renamed name, you can use a simple name to replace the original complex name, optional
+      - claude-sonnet-4-5-20250929: claude-sonnet-4-5-think # Rename model, claude-sonnet-4-5-20250929 is the provider's model name, claude-sonnet-4-5-think is the renamed name, if "think" is in the renamed name, it will be automatically converted to claude think model, default think token limit is 4096. Optional
     tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
     preferences:
       post_body_parameter_overrides: # Support customizing request body parameters
-        claude-3-7-sonnet-think: # Add custom request body parameters to the model claude-3-7-sonnet-think
+        claude-sonnet-4-5-think: # Add custom request body parameters to the model claude-sonnet-4-5-think
           tools:
-            - type: code_execution_20250522 # Add code_execution tool to the model claude-3-7-sonnet-think
+            - type: code_execution_20250522 # Add code_execution tool to the model claude-sonnet-4-5-think
               name: code_execution
-            - type: web_search_20250305 # Add web_search tool to the model claude-3-7-sonnet-think, max_uses means to use up to 5 times
+            - type: web_search_20250305 # Add web_search tool to the model claude-sonnet-4-5-think, max_uses means to use up to 5 times
               name: web_search
               max_uses: 5
 
@@ -95,10 +95,10 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro
+      - gemini-3-pro-preview: gemini-3-pro
       - gemini-2.5-flash: gemini-2.5-flash # After renaming, the original model name gemini-2.5-flash cannot be used, if you want to use the original name, you can add the original name in the model, just add the line below to use the original name
       - gemini-2.5-flash
-      - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
+      - gemini-pro-latest: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`.
       - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in post_body_parameter_overrides. Additionally, you can customize the inference budget using -think-number. These options can be used together or separately.
       - gemini-2.5-flash: gemini-2.5-flash-think-0 # Support to rename models with -think-number suffix to enable search, if the number is 0, it means to close the reasoning.
       - gemini-embedding-001
@@ -134,12 +134,11 @@ providers:
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # Description: Email address of the Google Cloud Vertex AI service account. Format: Usually a string like "service-account-name@project-id.iam.gserviceaccount.com". How to obtain: Generated when creating a service account, or you can view the service account details in the "IAM and Admin" section of the Google Cloud Console.
     model:
       - gemini-2.5-flash
-      - gemini-2.5-pro
-      - gemini-2.5-pro: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
-      - claude-3-5-sonnet@20240620: claude-3-5-sonnet
-      - claude-3-opus@20240229: claude-3-opus
-      - claude-3-sonnet@20240229: claude-3-sonnet
-      - claude-3-haiku@20240307: claude-3-haiku
+      - gemini-3-pro-preview: gemini-3-pro
+      - gemini-pro-latest: gemini-2.5-pro-search # To enable search for a model, rename it with the -search suffix and set custom request body parameters for this model in `post_body_parameter_overrides`. Not setting post_body_parameter_overrides will not enable search.
+      - claude-sonnet-4-5@20250929: claude-sonnet-4-5
+      - claude-opus-4-5@20251101: claude-opus-4-5
+      - claude-haiku-4-5@20251001: claude-haiku-4-5
       - gemini-embedding-001
       - text-embedding-004
     tools: true
@@ -171,7 +170,7 @@ providers:
     base_url: https://your-endpoint.openai.azure.com
     api: your-api-key
     model:
-      - gpt-4o
+      - gpt-5.2
     preferences:
       post_body_parameter_overrides: # Support customizing request body parameters
         key1: value1 # Force the request to add "key1": "value1" parameter
@@ -187,14 +186,14 @@ providers:
     model:
       - databricks-claude-sonnet-4: claude-sonnet-4
       - databricks-claude-opus-4: claude-opus-4
-      - databricks-claude-3-7-sonnet: claude-3-7-sonnet
+      - databricks-claude-sonnet-4-5: claude-sonnet-4-5
 
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
     aws_access_key: xxxxxxxx
     aws_secret_key: xxxxxxxx
     model:
-      - anthropic.claude-3-5-sonnet-20240620-v1:0: claude-3-5-sonnet
+      - anthropic.claude-sonnet-4-5-20250929-v1:0: claude-sonnet-4-5
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
@@ -205,29 +204,29 @@ providers:
       - xx.xxx # api of key1
       - xx.xxx # api of key2
     model:
-      - gemini-2.5-pro-preview-06-05
+      - gemini-3-pro-preview
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
     api: sk-bNnAOJyA-xQw_twAA
     model:
       - causallm-35b-beta2ep-q6k: causallm-35b
-      - anthropic/claude-3-5-sonnet
+      - anthropic/claude-sonnet-4-5
     tools: false
     engine: openrouter # Force the use of a specific message format, currently supports gpt, claude, gemini, openrouter native format, optional
 
 api_keys:
   - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, required for users to use this service
     model: # Models that can be used by this API Key, optional. Default channel-level polling load balancing is enabled, and each request model is requested in sequence according to the model configuration. It is not related to the original channel order in providers. Therefore, you can set different request sequences for each API key.
-      - gpt-4o # Usable model name, can use all gpt-4o models provided by providers
-      - claude-3-5-sonnet # Usable model name, can use all claude-3-5-sonnet models provided by providers
+      - gpt-5.2 # Usable model name, can use all gpt-5.2 models provided by providers
+      - claude-sonnet-4-5 # Usable model name, can use all claude-sonnet-4-5 models provided by providers
       - gemini/* # Usable model name, can only use all models provided by providers named gemini, where gemini is the provider name, * represents all models
     role: admin # Set the alias of the API key, optional. The request log will display the alias of the API key. If role is admin, only this API key can request the v1/stats,/v1/generate-api-key endpoints. If all API keys do not have role set to admin, the first API key is set as admin and has permission to request the v1/stats,/v1/generate-api-key endpoints.
 
   - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
-      - anthropic/claude-3-5-sonnet # Usable model name, can only use the claude-3-5-sonnet model provided by the provider named anthropic. Models with the same name from other providers cannot be used. This syntax will not match the model named anthropic/claude-3-5-sonnet provided by other-provider.
-      - <anthropic/claude-3-5-sonnet> # By adding angle brackets on both sides of the model name, it will not search for the claude-3-5-sonnet model under the channel named anthropic, but will take the entire anthropic/claude-3-5-sonnet as the model name. This syntax can match the model named anthropic/claude-3-5-sonnet provided by other-provider. But it will not match the claude-3-5-sonnet model under anthropic.
+      - anthropic/claude-sonnet-4-5 # Usable model name, can only use the claude-sonnet-4-5 model provided by the provider named anthropic. Models with the same name from other providers cannot be used. This syntax will not match the model named anthropic/claude-sonnet-4-5 provided by other-provider.
+      - <anthropic/claude-sonnet-4-5> # By adding angle brackets on both sides of the model name, it will not search for the claude-sonnet-4-5 model under the channel named anthropic, but will take the entire anthropic/claude-sonnet-4-5 as the model name. This syntax can match the model named anthropic/claude-sonnet-4-5 provided by other-provider. But it will not match the claude-sonnet-4-5 model under anthropic.
       - openai-test/omni-moderation-latest # When message moderation is enabled, the omni-moderation-latest model under the channel named openai-test can be used for moderation.
       - sk-KjjI60Yd0JFWtxxxxxxxxxxxxxxwmRWpWpQRo/* # Support using other API keys as channels
     preferences:
@@ -257,11 +256,11 @@ api_keys:
 
 preferences: # Global configuration
   model_timeout: # Model timeout, in seconds, default 100 seconds, optional
-    gpt-4o: 10 # Model gpt-4o timeout is 10 seconds, gpt-4o is the model name, when requesting models like gpt-4o-2024-08-06, the timeout is also 10 seconds
-    claude-3-5-sonnet: 10 # Model claude-3-5-sonnet timeout is 10 seconds, when requesting models like claude-3-5-sonnet-20240620, the timeout is also 10 seconds
+    gpt-5.2: 10 # Model gpt-5.2 timeout is 10 seconds, gpt-5.2 is the model name, when requesting models like gpt-5.2-2025-12-11, the timeout is also 10 seconds
+    claude-sonnet-4-5: 10 # Model claude-sonnet-4-5 timeout is 10 seconds, when requesting models like claude-sonnet-4-5-20250929, the timeout is also 10 seconds
     default: 10 # Model does not have a timeout set, use the default timeout of 10 seconds, when requesting a model not in model_timeout, the default timeout is 10 seconds, if default is not set, uni-api will use the default timeout set by the environment variable TIMEOUT, the default timeout is 100 seconds
-    o1-mini: 30 # Model o1-mini timeout is 30 seconds, when requesting models starting with o1-mini, the timeout is 30 seconds
-    o1-preview: 100 # Model o1-preview timeout is 100 seconds, when requesting models starting with o1-preview, the timeout is 100 seconds
+    gemini-3-pro: 30 # Model gemini-3-pro timeout is 30 seconds, when requesting models starting with gemini-3-pro, the timeout is 30 seconds
+    gemini-3-pro-image: 100 # Model gemini-3-pro-image timeout is 100 seconds, when requesting models starting with gemini-3-pro-image, the timeout is 100 seconds
   cooldown_period: 300 # Channel cooldown time, in seconds, default 300 seconds, optional. When a model request fails, the channel will be automatically excluded and cooled down for a period of time, and will not request the channel again. After the cooldown time ends, the model will be automatically restored until the request fails again, and it will be cooled down again. When cooldown_period is set to 0, the cooling mechanism is not enabled.
   rate_limit: 999999/min # uni-api global rate limit, in times/minute, supports multiple frequency constraints, such as: 15/min,10/day. Default 999999/min, optional.
   keepalive_interval: # Heartbeat interval, in seconds, default 99999 seconds, optional. Suitable for when uni-api is hosted on cloudflare and uses inference models.
@@ -271,8 +270,8 @@ preferences: # Global configuration
     - process this request due to overload or policy
   proxy: socks5://[username]:[password]@[ip]:[port] # Proxy address, optional.
   model_price: # Model price, in dollars/M tokens, optional. Default price is 1,2, which means input 1 dollar/1M tokens, output 2 dollars/1M tokens.
-    gpt-4o: 1,2
-    claude-3-5-sonnet: 0.12,0.48
+    gpt-5.2: 1,2
+    claude-sonnet-4-5: 0.12,0.48
     default: 1,2
 ```
 
@@ -370,7 +369,7 @@ Use ctrl+b d to exit tmux, allowing the program to run in the background. At thi
 curl -X POST https://xxx.serv00.net/v1/chat/completions \
 -H 'Content-Type: application/json' \
 -H 'Authorization: Bearer sk-xxx' \
--d '{"model": "gpt-4o","messages": [{"role": "user","content": "Hello"}]}'
+-d '{"model": "gpt-5.2","messages": [{"role": "user","content": "Hello"}]}'
 ```
 
 Reference document:
@@ -449,7 +448,7 @@ RESTful curl test
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer ${API}" \
--d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
+-d '{"model": "gpt-5.2","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
 
 pex linux packaging:
@@ -642,7 +641,7 @@ All scheduling algorithms need to be enabled by setting api_keys.(api).preferenc
 
 - How should the base_url be filled in correctly?
 
-Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completions, not Azure's URL.
+Except for some special channels shown in the advanced configuration, all OpenAI format providers need to fill in the base_url completely, which means the base_url must end with /v1/chat/completions or /v1/responses. If you are using GitHub models, the base_url should be filled in as https://models.inference.ai.azure.com/chat/completions, not Azure's URL.
 
 For Azure channels, the base_url is compatible with the following formats: https://your-endpoint.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview and https://your-endpoint.services.ai.azure.com/models/chat/completions, https://your-endpoint.openai.azure.com, it is recommended to use the first format. If api-version is not explicitly specified, the default is 2024-10-21.
 
@@ -653,15 +652,15 @@ The channel-level timeout setting has higher priority than the global model time
 More specifically, `model_timeout` and `keepalive_interval` share the same matching and fallback rules (they are applied in the same way for global `preferences.model_timeout` / `preferences.keepalive_interval` and for each provider's `preferences.model_timeout` / `preferences.keepalive_interval`):
 
 1. Define two names:
-   - **Request model name**: the value you send in the request body `model` field, for example `gpt-4o`, `claude-3-5-sonnet`.
+   - **Request model name**: the value you send in the request body `model` field, for example `gpt-5.2`, `claude-sonnet-4-5`.
    - **Upstream model name**: the original model ID on the provider side, i.e. the *left* side of your mapping in `providers.(provider).model`. For example:
      ```yaml
      providers:
        - provider: openai
          model:
-           - gpt-4o-2024-08-06: gpt-4o   # left = upstream model name, right = request model alias
+           - gpt-5.2-2025-12-11: gpt-5.2   # left = upstream model name, right = request model alias
      ```
-     In this case, the request model name is `gpt-4o`, and the upstream model name is `gpt-4o-2024-08-06`.
+     In this case, the request model name is `gpt-5.2`, and the upstream model name is `gpt-5.2-2025-12-11`.
 
 2. When resolving timeout / keepalive for a *specific provider* (its own `preferences.model_timeout` or `preferences.keepalive_interval`), uni-api tries the following 6 steps in order (it stops at the first match):
 
@@ -671,9 +670,9 @@ More specifically, `model_timeout` and `keepalive_interval` share the same match
       For example, if you only configure:
       ```yaml
       model_timeout:
-        gpt-4o: 20
+        gpt-5.2: 20
       ```
-      then models like `gpt-4o-2024-08-06` or `gpt-4o-mini` will also match 20 seconds.
+      then models like `gpt-5.2-2025-12-11` or `gpt-5-mini` will also match 20 seconds.
 
    3) If the request model name did not match anything for this provider, switch to the **upstream model name** and look for an exact key match in the same `model_timeout` / `keepalive_interval`.
 
@@ -682,14 +681,15 @@ More specifically, `model_timeout` and `keepalive_interval` share the same match
    5) If none of the above matched, but the provider-level `model_timeout` / `keepalive_interval` defines a `default`, use this provider-level `default`.
 
    6) If this provider has no match at all (including no provider-level `default`), uni-api falls back to the **global** `preferences.model_timeout` / `preferences.keepalive_interval`:
-      - It re-tries with the **upstream model name** against the global config using the same sequence: exact match → fuzzy match → global `default`.
+      - It re-tries with the **request model name** against the global config using the same sequence: exact match → fuzzy match → global `default`.
+      - If not found, it re-tries with the **upstream model name** against the global config using the same sequence: exact match → fuzzy match → global `default`.
       - If even the global config has no match, the final fallback is the environment variable `TIMEOUT` (default 100 seconds).
 
 In practice, this means that the keys under `model_timeout` / `keepalive_interval` can be:
 
-- The request alias you actually use (e.g. `gpt-4o`, `claude-3-5-sonnet`);
-- The upstream model ID (e.g. `gpt-4o-2024-08-06`);
-- Or a stable prefix / substring that is shared by a family of models (e.g. just `gpt-4o` to cover `gpt-4o-2024-08-06`, `gpt-4o-mini`, etc.).
+- The request alias you actually use (e.g. `gpt-5.2`, `claude-sonnet-4-5`);
+- The upstream model ID (e.g. `gpt-5.2-2025-12-11`);
+- Or a stable prefix / substring that is shared by a family of models (e.g. just `gpt-5.2` to cover `gpt-5.2-2025-12-11`, `gpt-5-mini`, etc.).
 
 By tuning `model_timeout` and `keepalive_interval` based on this matching behavior, you can avoid unnecessary timeouts and better control how long uni-api waits on each provider. If you encounter the error `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}`, try increasing the timeout for the corresponding model (or its prefix) instead of only changing the global TIMEOUT.
 
@@ -729,8 +729,8 @@ api_keys:
 
   - api: sk-xxx2
     model:
-      - anthropic/claude-3-7-sonnet # channel 1
-      - openrouter/claude-3-7-sonnet # channel 2
+      - anthropic/claude-sonnet-4-5 # channel 1
+      - openrouter/claude-sonnet-4-5 # channel 2
     preferences:
       SCHEDULING_ALGORITHM: random # channel 1 2 use random round-robin
 ```

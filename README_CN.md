@@ -65,8 +65,8 @@ providers:
     base_url: https://api.your.com/v1/chat/completions # 后端服务的API地址，必填
     api: sk-YgS6GTi0b4bEabc4C # 提供商的API Key，必填
     model: # 选填，如果不配置 model，会自动通过 base_url 和 api 通过 /v1/models 端点获取可用的所有模型。
-      - gpt-4o # 可以使用的模型名称，必填
-      - claude-3-5-sonnet-20240620: claude-3-5-sonnet # 重命名模型，claude-3-5-sonnet-20240620 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+      - gpt-5.2 # 可以使用的模型名称，必填
+      - claude-sonnet-4-5-20250929: claude-sonnet-4-5 # 重命名模型，claude-sonnet-4-5-20250929 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
       - dall-e-3
 
   - provider: anthropic
@@ -75,16 +75,16 @@ providers:
       - sk-ant-api03-bNnAOJyA-xQw_twAA
       - sk-ant-api02-bNnxxxx
     model:
-      - claude-3-7-sonnet-20240620: claude-3-7-sonnet # 重命名模型，claude-3-7-sonnet-20240620 是服务商的模型名称，claude-3-7-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
-      - claude-3-7-sonnet-20250219: claude-3-7-sonnet-think # 重命名模型，claude-3-7-sonnet-20250219 是服务商的模型名称，claude-3-7-sonnet-think 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，如果重命名后的名字里面有think，则自动转换为 claude 思考模型，默认思考 token 限制为 4096。选填
+      - claude-sonnet-4-5-20250929: claude-sonnet-4-5 # 重命名模型，claude-sonnet-4-5-20250929 是服务商的模型名称，claude-sonnet-4-5 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
+      - claude-sonnet-4-5-20250929: claude-sonnet-4-5-think # 重命名模型，claude-sonnet-4-5-20250929 是服务商的模型名称，claude-sonnet-4-5-think 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，如果重命名后的名字里面有think，则自动转换为 claude 思考模型，默认思考 token 限制为 4096。选填
     tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
     preferences:
       post_body_parameter_overrides: # 支持自定义请求体参数
-        claude-3-7-sonnet-think: # 给模型 claude-3-7-sonnet-think 添加自定义请求体参数
+        claude-sonnet-4-5-think: # 给模型 claude-sonnet-4-5-think 添加自定义请求体参数
           tools:
-            - type: code_execution_20250522 # 给模型 claude-3-7-sonnet-think 添加 code_execution 工具
+            - type: code_execution_20250522 # 给模型 claude-sonnet-4-5-think 添加 code_execution 工具
               name: code_execution
-            - type: web_search_20250305 # 给模型 claude-3-7-sonnet-think 添加 web_search 工具，max_uses 表示最多使用 5 次
+            - type: web_search_20250305 # 给模型 claude-sonnet-4-5-think 添加 web_search 工具，max_uses 表示最多使用 5 次
               name: web_search
               max_uses: 5
 
@@ -95,10 +95,10 @@ providers:
       - AIzaSyAN2k6IRdgw456
       - AIzaSyAN2k6IRdgw789
     model:
-      - gemini-2.5-pro
+      - gemini-3-pro-preview: gemini-3-pro
       - gemini-2.5-flash: gemini-2.5-flash # 重命名后，原来的模型名字 gemini-2.5-flash 无法使用，如果要使用原来的名字，可以在 model 中添加原来的名字，只要加上下面一行就可以使用原来的名字了
       - gemini-2.5-flash
-      - gemini-2.5-pro: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。
+      - gemini-pro-latest: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。
       - gemini-2.5-flash: gemini-2.5-flash-think-24576-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索，同时支持使用 `-think-数字` 自定义推理预算，可以同时开启也可以单独开启。
       - gemini-2.5-flash: gemini-2.5-flash-think-0 # 支持以 -think-数字 自定义推理预算，当数字为 0 时，表示关闭推理。
       - gemini-embedding-001
@@ -134,12 +134,11 @@ providers:
     client_email: xxxxxxxxxx@xxxxxxx.gserviceaccount.com # 描述： Google Cloud Vertex AI 服务账号的电子邮件地址。格式： 通常是形如 "service-account-name@project-id.iam.gserviceaccount.com" 的字符串。获取方式： 在创建服务账号时生成，也可以在 Google Cloud Console 的"IAM与管理"部分查看服务账号详情获得。
     model:
       - gemini-2.5-flash
-      - gemini-2.5-pro
-      - gemini-2.5-pro: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。不设置 post_body_parameter_overrides 参数，则无法启用搜索。
-      - claude-3-5-sonnet@20240620: claude-3-5-sonnet
-      - claude-3-opus@20240229: claude-3-opus
-      - claude-3-sonnet@20240229: claude-3-sonnet
-      - claude-3-haiku@20240307: claude-3-haiku
+      - gemini-3-pro-preview: gemini-3-pro
+      - gemini-pro-latest: gemini-2.5-pro-search # 可以以 -search 后缀重命名模型，同时在 post_body_parameter_overrides 设置针对此模型的自定义请求体参数即可启用搜索。不设置 post_body_parameter_overrides 参数，则无法启用搜索。
+      - claude-sonnet-4-5@20250929: claude-sonnet-4-5
+      - claude-opus-4-5@20251101: claude-opus-4-5
+      - claude-haiku-4-5@20251001: claude-haiku-4-5
       - gemini-embedding-001
       - text-embedding-004
     tools: true
@@ -171,7 +170,7 @@ providers:
     base_url: https://your-endpoint.openai.azure.com
     api: your-api-key
     model:
-      - gpt-4o
+      - gpt-5.2
     preferences:
       post_body_parameter_overrides: # 支持自定义请求体参数
         key1: value1 # 强制在请求中添加 "key1": "value1" 参数
@@ -187,14 +186,14 @@ providers:
     model:
       - databricks-claude-sonnet-4: claude-sonnet-4
       - databricks-claude-opus-4: claude-opus-4
-      - databricks-claude-3-7-sonnet: claude-3-7-sonnet
+      - databricks-claude-sonnet-4-5: claude-sonnet-4-5
 
   - provider: aws
     base_url: https://bedrock-runtime.us-east-1.amazonaws.com
     aws_access_key: xxxxxxxx
     aws_secret_key: xxxxxxxx
     model:
-      - anthropic.claude-3-5-sonnet-20240620-v1:0: claude-3-5-sonnet
+      - anthropic.claude-sonnet-4-5-20250929-v1:0: claude-sonnet-4-5
 
   - provider: vertex-express
     base_url: https://aiplatform.googleapis.com/
@@ -205,29 +204,29 @@ providers:
       - xx.xxx # key1 的 api
       - xx.xxx # key2 的 api
     model:
-      - gemini-2.5-pro-preview-06-05
+      - gemini-3-pro-preview
 
   - provider: other-provider
     base_url: https://api.xxx.com/v1/messages
     api: sk-bNnAOJyA-xQw_twAA
     model:
       - causallm-35b-beta2ep-q6k: causallm-35b
-      - anthropic/claude-3-5-sonnet
+      - anthropic/claude-sonnet-4-5
     tools: false
     engine: openrouter # 强制使用某个消息格式，目前支持 gpt，claude，gemini，openrouter 原生格式，选填
 
 api_keys:
   - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
     model: # 该 API Key 可以使用的模型，选填。默认开启渠道级轮询负载均衡，每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
-      - gpt-4o # 可以使用的模型名称，可以使用所有提供商提供的 gpt-4o 模型
-      - claude-3-5-sonnet # 可以使用的模型名称，可以使用所有提供商提供的 claude-3-5-sonnet 模型
+      - gpt-5.2 # 可以使用的模型名称，可以使用所有提供商提供的 gpt-5.2 模型
+      - claude-sonnet-4-5 # 可以使用的模型名称，可以使用所有提供商提供的 claude-sonnet-4-5 模型
       - gemini/* # 可以使用的模型名称，仅可以使用名为 gemini 提供商提供的所有模型，其中 gemini 是 provider 名称，* 代表所有模型
     role: admin # 设置 API key 的别名，选填。请求日志会显示该 API key 的别名。如果 role 为 admin，则仅有此 API key 可以请求 v1/stats,/v1/generate-api-key 端点。如果所有 API key 都没有设置 role 为 admin，则默认第一个 API key 为 admin 拥有请求 v1/stats,/v1/generate-api-key 端点的权限。
 
   - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
-      - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。这种写法不会匹配到other-provider提供的名为anthropic/claude-3-5-sonnet的模型。
-      - <anthropic/claude-3-5-sonnet> # 通过在模型名两侧加上尖括号，这样就不会去名为anthropic的渠道下去寻找claude-3-5-sonnet模型，而是将整个 anthropic/claude-3-5-sonnet 作为模型名称。这种写法可以匹配到other-provider提供的名为 anthropic/claude-3-5-sonnet 的模型。但不会匹配到anthropic下面的claude-3-5-sonnet模型。
+      - anthropic/claude-sonnet-4-5 # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-sonnet-4-5 模型。其他提供商的 claude-sonnet-4-5 模型不可以使用。这种写法不会匹配到other-provider提供的名为anthropic/claude-3-5-sonnet的模型。
+      - <anthropic/claude-sonnet-4-5> # 通过在模型名两侧加上尖括号，这样就不会去名为anthropic的渠道下去寻找claude-3-5-sonnet模型，而是将整个 anthropic/claude-sonnet-4-5 作为模型名称。这种写法可以匹配到other-provider提供的名为 anthropic/claude-sonnet-4-5 的模型。但不会匹配到anthropic下面的claude-3-5-sonnet模型。
       - openai-test/omni-moderation-latest # 当开启消息道德审查后，可以使用名为 openai-test 渠道下的 omni-moderation-latest 模型进行道德审查。
       - sk-KjjI60Yd0JFWtxxxxxxxxxxxxxxwmRWpWpQRo/* # 支持将其他 api key 当作渠道
     preferences:
@@ -257,11 +256,11 @@ api_keys:
 
 preferences: # 全局配置
   model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
-    gpt-4o: 10 # 模型 gpt-4o 的超时时间为 10 秒,gpt-4o 是模型名称，当请求 gpt-4o-2024-08-06 等模型时，超时时间也是 10 秒
-    claude-3-5-sonnet: 10 # 模型 claude-3-5-sonnet 的超时时间为 10 秒，当请求 claude-3-5-sonnet-20240620 等模型时，超时时间也是 10 秒
+    gpt-5.2: 10 # 模型 gpt-5.2 的超时时间为 10 秒,gpt-5.2 是模型名称，当请求 gpt-5.2-2025-12-11 等模型时，超时时间也是 10 秒
+    claude-sonnet-4-5: 10 # 模型 claude-sonnet-4-5 的超时时间为 10 秒，当请求 claude-sonnet-4-5-20250929 等模型时，超时时间也是 10 秒
     default: 10 # 模型没有设置超时时间，使用默认的超时时间 10 秒，当请求的不在 model_timeout 里面的模型时，超时时间默认是 10 秒，不设置 default，uni-api 会使用 环境变量 TIMEOUT 设置的默认超时时间，默认超时时间是 100 秒
-    o1-mini: 30 # 模型 o1-mini 的超时时间为 30 秒，当请求名字是 o1-mini 开头的模型时，超时时间是 30 秒
-    o1-preview: 100 # 模型 o1-preview 的超时时间为 100 秒，当请求名字是 o1-preview 开头的模型时，超时时间是 100 秒
+    gemini-3-pro: 30 # 模型 gemini-3-pro 的超时时间为 30 秒，当请求名字是 gemini-3-pro 开头的模型时，超时时间是 30 秒
+    gemini-3-pro-image: 100 # 模型 gemini-3-pro-image 的超时时间为 100 秒，当请求名字是 gemini-3-pro-image 开头的模型时，超时时间是 100 秒
   cooldown_period: 300 # 渠道冷却时间，单位为秒，默认 300 秒，选填。当模型请求失败时，会自动将该渠道排除冷却一段时间，不再请求该渠道，冷却时间结束后，会自动将该模型恢复，直到再次请求失败，会重新冷却。当 cooldown_period 设置为 0 时，不启用冷却机制。
   rate_limit: 999999/min # uni-api 全局速率限制，单位为次数/分钟，支持多个频率约束条件，例如：15/min,10/day。默认 999999/min，选填。
   keepalive_interval: # 心跳间隔，单位为秒，默认 99999 秒，选填。适合当 uni-api 域名托管在 cloudflare 并使用推理模型时使用。
@@ -271,8 +270,8 @@ preferences: # 全局配置
     - process this request due to overload or policy
   proxy: socks5://[username]:[password]@[ip]:[port] # 全局代理地址，选填。
   model_price: # 模型价格，单位为美元/M tokens，选填。默认价格为 1,2，表示输入 1 美元/100 万 tokens，输出 2 美元/100 万 tokens。
-    gpt-4o: 1,2
-    claude-3-5-sonnet: 0.12,0.48
+    gpt-5.2: 1,2
+    claude-sonnet-4-5: 0.12,0.48
     default: 1,2
 ```
 
@@ -370,7 +369,7 @@ python main.py
 curl -X POST https://xxx.serv00.net/v1/chat/completions \
 -H 'Content-Type: application/json' \
 -H 'Authorization: Bearer sk-xxx' \
--d '{"model": "gpt-4o","messages": [{"role": "user","content": "你好"}]}'
+-d '{"model": "gpt-5.2","messages": [{"role": "user","content": "你好"}]}'
 ```
 
 参考文档：
@@ -449,7 +448,7 @@ RESTful curl test
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer ${API}" \
--d '{"model": "gpt-4o","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
+-d '{"model": "gpt-5.2","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
 
 pex linux 打包：
@@ -643,7 +642,7 @@ api_keys:
 
 - 应该怎么正确填写 base_url？
 
-除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completions，而不是 Azure 的 URL。
+除了高级配置里面所展示的一些特殊的渠道，所有 OpenAI 格式的提供商需要把 base_url 填完整，也就是说 base_url 必须以 /v1/chat/completions 结尾或者 /v1/responses 结尾。如果你使用的 GitHub models，base_url 应该填写为 https://models.inference.ai.azure.com/chat/completions，而不是 Azure 的 URL。
 
 对于 Azure 渠道，base_url 兼容以下几种写法：https://your-endpoint.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview 和 https://your-endpoint.services.ai.azure.com/models/chat/completions，https://your-endpoint.openai.azure.com，推荐使用第一种写法。如果不显式指定 api-version，默认使用 2024-10-21 版本。
 
@@ -654,15 +653,15 @@ api_keys:
 更细一点，`model_timeout` 和 `keepalive_interval` 的匹配规则是一样的（同时适用于全局 `preferences.model_timeout` / `preferences.keepalive_interval` 和单个渠道 `providers.(provider).preferences.model_timeout` / `providers.(provider).preferences.keepalive_interval`）：
 
 1. 先定义两个名字：
-   - 「请求模型名」：你在请求体 `model` 字段里写的，例如 `gpt-4o`、`claude-3-5-sonnet`。
+   - 「请求模型名」：你在请求体 `model` 字段里写的，例如 `gpt-5.2`、`claude-sonnet-4-5`。
    - 「真实上游模型名」：在 `providers.(provider).model` 左边配置的原始 ID，例如：
      ```yaml
      providers:
        - provider: openai
          model:
-           - gpt-4o-2024-08-06: gpt-4o   # 左边是真实上游模型名，右边是请求里使用的别名
+           - gpt-5.2-2025-12-11: gpt-5.2   # 左边是真实上游模型名，右边是请求里使用的别名
      ```
-     在这个例子里，请求模型名是 `gpt-4o`，真实上游模型名是 `gpt-4o-2024-08-06`。
+     在这个例子里，请求模型名是 `gpt-5.2`，真实上游模型名是 `gpt-5.2-2025-12-11`。
 
 2. 在某个具体渠道下（单个 provider 的 `preferences.model_timeout`）确定超时时间时，会按下面 6 层回退顺序依次尝试（前一步命中就不会再往后走）：
 
@@ -672,26 +671,27 @@ api_keys:
       比如你只配置了：
       ```yaml
       model_timeout:
-        gpt-4o: 20
+        gpt-5.2: 20
       ```
-      那么 `gpt-4o-2024-08-06`、`gpt-4o-mini` 等模型都会命中 20 秒。
+      那么 `gpt-5.2-2025-12-11`、`gpt-5-mini` 等模型都会命中 20 秒。
 
    3) 如果请求模型名在这个渠道里完全匹配不到任何 key，再换成「真实上游模型名」在该渠道的 `model_timeout` 中做精确匹配。
-      例如只给上游 ID `gpt-4o-2024-08-06` 配了超时，也能在这一步被命中。
+      例如只给上游 ID `gpt-5.2-2025-12-11` 配了超时，也能在这一步被命中。
 
    4) 如果真实上游模型名的精确匹配失败，再用「真实上游模型名」做模糊匹配：检查 `model_timeout` 下面的某个 key 是否是真实上游模型名的一部分。
 
    5) 如果前四步都没有命中，并且该渠道的 `model_timeout` 里配置了 `default`，则使用该渠道的 `default` 超时时间。
 
    6) 如果这个渠道完全没有命中（包括没有渠道级 `default`），则回退到全局 `preferences.model_timeout`：
-      - 再用「真实上游模型名」按「精确匹配 → 模糊匹配 → 全局 `default`」的顺序尝试一遍；
+      - 先用「请求模型名」按「精确匹配 → 模糊匹配 → 全局 `default`」的顺序尝试一遍；
+      - 如果没有命中，再用「真实上游模型名」按「精确匹配 → 模糊匹配 → 全局 `default`」的顺序尝试一遍；
       - 如果全局也没有任何匹配，最后才会退回到环境变量 `TIMEOUT` 的值（默认 100 秒）。
 
 实际配置时，`model_timeout` 下面的模型名可以这样写：
 
-- 写成你请求时用的别名（例如 `gpt-4o`、`claude-3-5-sonnet`），方便按「请求模型名」直接命中；
-- 写成真实上游模型名（例如 `gpt-4o-2024-08-06`），适合只想精确控制某个供应商的某个版本；
-- 或者写一段稳定的公共前缀 / 关键子串（例如只写 `gpt-4o`），用来同时覆盖一批以该前缀开头的模型。
+- 写成你请求时用的别名（例如 `gpt-5.2`、`claude-sonnet-4-5`），方便按「请求模型名」直接命中；
+- 写成真实上游模型名（例如 `gpt-5.2-2025-12-11`），适合只想精确控制某个供应商的某个版本；
+- 或者写一段稳定的公共前缀 / 关键子串（例如只写 `gpt-5.2`），用来同时覆盖一批以该前缀开头的模型。
 
 通过合理配置 `model_timeout`，可以避免出现某些渠道请求超时报错的情况。如果你遇到 `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}` 错误，请尝试增加对应模型的超时时间。
 
@@ -731,8 +731,8 @@ api_keys:
 
   - api: sk-xxx2
     model:
-      - anthropic/claude-3-7-sonnet # 渠道1
-      - openrouter/claude-3-7-sonnet # 渠道2
+      - anthropic/claude-sonnet-4-5 # 渠道1
+      - openrouter/claude-sonnet-4-5 # 渠道2
     preferences:
       SCHEDULING_ALGORITHM: random # 渠道 1 2 采用随机轮训
 ```
