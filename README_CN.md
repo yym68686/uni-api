@@ -410,6 +410,91 @@ services:
 
 CONFIG_URL 就是可以自动下载远程的配置文件。比如你在某个平台不方便修改配置文件，可以把配置文件传到某个托管服务，可以提供直链给 uni-api 下载，CONFIG_URL 就是这个直链。如果使用本地挂载的配置文件，不需要设置 CONFIG_URL。CONFIG_URL 是在不方便挂载配置文件的情况下使用。
 
+### api.yaml 热重启（最小修改）+ 前端同步读取
+
+`uni-api` 默认启动时读取一次 `api.yaml`。如果你希望“在前端修改 api.yaml 后，uni-api 立即生效”，最小修改的做法是：
+
+- `api.yaml` 同时挂载给后端 `uni-api` 和前端（`uni-api-status`）
+- 额外加一个 `config-watcher` 监听 `api.yaml` 变更，并自动 `docker restart uni-api`
+
+下面是一个可直接使用的 `docker-compose.yml` 示例（把 `./api.yaml` 放在同目录）：
+
+```yaml
+services:
+  uni-api:
+    image: yym68686/uni-api:latest
+    container_name: uni-api
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - WATCHFILES_FORCE_POLLING=true
+    volumes:
+      - ./api.yaml:/home/api.yaml
+      - ./uniapi_db:/home/data
+
+  uniapi-frontend:
+    image: ghcr.io/melosbot/uni-api-status:latest
+    container_name: uni-api-frontend
+    restart: unless-stopped
+    ports:
+      - "3700:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - API_YAML_PATH=/app/config/api.yaml
+      - STATS_DB_PATH=/app/data/stats.db
+    volumes:
+      - ./api.yaml:/app/config/api.yaml
+      - ./uniapi_db:/app/data:ro
+    depends_on:
+      - uni-api
+
+  config-watcher:
+    image: alpine:latest
+    container_name: uni-api-config-watcher
+    restart: unless-stopped
+    volumes:
+      - ./api.yaml:/watch/api.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c "
+      apk add --no-cache inotify-tools docker-cli &&
+      while true; do
+        inotifywait -e modify,close_write /watch/api.yaml &&
+        echo 'api.yaml changed, restarting uni-api...' &&
+        docker restart uni-api
+      done
+      "
+```
+
+注意：`config-watcher` 通过挂载 `/var/run/docker.sock` 来重启容器，仅建议在可信机器/环境中使用。
+
+如需用域名同时访问前端和 API，可用 Caddy 反代（`Caddyfile` 示例）：
+
+```caddyfile
+yourdomain.com {
+  encode gzip
+  tls a@bc.com
+
+  route /v1* {
+    reverse_proxy localhost:8001 {
+      header_up Host {host}
+      header_up X-Real-IP {remote}
+    }
+  }
+
+  route * {
+    reverse_proxy localhost:3700 {
+      header_up Host {host}
+      header_up X-Real-IP {remote}
+    }
+  }
+}
+```
+
+这样就可以通过 `yourdomain.com` 在前端修改 `api.yaml`，保存后会触发重启 `uni-api`，随后 `uni-api` 会读取最新配置。
+
 Run Docker Compose container in the background
 
 ```bash

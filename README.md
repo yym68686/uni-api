@@ -410,6 +410,91 @@ services:
 
 CONFIG_URL is the URL of the remote configuration file that can be automatically downloaded. For example, if you are not comfortable modifying the configuration file on a certain platform, you can upload the configuration file to a hosting service and provide a direct link to uni-api to download, which is the CONFIG_URL. If you are using a local mounted configuration file, there is no need to set CONFIG_URL. CONFIG_URL is used when it is not convenient to mount the configuration file.
 
+### api.yaml hot reload (minimal change) + frontend sync
+
+`uni-api` reads `api.yaml` on startup. If you want “edit `api.yaml` in a frontend and have uni-api take effect immediately”, the minimal-change approach is:
+
+- Mount the same `api.yaml` into both backend `uni-api` and a frontend (`uni-api-status`)
+- Add a `config-watcher` service to watch `api.yaml` and `docker restart uni-api` on change
+
+Here is a ready-to-use `docker-compose.yml` example (place `./api.yaml` in the same directory):
+
+```yaml
+services:
+  uni-api:
+    image: yym68686/uni-api:latest
+    container_name: uni-api
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - WATCHFILES_FORCE_POLLING=true
+    volumes:
+      - ./api.yaml:/home/api.yaml
+      - ./uniapi_db:/home/data
+
+  uniapi-frontend:
+    image: ghcr.io/melosbot/uni-api-status:latest
+    container_name: uni-api-frontend
+    restart: unless-stopped
+    ports:
+      - "3700:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - API_YAML_PATH=/app/config/api.yaml
+      - STATS_DB_PATH=/app/data/stats.db
+    volumes:
+      - ./api.yaml:/app/config/api.yaml
+      - ./uniapi_db:/app/data:ro
+    depends_on:
+      - uni-api
+
+  config-watcher:
+    image: alpine:latest
+    container_name: uni-api-config-watcher
+    restart: unless-stopped
+    volumes:
+      - ./api.yaml:/watch/api.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c "
+      apk add --no-cache inotify-tools docker-cli &&
+      while true; do
+        inotifywait -e modify,close_write /watch/api.yaml &&
+        echo 'api.yaml changed, restarting uni-api...' &&
+        docker restart uni-api
+      done
+      "
+```
+
+Note: `config-watcher` mounts `/var/run/docker.sock` to restart containers; use it only on a trusted host/environment.
+
+If you want to use a single domain for both frontend and API, here is a Caddy reverse proxy example (`Caddyfile`):
+
+```caddyfile
+yourdomain.com {
+  encode gzip
+  tls a@bc.com
+
+  route /v1* {
+    reverse_proxy localhost:8001 {
+      header_up Host {host}
+      header_up X-Real-IP {remote}
+    }
+  }
+
+  route * {
+    reverse_proxy localhost:3700 {
+      header_up Host {host}
+      header_up X-Real-IP {remote}
+    }
+  }
+}
+```
+
+Now you can edit `api.yaml` via `yourdomain.com` (frontend). After saving, `uni-api` will be restarted and read the latest `api.yaml`.
+
 Run Docker Compose container in the background
 
 ```bash
