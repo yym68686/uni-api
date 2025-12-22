@@ -30,7 +30,7 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10.12'
+          python-version: '3.10'
 
       - name: Install pex
         run: pip install pex
@@ -60,7 +60,7 @@ jobs:
           pex -D . -r requirements.txt \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
-          --platform linux_x86_64-cp-3.10.12-cp310 \
+          --platform linux_x86_64-cp-310-cp310 \
           --interpreter-constraint '==3.10.*' \
           --no-strip-pex-env \
           -o uni-api-linux-x86_64-${VERSION}.pex
