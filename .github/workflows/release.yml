@@ -40,13 +40,11 @@ jobs:
         with:
           version: "0.8.0"
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - name: Generate requirements.txt
+        run: uv pip compile pyproject.toml -o requirements.txt
 
       - name: Install dependencies with uv
-        run: uv pip install -r pyproject.toml
+        run: uv pip install -r requirements.txt
         env:
           UV_SYSTEM_PYTHON: 1
 
@@ -59,7 +57,7 @@ jobs:
       - name: Build Linux PEX
         if: matrix.platform == 'linux'
         run: |
-          pex -D . -r pyproject.toml \
+          pex -D . -r requirements.txt \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
           --platform linux_x86_64-cp-3.10.12-cp310 \
@@ -70,7 +68,7 @@ jobs:
       - name: Build MacOS PEX
         if: matrix.platform == 'macos'
         run: |
-          pex -r pyproject.toml \
+          pex -r requirements.txt \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
           -o uni-api-macos-arm64-${VERSION}.pex
