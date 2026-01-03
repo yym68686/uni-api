@@ -1002,6 +1002,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     if stream_mode is not None:
         request.stream = stream_mode
 
+    # Gemini preview TTS returns inline audio; force non-stream so we can return a single OpenAI-style JSON response.
+    try:
+        has_audio_modality = any(str(m).lower() == "audio" for m in (getattr(request, "modalities", None) or []))
+    except Exception:
+        has_audio_modality = False
+    if engine in ["gemini", "vertex-gemini"] and (has_audio_modality or "preview-tts" in original_model.lower()):
+        request.stream = False
+
     channel_id = f"{provider['provider']}"
     if engine != "moderation":
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")

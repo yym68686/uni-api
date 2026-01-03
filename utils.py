@@ -397,9 +397,12 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         if isinstance(first_item_str, dict) and finish_reason == "stop" and \
         not safe_get(first_item_str, "choices", 0, "message", "content", default=None) and \
+        not safe_get(first_item_str, "choices", 0, "message", "audio", default=None) and \
+        not safe_get(first_item_str, "choices", 0, "message", "refusal", default=None) and \
         not safe_get(first_item_str, "choices", 0, "message", "tool_calls", default=None) and \
         not safe_get(first_item_str, "choices", 0, "delta", "tool_calls", default=None) and \
         not safe_get(first_item_str, "choices", 0, "delta", "content", default=None) and \
+        not safe_get(first_item_str, "choices", 0, "delta", "audio", default=None) and \
         last_message_role != "assistant":
             raise StopAsyncIteration
 
@@ -411,7 +414,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             reasoning_content = safe_get(first_item_str, "choices", 0, "message", "reasoning_content", default=None)
             b64_json = safe_get(first_item_str, "data", 0, "b64_json", default=None)
             tool_calls = safe_get(first_item_str, "choices", 0, "message", "tool_calls", default=None)
-            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None) and b64_json is None:
+            audio = safe_get(first_item_str, "choices", 0, "message", "audio", default=None)
+            refusal = safe_get(first_item_str, "choices", 0, "message", "refusal", default=None)
+            if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None) and b64_json is None and (audio == "" or audio is None) and (refusal == "" or refusal is None):
                 raise StopAsyncIteration
 
         return new_generator(first_item), first_response_time
