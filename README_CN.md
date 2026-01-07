@@ -536,6 +536,64 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -d '{"model": "gpt-5.2","messages": [{"role": "user", "content": "Hello"}],"stream": true}'
 ```
 
+音频输入（/v1/chat/completions）示例：
+
+```bash
+curl -X POST 'https://xxx.xxx/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --header "Authorization: Bearer ${API}" \
+  --data '{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Generate a transcript of the speech."
+        },
+        {
+          "type": "input_audio",
+          "input_audio": {
+            "data": "<base64 bytes here>",
+            "format": "wav"
+          }
+        }
+      ]
+    }
+  ]
+}'
+```
+
+使用 URL 作为音频输入：
+
+```bash
+curl -X POST 'https://xxx.xxx/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --header "Authorization: Bearer ${API}" \
+  --data '{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Generate a transcript of the speech."
+        },
+        {
+          "type": "input_audio",
+          "input_audio": {
+            "data": "https://www.youtube.com/watch?v=ku-N-eS1lgM",
+            "format": "mp4"
+          }
+        }
+      ]
+    }
+  ]
+}'
+```
+
 pex linux 打包：
 
 ```bash
