@@ -32,7 +32,7 @@ For personal use, one/new-api is too complex with many commercial features that 
 - Support fine-grained model timeout settings, allowing different timeout durations for each model.
 - Support fine-grained permission control. Support using wildcards to set specific models available for API key channels.
 - Support rate limiting, you can set the maximum number of requests per minute as an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min.
-- Supports multiple standard OpenAI format interfaces: `/v1/chat/completions`, `/v1/images/generations`, `/v1/audio/transcriptions`, `/v1/moderations`, `/v1/models`.
+- Supports multiple standard OpenAI format interfaces: `/v1/chat/completions`, `/v1/images/generations`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/audio/speech`, `/v1/moderations`, `/v1/models`.
 - Support OpenAI moderation moral review, which can conduct moral reviews of user messages. If inappropriate messages are found, an error message will be returned. This reduces the risk of the backend API being banned by providers.
 
 ## Usage method
@@ -214,6 +214,19 @@ providers:
       - anthropic/claude-sonnet-4-5
     tools: false
     engine: openrouter # Force the use of a specific message format, currently supports gpt, claude, gemini, openrouter native format, optional
+
+  # Doubao (Volcengine Ark) Translation via /api/v3/responses
+  - provider: doubao-translate
+    base_url: https://ark.cn-beijing.volces.com/api/v3/responses
+    api: xxxxxxxxxxxxxxxxxxxxxxxx
+    model:
+      - doubao-seed-translation
+    preferences:
+      post_body_parameter_overrides:
+        doubao-seed-translation:
+          translation_options:
+            target_language: zh # Default target language (optional)
+            # source_language: en # Optional
 
 api_keys:
   - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key, required for users to use this service

@@ -32,7 +32,7 @@
 - 支持细粒度的模型超时时间设置，可以为每个模型设置不同的超时时间。
 - 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
 - 支持限流，可以设置每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min。
-- 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/images/generations`，`/v1/audio/transcriptions`，`/v1/moderations`，`/v1/models`。
+- 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/images/generations`，`/v1/embeddings`，`/v1/audio/transcriptions`，`/v1/audio/speech`，`/v1/moderations`，`/v1/models`。
 - 支持 OpenAI moderation 道德审查，可以对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。降低后台 API 被提供商封禁的风险。
 
 ## 使用方法
@@ -214,6 +214,19 @@ providers:
       - anthropic/claude-sonnet-4-5
     tools: false
     engine: openrouter # 强制使用某个消息格式，目前支持 gpt，claude，gemini，openrouter 原生格式，选填
+
+  # 豆包火山引擎翻译（Ark /api/v3/responses）
+  - provider: doubao-translate
+    base_url: https://ark.cn-beijing.volces.com/api/v3/responses
+    api: xxxxxxxxxxxxxxxxxxxxxxxx
+    model:
+      - doubao-seed-translation
+    preferences:
+      post_body_parameter_overrides:
+        doubao-seed-translation:
+          translation_options:
+            target_language: zh # 默认目标语言，可选
+            # source_language: en # 可选
 
 api_keys:
   - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
