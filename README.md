@@ -726,6 +726,8 @@ The frontend of uni-api can be deployed by yourself, address: https://github.com
 
 You can also use the frontend I deployed, address: https://uni-api-web.pages.dev/
 
+Note: `uni-api-web` is a standalone project with both frontend and backend, while `uni-api` currently provides backend-only capabilities. `uni-api-web` does not handle automatic retries/failover; those capabilities remain in `uni-api`. You only need to configure the base URL of `uni-api` in `uni-api-web` (and `uni-api-web` can also connect to other compatible APIs). `uni-api-web` mainly provides user management, billing, logs, and permission control; `uni-api` will continue to keep the “backend-only” design.
+
 For explanations of the frontend environment variables, see the `uni-api-web` README: https://github.com/yym68686/uni-api-web
 
 Here is a `docker-compose.yml` example (removed `mybot/publicbot/servicebot/addetect`; environment variables use `${VAR:-}` placeholders):

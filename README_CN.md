@@ -727,6 +727,8 @@ uni-api 的 web 前端可以自行部署，地址：https://github.com/yym68686/
 
 也可以使用我提前部署好的前端，地址：https://uni-api-web.pages.dev/
 
+说明：`uni-api-web` 是独立的前后端项目，而 `uni-api` 目前仅提供后端能力。`uni-api-web` 不负责自动重试/故障转移等能力，这些能力仍由 `uni-api` 负责；你只需要在 `uni-api-web` 配置 `uni-api` 的 base url 即可（同时 `uni-api-web` 也可以对接其他兼容的 API）。`uni-api-web` 主要提供用户管理、计费、日志、权限控制等功能；`uni-api` 会一直保持“仅后端”的设计。
+
 前端相关环境变量的解释请参考 `uni-api-web` 的 README：https://github.com/yym68686/uni-api-web
 
 下面是一个 `docker-compose.yml` 示例：
