@@ -726,6 +726,109 @@ The frontend of uni-api can be deployed by yourself, address: https://github.com
 
 You can also use the frontend I deployed, address: https://uni-api-web.pages.dev/
 
+For explanations of the frontend environment variables, see the `uni-api-web` README: https://github.com/yym68686/uni-api-web
+
+Here is a `docker-compose.yml` example (removed `mybot/publicbot/servicebot/addetect`; environment variables use `${VAR:-}` placeholders):
+
+```yaml
+services:
+  web:
+    image: yym68686/uni-api-frontend:main
+    container_name: uni-api-frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      # Inside Docker, use service-to-service networking (NOT localhost).
+      API_BASE_URL: ${API_BASE_URL:-http://api:8000/v1}
+      NEXT_TELEMETRY_DISABLED: ${NEXT_TELEMETRY_DISABLED:-1}
+      NODE_ENV: ${NODE_ENV:-production}
+      APP_NAME: ${APP_NAME:-UniAPI}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+    ports:
+      - "8003:3000"
+
+  db:
+    image: postgres:17.6-alpine
+    container_name: uni-api-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_POSTGRES_USER:-uniapi}
+      POSTGRES_PASSWORD: ${DB_POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${DB_POSTGRES_DB:-uniapi}
+    ports:
+      - "5433:5432"
+    volumes:
+      - uniapi_pg_data:/var/lib/postgresql/data
+
+  api:
+    image: yym68686/uni-api-backend:main
+    container_name: uni-api-backend
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      APP_ENV: ${APP_ENV:-dev}
+      APP_NAME: ${BACKEND_APP_NAME:-Uni API Backend}
+      API_PREFIX: ${API_PREFIX:-/v1}
+      SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-7}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-}
+      EMAIL_VERIFICATION_REQUIRED: ${EMAIL_VERIFICATION_REQUIRED:-true}
+    ports:
+      - "8002:8000"
+
+  postgres:
+    container_name: postgres
+    image: postgres:17.6
+    restart: always
+    environment:
+      POSTGRES_USER: ${UNIAPI_POSTGRES_USER:-root}
+      POSTGRES_PASSWORD: ${UNIAPI_POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${UNIAPI_POSTGRES_DB:-uniapi}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${UNIAPI_POSTGRES_USER:-root} -d ${UNIAPI_POSTGRES_DB:-uniapi}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  uni-api:
+    container_name: uni-api
+    image: yym68686/uni-api:latest
+    environment:
+      # CONFIG_URL: ${CONFIG_URL:-}
+      TIMEOUT: ${TIMEOUT:-200}
+      DB_TYPE: ${DB_TYPE:-postgres}
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_NAME: ${DB_NAME:-uniapi}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./api-copy.yaml:/home/api.yaml
+      - ./uniapi_db:/home/data
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+
+volumes:
+  uniapi_pg_data:
+```
+
 ## Sponsors
 
 We thank the following sponsors for their support:
