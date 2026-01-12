@@ -807,7 +807,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
             return response
 
         except ValidationError as e:
-            logger.error(f"Invalid request body: {json.dumps(parsed_body, indent=2, ensure_ascii=False)}, errors: {e.errors()}")
+            logger.error(f"API key: {token}, Invalid request body: {json.dumps(parsed_body, indent=2, ensure_ascii=False)}, errors: {e.errors()}")
             content = await asyncio.to_thread(jsonable_encoder, {"detail": e.errors()})
             return JSONResponse(
                 status_code=422,
