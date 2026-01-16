@@ -1547,7 +1547,7 @@ class ModelRequestHandler:
 
 
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
-                if is_debug:
+                if is_debug or status_code == 500:
                     import traceback
                     traceback.print_exc()
 
