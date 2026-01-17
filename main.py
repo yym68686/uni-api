@@ -806,6 +806,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
             return response
 
+        except HTTPException:
+            # Let FastAPI's http_exception_handler format the response consistently.
+            raise
         except ValidationError as e:
             logger.error(f"API key: {token}, Invalid request body: {json.dumps(parsed_body, indent=2, ensure_ascii=False)}, errors: {e.errors()}")
             content = await asyncio.to_thread(jsonable_encoder, {"detail": e.errors()})
