@@ -13,7 +13,7 @@ import contextvars
 from time import time
 from urllib.parse import urlparse
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Union, Optional, List, Any
 from pydantic import ValidationError, BaseModel, field_serializer
@@ -660,6 +660,18 @@ def get_client_ip(request: Request) -> str:
     # 5. 回退到直连 IP
     return request.client.host if request.client else "unknown"
 
+async def monitor_disconnect(request: Request, disconnect_event: asyncio.Event) -> None:
+    try:
+        while not disconnect_event.is_set():
+            message = await request.receive()
+            if message.get("type") == "http.disconnect":
+                disconnect_event.set()
+                return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        disconnect_event.set()
+
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -735,8 +747,14 @@ class StatsMiddleware(BaseHTTPMiddleware):
         # 设置请求信息到上下文
         current_request_info = request_info.set(request_info_data)
         current_info = request_info.get()
+        disconnect_event: Optional[asyncio.Event] = None
+        disconnect_task: Optional[asyncio.Task] = None
         try:
             parsed_body = await parse_request_body(request)
+            if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
+                disconnect_event = asyncio.Event()
+                current_info["disconnect_event"] = disconnect_event
+                disconnect_task = asyncio.create_task(monitor_disconnect(request, disconnect_event))
             if parsed_body and not request.url.path.startswith("/v1/api_config"):
                 request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
                 request_model = request_model.data
@@ -827,6 +845,10 @@ class StatsMiddleware(BaseHTTPMiddleware):
             )
 
         finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await disconnect_task
             # print("current_request_info", current_request_info)
             request_info.reset(current_request_info)
 
@@ -1352,11 +1374,20 @@ class ModelRequestHandler:
         self.last_provider_indices = defaultdict(lambda: -1)
         self.locks = defaultdict(asyncio.Lock)
 
-    async def request_model(self, request_data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], api_index: int, background_tasks: BackgroundTasks, endpoint=None):
+    async def request_model(
+        self,
+        request_data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
+        api_index: int,
+        background_tasks: BackgroundTasks,
+        endpoint=None,
+    ):
         config = app.state.config
         request_model_name = request_data.model
         if not safe_get(config, 'api_keys', api_index, 'model'):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+
+        current_info = request_info.get()
+        disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
 
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
 
@@ -1394,6 +1425,9 @@ class ModelRequestHandler:
                 retry_count = 10
 
         while True:
+            if disconnect_event is not None and disconnect_event.is_set():
+                current_info = request_info.get()
+                return Response(content="", status_code=499)
             # print("start_index", start_index)
             # print("index", index)
             # print("num_matching_providers", num_matching_providers)
@@ -1448,9 +1482,47 @@ class ModelRequestHandler:
             # print("keepalive_interval", provider_name, keepalive_interval)
 
             try:
-                response = await process_request(request_data, provider, background_tasks, endpoint, role, local_timeout_value, keepalive_interval)
+                process_task = asyncio.create_task(
+                    process_request(
+                        request_data,
+                        provider,
+                        background_tasks,
+                        endpoint,
+                        role,
+                        local_timeout_value,
+                        keepalive_interval,
+                    )
+                )
+                disconnect_task: Optional[asyncio.Task] = None
+                try:
+                    if disconnect_event is not None:
+                        disconnect_task = asyncio.create_task(disconnect_event.wait())
+                        done, pending = await asyncio.wait(
+                            [process_task, disconnect_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if disconnect_task in done and disconnect_event.is_set():
+                            process_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await process_task
+                            current_info = request_info.get()
+                            return Response(content="", status_code=499)
+
+                    response = await process_task
+                finally:
+                    if disconnect_task is not None:
+                        disconnect_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await disconnect_task
                 return response
-            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+            except asyncio.CancelledError:
+                raise
+            except (Exception, HTTPException, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+
+                # 如果客户端已经断开，不要再继续重试/打日志
+                if disconnect_event is not None and disconnect_event.is_set():
+                    current_info = request_info.get()
+                    return Response(content="", status_code=499)
 
                 # 根据异常类型设置状态码和错误消息
                 if isinstance(e, httpx.ReadTimeout):
@@ -1469,9 +1541,6 @@ class ModelRequestHandler:
                 elif isinstance(e, httpx.LocalProtocolError):
                     status_code = 502  # Bad Gateway
                     error_message = "Local protocol error"
-                elif isinstance(e, asyncio.CancelledError):
-                    status_code = 499  # Client Closed Request
-                    error_message = "Request was cancelled"
                 elif isinstance(e, HTTPException):
                     status_code = e.status_code
                     error_message = str(e.detail)
