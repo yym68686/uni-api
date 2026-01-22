@@ -406,7 +406,9 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         last_message_role != "assistant":
             raise StopAsyncIteration
 
-        if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper"] and not stream:
+        # For non-stream OpenAI-style endpoints, treat empty "choices/message" as an invalid response.
+        # Some engines (e.g. search) intentionally return non-OpenAI JSON and should bypass this check.
+        if isinstance(first_item_str, dict) and engine not in ["tts", "embedding", "dalle", "moderation", "whisper", "search"] and not stream:
             if any(x in str(first_item_str) for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", first_item_str)
                 raise StopAsyncIteration

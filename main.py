@@ -1678,6 +1678,28 @@ async def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depen
         raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
+@app.get("/search", dependencies=[Depends(rate_limit_dependency)])
+@app.get("/v1/search", dependencies=[Depends(rate_limit_dependency)])
+async def jina_search(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    q: str = Query("Jina+AI"),
+    api_index: int = Depends(verify_api_key),
+):
+    """
+    Config-driven search routed through the existing provider selection/rotation architecture.
+
+    Usage:
+      - Provider config must include model: search (e.g. provider: jina + model: [search, ...])
+      - User api key must include a rule like: jina/search
+    """
+    search_request = RequestModel(
+        model="search",
+        messages=[{"role": "user", "content": q}],
+        stream=False,
+    )
+    return await model_handler.request_model(search_request, api_index, background_tasks, endpoint=str(request.url.path))
+
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def chat_completions_route(request: RequestModel, background_tasks: BackgroundTasks, api_index: int = Depends(verify_api_key)):
     return await model_handler.request_model(request, api_index, background_tasks)
