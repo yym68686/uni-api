@@ -306,6 +306,43 @@ docker run --user root -p 8001:8000 --name uni-api -dit \
 yym68686/uni-api:latest
 ```
 
+### 搜索渠道（`/v1/search`）
+
+要启用 `/v1/search`，需要在 `providers` 中配置包含 `search` 模型的渠道，并在 `api_keys[].model` 中显式授权 `provider/search`。
+
+示例（Jina + Tavily）：
+
+```yaml
+providers:
+  - provider: jina
+    base_url: https://api.jina.ai/v1/chat/completions
+    api:
+      - jina_xxx1
+      - jina_xxx2
+    model:
+      - jina-embeddings-v3
+      - search
+    preferences:
+      api_key_rate_limit:
+        search: 100/min
+
+  - provider: tavily
+    base_url: https://api.tavily.com/search
+    api:
+      - tvly-dev-xxx
+    model:
+      - search
+    preferences:
+      api_key_rate_limit:
+        search: 100/min
+
+api_keys:
+  - api: sk-xxx
+    model:
+      - jina/search
+      - tavily/search
+```
+
 ## 环境变量
 
 - CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填。

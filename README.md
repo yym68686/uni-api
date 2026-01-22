@@ -306,6 +306,43 @@ docker run --user root -p 8001:8000 --name uni-api -dit \
 yym68686/uni-api:latest
 ```
 
+### Search providers (`/v1/search`)
+
+To enable the `/v1/search` endpoint, configure providers that include the `search` model, then explicitly allow `provider/search` in `api_keys[].model`.
+
+Example (Jina + Tavily):
+
+```yaml
+providers:
+  - provider: jina
+    base_url: https://api.jina.ai/v1/chat/completions
+    api:
+      - jina_xxx1
+      - jina_xxx2
+    model:
+      - jina-embeddings-v3
+      - search
+    preferences:
+      api_key_rate_limit:
+        search: 100/min
+
+  - provider: tavily
+    base_url: https://api.tavily.com/search
+    api:
+      - tvly-dev-xxx
+    model:
+      - search
+    preferences:
+      api_key_rate_limit:
+        search: 100/min
+
+api_keys:
+  - api: sk-xxx
+    model:
+      - jina/search
+      - tavily/search
+```
+
 ## Environment variable
 
 - CONFIG_URL: The download address of the configuration file, which can be a local file or a remote file, optional
