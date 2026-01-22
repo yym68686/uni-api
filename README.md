@@ -343,6 +343,13 @@ api_keys:
       - tavily/search
 ```
 
+Example request:
+
+```bash
+curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
+  --header 'Authorization: Bearer sk-xxx'
+```
+
 ## Environment variable
 
 - CONFIG_URL: The download address of the configuration file, which can be a local file or a remote file, optional

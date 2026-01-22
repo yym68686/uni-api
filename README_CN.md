@@ -343,6 +343,13 @@ api_keys:
       - tavily/search
 ```
 
+请求示例：
+
+```bash
+curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
+  --header 'Authorization: Bearer sk-xxx'
+```
+
 ## 环境变量
 
 - CONFIG_URL: 配置文件的下载地址，可以是本地文件，也可以是远程文件，选填。
