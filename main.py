@@ -536,6 +536,7 @@ class LoggingStreamingResponse(Response):
         self.body_iterator = content
         self._closed = False
         self.current_info = current_info
+        self._sse_buffer = ""
 
         # Remove Content-Length header if it exists
         if 'content-length' in self.headers:
@@ -594,25 +595,78 @@ class LoggingStreamingResponse(Response):
             if self.current_info.get("endpoint").endswith("/v1/audio/speech"):
                 yield chunk
                 continue
-            line = chunk.decode('utf-8')
-            if is_debug:
-                logger.info(f"{line.encode('utf-8').decode('unicode_escape')}")
-            if line.startswith("data:"):
-                line = line.lstrip("data: ")
-            if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(":"):
-                try:
-                    resp: dict = await asyncio.to_thread(json.loads, line)
-                    input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
-                    input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
-                    output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
-                    total_tokens = input_tokens + output_tokens
 
-                    self.current_info["prompt_tokens"] = input_tokens
-                    self.current_info["completion_tokens"] = output_tokens
-                    self.current_info["total_tokens"] = total_tokens
-                except Exception as e:
-                    logger.error(f"Error parsing response: {str(e)}, line: {repr(line)}")
+            try:
+                text = chunk.decode("utf-8", errors="replace")
+            except Exception:
+                yield chunk
+                continue
+
+            if is_debug:
+                try:
+                    logger.info(text.encode("utf-8").decode("unicode_escape"))
+                except Exception:
+                    logger.info(text)
+
+            # Stream may contain multiple SSE lines per chunk, and/or partial lines.
+            self._sse_buffer += text
+            while "\n" in self._sse_buffer:
+                line, self._sse_buffer = self._sse_buffer.split("\n", 1)
+                line = line.rstrip("\r")
+                if not line or line.startswith(":") or line.startswith("event:"):
                     continue
+
+                data = None
+                if line.startswith("data:"):
+                    data = line.removeprefix("data:").lstrip()
+                elif line.startswith("{") or line.startswith("["):
+                    data = line
+
+                if not data:
+                    continue
+                if data.startswith("[DONE]") or data.startswith("OK"):
+                    continue
+
+                # Avoid parsing every delta event; only parse when usage is present.
+                if "\"usage\"" not in data:
+                    continue
+
+                try:
+                    resp = await asyncio.to_thread(json.loads, data)
+                except Exception:
+                    continue
+
+                usage_obj = None
+                if isinstance(resp, dict):
+                    usage_obj = resp.get("usage") or safe_get(resp, "response", "usage", default=None) or safe_get(resp, "message", "usage", default=None)
+                if not isinstance(usage_obj, dict):
+                    continue
+
+                prompt_tokens = usage_obj.get("prompt_tokens")
+                completion_tokens = usage_obj.get("completion_tokens")
+                if prompt_tokens is None and "input_tokens" in usage_obj:
+                    prompt_tokens = usage_obj.get("input_tokens")
+                if completion_tokens is None and "output_tokens" in usage_obj:
+                    completion_tokens = usage_obj.get("output_tokens")
+
+                try:
+                    prompt_tokens = int(prompt_tokens or 0)
+                except Exception:
+                    prompt_tokens = 0
+                try:
+                    completion_tokens = int(completion_tokens or 0)
+                except Exception:
+                    completion_tokens = 0
+
+                total_tokens = usage_obj.get("total_tokens")
+                try:
+                    total_tokens = int(total_tokens) if total_tokens is not None else (prompt_tokens + completion_tokens)
+                except Exception:
+                    total_tokens = prompt_tokens + completion_tokens
+
+                self.current_info["prompt_tokens"] = prompt_tokens
+                self.current_info["completion_tokens"] = completion_tokens
+                self.current_info["total_tokens"] = total_tokens
             yield chunk
 
     async def close(self):
