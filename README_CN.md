@@ -32,7 +32,7 @@
 - 支持细粒度的模型超时时间设置，可以为每个模型设置不同的超时时间。
 - 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
 - 支持限流，可以设置每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min。
-- 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/images/generations`，`/v1/embeddings`，`/v1/audio/transcriptions`，`/v1/audio/speech`，`/v1/moderations`，`/v1/models`。
+- 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/responses`，`/v1/images/generations`，`/v1/embeddings`，`/v1/audio/transcriptions`，`/v1/audio/speech`，`/v1/moderations`，`/v1/models`。
 - 支持 OpenAI moderation 道德审查，可以对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。降低后台 API 被提供商封禁的风险。
 
 ## 使用方法
@@ -305,6 +305,43 @@ docker run --user root -p 8001:8000 --name uni-api -dit \
 -e CONFIG_URL=http://file_url/api.yaml \
 yym68686/uni-api:latest
 ```
+
+### Codex（`/v1/responses` + `engine: codex`）
+
+如果你希望使用 Codex CLI / OpenAI Responses API 客户端直接请求 uni-api，请：
+
+1. 客户端将 `base_url` 指向 uni-api，并携带 uni-api 的 `api_keys[].api`。
+2. 在 uni-api 的 `providers` 中新增一个 `engine: codex` 的渠道，配置多个账号凭据（`api` 支持列表；使用 `account_id,refresh_token` 逗号格式，uni-api 会自动换取/刷新 `access_token`）。
+3. 当某个账号额度耗尽时，uni-api 会对该 token 进行冷却并自动切换到下一个账号（默认冷却 6 小时，可用 `api_key_quota_cooldown_period` 覆盖）。
+
+示例配置：
+
+```yaml
+providers:
+  - provider: codex
+    engine: codex
+    # 支持填写为 https://chatgpt.com/backend-api/codex 或 https://chatgpt.com/backend-api/codex/responses
+    base_url: https://chatgpt.com/backend-api/codex
+    api:
+      # 每个条目为 "account_id,refresh_token"（用于自动设置 Chatgpt-Account-Id，并自动换取 access_token 作为 Bearer）
+      - <chatgpt_account_id_1>,<refresh_token_1>
+      - <chatgpt_account_id_2>,<refresh_token_2>
+    model:
+      - gpt-5.2-codex
+      - gpt-5.2-codex-mini
+    preferences:
+      api_key_schedule_algorithm: round_robin
+      api_key_quota_cooldown_period: 21600 # 额度耗尽冷却时间(秒)，可选
+
+api_keys:
+  - api: sk-xxx
+    model:
+      - codex/*
+```
+
+> 提示：如果你的客户端只支持 `/v1/chat/completions`，也可以直接用同样的模型名走 `/v1/chat/completions`，uni-api 会按需对上游 Responses 流进行转换。
+>
+> 注意：Codex 上游会拒绝部分 Chat Completions 参数（如 `temperature`/`top_p`/`max_tokens` 等），uni-api 会在转发时自动过滤；如果你看到 `403 Forbidden`，也请先确认客户端携带的是 uni-api 的 `api_keys[].api`。
 
 ### 搜索渠道（`/v1/search`）
 

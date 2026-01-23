@@ -32,7 +32,7 @@ For personal use, one/new-api is too complex with many commercial features that 
 - Support fine-grained model timeout settings, allowing different timeout durations for each model.
 - Support fine-grained permission control. Support using wildcards to set specific models available for API key channels.
 - Support rate limiting, you can set the maximum number of requests per minute as an integer, such as 2/min, 2 times per minute, 5/hour, 5 times per hour, 10/day, 10 times per day, 10/month, 10 times per month, 10/year, 10 times per year. Default is 60/min.
-- Supports multiple standard OpenAI format interfaces: `/v1/chat/completions`, `/v1/images/generations`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/audio/speech`, `/v1/moderations`, `/v1/models`.
+- Supports multiple standard OpenAI format interfaces: `/v1/chat/completions`, `/v1/responses`, `/v1/images/generations`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/audio/speech`, `/v1/moderations`, `/v1/models`.
 - Support OpenAI moderation moral review, which can conduct moral reviews of user messages. If inappropriate messages are found, an error message will be returned. This reduces the risk of the backend API being banned by providers.
 
 ## Usage method
@@ -305,6 +305,41 @@ docker run --user root -p 8001:8000 --name uni-api -dit \
 -e CONFIG_URL=http://file_url/api.yaml \
 yym68686/uni-api:latest
 ```
+
+### Codex (`/v1/responses` + `engine: codex`)
+
+If you want to use Codex CLI / OpenAI Responses API clients directly against uni-api:
+
+1. Point the client `base_url` to uni-api and use a uni-api `api_keys[].api`.
+2. Add a provider with `engine: codex`, and configure multiple account credentials via `api` (list supported; use `account_id,refresh_token` comma format; uni-api will automatically mint/refresh an `access_token`).
+3. When an account runs out of quota, uni-api will cool down that token and automatically switch to the next one (default cooldown is 6 hours; override with `api_key_quota_cooldown_period`).
+
+Example:
+
+```yaml
+providers:
+  - provider: codex
+    engine: codex
+    # Supports https://chatgpt.com/backend-api/codex or https://chatgpt.com/backend-api/codex/responses
+    base_url: https://chatgpt.com/backend-api/codex
+    api:
+      # Each entry is "account_id,refresh_token" (sets Chatgpt-Account-Id and mints an access_token for Bearer)
+      - <chatgpt_account_id_1>,<refresh_token_1>
+      - <chatgpt_account_id_2>,<refresh_token_2>
+    model:
+      - gpt-5.2-codex
+      - gpt-5.2-codex-mini
+    preferences:
+      api_key_schedule_algorithm: round_robin
+      api_key_quota_cooldown_period: 21600 # seconds (optional)
+
+api_keys:
+  - api: sk-xxx
+    model:
+      - codex/*
+```
+
+Tip: if your client only supports `/v1/chat/completions`, you can still call `/v1/chat/completions` with the same Codex model names; uni-api will translate upstream Responses streams when needed.
 
 ### Search providers (`/v1/search`)
 

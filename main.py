@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTa
 from core.log_config import logger
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream
-from core.models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
+from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.utils import (
     get_proxy,
     get_engine,
@@ -1010,22 +1010,252 @@ def get_preference(preference_config, channel_id, original_request_model, defaul
     # print("timeout_value", channel_id, timeout_value)
     return timeout_value
 
+def _split_codex_api_key(raw_api_key: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if raw_api_key is None:
+        return None, None
+    raw = str(raw_api_key).strip()
+    if not raw:
+        return None, None
+    if "," not in raw:
+        return None, raw
+    account_id, token = raw.split(",", 1)
+    account_id = account_id.strip() or None
+    token = token.strip()
+    if not token:
+        raise ValueError("Invalid Codex API key format: expected 'account_id,refresh_token' (refresh_token missing)")
+    return account_id, token
+
+_CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_CODEX_OAUTH_REFRESH_SKEW_SECONDS = 30
+
+# provider_api_key_raw -> {"access_token": str, "refresh_token": str, "expires_at": float|None}
+_codex_oauth_cache: dict[str, dict[str, Any]] = {}
+_codex_oauth_locks: dict[str, asyncio.Lock] = {}
+
+# chatgpt_account_id -> refresh_token
+_CODEX_REFRESH_TOKEN_STORE_PATH = os.getenv("CODEX_REFRESH_TOKEN_STORE_PATH", "./data/codex_refresh_tokens.json")
+_codex_refresh_token_store: dict[str, str] = {}
+_codex_refresh_token_store_loaded = False
+_codex_refresh_token_store_lock = asyncio.Lock()
+
+async def _ensure_codex_refresh_token_store_loaded() -> None:
+    global _codex_refresh_token_store_loaded
+    if _codex_refresh_token_store_loaded:
+        return
+    async with _codex_refresh_token_store_lock:
+        if _codex_refresh_token_store_loaded:
+            return
+        try:
+            with open(_CODEX_REFRESH_TOKEN_STORE_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    key = str(k).strip()
+                    val = str(v).strip()
+                    if key and val:
+                        _codex_refresh_token_store[key] = val
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("Failed to load Codex refresh token store '%s': %s", _CODEX_REFRESH_TOKEN_STORE_PATH, e)
+        _codex_refresh_token_store_loaded = True
+
+async def _reload_codex_refresh_token_store() -> None:
+    global _codex_refresh_token_store_loaded
+    async with _codex_refresh_token_store_lock:
+        _codex_refresh_token_store.clear()
+        try:
+            with open(_CODEX_REFRESH_TOKEN_STORE_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    key = str(k).strip()
+                    val = str(v).strip()
+                    if key and val:
+                        _codex_refresh_token_store[key] = val
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("Failed to reload Codex refresh token store '%s': %s", _CODEX_REFRESH_TOKEN_STORE_PATH, e)
+        _codex_refresh_token_store_loaded = True
+
+async def _get_codex_refresh_token_from_store(account_id: Optional[str], *, force_reload: bool = False) -> Optional[str]:
+    if not account_id:
+        return None
+    key = str(account_id).strip()
+    if not key:
+        return None
+    if force_reload:
+        await _reload_codex_refresh_token_store()
+    else:
+        await _ensure_codex_refresh_token_store_loaded()
+    token = _codex_refresh_token_store.get(key)
+    return str(token) if token else None
+
+async def _persist_codex_refresh_token(account_id: Optional[str], refresh_token: Optional[str]) -> None:
+    if not account_id:
+        return
+    key = str(account_id).strip()
+    rt = str(refresh_token or "").strip()
+    if not key or not rt:
+        return
+    await _ensure_codex_refresh_token_store_loaded()
+
+    async with _codex_refresh_token_store_lock:
+        if _codex_refresh_token_store.get(key) == rt:
+            return
+        _codex_refresh_token_store[key] = rt
+        try:
+            store_dir = os.path.dirname(_CODEX_REFRESH_TOKEN_STORE_PATH)
+            if store_dir:
+                os.makedirs(store_dir, exist_ok=True)
+            tmp_path = f"{_CODEX_REFRESH_TOKEN_STORE_PATH}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(_codex_refresh_token_store, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, _CODEX_REFRESH_TOKEN_STORE_PATH)
+        except Exception as e:
+            logger.warning("Failed to persist Codex refresh token store '%s': %s", _CODEX_REFRESH_TOKEN_STORE_PATH, e)
+
+def _codex_oauth_lock(key: str) -> asyncio.Lock:
+    lock = _codex_oauth_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _codex_oauth_locks[key] = lock
+    return lock
+
+def _codex_access_token_is_valid(entry: dict[str, Any]) -> bool:
+    token = entry.get("access_token")
+    if not token:
+        return False
+    expires_at = entry.get("expires_at")
+    if expires_at is None:
+        return True
+    try:
+        return time() < float(expires_at) - _CODEX_OAUTH_REFRESH_SKEW_SECONDS
+    except Exception:
+        return True
+
+async def _refresh_codex_access_token(refresh_token: str, proxy: Optional[str]) -> dict[str, Any]:
+    rt = (refresh_token or "").strip()
+    if not rt:
+        raise HTTPException(status_code=401, detail="Codex refresh_token missing")
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    data = {
+        "client_id": _CODEX_OAUTH_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": rt,
+        "scope": "openid profile email",
+    }
+
+    try:
+        async with app.state.client_manager.get_client(_CODEX_OAUTH_TOKEN_URL, proxy) as client:
+            resp = await client.post(_CODEX_OAUTH_TOKEN_URL, data=data, headers=headers, timeout=30)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Codex token refresh request failed: {type(e).__name__}: {e}")
+
+    if resp.status_code != 200:
+        body = (resp.text or "").strip()
+        raise HTTPException(status_code=401, detail=f"Codex token refresh failed: status {resp.status_code}: {body}")
+
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {}
+
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=401, detail=f"Codex token refresh returned empty access_token: {resp.text}")
+
+    new_refresh_token = str(payload.get("refresh_token") or "").strip() or None
+    expires_in = payload.get("expires_in")
+    expires_at = None
+    try:
+        expires_in_int = int(expires_in)
+        if expires_in_int > 0:
+            expires_at = time() + expires_in_int
+    except Exception:
+        expires_at = None
+
+    return {
+        "access_token": access_token,
+        "refresh_token": new_refresh_token,
+        "expires_at": expires_at,
+    }
+
+async def _get_codex_access_token(provider_name: str, provider_api_key_raw: str, proxy: Optional[str]) -> str:
+    # provider_api_key_raw is the stable key-id we use for rate-limit/cooling/logging.
+    account_id, refresh_token_from_config = _split_codex_api_key(provider_api_key_raw)
+    if not refresh_token_from_config:
+        raise HTTPException(status_code=401, detail="Codex refresh_token missing")
+
+    persisted_refresh_token = await _get_codex_refresh_token_from_store(account_id)
+    if persisted_refresh_token:
+        refresh_token_from_config = persisted_refresh_token
+
+    lock = _codex_oauth_lock(provider_api_key_raw)
+    async with lock:
+        entry = _codex_oauth_cache.get(provider_api_key_raw) or {}
+        if _codex_access_token_is_valid(entry):
+            return str(entry["access_token"])
+
+        old_refresh_token = str(entry.get("refresh_token") or refresh_token_from_config).strip()
+        try:
+            refreshed = await _refresh_codex_access_token(old_refresh_token, proxy)
+        except HTTPException as e:
+            detail = str(getattr(e, "detail", "") or "")
+            if account_id and "refresh_token_reused" in detail:
+                latest = await _get_codex_refresh_token_from_store(account_id, force_reload=True)
+                if latest and latest != old_refresh_token:
+                    refreshed = await _refresh_codex_access_token(latest, proxy)
+                    old_refresh_token = latest
+                else:
+                    raise
+            raise
+
+        updated_refresh_token = refreshed.get("refresh_token") or old_refresh_token
+        _codex_oauth_cache[provider_api_key_raw] = {
+            "access_token": refreshed["access_token"],
+            "refresh_token": updated_refresh_token,
+            "expires_at": refreshed.get("expires_at"),
+        }
+        await _persist_codex_refresh_token(account_id, updated_refresh_token)
+        return str(refreshed["access_token"])
+
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, background_tasks: BackgroundTasks, endpoint=None, role=None, timeout_value=DEFAULT_TIMEOUT, keepalive_interval=None):
     timeout_value = int(timeout_value)
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     if provider['provider'].startswith("sk-"):
-        api_key = provider['provider']
+        provider_api_key_raw = provider['provider']
     elif provider.get("api"):
-        api_key = await provider_api_circular_list[provider['provider']].next(original_model)
+        provider_api_key_raw = await provider_api_circular_list[provider['provider']].next(original_model)
     else:
-        api_key = None
+        provider_api_key_raw = None
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
 
     if stream_mode is not None:
         request.stream = stream_mode
+
+    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
+    proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
+
+    api_key = provider_api_key_raw
+    codex_account_id = None
+    if engine == "codex" and provider_api_key_raw:
+        try:
+            codex_account_id, _ = _split_codex_api_key(provider_api_key_raw)
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        api_key = await _get_codex_access_token(provider['provider'], provider_api_key_raw, proxy)
 
     # Gemini preview TTS returns inline audio; force non-stream so we can return a single OpenAI-style JSON response.
     try:
@@ -1041,6 +1271,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     last_message_role = safe_get(request, "messages", -1, "role", default=None)
     url, headers, payload = await get_payload(request, engine, provider, api_key)
+    if engine == "codex" and codex_account_id:
+        headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if is_debug:
         logger.info(url)
@@ -1048,9 +1280,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         logger.info(json.dumps({k: v for k, v in payload.items() if k != 'file'}, indent=4, ensure_ascii=False))
 
     current_info = request_info.get()
-
-    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
-    proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
     # print("proxy", proxy)
 
     try:
@@ -1075,14 +1304,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
                     response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json")
 
             # 更新成功计数和首次响应时间
-            background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True, provider_api_key=api_key)
+            background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
             current_info["provider"] = channel_id
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False, provider_api_key=api_key)
+        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False, provider_api_key=provider_api_key_raw)
         raise e
 
 def weighted_round_robin(weights):
@@ -1405,24 +1634,19 @@ class ModelRequestHandler:
         status_code = 500
         error_message = None
 
-        start_index = 0
-        if scheduling_algorithm != "fixed_priority":
-            async with self.locks[request_model_name]:
-                self.last_provider_indices[request_model_name] = (self.last_provider_indices[request_model_name] + 1) % num_matching_providers
-                start_index = self.last_provider_indices[request_model_name]
+        start_index = await _compute_start_index(
+            self.last_provider_indices,
+            self.locks,
+            request_model_name,
+            scheduling_algorithm,
+            num_matching_providers,
+        )
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
         role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
 
+        retry_count = _compute_retry_count(matching_providers)
         index = 0
-        if num_matching_providers == 1 and (count := provider_api_circular_list[matching_providers[0]['provider']].get_items_count()) > 1:
-            retry_count = count
-        else:
-            tmp_retry_count = sum(provider_api_circular_list[provider['provider']].get_items_count() for provider in matching_providers) * 2
-            if tmp_retry_count < 10:
-                retry_count = tmp_retry_count
-            else:
-                retry_count = 10
 
         while True:
             if disconnect_event is not None and disconnect_event.is_set():
@@ -1576,11 +1800,29 @@ class ModelRequestHandler:
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
 
+                quota_cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=0)
                 cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
                 api_key_count = provider_api_circular_list[channel_id].get_items_count()
                 current_api = await provider_api_circular_list[channel_id].after_next_current()
 
-                if cooling_time > 0 and api_key_count > 1 \
+                # Codex refresh_token failures (401/403) should cool down the key so fixed_priority can fall back.
+                is_codex_refresh_failure = False
+                try:
+                    failed_engine_for_cooldown, _ = get_engine(provider, endpoint, original_model)
+                    if failed_engine_for_cooldown == "codex" and status_code in (401, 403):
+                        msg = str(error_message or "")
+                        if "Codex token refresh" in msg or "refresh_token_reused" in msg:
+                            is_codex_refresh_failure = True
+                except Exception:
+                    pass
+
+                if api_key_count > 1 and current_api and is_codex_refresh_failure:
+                    effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
+                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=effective_quota_cooldown)
+                elif api_key_count > 1 and current_api and _is_quota_exhausted_error(status_code, error_message):
+                    effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
+                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=effective_quota_cooldown)
+                elif cooling_time > 0 and api_key_count > 1 \
                 and all(error not in error_message for error in exclude_error_rate_limit):
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
 
@@ -1617,6 +1859,13 @@ class ModelRequestHandler:
                 if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
                     status_code = 429
 
+                # If Codex access_token expired/invalid, clear cache so next retry refreshes it.
+                try:
+                    failed_engine, _ = get_engine(provider, endpoint, original_model)
+                except Exception:
+                    failed_engine = None
+                if failed_engine == "codex" and current_api and status_code in (401, 403):
+                    _codex_oauth_cache.pop(current_api, None)
 
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
                 if is_debug or status_code == 500:
@@ -1640,7 +1889,336 @@ class ModelRequestHandler:
             content={"error": f"All {request_data.model} error: {error_message}"}
         )
 
+def _normalize_responses_upstream_url(base_url: str, engine: str) -> str:
+    base = (base_url or "").strip()
+    if not base:
+        return base
+    base = base.rstrip("/")
+    if engine != "codex":
+        return base
+    if base.endswith("/v1/responses") or base.endswith("/responses"):
+        return base
+    return f"{base}/responses"
+
+def _normalize_responses_compact_upstream_url(base_url: str, engine: str) -> str:
+    base = (base_url or "").strip()
+    if not base:
+        return base
+    base = base.rstrip("/")
+
+    if base.endswith("/v1/responses/compact") or base.endswith("/responses/compact"):
+        return base
+
+    if engine == "codex":
+        base = _normalize_responses_upstream_url(base, engine)
+
+    if base.endswith("/v1/responses") or base.endswith("/responses"):
+        return f"{base}/compact"
+
+    if base.endswith("/compact"):
+        return base
+
+    return f"{base}/compact"
+
+def _is_quota_exhausted_error(status_code: int, details: str) -> bool:
+    if status_code == 401:
+        return False
+    text = (details or "").lower()
+    return any(
+        k in text
+        for k in (
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+            "quota exceeded",
+            "exceeded your current quota",
+            "usage limit",
+            "out of credits",
+            "payment required",
+        )
+    )
+
+async def _compute_start_index(
+    last_provider_indices: dict,
+    locks: dict,
+    request_model_name: str,
+    scheduling_algorithm: str,
+    num_matching_providers: int,
+) -> int:
+    start_index = 0
+    if scheduling_algorithm != "fixed_priority" and num_matching_providers > 1:
+        async with locks[request_model_name]:
+            last_provider_indices[request_model_name] = (last_provider_indices[request_model_name] + 1) % num_matching_providers
+            start_index = last_provider_indices[request_model_name]
+    return start_index
+
+def _compute_retry_count(matching_providers: list[dict]) -> int:
+    num_matching_providers = len(matching_providers)
+    if num_matching_providers <= 0:
+        return 0
+
+    if num_matching_providers == 1:
+        provider_name = safe_get(matching_providers, 0, "provider", default=None)
+        if provider_name:
+            count = provider_api_circular_list[provider_name].get_items_count()
+            if count > 1:
+                return count
+
+    tmp_retry_count = sum(provider_api_circular_list[p["provider"]].get_items_count() for p in matching_providers) * 2
+    return tmp_retry_count if tmp_retry_count < 10 else 10
+
+class ResponsesRequestHandler:
+    def __init__(self):
+        self.last_provider_indices = defaultdict(lambda: -1)
+        self.locks = defaultdict(asyncio.Lock)
+
+    async def request_responses(
+        self,
+        http_request: Request,
+        request_data: ResponsesRequest,
+        api_index: int,
+        background_tasks: BackgroundTasks,
+        endpoint: str = "/v1/responses",
+    ):
+        config = app.state.config
+        request_model_name = request_data.model
+        if not safe_get(config, 'api_keys', api_index, 'model'):
+            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+
+        current_info = request_info.get()
+        disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
+
+        scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+        matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
+        num_matching_providers = len(matching_providers)
+
+        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
+
+        status_code = 500
+        error_message = None
+
+        start_index = await _compute_start_index(
+            self.last_provider_indices,
+            self.locks,
+            request_model_name,
+            scheduling_algorithm,
+            num_matching_providers,
+        )
+
+        retry_count = _compute_retry_count(matching_providers)
+        index = 0
+        while True:
+            if disconnect_event is not None and disconnect_event.is_set():
+                return Response(content="", status_code=499)
+
+            if index > num_matching_providers + retry_count:
+                break
+            current_index = (start_index + index) % num_matching_providers
+            index += 1
+            provider = matching_providers[current_index]
+
+            provider_name = provider['provider']
+            model_dict = provider["_model_dict_cache"]
+            original_model = model_dict[request_model_name]
+
+            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+                error_message = "All API keys are rate limited and stop auto retry!"
+                if num_matching_providers == 1:
+                    break
+                continue
+
+            engine, stream_mode = get_engine(provider, endpoint=endpoint, original_model=original_model)
+            if stream_mode is not None:
+                request_data.stream = stream_mode
+
+            provider_api_key_raw = None
+            if provider_name.startswith("sk-"):
+                provider_api_key_raw = provider_name
+            elif provider.get("api"):
+                provider_api_key_raw = await provider_api_circular_list[provider_name].next(original_model)
+
+            if engine not in ("gpt", "codex"):
+                status_code = 400
+                error_message = f"{endpoint} only supports upstream engines: gpt/codex (got {engine})"
+                if not auto_retry:
+                    break
+                continue
+
+            wants_compact = endpoint.rstrip("/").endswith("/compact")
+            if wants_compact:
+                upstream_url = _normalize_responses_compact_upstream_url(provider.get("base_url", ""), engine)
+            else:
+                upstream_url = _normalize_responses_upstream_url(provider.get("base_url", ""), engine)
+
+            if engine == "gpt" and "v1/responses" not in upstream_url:
+                status_code = 400
+                error_message = f"{endpoint} requires provider base_url ending with /v1/responses (got {upstream_url})"
+                if not auto_retry:
+                    break
+                continue
+            if wants_compact and "compact" not in upstream_url:
+                status_code = 400
+                error_message = f"{endpoint} requires provider base_url ending with /v1/responses/compact (got {upstream_url})"
+                if not auto_retry:
+                    break
+                continue
+
+            proxy = safe_get(config, "preferences", "proxy", default=None)
+            proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+
+            api_key = provider_api_key_raw
+            codex_account_id = None
+            if engine == "codex" and provider_api_key_raw:
+                try:
+                    codex_account_id, _ = _split_codex_api_key(provider_api_key_raw)
+                except ValueError as e:
+                    status_code = 500
+                    error_message = str(e)
+                    logger.error(f"/v1/responses invalid codex api key with provider {provider_name}: {provider_api_key_raw}: {error_message}")
+                    if not auto_retry:
+                        break
+                    continue
+                try:
+                    api_key = await _get_codex_access_token(provider_name, provider_api_key_raw, proxy)
+                except HTTPException as e:
+                    status_code = getattr(e, "status_code", 401)
+                    error_message = str(getattr(e, "detail", "")) or str(e)
+                    logger.error(f"/v1/responses codex token refresh failed with provider {provider_name}: {provider_api_key_raw}: {error_message}")
+                    # If a Codex refresh_token is invalid/reused, treat it as a dead key and cool it down
+                    # so fixed_priority schedules can fall back to the next key immediately.
+                    if provider_api_key_raw and provider_name and not provider_name.startswith("sk-") and status_code in (401, 403):
+                        api_key_count = provider_api_circular_list[provider_name].get_items_count()
+                        if api_key_count > 1:
+                            cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
+                            await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
+                    if not auto_retry:
+                        break
+                    continue
+
+            timeout_value = get_preference(app.state.provider_timeouts, provider_name, (original_model, request_model_name), DEFAULT_TIMEOUT)
+            timeout_value = int(timeout_value)
+
+            headers = {
+                "Content-Type": "application/json",
+            }
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            if engine == "codex":
+                headers.setdefault("Openai-Beta", http_request.headers.get("Openai-Beta") or "responses=experimental")
+                headers.setdefault("Originator", http_request.headers.get("Originator") or "codex_cli_rs")
+                headers.setdefault("Version", http_request.headers.get("Version") or "0.21.0")
+                headers.setdefault("Session_id", http_request.headers.get("Session_id") or str(uuid.uuid4()))
+                headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or "codex_cli_rs/0.50.0")
+                headers.setdefault("Connection", "Keep-Alive")
+                headers.setdefault("Accept", "text/event-stream" if request_data.stream else "application/json")
+                if codex_account_id:
+                    headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
+
+            headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+
+            payload = request_data.model_dump(exclude_unset=True)
+            payload["model"] = original_model
+            if engine == "codex":
+                payload.pop("previous_response_id", None)
+                payload.pop("prompt_cache_retention", None)
+                payload.pop("safety_identifier", None)
+                payload.setdefault("instructions", "")
+
+            overrides = safe_get(provider, "preferences", "post_body_parameter_overrides", default={}) or {}
+            if isinstance(overrides, dict):
+                model_overrides = overrides.get(request_model_name)
+                if isinstance(model_overrides, dict):
+                    for k, v in model_overrides.items():
+                        if k == "translation_options":
+                            continue
+                        payload[k] = v
+
+            channel_id = f"{provider_name}"
+            logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13}")
+
+            try:
+                async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+                    json_payload = await asyncio.to_thread(json.dumps, payload)
+                    if request_data.stream:
+                        stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                        upstream_resp = await stream_cm.__aenter__()
+                        if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                            raw = await upstream_resp.aread()
+                            await stream_cm.__aexit__(None, None, None)
+                            try:
+                                error_message = raw.decode("utf-8", errors="replace")
+                            except Exception:
+                                error_message = str(raw)
+                            status_code = upstream_resp.status_code
+                            raise HTTPException(status_code=status_code, detail=error_message)
+
+                        async def proxy_stream():
+                            try:
+                                async for chunk in upstream_resp.aiter_raw():
+                                    if disconnect_event is not None and disconnect_event.is_set():
+                                        break
+                                    yield chunk
+                            finally:
+                                await stream_cm.__aexit__(None, None, None)
+
+                        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
+                        current_info["first_response_time"] = 0
+                        current_info["success"] = True
+                        current_info["provider"] = channel_id
+                        return StarletteStreamingResponse(proxy_stream(), media_type="text/event-stream")
+
+                    upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                    if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                        raw = await upstream_resp.aread()
+                        try:
+                            error_message = raw.decode("utf-8", errors="replace")
+                        except Exception:
+                            error_message = str(raw)
+                        status_code = upstream_resp.status_code
+                        raise HTTPException(status_code=status_code, detail=error_message)
+
+                    data = upstream_resp.json()
+                    background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
+                    current_info["first_response_time"] = 0
+                    current_info["success"] = True
+                    current_info["provider"] = channel_id
+                    return JSONResponse(status_code=upstream_resp.status_code, content=data)
+
+            except (HTTPException, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+                background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=False, provider_api_key=provider_api_key_raw)
+
+                status_code = getattr(e, "status_code", 500)
+                error_message = str(getattr(e, "detail", "")) or str(e)
+
+                if engine == "codex" and provider_api_key_raw and status_code in (401, 403):
+                    _codex_oauth_cache.pop(provider_api_key_raw, None)
+
+                # Cool down keys on quota exhaustion by default (so dead accounts are skipped).
+                if provider_api_key_raw and provider_name and not provider_name.startswith("sk-"):
+                    api_key_count = provider_api_circular_list[provider_name].get_items_count()
+                    if api_key_count > 1 and _is_quota_exhausted_error(status_code, error_message):
+                        cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
+                        await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
+                    else:
+                        cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
+                        if api_key_count > 1 and int(cooling_time) > 0:
+                            await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
+
+                logger.error(f"/v1/responses upstream error {status_code} with provider {channel_id} api_key: {provider_api_key_raw}: {error_message}")
+                if not auto_retry:
+                    break
+                continue
+
+        current_info["first_response_time"] = -1
+        current_info["success"] = False
+        current_info["provider"] = None
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": f"All {request_model_name} error: {error_message}"},
+        )
+
 model_handler = ModelRequestHandler()
+responses_handler = ResponsesRequestHandler()
 
 security = HTTPBearer()
 
@@ -1703,6 +2281,30 @@ async def jina_search(
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def chat_completions_route(request: RequestModel, background_tasks: BackgroundTasks, api_index: int = Depends(verify_api_key)):
     return await model_handler.request_model(request, api_index, background_tasks)
+
+@app.post("/v1/responses", dependencies=[Depends(rate_limit_dependency)])
+async def responses_route(
+    http_request: Request,
+    request: ResponsesRequest,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key),
+):
+    return await responses_handler.request_responses(http_request, request, api_index, background_tasks)
+
+@app.post("/v1/responses/compact", dependencies=[Depends(rate_limit_dependency)])
+async def responses_compact_route(
+    http_request: Request,
+    request: ResponsesRequest,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key),
+):
+    return await responses_handler.request_responses(
+        http_request,
+        request,
+        api_index,
+        background_tasks,
+        endpoint="/v1/responses/compact",
+    )
 
 # @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 # async def options_handler():
