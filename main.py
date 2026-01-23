@@ -2041,6 +2041,7 @@ class ResponsesRequestHandler:
         current_info = request_info.get()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
 
+        role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
         matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
         num_matching_providers = len(matching_providers)
@@ -2188,7 +2189,7 @@ class ResponsesRequestHandler:
                         payload[k] = v
 
             channel_id = f"{provider_name}"
-            logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13}")
+            logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13} role: {role}")
 
             try:
                 async with app.state.client_manager.get_client(upstream_url, proxy) as client:
