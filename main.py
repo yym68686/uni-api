@@ -1087,7 +1087,9 @@ _CODEX_OAUTH_REFRESH_SKEW_SECONDS = 30
 _codex_oauth_cache: dict[str, dict[str, Any]] = {}
 _codex_oauth_locks: dict[str, asyncio.Lock] = {}
 
-# chatgpt_account_id -> refresh_token
+# provider_api_key_raw -> refresh_token
+# NOTE: We intentionally key by the full raw config string (usually "account_id,refresh_token") so multiple
+# Codex keys sharing the same account_id but having different refresh tokens won't overwrite each other.
 _CODEX_REFRESH_TOKEN_STORE_PATH = os.getenv("CODEX_REFRESH_TOKEN_STORE_PATH", "./data/codex_refresh_tokens.json")
 _codex_refresh_token_store: dict[str, str] = {}
 _codex_refresh_token_store_loaded = False
@@ -1134,10 +1136,10 @@ async def _reload_codex_refresh_token_store() -> None:
             logger.warning("Failed to reload Codex refresh token store '%s': %s", _CODEX_REFRESH_TOKEN_STORE_PATH, e)
         _codex_refresh_token_store_loaded = True
 
-async def _get_codex_refresh_token_from_store(account_id: Optional[str], *, force_reload: bool = False) -> Optional[str]:
-    if not account_id:
+async def _get_codex_refresh_token_from_store(provider_api_key_raw: Optional[str], *, force_reload: bool = False) -> Optional[str]:
+    if provider_api_key_raw is None:
         return None
-    key = str(account_id).strip()
+    key = str(provider_api_key_raw).strip()
     if not key:
         return None
     if force_reload:
@@ -1147,10 +1149,10 @@ async def _get_codex_refresh_token_from_store(account_id: Optional[str], *, forc
     token = _codex_refresh_token_store.get(key)
     return str(token) if token else None
 
-async def _persist_codex_refresh_token(account_id: Optional[str], refresh_token: Optional[str]) -> None:
-    if not account_id:
+async def _persist_codex_refresh_token(provider_api_key_raw: Optional[str], refresh_token: Optional[str]) -> None:
+    if provider_api_key_raw is None:
         return
-    key = str(account_id).strip()
+    key = str(provider_api_key_raw).strip()
     rt = str(refresh_token or "").strip()
     if not key or not rt:
         return
@@ -1249,7 +1251,7 @@ async def _get_codex_access_token(provider_name: str, provider_api_key_raw: str,
     if not refresh_token_from_config:
         raise HTTPException(status_code=401, detail="Codex refresh_token missing")
 
-    persisted_refresh_token = await _get_codex_refresh_token_from_store(account_id)
+    persisted_refresh_token = await _get_codex_refresh_token_from_store(provider_api_key_raw)
     if persisted_refresh_token:
         refresh_token_from_config = persisted_refresh_token
 
@@ -1264,8 +1266,8 @@ async def _get_codex_access_token(provider_name: str, provider_api_key_raw: str,
             refreshed = await _refresh_codex_access_token(old_refresh_token, proxy)
         except HTTPException as e:
             detail = str(getattr(e, "detail", "") or "")
-            if account_id and "refresh_token_reused" in detail:
-                latest = await _get_codex_refresh_token_from_store(account_id, force_reload=True)
+            if "refresh_token_reused" in detail:
+                latest = await _get_codex_refresh_token_from_store(provider_api_key_raw, force_reload=True)
                 if latest and latest != old_refresh_token:
                     refreshed = await _refresh_codex_access_token(latest, proxy)
                     old_refresh_token = latest
@@ -1279,7 +1281,7 @@ async def _get_codex_access_token(provider_name: str, provider_api_key_raw: str,
             "refresh_token": updated_refresh_token,
             "expires_at": refreshed.get("expires_at"),
         }
-        await _persist_codex_refresh_token(account_id, updated_refresh_token)
+        await _persist_codex_refresh_token(provider_api_key_raw, updated_refresh_token)
         return str(refreshed["access_token"])
 
 # 在 process_request 函数中更新成功和失败计数
