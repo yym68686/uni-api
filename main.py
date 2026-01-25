@@ -2215,6 +2215,15 @@ class ResponsesRequestHandler:
                                     if disconnect_event is not None and disconnect_event.is_set():
                                         break
                                     yield chunk
+                            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+                                # Upstream may occasionally reset an HTTP/2 stream; avoid surfacing it as an ASGI exception.
+                                logger.warning(
+                                    "Upstream stream aborted (%s) provider=%s key=%s: %s",
+                                    type(e).__name__,
+                                    provider_name,
+                                    provider_api_key_raw,
+                                    str(e),
+                                )
                             finally:
                                 await stream_cm.__aexit__(None, None, None)
 
