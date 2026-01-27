@@ -978,7 +978,7 @@ class ClientManager:
         self.default_config = default_config
 
     @asynccontextmanager
-    async def get_client(self, base_url, proxy=None):
+    async def get_client(self, base_url, proxy=None, http2: Optional[bool] = None):
         # 直接获取或创建客户端,不使用锁
         # 从base_url中提取主机名
         parsed_url = urlparse(base_url)
@@ -990,6 +990,8 @@ class ClientManager:
             # 对代理URL进行规范化处理
             proxy_normalized = proxy.replace('socks5h://', 'socks5://')
             client_key += f"_{proxy_normalized}"
+        if http2 is not None:
+            client_key += f"_http2_{int(bool(http2))}"
 
         if client_key not in self.clients:
             timeout = httpx.Timeout(
@@ -1007,6 +1009,8 @@ class ClientManager:
             }
 
             client_config = get_proxy(proxy, client_config)
+            if http2 is not None:
+                client_config["http2"] = bool(http2)
 
             self.clients[client_key] = httpx.AsyncClient(**client_config)
 
@@ -2166,7 +2170,6 @@ class ResponsesRequestHandler:
                 headers.setdefault("Version", http_request.headers.get("Version") or "0.21.0")
                 headers.setdefault("Session_id", http_request.headers.get("Session_id") or str(uuid.uuid4()))
                 headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or "codex_cli_rs/0.50.0")
-                headers.setdefault("Connection", "Keep-Alive")
                 headers.setdefault("Accept", "text/event-stream" if request_data.stream else "application/json")
                 if codex_account_id:
                     headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
@@ -2194,7 +2197,7 @@ class ResponsesRequestHandler:
             logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13} role: {role}")
 
             try:
-                async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+                async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
                     json_payload = await asyncio.to_thread(json.dumps, payload)
                     if request_data.stream:
                         stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
@@ -2209,9 +2212,25 @@ class ResponsesRequestHandler:
                             status_code = upstream_resp.status_code
                             raise HTTPException(status_code=status_code, detail=error_message)
 
+                        upstream_iter = upstream_resp.aiter_raw()
+                        first_chunk: bytes | None = None
+                        if engine == "codex":
+                            try:
+                                first_chunk = await upstream_iter.__anext__()
+                            except StopAsyncIteration:
+                                await stream_cm.__aexit__(None, None, None)
+                                raise HTTPException(status_code=502, detail="Codex upstream closed stream without data")
+                            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError):
+                                await stream_cm.__aexit__(None, None, None)
+                                raise
+
                         async def proxy_stream():
                             try:
-                                async for chunk in upstream_resp.aiter_raw():
+                                if first_chunk is not None:
+                                    if disconnect_event is not None and disconnect_event.is_set():
+                                        return
+                                    yield first_chunk
+                                async for chunk in upstream_iter:
                                     if disconnect_event is not None and disconnect_event.is_set():
                                         break
                                     yield chunk
@@ -2224,6 +2243,8 @@ class ResponsesRequestHandler:
                                     provider_api_key_raw,
                                     str(e),
                                 )
+                                # Best-effort: terminate SSE stream cleanly for downstream clients.
+                                yield b"data: [DONE]\n\n"
                             finally:
                                 await stream_cm.__aexit__(None, None, None)
 
