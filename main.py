@@ -1867,16 +1867,19 @@ class ModelRequestHandler:
 
                 # Codex refresh_token failures (401/403) should cool down the key so fixed_priority can fall back.
                 is_codex_refresh_failure = False
+                is_codex_permanent_auth_failure = False
                 try:
                     failed_engine_for_cooldown, _ = get_engine(provider, endpoint, original_model)
                     if failed_engine_for_cooldown == "codex" and status_code in (401, 403):
                         msg = str(error_message or "")
                         if "Codex token refresh" in msg or "refresh_token_reused" in msg:
                             is_codex_refresh_failure = True
+                        elif _is_codex_permanent_auth_error(status_code, msg):
+                            is_codex_permanent_auth_failure = True
                 except Exception:
                     pass
 
-                if api_key_count > 1 and current_api and is_codex_refresh_failure:
+                if api_key_count > 1 and current_api and (is_codex_refresh_failure or is_codex_permanent_auth_failure):
                     effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=effective_quota_cooldown)
                 elif api_key_count > 1 and current_api and _is_quota_exhausted_error(status_code, error_message):
@@ -1994,6 +1997,65 @@ def _is_quota_exhausted_error(status_code: int, details: str) -> bool:
             "usage limit",
             "out of credits",
             "payment required",
+        )
+    )
+
+def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
+    if status_code not in (401, 403):
+        return False
+
+    raw = str(details or "")
+    code = None
+    message = None
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, dict):
+            code = err.get("code")
+            message = err.get("message")
+
+    # Some error paths stringify Python dicts (single quotes / None). Best-effort parse.
+    if code is None and (raw.startswith("{") or raw.startswith("[")):
+        try:
+            import ast
+
+            parsed_py = ast.literal_eval(raw)
+        except Exception:
+            parsed_py = None
+        if isinstance(parsed_py, dict):
+            err = parsed_py.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                message = err.get("message")
+
+    permanent_codes = {
+        "account_deactivated",
+        "account_disabled",
+        "account_suspended",
+        "user_deactivated",
+        "user_suspended",
+        "organization_deactivated",
+        "organization_suspended",
+    }
+    if code and str(code).strip() in permanent_codes:
+        return True
+
+    haystack = (message or raw).lower()
+    return any(
+        k in haystack
+        for k in (
+            "account_deactivated",
+            "account_disabled",
+            "account_suspended",
+            "organization_deactivated",
+            "user_deactivated",
+            "has been deactivated",
+            "has been suspended",
         )
     )
 
@@ -2277,13 +2339,20 @@ class ResponsesRequestHandler:
                 status_code = getattr(e, "status_code", 500)
                 error_message = str(getattr(e, "detail", "")) or str(e)
 
+                is_codex_permanent_auth_failure = (
+                    engine == "codex"
+                    and provider_api_key_raw
+                    and status_code in (401, 403)
+                    and _is_codex_permanent_auth_error(status_code, error_message)
+                )
+
                 if engine == "codex" and provider_api_key_raw and status_code in (401, 403):
                     _codex_oauth_cache.pop(provider_api_key_raw, None)
 
                 # Cool down keys on quota exhaustion by default (so dead accounts are skipped).
                 if provider_api_key_raw and provider_name and not provider_name.startswith("sk-"):
                     api_key_count = provider_api_circular_list[provider_name].get_items_count()
-                    if api_key_count > 1 and _is_quota_exhausted_error(status_code, error_message):
+                    if api_key_count > 1 and (_is_quota_exhausted_error(status_code, error_message) or is_codex_permanent_auth_failure):
                         cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
                         await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
                     else:
