@@ -1,6 +1,6 @@
 [project]
 name = "uni-api"
-version = "1.7.44"
+version = "1.7.45"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
