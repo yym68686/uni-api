@@ -1870,7 +1870,7 @@ class ModelRequestHandler:
                 is_codex_permanent_auth_failure = False
                 try:
                     failed_engine_for_cooldown, _ = get_engine(provider, endpoint, original_model)
-                    if failed_engine_for_cooldown == "codex" and status_code in (401, 403):
+                    if failed_engine_for_cooldown == "codex" and status_code in (401, 403, 402):
                         msg = str(error_message or "")
                         if "Codex token refresh" in msg or "refresh_token_reused" in msg:
                             is_codex_refresh_failure = True
@@ -2001,7 +2001,7 @@ def _is_quota_exhausted_error(status_code: int, details: str) -> bool:
     )
 
 def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
-    if status_code not in (401, 403):
+    if status_code not in (401, 403, 402):
         return False
 
     raw = str(details or "")
@@ -2018,6 +2018,10 @@ def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
         if isinstance(err, dict):
             code = err.get("code")
             message = err.get("message")
+        detail = parsed.get("detail")
+        if code is None and isinstance(detail, dict):
+            code = detail.get("code")
+            message = detail.get("message") or message
 
     # Some error paths stringify Python dicts (single quotes / None). Best-effort parse.
     if code is None and (raw.startswith("{") or raw.startswith("[")):
@@ -2032,11 +2036,16 @@ def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
             if isinstance(err, dict):
                 code = err.get("code")
                 message = err.get("message")
+            detail = parsed_py.get("detail")
+            if code is None and isinstance(detail, dict):
+                code = detail.get("code")
+                message = detail.get("message") or message
 
     permanent_codes = {
         "account_deactivated",
         "account_disabled",
         "account_suspended",
+        "deactivated_workspace",
         "user_deactivated",
         "user_suspended",
         "organization_deactivated",
@@ -2052,6 +2061,7 @@ def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
             "account_deactivated",
             "account_disabled",
             "account_suspended",
+            "deactivated_workspace",
             "organization_deactivated",
             "user_deactivated",
             "has been deactivated",
@@ -2342,7 +2352,7 @@ class ResponsesRequestHandler:
                 is_codex_permanent_auth_failure = (
                     engine == "codex"
                     and provider_api_key_raw
-                    and status_code in (401, 403)
+                    and status_code in (401, 403, 402)
                     and _is_codex_permanent_auth_error(status_code, error_message)
                 )
 
