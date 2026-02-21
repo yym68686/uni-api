@@ -41,6 +41,7 @@ from core.utils import (
     get_model_dict,
     parse_rate_limit,
     circular_list_encoder,
+    collect_openai_chat_completion_from_streaming_sse,
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
@@ -1344,13 +1345,23 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
 
     try:
         async with app.state.client_manager.get_client(url, proxy) as client:
-            if request.stream:
+            downstream_stream = bool(getattr(request, "stream", None))
+            force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
+
+            if downstream_stream and not force_collect_codex_stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
+            elif force_collect_codex_stream:
+                payload["stream"] = True
+                headers["Accept"] = "text/event-stream"
+                generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
+                json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
+                response = StarletteStreamingResponse(iter([json_data]), media_type="application/json")
             else:
                 generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
-                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, request.stream, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
+                wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, False, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
 
                 # 处理音频和其他二进制响应
                 if endpoint == "/v1/audio/speech":
