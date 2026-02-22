@@ -3,6 +3,7 @@ name = "uni-api"
 version = "1.7.47"
 description = "Add your description here"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "aiofiles>=24.1.0",

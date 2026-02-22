@@ -1132,6 +1132,10 @@ We take security seriously. If you discover any security issues, please contact 
 
 We would like to thank **@ryougishiki214** for reporting a security issue, which has been resolved in [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1).
 
+## License
+
+Licensed under the Apache License, Version 2.0. See `LICENSE`.
+
 ## ⭐ Star History
 
 <a href="https://github.com/yym68686/uni-api/stargazers">

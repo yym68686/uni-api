@@ -1135,6 +1135,10 @@ python main.py
 
 *   我们特别感谢 **@ryougishiki214** 报告了一个安全问题，该问题已在 [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1) 版本中得到解决。
 
+## 许可证
+
+本项目基于 Apache License 2.0 开源，详见 `LICENSE`。
+
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
