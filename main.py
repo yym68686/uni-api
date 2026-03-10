@@ -2109,6 +2109,26 @@ def _compute_retry_count(matching_providers: list[dict]) -> int:
     tmp_retry_count = sum(provider_api_circular_list[p["provider"]].get_items_count() for p in matching_providers) * 2
     return tmp_retry_count if tmp_retry_count < 10 else 10
 
+def _build_upstream_error_response(status_code: int, error_message: Any, fallback_prefix: Optional[str] = None) -> JSONResponse:
+    parsed_error = None
+    if isinstance(error_message, (dict, list)):
+        parsed_error = error_message
+    elif isinstance(error_message, str):
+        stripped = error_message.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                parsed_error = json.loads(stripped)
+            except Exception:
+                parsed_error = None
+
+    if parsed_error is not None:
+        return JSONResponse(status_code=status_code, content=parsed_error)
+
+    message_text = str(error_message)
+    if fallback_prefix:
+        message_text = f"{fallback_prefix}: {message_text}"
+    return JSONResponse(status_code=status_code, content={"error": message_text})
+
 class ResponsesRequestHandler:
     def __init__(self):
         self.last_provider_indices = defaultdict(lambda: -1)
@@ -2371,7 +2391,7 @@ class ResponsesRequestHandler:
                     _codex_oauth_cache.pop(provider_api_key_raw, None)
 
                 # Cool down keys on quota exhaustion by default (so dead accounts are skipped).
-                if provider_api_key_raw and provider_name and not provider_name.startswith("sk-"):
+                if provider_api_key_raw and provider_name and not provider_name.startswith("sk-") and status_code not in (400, 413):
                     api_key_count = provider_api_circular_list[provider_name].get_items_count()
                     if api_key_count > 1 and (_is_quota_exhausted_error(status_code, error_message) or is_codex_permanent_auth_failure):
                         cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
@@ -2382,9 +2402,22 @@ class ResponsesRequestHandler:
                             await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
 
                 logger.error(f"/v1/responses upstream error {status_code} with provider {channel_id} api_key: {provider_api_key_raw}: {error_message}")
-                if not auto_retry:
-                    break
-                continue
+
+                should_retry = auto_retry and (
+                    status_code not in (400, 413)
+                    or urlparse(provider.get("base_url", "")).netloc == 'models.inference.ai.azure.com'
+                )
+                if should_retry:
+                    continue
+
+                current_info["first_response_time"] = -1
+                current_info["success"] = False
+                current_info["provider"] = None
+                return _build_upstream_error_response(
+                    status_code=status_code,
+                    error_message=error_message,
+                    fallback_prefix="Error: Current provider response failed",
+                )
 
         current_info["first_response_time"] = -1
         current_info["success"] = False
