@@ -32,7 +32,7 @@ from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks, UploadFile, File, Form, Query
 
 from core.log_config import logger
-from core.request import get_payload
+from core.request import get_payload, strip_unsupported_codex_payload_fields
 from core.response import fetch_response, fetch_response_stream
 from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.utils import (
@@ -2295,6 +2295,9 @@ class ResponsesRequestHandler:
                         if k == "translation_options":
                             continue
                         payload[k] = v
+
+            if engine == "codex":
+                strip_unsupported_codex_payload_fields(payload)
 
             channel_id = f"{provider_name}"
             logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13} role: {role}")
