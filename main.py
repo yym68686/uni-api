@@ -32,7 +32,11 @@ from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks, UploadFile, File, Form, Query
 
 from core.log_config import logger
-from core.request import get_payload, strip_unsupported_codex_payload_fields
+from core.request import (
+    apply_post_body_parameter_overrides,
+    get_payload,
+    strip_unsupported_codex_payload_fields,
+)
 from core.response import fetch_response, fetch_response_stream
 from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.utils import (
@@ -2289,14 +2293,12 @@ class ResponsesRequestHandler:
                 payload.pop("safety_identifier", None)
                 payload.setdefault("instructions", "")
 
-            overrides = safe_get(provider, "preferences", "post_body_parameter_overrides", default={}) or {}
-            if isinstance(overrides, dict):
-                model_overrides = overrides.get(request_model_name)
-                if isinstance(model_overrides, dict):
-                    for k, v in model_overrides.items():
-                        if k == "translation_options":
-                            continue
-                        payload[k] = v
+            apply_post_body_parameter_overrides(
+                payload,
+                provider,
+                request_model_name,
+                skip_keys={"translation_options"},
+            )
 
             if engine == "codex":
                 strip_unsupported_codex_payload_fields(payload)

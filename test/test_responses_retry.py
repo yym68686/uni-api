@@ -89,7 +89,7 @@ class DummyClientManager:
         yield DummyClient(self.response, self.stream_calls, self.post_calls)
 
 
-def _configure_responses_test(monkeypatch, *, engine):
+def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None):
     provider_name = f"{engine}-provider"
     keys = DummyCircularList(["key-1"])
     monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
@@ -101,7 +101,7 @@ def _configure_responses_test(monkeypatch, *, engine):
                 "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
                 "base_url": "https://example.com/v1/responses",
                 "api": ["key-1"],
-                "preferences": {},
+                "preferences": provider_preferences or {},
             }
         ]
 
@@ -264,3 +264,59 @@ def test_responses_gpt_keeps_max_output_tokens(monkeypatch):
     assert len(client_manager.post_calls) == 1
     sent_payload = json.loads(client_manager.post_calls[0]["content"])
     assert sent_payload["max_output_tokens"] == 123
+
+
+def test_responses_generic_post_body_overrides_apply(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="gpt",
+        provider_preferences={"post_body_parameter_overrides": {"store": False}},
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            store=True,
+        )
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["store"] is False
+
+
+def test_responses_codex_without_overrides_keeps_client_store_value(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            store=False,
+        )
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["store"] is False
+
+
+def test_responses_codex_generic_post_body_overrides_apply(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={"post_body_parameter_overrides": {"store": True}},
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            store=False,
+        )
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert sent_payload["store"] is True
