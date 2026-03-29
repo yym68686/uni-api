@@ -1742,6 +1742,7 @@ class ModelRequestHandler:
             original_model = model_dict[request_model_name]
             if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
                 # logger.warning(f"Provider {provider_name}: All API keys are rate limited and stop auto retry!")
+                status_code = 429
                 error_message = "All API keys are rate limited and stop auto retry!"
                 if num_matching_providers == 1:
                     break
@@ -2185,6 +2186,7 @@ class ResponsesRequestHandler:
             original_model = model_dict[request_model_name]
 
             if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+                status_code = 429
                 error_message = "All API keys are rate limited and stop auto retry!"
                 if num_matching_providers == 1:
                     break
