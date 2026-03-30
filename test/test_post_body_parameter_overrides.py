@@ -55,3 +55,28 @@ def test_codex_generic_post_body_overrides_apply():
     _, _, payload = asyncio.run(get_payload(request, "codex", provider, api_key="access-token"))
 
     assert payload["store"] is True
+
+
+def test_codex_strips_response_format_from_post_body_overrides():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        stream=False,
+    )
+    provider = {
+        "provider": "codex",
+        "engine": "codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "account-id,refresh-token",
+        "model": ["gpt-5.4"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "response_format": {"type": "json_object"},
+            }
+        },
+        "tools": True,
+    }
+
+    _, _, payload = asyncio.run(get_payload(request, "codex", provider, api_key="access-token"))
+
+    assert "response_format" not in payload

@@ -249,6 +249,23 @@ def test_responses_codex_strips_max_output_tokens(monkeypatch):
     assert "max_output_tokens" not in sent_payload
 
 
+def test_responses_codex_strips_response_format(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            response_format={"type": "json_object"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(client_manager.post_calls) == 1
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert "response_format" not in sent_payload
+
+
 def test_responses_gpt_keeps_max_output_tokens(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="gpt")
 
