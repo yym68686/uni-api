@@ -1,7 +1,9 @@
 import os
 import io
+import re
 import json
 import uuid
+import codecs
 import httpx
 import string
 import random
@@ -2134,6 +2136,89 @@ def _build_upstream_error_response(status_code: int, error_message: Any, fallbac
         message_text = f"{fallback_prefix}: {message_text}"
     return JSONResponse(status_code=status_code, content={"error": message_text})
 
+RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset({
+    "response.created",
+    "response.in_progress",
+    "response.queued",
+})
+
+RESPONSES_STREAM_NETWORK_ERRORS = (
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.LocalProtocolError,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+)
+
+def _extract_responses_stream_event_type(raw_event: str) -> str:
+    event_name = ""
+    data_lines = []
+    for line in raw_event.splitlines():
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+    data_str = "\n".join(data_lines).strip()
+    if data_str == "[DONE]":
+        return "[DONE]"
+
+    if not event_name and data_str:
+        try:
+            event_payload = json.loads(data_str)
+        except Exception:
+            event_payload = None
+        if isinstance(event_payload, dict):
+            event_name = str(event_payload.get("type") or "").strip()
+
+    return event_name
+
+async def _prime_responses_upstream_stream(
+    upstream_iter,
+    *,
+    disconnect_event: Optional[asyncio.Event] = None,
+) -> tuple[list[bytes], bool]:
+    """
+    Buffer only the initial status events so we can still fail over before any
+    user-visible / semantic Responses event has been sent downstream.
+    """
+    buffered_chunks: list[bytes] = []
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+
+    while True:
+        if disconnect_event is not None and disconnect_event.is_set():
+            return buffered_chunks, False
+
+        try:
+            chunk = await upstream_iter.__anext__()
+        except StopAsyncIteration:
+            if not buffered_chunks:
+                raise HTTPException(status_code=502, detail="Upstream closed stream without data")
+            if text_buffer.strip():
+                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
+            return buffered_chunks, False
+
+        buffered_chunks.append(chunk)
+        text_buffer += decoder.decode(chunk)
+
+        while True:
+            match = re.search(r"\r?\n\r?\n", text_buffer)
+            if not match:
+                break
+
+            raw_event = text_buffer[:match.start()]
+            text_buffer = text_buffer[match.end():]
+            if not raw_event.strip():
+                continue
+
+            event_type = _extract_responses_stream_event_type(raw_event)
+            if event_type == "[DONE]":
+                return buffered_chunks, False
+
+            if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                return buffered_chunks, True
+
 class ResponsesRequestHandler:
     def __init__(self):
         self.last_provider_indices = defaultdict(lambda: -1)
@@ -2323,28 +2408,33 @@ class ResponsesRequestHandler:
                             raise HTTPException(status_code=status_code, detail=error_message)
 
                         upstream_iter = upstream_resp.aiter_raw()
-                        first_chunk: bytes | None = None
-                        if engine == "codex":
-                            try:
-                                first_chunk = await upstream_iter.__anext__()
-                            except StopAsyncIteration:
-                                await stream_cm.__aexit__(None, None, None)
-                                raise HTTPException(status_code=502, detail="Codex upstream closed stream without data")
-                            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError):
-                                await stream_cm.__aexit__(None, None, None)
-                                raise
+                        try:
+                            buffered_chunks, stream_committed = await _prime_responses_upstream_stream(
+                                upstream_iter,
+                                disconnect_event=disconnect_event,
+                            )
+                        except HTTPException:
+                            await stream_cm.__aexit__(None, None, None)
+                            raise
+                        except RESPONSES_STREAM_NETWORK_ERRORS:
+                            await stream_cm.__aexit__(None, None, None)
+                            raise
+
+                        if disconnect_event is not None and disconnect_event.is_set():
+                            await stream_cm.__aexit__(None, None, None)
+                            return Response(content="", status_code=499)
 
                         async def proxy_stream():
                             try:
-                                if first_chunk is not None:
+                                for chunk in buffered_chunks:
                                     if disconnect_event is not None and disconnect_event.is_set():
                                         return
-                                    yield first_chunk
+                                    yield chunk
                                 async for chunk in upstream_iter:
                                     if disconnect_event is not None and disconnect_event.is_set():
                                         break
                                     yield chunk
-                            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+                            except RESPONSES_STREAM_NETWORK_ERRORS as e:
                                 # Upstream may occasionally reset an HTTP/2 stream; avoid surfacing it as an ASGI exception.
                                 logger.warning(
                                     "Upstream stream aborted (%s) provider=%s key=%s: %s",
@@ -2353,8 +2443,10 @@ class ResponsesRequestHandler:
                                     provider_api_key_raw,
                                     str(e),
                                 )
-                                # Best-effort: terminate SSE stream cleanly for downstream clients.
-                                yield b"data: [DONE]\n\n"
+                                # Once a semantic event has been emitted to the client we can no longer
+                                # switch providers safely, so we terminate the SSE stream cleanly.
+                                if stream_committed:
+                                    yield b"data: [DONE]\n\n"
                             finally:
                                 await stream_cm.__aexit__(None, None, None)
 
