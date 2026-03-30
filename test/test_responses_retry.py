@@ -303,6 +303,28 @@ def test_responses_generic_post_body_overrides_apply(monkeypatch):
     assert sent_payload["store"] is False
 
 
+def test_responses_generic_post_body_overrides_can_remove_fields(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="gpt",
+        provider_preferences={"post_body_parameter_overrides": {"__remove__": ["store", "response_format"]}},
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            store=True,
+            response_format={"type": "json_object"},
+        )
+    )
+
+    assert response.status_code == 200
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert "store" not in sent_payload
+    assert "response_format" not in sent_payload
+
+
 def test_responses_codex_without_overrides_keeps_client_store_value(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
 

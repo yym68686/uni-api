@@ -80,7 +80,11 @@ providers:
     tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
     preferences:
       post_body_parameter_overrides: # Support customizing request body parameters
+        __remove__: # Optional. Remove top-level request body fields; accepts a string or a list. If omitted, nothing is removed.
+          - response_format
         claude-sonnet-4-5-think: # Add custom request body parameters to the model claude-sonnet-4-5-think
+          __remove__:
+            - temperature
           tools:
             - type: code_execution_20250522 # Add code_execution tool to the model claude-sonnet-4-5-think
               name: code_execution

@@ -80,7 +80,11 @@ providers:
     tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
     preferences:
       post_body_parameter_overrides: # 支持自定义请求体参数
+        __remove__: # 可选，删除顶层请求体参数；支持字符串或字符串列表。不配置则不删除
+          - response_format
         claude-sonnet-4-5-think: # 给模型 claude-sonnet-4-5-think 添加自定义请求体参数
+          __remove__:
+            - temperature
           tools:
             - type: code_execution_20250522 # 给模型 claude-sonnet-4-5-think 添加 code_execution 工具
               name: code_execution

@@ -82,6 +82,60 @@ def test_codex_strips_response_format_from_post_body_overrides():
     assert "response_format" not in payload
 
 
+def test_post_body_parameter_overrides_can_remove_global_fields():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+        stream=False,
+    )
+    provider = {
+        "provider": "wusan",
+        "base_url": "https://example.com/v1/responses",
+        "api": "test-key",
+        "model": ["gpt-5.4"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "__remove__": ["response_format", "temperature"],
+            }
+        },
+        "tools": True,
+    }
+
+    _, _, payload = asyncio.run(get_payload(request, "gpt", provider, api_key="test-key"))
+
+    assert "response_format" not in payload
+    assert "temperature" not in payload
+
+
+def test_post_body_parameter_overrides_can_remove_model_specific_fields():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        response_format={"type": "json_object"},
+        stream=False,
+    )
+    provider = {
+        "provider": "wusan",
+        "base_url": "https://example.com/v1/responses",
+        "api": "test-key",
+        "model": ["gpt-5.4"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "gpt-5.4": {
+                    "__remove__": ["response_format"],
+                }
+            }
+        },
+        "tools": True,
+    }
+
+    _, _, payload = asyncio.run(get_payload(request, "gpt", provider, api_key="test-key"))
+
+    assert "response_format" not in payload
+
+
 def test_gemini_reasoning_effort_overrides_post_body_thinking_level():
     request = RequestModel(
         model="gemini-3-flash",
