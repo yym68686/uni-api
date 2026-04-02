@@ -517,6 +517,104 @@ def test_responses_stream_retries_next_provider_before_output(monkeypatch):
     ]
 
 
+def test_responses_stream_retries_next_provider_on_semantic_failure(monkeypatch):
+    provider_a = "provider-a"
+    provider_b = "provider-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-a.example/v1/responses": DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse("response.created", {"type": "response.created", "provider": "a"}),
+                    _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "a"}),
+                    _responses_sse(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "tokens",
+                                "code": "rate_limit_exceeded",
+                                "message": "too many requests",
+                            },
+                        },
+                    ),
+                    _responses_sse(
+                        "response.failed",
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "status": "failed",
+                                "error": {
+                                    "code": "rate_limit_exceeded",
+                                    "message": "too many requests",
+                                },
+                            },
+                        },
+                    ),
+                ]
+            ),
+            "https://provider-b.example/v1/responses": DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse("response.created", {"type": "response.created", "provider": "b"}),
+                    _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "b"}),
+                    _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-b"}),
+                    _responses_sse(None, "[DONE]"),
+                ]
+            ),
+        }
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+    )
+
+    assert response.status_code == 200
+    assert '"provider": "a"' not in body
+    assert '"provider": "b"' in body
+    assert "hello-b" in body
+    assert [call["url"] for call in main.app.state.client_manager.stream_calls] == [
+        "https://provider-a.example/v1/responses",
+        "https://provider-b.example/v1/responses",
+    ]
+
+
 def test_responses_stream_does_not_retry_after_output_started(monkeypatch):
     provider_a = "provider-a"
     provider_b = "provider-b"
@@ -590,5 +688,171 @@ def test_responses_stream_does_not_retry_after_output_started(monkeypatch):
     assert "hello-b" not in body
     assert body.endswith("data: [DONE]\n\n")
     assert [call["url"] for call in main.app.state.client_manager.stream_calls] == [
+        "https://provider-a.example/v1/responses",
+    ]
+
+
+def test_responses_non_stream_retries_next_provider_on_semantic_failure(monkeypatch):
+    provider_a = "provider-a"
+    provider_b = "provider-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-a.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
+                json={
+                    "id": "resp-a",
+                    "status": "failed",
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "too many requests",
+                    },
+                },
+            ),
+            "https://provider-b.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-b.example/v1/responses"),
+                json={
+                    "id": "resp-b",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "hello-b",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ),
+        }
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["id"] == "resp-b"
+    assert [call["url"] for call in main.app.state.client_manager.post_calls] == [
+        "https://provider-a.example/v1/responses",
+        "https://provider-b.example/v1/responses",
+    ]
+
+
+def test_responses_non_stream_semantic_bad_request_does_not_retry(monkeypatch):
+    provider_a = "provider-a"
+    provider_b = "provider-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-a.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
+                json={
+                    "id": "resp-a",
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_type",
+                        "message": "bad input",
+                    },
+                },
+            ),
+            "https://provider-b.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-b.example/v1/responses"),
+                json={"id": "resp-b", "status": "completed"},
+            ),
+        }
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {
+        "error": {
+            "code": "invalid_type",
+            "message": "bad input",
+        }
+    }
+    assert [call["url"] for call in main.app.state.client_manager.post_calls] == [
         "https://provider-a.example/v1/responses",
     ]

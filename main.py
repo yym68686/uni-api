@@ -2150,7 +2150,38 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
     httpx.ConnectError,
 )
 
-def _extract_responses_stream_event_type(raw_event: str) -> str:
+RESPONSES_FAILURE_STATUS_BY_CODE = {
+    "account_deactivated": 403,
+    "account_disabled": 403,
+    "account_suspended": 403,
+    "authentication_error": 401,
+    "billing_hard_limit_reached": 429,
+    "context_length_exceeded": 400,
+    "deactivated_workspace": 403,
+    "incorrect_api_key_provided": 401,
+    "insufficient_quota": 429,
+    "invalid_api_key": 401,
+    "invalid_request_error": 400,
+    "invalid_type": 400,
+    "model_not_found": 404,
+    "not_found_error": 404,
+    "permission_denied": 403,
+    "rate_limit_exceeded": 429,
+    "unsupported_parameter": 400,
+    "user_deactivated": 403,
+    "user_suspended": 403,
+}
+
+RESPONSES_FAILURE_STATUS_BY_TYPE = {
+    "authentication_error": 401,
+    "invalid_request_error": 400,
+    "not_found_error": 404,
+    "permission_error": 403,
+    "rate_limit_error": 429,
+    "tokens": 429,
+}
+
+def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
     event_name = ""
     data_lines = []
     for line in raw_event.splitlines():
@@ -2161,17 +2192,83 @@ def _extract_responses_stream_event_type(raw_event: str) -> str:
 
     data_str = "\n".join(data_lines).strip()
     if data_str == "[DONE]":
-        return "[DONE]"
+        return "[DONE]", "[DONE]"
 
-    if not event_name and data_str:
+    parsed_payload: Any = data_str
+    if data_str:
         try:
-            event_payload = json.loads(data_str)
+            parsed_payload = json.loads(data_str)
         except Exception:
-            event_payload = None
-        if isinstance(event_payload, dict):
-            event_name = str(event_payload.get("type") or "").strip()
+            parsed_payload = data_str
 
-    return event_name
+    if not event_name and isinstance(parsed_payload, dict):
+        event_name = str(parsed_payload.get("type") or "").strip()
+
+    return event_name, parsed_payload
+
+def _responses_error_status_code(error_obj: Any) -> int:
+    if isinstance(error_obj, dict):
+        raw_status = error_obj.get("status_code") or error_obj.get("status")
+        try:
+            status_code = int(raw_status)
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code is not None and 100 <= status_code <= 599:
+            return status_code
+
+        error_code = str(error_obj.get("code") or "").strip().lower()
+        if error_code in RESPONSES_FAILURE_STATUS_BY_CODE:
+            return RESPONSES_FAILURE_STATUS_BY_CODE[error_code]
+
+        error_type = str(error_obj.get("type") or "").strip().lower()
+        if error_type in RESPONSES_FAILURE_STATUS_BY_TYPE:
+            return RESPONSES_FAILURE_STATUS_BY_TYPE[error_type]
+
+        message = str(error_obj.get("message") or "").lower()
+        if "rate limit" in message or "too many requests" in message:
+            return 429
+        if "invalid" in message or "unsupported" in message:
+            return 400
+        if "not found" in message:
+            return 404
+        if "permission" in message or "forbidden" in message:
+            return 403
+        if "auth" in message or "api key" in message or "unauthorized" in message:
+            return 401
+
+    return 500
+
+def _responses_failure_http_exception(payload: Any) -> Optional[HTTPException]:
+    if not isinstance(payload, dict):
+        return None
+
+    error_obj = None
+    response_status = str(safe_get(payload, "response", "status", default="") or "").strip().lower()
+    payload_status = str(payload.get("status") or "").strip().lower()
+    payload_type = str(payload.get("type") or "").strip().lower()
+
+    if payload_type == "error" and payload.get("error") is not None:
+        error_obj = payload.get("error")
+    elif payload_type == "response.failed":
+        error_obj = safe_get(payload, "response", "error", default=None)
+    elif payload_status == "failed":
+        error_obj = payload.get("error")
+    elif response_status == "failed":
+        error_obj = safe_get(payload, "response", "error", default=None)
+    elif isinstance(payload.get("error"), dict):
+        error_obj = payload.get("error")
+
+    if error_obj is None and (payload_status == "failed" or response_status == "failed"):
+        error_obj = {"message": "Responses upstream returned status=failed"}
+
+    if error_obj is None:
+        return None
+
+    error_body = {"error": error_obj}
+    return HTTPException(
+        status_code=_responses_error_status_code(error_obj),
+        detail=json.dumps(error_body, ensure_ascii=False),
+    )
 
 async def _prime_responses_upstream_stream(
     upstream_iter,
@@ -2212,9 +2309,13 @@ async def _prime_responses_upstream_stream(
             if not raw_event.strip():
                 continue
 
-            event_type = _extract_responses_stream_event_type(raw_event)
+            event_type, event_payload = _extract_responses_stream_event(raw_event)
             if event_type == "[DONE]":
                 return buffered_chunks, False
+
+            semantic_failure = _responses_failure_http_exception(event_payload)
+            if semantic_failure is not None:
+                raise semantic_failure
 
             if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
                 return buffered_chunks, True
@@ -2467,6 +2568,10 @@ class ResponsesRequestHandler:
                         raise HTTPException(status_code=status_code, detail=error_message)
 
                     data = upstream_resp.json()
+                    semantic_failure = _responses_failure_http_exception(data)
+                    if semantic_failure is not None:
+                        raise semantic_failure
+
                     background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
                     current_info["first_response_time"] = 0
                     current_info["success"] = True
