@@ -5,7 +5,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import RequestModel
-from core.request import get_payload
+from core.request import apply_post_body_parameter_overrides, get_payload
 
 
 def test_gpt_responses_generic_post_body_overrides_apply():
@@ -136,6 +136,40 @@ def test_post_body_parameter_overrides_can_remove_model_specific_fields():
     assert "response_format" not in payload
 
 
+def test_post_body_parameter_overrides_deep_merge_nested_dicts_without_mutating_provider_config():
+    payload = {
+        "generationConfig": {
+            "temperature": 1,
+            "thinkingConfig": {
+                "thinkingLevel": "minimal",
+            },
+        }
+    }
+    provider = {
+        "model": ["gemini-3-flash"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "gemini-3-flash": {
+                    "generationConfig": {
+                        "thinkingConfig": {
+                            "includeThoughts": True,
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    apply_post_body_parameter_overrides(payload, provider, "gemini-3-flash")
+
+    assert payload["generationConfig"]["temperature"] == 1
+    assert payload["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+    assert provider["preferences"]["post_body_parameter_overrides"]["gemini-3-flash"]["generationConfig"]["thinkingConfig"] == {
+        "includeThoughts": True,
+    }
+
+
 def test_gemini_reasoning_effort_overrides_post_body_thinking_level():
     request = RequestModel(
         model="gemini-3-flash",
@@ -168,6 +202,43 @@ def test_gemini_reasoning_effort_overrides_post_body_thinking_level():
     assert payload["generationConfig"]["maxOutputTokens"] == 65535
     assert payload["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
     assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+
+
+def test_gemini_reasoning_effort_is_preserved_for_aliased_gemini_3_latest_models():
+    request = RequestModel(
+        model="gemini-3-flash",
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning={"effort": "minimal"},
+        temperature=1,
+        stream=False,
+    )
+    provider = {
+        "provider": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api": "test-key",
+        "model": [{"gemini-flash-latest": "gemini-3-flash"}],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "gemini-3-flash": {
+                    "generationConfig": {
+                        "thinkingConfig": {
+                            "includeThoughts": True,
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    _, _, payload = asyncio.run(get_payload(request, "gemini", provider, api_key="test-key"))
+
+    assert payload["generationConfig"]["temperature"] == 1
+    assert payload["generationConfig"]["maxOutputTokens"] == 8192
+    assert payload["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+    assert provider["preferences"]["post_body_parameter_overrides"]["gemini-3-flash"]["generationConfig"]["thinkingConfig"] == {
+        "includeThoughts": True,
+    }
 
 
 def test_vertex_gemini_reasoning_effort_overrides_post_body_thinking_level():
