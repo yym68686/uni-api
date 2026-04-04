@@ -44,6 +44,10 @@
 
 ### 方法一：挂载 `api.yaml` 配置文件启动 uni-api
 
+一键部署：
+
+[![Deploy to Fugue](https://api.fugue.pro/button.svg?v=a37d3d9)](https://fugue.pro/new/repository?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api)
+
 必须事先填写完成配置文件才能启动 `uni-api`，必须使用名为 `api.yaml` 的配置文件才能启动 `uni-api`，可以配置多个模型，每个模型可以配置多个后端服务，支持负载均衡。下面是最小可运行的 `api.yaml` 配置文件的示例：
 
 ```yaml

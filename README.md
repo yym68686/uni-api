@@ -44,6 +44,10 @@ To start uni-api, a configuration file must be used. There are two ways to start
 
 ### Method 1: Mount the `api.yaml` configuration file to start uni-api
 
+One-click deployment:
+
+[![Deploy to Fugue](https://api.fugue.pro/button.svg?v=a37d3d9)](https://fugue.pro/new/repository?repository-url=https%3A%2F%2Fgithub.com%2Fyym68686%2Funi-api)
+
 You must fill in the configuration file in advance to start `uni-api`, and you must use a configuration file named `api.yaml` to start `uni-api`, you can configure multiple models, each model can configure multiple backend services, and support load balancing. Below is an example of the minimum `api.yaml` configuration file that can be run:
 
 ```yaml
