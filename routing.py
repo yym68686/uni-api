@@ -22,6 +22,43 @@ def _provider_model_dict(provider: dict) -> dict:
     return provider.get("_model_dict_cache") or get_model_dict(provider)
 
 
+def _normalize_endpoint_path(endpoint: Optional[str]) -> str:
+    if endpoint is None:
+        return ""
+    endpoint_path = str(endpoint).strip()
+    if not endpoint_path:
+        return ""
+    endpoint_path = endpoint_path.rstrip("/")
+    if not endpoint_path.startswith("/"):
+        endpoint_path = f"/{endpoint_path}"
+    return endpoint_path or "/"
+
+
+def _endpoint_list(value: Any) -> list[Any]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _provider_excludes_endpoint(provider: dict, endpoint: Optional[str]) -> bool:
+    normalized_endpoint = _normalize_endpoint_path(endpoint)
+    if not normalized_endpoint:
+        return False
+
+    excluded_endpoints = []
+    excluded_endpoints.extend(_endpoint_list(provider.get("exclude_endpoints")))
+    excluded_endpoints.extend(_endpoint_list(safe_get(provider, "preferences", "exclude_endpoints")))
+
+    return any(
+        _normalize_endpoint_path(excluded_endpoint) == normalized_endpoint
+        for excluded_endpoint in excluded_endpoints
+    )
+
+
 def weighted_round_robin(weights: dict[str, int]) -> list[str]:
     provider_names = list(weights.keys())
     current_weights = {name: 0 for name in provider_names}
@@ -162,6 +199,7 @@ def get_provider_list(
                     "aws_access_key": provider.get("aws_access_key", None),
                     "aws_secret_key": provider.get("aws_secret_key", None),
                     "engine": provider.get("engine", None),
+                    "exclude_endpoints": provider.get("exclude_endpoints", []),
                 }
                 provider_list.append(new_provider)
             elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
@@ -180,6 +218,7 @@ def get_provider_list(
                     "aws_access_key": provider.get("aws_access_key", None),
                     "aws_secret_key": provider.get("aws_secret_key", None),
                     "engine": provider.get("engine", None),
+                    "exclude_endpoints": provider.get("exclude_endpoints", []),
                 }
                 provider_list.append(new_provider)
 
@@ -208,11 +247,18 @@ async def get_right_order_providers(
     api_list: list[str],
     models_list: dict[str, list[str]],
     *,
+    endpoint: Optional[str] = None,
     channel_manager=None,
     request_total_tokens: Optional[int] = None,
     debug: bool = False,
 ) -> list[dict]:
     matching_providers = await get_matching_providers(request_model, config, api_index, api_list, models_list)
+    if endpoint:
+        matching_providers = [
+            provider
+            for provider in matching_providers
+            if not _provider_excludes_endpoint(provider, endpoint)
+        ]
 
     if request_total_tokens and matching_providers:
         available_providers = []
@@ -394,12 +440,24 @@ async def _call_provider_resolver(
     *,
     api_list: list[str],
     models_list: dict[str, list[str]],
+    endpoint: Optional[str] = None,
     channel_manager=None,
     request_total_tokens: int = 0,
     debug: bool = False,
 ) -> list[dict]:
     params = inspect.signature(resolver).parameters
     if "api_list" in params:
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+        resolver_kwargs = {}
+        if "endpoint" in params or accepts_kwargs:
+            resolver_kwargs["endpoint"] = endpoint
+        if "channel_manager" in params or accepts_kwargs:
+            resolver_kwargs["channel_manager"] = channel_manager
+        if "request_total_tokens" in params or accepts_kwargs:
+            resolver_kwargs["request_total_tokens"] = request_total_tokens
+        if "debug" in params or accepts_kwargs:
+            resolver_kwargs["debug"] = debug
+
         return await resolver(
             request_model_name,
             config,
@@ -407,9 +465,7 @@ async def _call_provider_resolver(
             scheduling_algorithm,
             api_list,
             models_list,
-            channel_manager=channel_manager,
-            request_total_tokens=request_total_tokens,
-            debug=debug,
+            **resolver_kwargs,
         )
     return await resolver(request_model_name, config, api_index, scheduling_algorithm)
 
@@ -467,6 +523,7 @@ class RoutingPlan:
         last_provider_indices: dict,
         locks: dict,
         *,
+        endpoint: Optional[str] = None,
         request_total_tokens: int = 0,
         debug: bool = False,
         provider_resolver=None,
@@ -502,6 +559,7 @@ class RoutingPlan:
             scheduling_algorithm,
             api_list=api_list,
             models_list=models_list,
+            endpoint=endpoint,
             channel_manager=getattr(app.state, "channel_manager", None),
             request_total_tokens=request_total_tokens,
             debug=debug,

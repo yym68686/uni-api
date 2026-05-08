@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -10,7 +11,7 @@ from fastapi import BackgroundTasks
 from fastapi import HTTPException
 from starlette.responses import Response
 from core.models import RequestModel
-from routing import build_api_key_models_map
+from routing import RoutingPlan, build_api_key_models_map, get_right_order_providers
 
 
 def test_build_api_key_models_map_resolves_nested_api_keys():
@@ -43,6 +44,126 @@ def test_build_api_key_models_map_resolves_nested_api_keys():
 
     assert models_map["sk-root"] == ["gpt-4.1", "gpt-4o-mini"]
     assert models_map["sk-nested"] == ["gpt-4.1", "gpt-4o-mini", "claude-sonnet-4-5"]
+
+
+def test_get_right_order_providers_filters_provider_excluded_endpoint():
+    config = {
+        "providers": [
+            {
+                "provider": "provider-a",
+                "base_url": "https://provider-a.example/v1/responses",
+                "model": ["gpt-5.4"],
+                "exclude_endpoints": ["v1/responses/compact"],
+            },
+            {
+                "provider": "provider-b",
+                "base_url": "https://provider-b.example/v1/responses",
+                "model": ["gpt-5.4"],
+            },
+            {
+                "provider": "provider-c",
+                "base_url": "https://provider-c.example/v1/responses",
+                "model": ["gpt-5.4"],
+                "preferences": {
+                    "exclude_endpoints": ["/v1/responses/compact/"],
+                },
+            },
+        ],
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+            }
+        ],
+    }
+
+    compact_providers = asyncio.run(
+        get_right_order_providers(
+            "gpt-5.4",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.4"]},
+            endpoint="/v1/responses/compact",
+        )
+    )
+    regular_providers = asyncio.run(
+        get_right_order_providers(
+            "gpt-5.4",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.4"]},
+            endpoint="/v1/responses",
+        )
+    )
+
+    assert [provider["provider"] for provider in compact_providers] == ["provider-b"]
+    assert [provider["provider"] for provider in regular_providers] == [
+        "provider-a",
+        "provider-b",
+        "provider-c",
+    ]
+
+
+def test_routing_plan_passes_endpoint_to_provider_resolver():
+    received = {}
+
+    async def fake_resolver(
+        request_model_name,
+        config,
+        api_index,
+        scheduling_algorithm,
+        api_list,
+        models_list,
+        *,
+        endpoint=None,
+        **kwargs,
+    ):
+        _ = config, api_index, scheduling_algorithm, api_list, models_list, kwargs
+        received["endpoint"] = endpoint
+        return [
+            {
+                "provider": "provider-a",
+                "_model_dict_cache": {request_model_name: request_model_name},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": None,
+                "preferences": {},
+            }
+        ]
+
+    config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+            }
+        ]
+    }
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config=config,
+            api_list=["sk-test"],
+            models_list={"sk-test": ["gpt-5.4"]},
+            channel_manager=None,
+        )
+    )
+
+    asyncio.run(
+        RoutingPlan.create(
+            app,
+            "gpt-5.4",
+            0,
+            {},
+            {},
+            endpoint="/v1/responses/compact",
+            provider_resolver=fake_resolver,
+        )
+    )
+
+    assert received["endpoint"] == "/v1/responses/compact"
 
 
 def test_client_manager_reuses_single_client_under_concurrency(monkeypatch):

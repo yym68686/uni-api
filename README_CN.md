@@ -72,6 +72,8 @@ providers:
       - gpt-5.2 # 可以使用的模型名称，必填
       - claude-sonnet-4-5-20250929: claude-sonnet-4-5 # 重命名模型，claude-sonnet-4-5-20250929 是服务商的模型名称，claude-3-5-sonnet 是重命名后的名字，可以使用简洁的名字代替原来复杂的名称，选填
       - dall-e-3
+    exclude_endpoints: # 选填，该渠道要跳过的请求端点，按请求路径精确匹配。
+      - /v1/responses/compact
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages

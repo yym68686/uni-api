@@ -72,6 +72,8 @@ providers:
       - gpt-5.2 # Usable model name, required
       - claude-sonnet-4-5-20250929: claude-sonnet-4-5 # Rename model, claude-sonnet-4-5-20250929 is the provider's model name, claude-sonnet-4-5 is the renamed name, you can use a simple name to replace the original complex name, optional
       - dall-e-3
+    exclude_endpoints: # Optional. Exact request paths this provider should skip.
+      - /v1/responses/compact
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages

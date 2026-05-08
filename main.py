@@ -1456,12 +1456,14 @@ class ModelRequestHandler:
         current_info = request_info.get()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_total_tokens = estimate_request_total_tokens(request_data)
+        routing_endpoint = endpoint or "/v1/chat/completions"
         plan = await RoutingPlan.create(
             app,
             request_model_name,
             api_index,
             self.last_provider_indices,
             self.locks,
+            endpoint=routing_endpoint,
             request_total_tokens=request_total_tokens,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
@@ -1515,6 +1517,7 @@ class ModelRequestHandler:
                     local_provider_scheduling_algorithm,
                     local_api_list,
                     app.state.models_list,
+                    endpoint=routing_endpoint,
                     channel_manager=app.state.channel_manager,
                     request_total_tokens=request_total_tokens,
                     debug=is_debug,
@@ -1957,6 +1960,7 @@ class ResponsesRequestHandler:
             api_index,
             self.last_provider_indices,
             self.locks,
+            endpoint=endpoint,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -2121,6 +2125,9 @@ class ResponsesRequestHandler:
             attempt.state["track_channel_stats"] = True
             async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
                 json_payload = await asyncio.to_thread(json.dumps, payload)
+                # json_payload = await asyncio.to_thread(json.dumps, payload, ensure_ascii=False)
+                # if wants_compact:
+                #     print("request /v1/responses/compact:", json_payload)
                 if request_data.stream:
                     stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
                     upstream_resp = await stream_cm.__aenter__()
@@ -2457,13 +2464,17 @@ async def responses_compact_route(
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key),
 ):
-    return await responses_handler.request_responses(
+    response = await responses_handler.request_responses(
         http_request,
         request,
         api_index,
         background_tasks,
         endpoint="/v1/responses/compact",
     )
+    # response_body = getattr(response, "body", None)
+    # if response_body is not None:
+    #     print("print /v1/responses/compact:", response_body.decode("utf-8", errors="replace"))
+    return response
 
 # @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 # async def options_handler():
