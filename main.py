@@ -1805,6 +1805,9 @@ def _responses_stream_event_has_real_output(event_type: str, payload: Any) -> bo
     return False
 
 def _responses_stream_event_commits(event_type: str, payload: Any, commit_policy: str) -> bool:
+    if event_type == "keepalive":
+        return True
+
     completed_with_usage = event_type == "response.completed" and _responses_usage_from_payload(payload) is not None
     if commit_policy == "completed_usage":
         return completed_with_usage
@@ -1881,8 +1884,8 @@ async def _prime_responses_upstream_stream(
     commit_policy: str = "real_output",
 ) -> tuple[list[bytes], bool]:
     """
-    Buffer structural Responses events so we can still fail over before a
-    substantive output event or a completed response with usage is sent.
+    Buffer structural Responses events until we see a keepalive, substantive
+    output event, or completed response with usage.
     """
     buffered_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
