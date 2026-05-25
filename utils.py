@@ -5,7 +5,7 @@ import h2.exceptions
 from time import time
 import time as time_module
 from fastapi import HTTPException
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Dict, Optional
 from ruamel.yaml import YAML, YAMLError
 from datetime import datetime, timedelta, timezone
@@ -24,24 +24,30 @@ from core.utils import (
 
 class InMemoryRateLimiter:
     def __init__(self):
-        self.requests = defaultdict(list)
+        self.requests = defaultdict(lambda: defaultdict(deque))
 
     async def is_rate_limited(self, key: str, limits) -> bool:
         now = time()
+        limits = list(limits or [])
+        request_windows = self.requests[key]
+        positive_periods = {period for _, period in limits if period > 0}
+
+        for period in positive_periods:
+            cutoff = now - period
+            window = request_windows[period]
+            while window and window[0] <= cutoff:
+                window.popleft()
 
         # 检查所有速率限制条件
         for limit, period in limits:
-            # 计算在当前时间窗口内的请求数量
-            recent_requests = sum(1 for req in self.requests[key] if req > now - period)
-            if recent_requests >= limit:
+            if period <= 0:
+                continue
+            if len(request_windows[period]) >= limit:
                 return True
 
-        # 清理太旧的请求记录（比最长时间窗口还要老的记录）
-        max_period = max(period for _, period in limits)
-        self.requests[key] = [req for req in self.requests[key] if req > now - max_period]
-
         # 记录新的请求
-        self.requests[key].append(now)
+        for period in positive_periods:
+            request_windows[period].append(now)
         return False
 
 yaml = YAML()

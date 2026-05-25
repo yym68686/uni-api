@@ -1,8 +1,10 @@
 import asyncio
+import bisect
 import inspect
 import json
 import random
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -18,8 +20,96 @@ from core.utils import (
 from utils import post_all_models
 
 
+MODEL_INFO_CREATED = 1720524448858
+
+
+@dataclass
+class RoutingIndex:
+    provider_by_name: dict[str, dict]
+    models_by_provider: dict[str, tuple[str, ...]]
+    providers_by_model: dict[str, tuple[dict, ...]]
+    api_key_to_index: dict[str, int]
+
+
+def build_routing_index(config: dict, api_list: list[str]) -> RoutingIndex:
+    provider_by_name: dict[str, dict] = {}
+    models_by_provider: dict[str, tuple[str, ...]] = {}
+    providers_by_model: dict[str, list[dict]] = {}
+
+    for provider in config.get("providers", []) or []:
+        provider_name = provider.get("provider")
+        if not provider_name:
+            continue
+        model_dict = _provider_model_dict(provider)
+        model_names = tuple(model_dict.keys())
+        provider_by_name[provider_name] = provider
+        models_by_provider[provider_name] = model_names
+        for model_name in model_names:
+            providers_by_model.setdefault(model_name, []).append(provider)
+
+    return RoutingIndex(
+        provider_by_name=provider_by_name,
+        models_by_provider=models_by_provider,
+        providers_by_model={
+            model_name: tuple(providers)
+            for model_name, providers in providers_by_model.items()
+        },
+        api_key_to_index={api_key: index for index, api_key in enumerate(api_list)},
+    )
+
+
+def build_api_key_model_response_cache(
+    api_list: list[str],
+    models_list: dict[str, list[str]],
+) -> dict[str, list[dict]]:
+    return {
+        api_key: [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": MODEL_INFO_CREATED,
+                "owned_by": "uni-api",
+            }
+            for model_id in models_list.get(api_key, [])
+        ]
+        for api_key in api_list
+    }
+
+
 def _provider_model_dict(provider: dict) -> dict:
     return provider.get("_model_dict_cache") or get_model_dict(provider)
+
+
+def _ensure_routing_index(
+    config: dict,
+    api_list: list[str],
+    routing_index: Optional[RoutingIndex] = None,
+) -> RoutingIndex:
+    return routing_index or build_routing_index(config, api_list)
+
+
+def _provider_rule(provider: dict, model_name: str) -> str:
+    return provider["provider"] + "/" + model_name
+
+
+def _provider_view(provider: dict, model_dict: dict, model_name: str, request_model: str) -> dict:
+    return {
+        "provider": provider["provider"],
+        "base_url": provider.get("base_url", ""),
+        "api": provider.get("api", None),
+        "model": [{model_dict[model_name]: request_model}],
+        "preferences": provider.get("preferences", {}),
+        "tools": provider.get("tools", False),
+        "_model_dict_cache": model_dict,
+        "project_id": provider.get("project_id", None),
+        "private_key": provider.get("private_key", None),
+        "client_email": provider.get("client_email", None),
+        "cf_account_id": provider.get("cf_account_id", None),
+        "aws_access_key": provider.get("aws_access_key", None),
+        "aws_secret_key": provider.get("aws_secret_key", None),
+        "engine": provider.get("engine", None),
+        "exclude_endpoints": provider.get("exclude_endpoints", []),
+    }
 
 
 def _normalize_endpoint_path(endpoint: Optional[str]) -> str:
@@ -59,8 +149,10 @@ def _provider_excludes_endpoint(provider: dict, endpoint: Optional[str]) -> bool
     )
 
 
-def weighted_round_robin(weights: dict[str, int]) -> list[str]:
-    provider_names = list(weights.keys())
+@lru_cache(maxsize=512)
+def _weighted_round_robin_cached(weight_items: tuple[tuple[str, int], ...]) -> tuple[str, ...]:
+    provider_names = [name for name, _ in weight_items]
+    weights = dict(weight_items)
     current_weights = {name: 0 for name in provider_names}
     num_selections = total_weight = sum(weights.values())
     weighted_provider_list = []
@@ -80,21 +172,38 @@ def weighted_round_robin(weights: dict[str, int]) -> list[str]:
         weighted_provider_list.append(selected_provider)
         current_weights[selected_provider] -= total_weight
 
-    return weighted_provider_list
+    return tuple(weighted_provider_list)
+
+
+def _weight_items(weights: dict[str, int]) -> tuple[tuple[str, int], ...]:
+    return tuple(
+        (name, int(weight))
+        for name, weight in weights.items()
+        if int(weight) > 0
+    )
+
+
+def weighted_round_robin(weights: dict[str, int]) -> list[str]:
+    weight_items = _weight_items(weights)
+    if not weight_items:
+        return []
+    return list(_weighted_round_robin_cached(weight_items))
 
 
 def lottery_scheduling(weights: dict[str, int]) -> list[str]:
-    total_tickets = sum(weights.values())
-    selections = []
-    for _ in range(total_tickets):
-        ticket = random.randint(1, total_tickets)
-        cumulative = 0
-        for provider, weight in weights.items():
-            cumulative += weight
-            if ticket <= cumulative:
-                selections.append(provider)
-                break
-    return selections
+    weight_items = _weight_items(weights)
+    if not weight_items:
+        return []
+    provider_names = [name for name, _ in weight_items]
+    cumulative_weights = []
+    running_total = 0
+    for _, weight in weight_items:
+        running_total += weight
+        cumulative_weights.append(running_total)
+    return [
+        provider_names[bisect.bisect_left(cumulative_weights, random.randint(1, running_total))]
+        for _ in range(running_total)
+    ]
 
 
 async def get_provider_rules(
@@ -103,21 +212,29 @@ async def get_provider_rules(
     request_model: str,
     api_list: list[str],
     models_list: dict[str, list[str]],
+    routing_index: Optional[RoutingIndex] = None,
 ) -> list[str]:
     provider_rules = []
+    routing_index = _ensure_routing_index(config, api_list, routing_index)
     if model_rule == "all":
-        for provider in config["providers"]:
-            model_dict = _provider_model_dict(provider)
-            for model in model_dict.keys():
-                provider_rules.append(provider["provider"] + "/" + model)
+        if request_model.endswith("*"):
+            prefix = request_model.rstrip("*")
+            for provider in config["providers"]:
+                for model in routing_index.models_by_provider.get(provider["provider"], ()):
+                    if model.startswith(prefix):
+                        provider_rules.append(_provider_rule(provider, model))
+        else:
+            for provider in routing_index.providers_by_model.get(request_model, ()):
+                provider_rules.append(_provider_rule(provider, request_model))
 
     elif isinstance(model_rule, str) and "/" in model_rule:
         if model_rule.startswith("<") and model_rule.endswith(">"):
             model_rule = model_rule[1:-1]
-            for provider in config["providers"]:
-                model_dict = _provider_model_dict(provider)
-                if model_rule in model_dict.keys():
-                    provider_rules.append(provider["provider"] + "/" + model_rule)
+            if model_rule == request_model or (
+                request_model.endswith("*") and model_rule.startswith(request_model.rstrip("*"))
+            ):
+                for provider in routing_index.providers_by_model.get(model_rule, ()):
+                    provider_rules.append(_provider_rule(provider, model_rule))
         else:
             provider_name = model_rule.split("/")[0]
             model_name_split = "/".join(model_rule.split("/")[1:])
@@ -126,10 +243,7 @@ async def get_provider_rules(
             if provider_name.startswith("sk-") and provider_name in api_list:
                 available_models = list(models_list.get(provider_name, []))
             else:
-                for provider in config["providers"]:
-                    model_dict = _provider_model_dict(provider)
-                    if provider["provider"] == provider_name:
-                        available_models.extend(list(model_dict.keys()))
+                available_models = list(routing_index.models_by_provider.get(provider_name, ()))
 
             if model_name_split == "*":
                 if request_model in available_models:
@@ -145,10 +259,13 @@ async def get_provider_rules(
                     provider_rules.append(provider_name + "/" + model_name_split)
 
     else:
-        for provider in config["providers"]:
-            model_dict = _provider_model_dict(provider)
-            if model_rule in model_dict.keys():
-                provider_rules.append(provider["provider"] + "/" + model_rule)
+        if model_rule == request_model or (
+            isinstance(model_rule, str)
+            and request_model.endswith("*")
+            and model_rule.startswith(request_model.rstrip("*"))
+        ):
+            for provider in routing_index.providers_by_model.get(model_rule, ()):
+                provider_rules.append(_provider_rule(provider, model_rule))
 
     return provider_rules
 
@@ -158,8 +275,10 @@ def get_provider_list(
     config: dict,
     request_model: str,
     api_list: list[str],
+    routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
     provider_list = []
+    routing_index = _ensure_routing_index(config, api_list, routing_index)
     for item in provider_rules:
         provider_name = item.split("/")[0]
         if provider_name.startswith("sk-") and provider_name in api_list:
@@ -174,53 +293,23 @@ def get_provider_list(
             )
             continue
 
-        for provider in config["providers"]:
-            model_dict = _provider_model_dict(provider)
-            if not model_dict:
-                continue
+        if "/" not in item:
+            continue
+        provider = routing_index.provider_by_name.get(provider_name)
+        if not provider:
+            continue
+        model_dict = _provider_model_dict(provider)
+        if not model_dict:
+            continue
 
-            model_name_split = "/".join(item.split("/")[1:])
-            if "/" not in item or provider["provider"] != provider_name or model_name_split not in model_dict.keys():
-                continue
+        model_name_split = "/".join(item.split("/")[1:])
+        if model_name_split not in model_dict:
+            continue
 
-            if request_model in model_dict.keys() and model_name_split == request_model:
-                new_provider = {
-                    "provider": provider["provider"],
-                    "base_url": provider.get("base_url", ""),
-                    "api": provider.get("api", None),
-                    "model": [{model_dict[model_name_split]: request_model}],
-                    "preferences": provider.get("preferences", {}),
-                    "tools": provider.get("tools", False),
-                    "_model_dict_cache": model_dict,
-                    "project_id": provider.get("project_id", None),
-                    "private_key": provider.get("private_key", None),
-                    "client_email": provider.get("client_email", None),
-                    "cf_account_id": provider.get("cf_account_id", None),
-                    "aws_access_key": provider.get("aws_access_key", None),
-                    "aws_secret_key": provider.get("aws_secret_key", None),
-                    "engine": provider.get("engine", None),
-                    "exclude_endpoints": provider.get("exclude_endpoints", []),
-                }
-                provider_list.append(new_provider)
-            elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
-                new_provider = {
-                    "provider": provider["provider"],
-                    "base_url": provider.get("base_url", ""),
-                    "api": provider.get("api", None),
-                    "model": [{model_dict[model_name_split]: request_model}],
-                    "preferences": provider.get("preferences", {}),
-                    "tools": provider.get("tools", False),
-                    "_model_dict_cache": model_dict,
-                    "project_id": provider.get("project_id", None),
-                    "private_key": provider.get("private_key", None),
-                    "client_email": provider.get("client_email", None),
-                    "cf_account_id": provider.get("cf_account_id", None),
-                    "aws_access_key": provider.get("aws_access_key", None),
-                    "aws_secret_key": provider.get("aws_secret_key", None),
-                    "engine": provider.get("engine", None),
-                    "exclude_endpoints": provider.get("exclude_endpoints", []),
-                }
-                provider_list.append(new_provider)
+        if model_name_split == request_model or (
+            request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*"))
+        ):
+            provider_list.append(_provider_view(provider, model_dict, model_name_split, request_model))
 
     return provider_list
 
@@ -231,12 +320,14 @@ async def get_matching_providers(
     api_index: int,
     api_list: list[str],
     models_list: dict[str, list[str]],
+    routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
     provider_rules = []
+    routing_index = _ensure_routing_index(config, api_list, routing_index)
     for model_rule in config["api_keys"][api_index]["model"]:
-        provider_rules.extend(await get_provider_rules(model_rule, config, request_model, api_list, models_list))
+        provider_rules.extend(await get_provider_rules(model_rule, config, request_model, api_list, models_list, routing_index))
 
-    return get_provider_list(provider_rules, config, request_model, api_list)
+    return get_provider_list(provider_rules, config, request_model, api_list, routing_index)
 
 
 async def get_right_order_providers(
@@ -251,8 +342,10 @@ async def get_right_order_providers(
     channel_manager=None,
     request_total_tokens: Optional[int] = None,
     debug: bool = False,
+    routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
-    matching_providers = await get_matching_providers(request_model, config, api_index, api_list, models_list)
+    routing_index = _ensure_routing_index(config, api_list, routing_index)
+    matching_providers = await get_matching_providers(request_model, config, api_index, api_list, models_list, routing_index)
     if endpoint:
         matching_providers = [
             provider
@@ -308,9 +401,9 @@ async def get_right_order_providers(
             provider_rules = []
             for model_rule in weight_keys:
                 provider_rules.extend(
-                    await get_provider_rules(model_rule, config, request_model, api_list, models_list)
+                    await get_provider_rules(model_rule, config, request_model, api_list, models_list, routing_index)
                 )
-            provider_list = get_provider_list(provider_rules, config, request_model, api_list)
+            provider_list = get_provider_list(provider_rules, config, request_model, api_list, routing_index)
             weight_keys = set(provider["provider"] + "/" + request_model for provider in provider_list)
             intersection = all_providers.intersection(weight_keys)
             if len(intersection) == 1:
@@ -330,11 +423,15 @@ async def get_right_order_providers(
             else:
                 weighted_provider_name_list = list(filtered_weights.keys())
 
+            providers_by_name = {
+                provider["provider"]: provider
+                for provider in matching_providers
+            }
             new_matching_providers = []
             for provider_name in weighted_provider_name_list:
-                for provider in matching_providers:
-                    if provider["provider"] == provider_name:
-                        new_matching_providers.append(provider)
+                provider = providers_by_name.get(provider_name)
+                if provider:
+                    new_matching_providers.append(provider)
             matching_providers = new_matching_providers
 
     if debug:
@@ -444,6 +541,7 @@ async def _call_provider_resolver(
     channel_manager=None,
     request_total_tokens: int = 0,
     debug: bool = False,
+    routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
     params = inspect.signature(resolver).parameters
     if "api_list" in params:
@@ -457,6 +555,8 @@ async def _call_provider_resolver(
             resolver_kwargs["request_total_tokens"] = request_total_tokens
         if "debug" in params or accepts_kwargs:
             resolver_kwargs["debug"] = debug
+        if "routing_index" in params or accepts_kwargs:
+            resolver_kwargs["routing_index"] = routing_index
 
         return await resolver(
             request_model_name,
@@ -535,6 +635,7 @@ class RoutingPlan:
             if item.get("api")
         ]
         models_list = getattr(app.state, "models_list", None) or build_api_key_models_map(config, api_list)
+        routing_index = getattr(app.state, "routing_index", None)
         api_key_preferences = safe_get(
             config,
             "api_keys",
@@ -563,6 +664,7 @@ class RoutingPlan:
             channel_manager=getattr(app.state, "channel_manager", None),
             request_total_tokens=request_total_tokens,
             debug=debug,
+            routing_index=routing_index,
         )
         start_index = await compute_start_index(
             last_provider_indices,
@@ -625,6 +727,7 @@ class RoutingPlan:
             if item.get("api")
         ]
         models_list = getattr(self.app.state, "models_list", None) or build_api_key_models_map(config, api_list)
+        routing_index = getattr(self.app.state, "routing_index", None)
         matching_providers = await _call_provider_resolver(
             self.provider_resolver,
             self.request_model_name,
@@ -636,6 +739,7 @@ class RoutingPlan:
             channel_manager=getattr(self.app.state, "channel_manager", None),
             request_total_tokens=self.request_total_tokens,
             debug=debug,
+            routing_index=routing_index,
         )
         last_num_matching_providers = self.num_matching_providers
         self.matching_providers = matching_providers

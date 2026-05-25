@@ -401,7 +401,12 @@ def rollback_failed_rate_limit_record(
 ) -> None:
     if not provider_api_key_raw or not any(error in error_message for error in rollback_errors):
         return
-    requests = provider_api_circular_list[provider_name].requests[provider_api_key_raw][original_model]
+    circular_list = provider_api_circular_list[provider_name]
+    if hasattr(circular_list, "rollback_rate_limit_record"):
+        circular_list.rollback_rate_limit_record(provider_api_key_raw, original_model)
+        return
+
+    requests = circular_list.requests[provider_api_key_raw][original_model]
     if requests:
         requests.pop()
 

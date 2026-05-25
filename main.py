@@ -47,13 +47,18 @@ from core.utils import (
     get_proxy,
     get_engine,
     parse_rate_limit,
+    IncrementalSSEParser,
+    parse_sse_event,
     collect_openai_chat_completion_from_streaming_sse,
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
 from routing import (
     RoutingPlan,
+    build_api_key_model_response_cache,
     build_api_key_models_map,
+    build_routing_index,
+    _call_provider_resolver,
     estimate_request_total_tokens,
     get_right_order_providers,
     select_provider_api_key_raw,
@@ -217,6 +222,8 @@ async def refresh_runtime_state(app: FastAPI) -> None:
     app.state.provider_timeouts = init_preference(config, "model_timeout", DEFAULT_TIMEOUT)
     app.state.keepalive_interval = init_preference(config, "keepalive_interval", 99999)
     app.state.models_list = build_api_key_models_map(config, api_list)
+    app.state.routing_index = build_routing_index(config, api_list)
+    app.state.model_response_cache = build_api_key_model_response_cache(api_list, app.state.models_list)
 
     if not DISABLE_DATABASE:
         app.state.paid_api_keys_states = {}
@@ -980,8 +987,13 @@ app.add_middleware(StatsMiddleware)
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
+    runtime_api_list = get_runtime_api_list()
     if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
-        app.state.models_list = build_api_key_models_map(app.state.config, app.state.api_list)
+        app.state.models_list = build_api_key_models_map(app.state.config, runtime_api_list)
+    if app and app.state.api_keys_db and not hasattr(app.state, "routing_index"):
+        app.state.routing_index = build_routing_index(app.state.config, runtime_api_list)
+    if app and app.state.api_keys_db and not hasattr(app.state, "model_response_cache"):
+        app.state.model_response_cache = build_api_key_model_response_cache(runtime_api_list, app.state.models_list)
     return await call_next(request)
 
 class ClientManager:
@@ -1510,17 +1522,19 @@ class ModelRequestHandler:
                     "SCHEDULING_ALGORITHM",
                     default="fixed_priority",
                 )
-                local_provider_matching_providers = await get_right_order_providers(
+                local_provider_matching_providers = await _call_provider_resolver(
+                    get_right_order_providers,
                     request_model_name,
                     config,
                     local_provider_api_index,
                     local_provider_scheduling_algorithm,
-                    local_api_list,
-                    app.state.models_list,
+                    api_list=local_api_list,
+                    models_list=app.state.models_list,
                     endpoint=routing_endpoint,
                     channel_manager=app.state.channel_manager,
                     request_total_tokens=request_total_tokens,
                     debug=is_debug,
+                    routing_index=getattr(app.state, "routing_index", None),
                 )
                 local_timeout_value = 0
                 for local_provider in local_provider_matching_providers:
@@ -1728,29 +1742,7 @@ RESPONSES_FAILURE_STATUS_BY_TYPE = {
 }
 
 def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
-    event_name = ""
-    data_lines = []
-    for line in raw_event.splitlines():
-        if line.startswith("event:"):
-            event_name = line[6:].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[5:].strip())
-
-    data_str = "\n".join(data_lines).strip()
-    if data_str == "[DONE]":
-        return "[DONE]", "[DONE]"
-
-    parsed_payload: Any = data_str
-    if data_str:
-        try:
-            parsed_payload = json.loads(data_str)
-        except Exception:
-            parsed_payload = data_str
-
-    if not event_name and isinstance(parsed_payload, dict):
-        event_name = str(parsed_payload.get("type") or "").strip()
-
-    return event_name, parsed_payload
+    return parse_sse_event(raw_event)
 
 def _responses_usage_from_payload(payload: Any) -> Optional[dict]:
     if not isinstance(payload, dict):
@@ -1889,7 +1881,7 @@ async def _prime_responses_upstream_stream(
     """
     buffered_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    text_buffer = ""
+    sse_parser = IncrementalSSEParser()
     commit_policy = (commit_policy or "real_output").strip().lower()
     if commit_policy not in {"real_output", "completed_usage"}:
         commit_policy = "real_output"
@@ -1903,20 +1895,14 @@ async def _prime_responses_upstream_stream(
         except StopAsyncIteration:
             if not buffered_chunks:
                 raise HTTPException(status_code=502, detail="Upstream closed stream without data")
-            if text_buffer.strip():
+            if sse_parser.pending_text.strip():
                 raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
             raise HTTPException(status_code=502, detail="Responses upstream closed before substantive output")
 
         buffered_chunks.append(chunk)
-        text_buffer += decoder.decode(chunk)
+        decoded_chunk = decoder.decode(chunk)
 
-        while True:
-            match = re.search(r"\r?\n\r?\n", text_buffer)
-            if not match:
-                break
-
-            raw_event = text_buffer[:match.start()]
-            text_buffer = text_buffer[match.end():]
+        for raw_event in sse_parser.feed(decoded_chunk):
             if not raw_event.strip():
                 continue
 
@@ -2173,18 +2159,12 @@ class ResponsesRequestHandler:
                         usage_seen = False
                         output_seen = False
                         proxy_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-                        proxy_text_buffer = ""
+                        proxy_sse_parser = IncrementalSSEParser()
 
                         def track_responses_events(chunk: bytes) -> None:
-                            nonlocal completed_seen, usage_seen, output_seen, proxy_text_buffer
-                            proxy_text_buffer += proxy_decoder.decode(chunk)
-                            while True:
-                                match = re.search(r"\r?\n\r?\n", proxy_text_buffer)
-                                if not match:
-                                    break
-
-                                raw_event = proxy_text_buffer[:match.start()]
-                                proxy_text_buffer = proxy_text_buffer[match.end():]
+                            nonlocal completed_seen, usage_seen, output_seen
+                            decoded_chunk = proxy_decoder.decode(chunk)
+                            for raw_event in proxy_sse_parser.feed(decoded_chunk):
                                 if not raw_event.strip():
                                     continue
 
@@ -2485,7 +2465,12 @@ async def responses_compact_route(
 
 @app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
 async def list_models(api_index: int = Depends(verify_api_key)):
-    models = post_all_models(api_index, app.state.config, get_runtime_api_list(), app.state.models_list)
+    runtime_api_list = get_runtime_api_list()
+    api_key = safe_get(runtime_api_list, api_index, default=None)
+    model_response_cache = getattr(app.state, "model_response_cache", {}) or {}
+    models = model_response_cache.get(api_key)
+    if models is None:
+        models = post_all_models(api_index, app.state.config, runtime_api_list, app.state.models_list)
     return JSONResponse(content={
         "object": "list",
         "data": models
