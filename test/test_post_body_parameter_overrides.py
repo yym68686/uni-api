@@ -109,6 +109,41 @@ def test_post_body_parameter_overrides_can_remove_global_fields():
     assert "temperature" not in payload
 
 
+def test_model_specific_overrides_apply_after_global_removals():
+    provider = {
+        "model": [
+            {"gpt-5.5": "gpt-5.5-fast"},
+            "gpt-5.4",
+        ],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "__remove__": ["response_format", "service_tier"],
+                "gpt-5.5-fast": {
+                    "service_tier": "priority",
+                },
+            }
+        },
+    }
+    fast_payload = {
+        "model": "gpt-5.5",
+        "response_format": {"type": "json_object"},
+        "service_tier": "default",
+    }
+    standard_payload = {
+        "model": "gpt-5.4",
+        "response_format": {"type": "json_object"},
+        "service_tier": "default",
+    }
+
+    apply_post_body_parameter_overrides(fast_payload, provider, "gpt-5.5-fast")
+    apply_post_body_parameter_overrides(standard_payload, provider, "gpt-5.4")
+
+    assert fast_payload["service_tier"] == "priority"
+    assert "response_format" not in fast_payload
+    assert "service_tier" not in standard_payload
+    assert "response_format" not in standard_payload
+
+
 def test_post_body_parameter_overrides_can_remove_model_specific_fields():
     request = RequestModel(
         model="gpt-5.4",

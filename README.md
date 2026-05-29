@@ -86,6 +86,7 @@ providers:
     tools: true # Whether to support tools, such as generating code, generating documents, etc., default is true, optional
     preferences:
       post_body_parameter_overrides: # Support customizing request body parameters
+        # Apply order: global parameters and global __remove__ first, then model-specific parameters and model-specific __remove__; model-specific settings take precedence.
         __remove__: # Optional. Remove top-level request body fields; accepts a string or a list. If omitted, nothing is removed.
           - response_format
         claude-sonnet-4-5-think: # Add custom request body parameters to the model claude-sonnet-4-5-think

@@ -86,9 +86,61 @@ from sqlalchemy import select, case, func, desc
 
 from db import Base, RequestStat, ChannelStat, db_engine, async_session, DISABLE_DATABASE
 
+def _env_flag(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
-is_debug = bool(os.getenv("DEBUG", False))
+is_debug = _env_flag(os.getenv("DEBUG"))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
+
+def _debug_json_body(body: Any) -> str:
+    try:
+        return json.dumps(body, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        return repr(body)
+
+def _debug_header_pairs(headers: Any) -> list[dict[str, str]]:
+    if not headers:
+        return []
+
+    raw_headers = getattr(headers, "raw", None)
+    if raw_headers:
+        pairs = []
+        for key, value in raw_headers:
+            if isinstance(key, bytes):
+                key = key.decode("latin-1", errors="replace")
+            if isinstance(value, bytes):
+                value = value.decode("latin-1", errors="replace")
+            pairs.append({"name": str(key), "value": str(value)})
+        return pairs
+
+    if hasattr(headers, "multi_items"):
+        return [
+            {"name": str(key), "value": str(value)}
+            for key, value in headers.multi_items()
+        ]
+
+    if hasattr(headers, "items"):
+        return [
+            {"name": str(key), "value": str(value)}
+            for key, value in headers.items()
+        ]
+
+    return [{"name": "<headers>", "value": str(headers)}]
+
+def _log_debug_request_body(label: str, body: Any, **metadata: Any) -> None:
+    if not is_debug:
+        return
+    meta = " ".join(
+        f"{key}={value}"
+        for key, value in metadata.items()
+        if value is not None
+    )
+    prefix = f"{label} {meta}".rstrip()
+    logger.info("%s:\n%s", prefix, _debug_json_body(body))
+
+def _log_debug_request_headers(label: str, headers: Any, **metadata: Any) -> None:
+    _log_debug_request_body(label, _debug_header_pairs(headers), **metadata)
 
 # 从 pyproject.toml 读取版本号
 try:
@@ -454,6 +506,33 @@ async def parse_request_body(request: Request):
             return await asyncio.to_thread(json.loads, body_bytes)
         except json.JSONDecodeError:
             return None
+    return None
+
+def _messages_request_last_text(parsed_body: Any) -> Optional[str]:
+    if not isinstance(parsed_body, dict):
+        return None
+
+    messages = parsed_body.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            return content
+        if not isinstance(content, list):
+            continue
+        for part in reversed(content):
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                return text
+            nested_content = part.get("content")
+            if isinstance(nested_content, str) and nested_content:
+                return nested_content
     return None
 
 class ChannelManager:
@@ -853,44 +932,73 @@ class StatsMiddleware(BaseHTTPMiddleware):
         disconnect_event: Optional[asyncio.Event] = None
         disconnect_task: Optional[asyncio.Task] = None
         try:
+            _log_debug_request_headers(
+                "DEBUG client request headers",
+                request.headers,
+                method=request.method,
+                endpoint=request.url.path,
+                request_id=request_id,
+            )
             parsed_body = await parse_request_body(request)
+            if parsed_body is not None:
+                _log_debug_request_body(
+                    "DEBUG client request body",
+                    parsed_body,
+                    method=request.method,
+                    endpoint=request.url.path,
+                    request_id=request_id,
+                )
             if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
                 disconnect_event = asyncio.Event()
                 current_info["disconnect_event"] = disconnect_event
                 disconnect_task = asyncio.create_task(monitor_disconnect(request, disconnect_event))
             if parsed_body and not request.url.path.startswith("/v1/api_config"):
-                request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
-                request_model = request_model.data
-                if is_debug:
-                    logger.info("request_model: %s", json.dumps(request_model.model_dump(exclude_unset=True), indent=2, ensure_ascii=False))
-                model = request_model.model
-                current_info["model"] = model
-
                 final_api_key = app.state.api_list[api_index]
-                try:
-                    await app.state.user_api_keys_rate_limit[final_api_key].next(model)
-                except Exception:
-                    return JSONResponse(
-                        status_code=429,
-                        content={"error": "Too many requests"}
-                    )
-
                 moderated_content = None
-                if request_model.request_type == "chat":
-                    moderated_content = request_model.get_last_text_message()
-                elif request_model.request_type == "image":
-                    moderated_content = request_model.prompt
-                elif request_model.request_type == "tts":
-                    moderated_content = request_model.input
-                elif request_model.request_type == "moderation":
-                    pass
-                elif request_model.request_type == "embedding":
-                    if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
-                        moderated_content = "\n".join(request_model.input)
+                if request.url.path.rstrip("/") == "/v1/messages":
+                    if isinstance(parsed_body, dict):
+                        model = str(parsed_body.get("model") or "").strip()
+                        if model:
+                            current_info["model"] = model
+                            try:
+                                await app.state.user_api_keys_rate_limit[final_api_key].next(model)
+                            except Exception:
+                                return JSONResponse(
+                                    status_code=429,
+                                    content={"error": "Too many requests"}
+                                )
+                        moderated_content = _messages_request_last_text(parsed_body)
                     else:
-                        moderated_content = request_model.input
+                        moderated_content = None
                 else:
-                    logger.error(f"Unknown request type: {request_model.request_type}")
+                    request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
+                    request_model = request_model.data
+                    model = request_model.model
+                    current_info["model"] = model
+
+                    try:
+                        await app.state.user_api_keys_rate_limit[final_api_key].next(model)
+                    except Exception:
+                        return JSONResponse(
+                            status_code=429,
+                            content={"error": "Too many requests"}
+                        )
+
+                    if request_model.request_type == "chat":
+                        moderated_content = request_model.get_last_text_message()
+                    elif request_model.request_type == "image":
+                        moderated_content = request_model.prompt
+                    elif request_model.request_type == "tts":
+                        moderated_content = request_model.input
+                    elif request_model.request_type == "moderation":
+                        pass
+                    elif request_model.request_type == "embedding":
+                        if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
+                            moderated_content = "\n".join(request_model.input)
+                        else:
+                            moderated_content = request_model.input
+                    else:
+                        logger.error(f"Unknown request type: {request_model.request_type}")
 
                 if enable_moderation and moderated_content:
                     background_tasks_for_moderation = BackgroundTasks()
@@ -1398,10 +1506,6 @@ async def process_request(
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if engine == "codex":
         force_codex_client_headers(headers)
-    if is_debug:
-        logger.info(url)
-        logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-        logger.info(json.dumps({k: v for k, v in payload.items() if k != 'file'}, indent=4, ensure_ascii=False))
 
     current_info = request_info.get()
     # print("proxy", proxy)
@@ -1412,17 +1516,71 @@ async def process_request(
             force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
 
             if downstream_stream and not force_collect_codex_stream:
+                _log_debug_request_headers(
+                    "DEBUG upstream request headers",
+                    headers,
+                    endpoint=endpoint or "/v1/chat/completions",
+                    upstream_url=url,
+                    provider=channel_id,
+                    model=request.model,
+                    actual_model=original_model,
+                )
+                _log_debug_request_body(
+                    "DEBUG upstream request body",
+                    payload,
+                    endpoint=endpoint or "/v1/chat/completions",
+                    upstream_url=url,
+                    provider=channel_id,
+                    model=request.model,
+                    actual_model=original_model,
+                )
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             elif force_collect_codex_stream:
                 payload["stream"] = True
                 headers["Accept"] = "text/event-stream"
+                _log_debug_request_headers(
+                    "DEBUG upstream request headers",
+                    headers,
+                    endpoint=endpoint or "/v1/chat/completions",
+                    upstream_url=url,
+                    provider=channel_id,
+                    model=request.model,
+                    actual_model=original_model,
+                )
+                _log_debug_request_body(
+                    "DEBUG upstream request body",
+                    payload,
+                    endpoint=endpoint or "/v1/chat/completions",
+                    upstream_url=url,
+                    provider=channel_id,
+                    model=request.model,
+                    actual_model=original_model,
+                )
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
                 response = StarletteStreamingResponse(iter([json_data]), media_type="application/json")
             else:
+                _log_debug_request_headers(
+                    "DEBUG upstream request headers",
+                    headers,
+                    endpoint=endpoint or "/v1/chat/completions",
+                    upstream_url=url,
+                    provider=channel_id,
+                    model=request.model,
+                    actual_model=original_model,
+                )
+                _log_debug_request_body(
+                    "DEBUG upstream request body",
+                    payload,
+                    endpoint=endpoint or "/v1/chat/completions",
+                    upstream_url=url,
+                    provider=channel_id,
+                    model=request.model,
+                    actual_model=original_model,
+                )
                 generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, False, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
 
@@ -1678,6 +1836,60 @@ def _normalize_responses_compact_upstream_url(base_url: str, engine: str) -> str
         return base
 
     return f"{base}/compact"
+
+def _normalize_messages_upstream_url(base_url: str) -> str:
+    base = (base_url or "").strip()
+    if not base:
+        return base
+    base = base.rstrip("/")
+    if base.endswith("/v1/messages") or base.endswith("/messages"):
+        return base
+    return f"{base}/messages"
+
+HOP_BY_HOP_RESPONSE_HEADERS = {
+    "connection",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+def _copy_upstream_response_headers(headers: Any) -> dict[str, str]:
+    copied: dict[str, str] = {}
+    if not headers:
+        return copied
+    for key, value in headers.items():
+        normalized_key = str(key).lower()
+        if normalized_key in HOP_BY_HOP_RESPONSE_HEADERS:
+            continue
+        copied[str(key)] = str(value)
+    return copied
+
+async def _prime_passthrough_upstream_stream(
+    upstream_iter,
+    *,
+    disconnect_event: Optional[asyncio.Event] = None,
+) -> list[bytes]:
+    buffered_chunks: list[bytes] = []
+    while True:
+        if disconnect_event is not None and disconnect_event.is_set():
+            return buffered_chunks
+
+        try:
+            chunk = await upstream_iter.__anext__()
+        except StopAsyncIteration:
+            if not buffered_chunks:
+                raise HTTPException(status_code=502, detail="Upstream closed stream without data")
+            return buffered_chunks
+
+        buffered_chunks.append(chunk)
+        if chunk:
+            return buffered_chunks
 
 def _log_model_names(request_model_name: Any, actual_model_name: Any = None) -> tuple[str, str]:
     request_model = str(request_model_name or "-")
@@ -2112,6 +2324,24 @@ class ResponsesRequestHandler:
 
             attempt.state["failure_stage"] = "upstream"
             attempt.state["track_channel_stats"] = True
+            _log_debug_request_headers(
+                "DEBUG upstream request headers",
+                headers,
+                endpoint=endpoint,
+                upstream_url=upstream_url,
+                provider=channel_id,
+                model=request_model_name,
+                actual_model=original_model,
+            )
+            _log_debug_request_body(
+                "DEBUG upstream request body",
+                payload,
+                endpoint=endpoint,
+                upstream_url=upstream_url,
+                provider=channel_id,
+                model=request_model_name,
+                actual_model=original_model,
+            )
             async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
                 json_payload = await asyncio.to_thread(json.dumps, payload)
                 # json_payload = await asyncio.to_thread(json.dumps, payload, ensure_ascii=False)
@@ -2366,8 +2596,365 @@ class ResponsesRequestHandler:
             should_cool_down=should_cool_down,
         )
 
+class MessagesPassthroughHandler:
+    def __init__(self):
+        self.last_provider_indices = defaultdict(lambda: -1)
+        self.locks = defaultdict(asyncio.Lock)
+
+    async def request_messages(
+        self,
+        http_request: Request,
+        request_body: dict[str, Any],
+        api_index: int,
+        background_tasks: BackgroundTasks,
+        endpoint: str = "/v1/messages",
+    ):
+        if not isinstance(request_body, dict):
+            raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+
+        request_model_name = str(request_body.get("model") or "").strip()
+        if not request_model_name:
+            raise HTTPException(status_code=422, detail="Request body requires a model")
+
+        config = app.state.config
+        if not safe_get(config, "api_keys", api_index, "model"):
+            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+
+        current_info = request_info.get()
+        disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
+        request_id = _responses_request_id(current_info)
+        plan = await RoutingPlan.create(
+            app,
+            request_model_name,
+            api_index,
+            self.last_provider_indices,
+            self.locks,
+            endpoint=endpoint,
+            debug=is_debug,
+            provider_resolver=get_right_order_providers,
+        )
+        runner = UpstreamRunner(
+            plan,
+            endpoint=endpoint,
+            debug=is_debug,
+        )
+        last_error_response: dict[str, Any] = {}
+
+        async def before_next_attempt():
+            if disconnect_event is not None and disconnect_event.is_set():
+                trace_logger.info(
+                    "%s downstream disconnect stage=before-provider-select request_id=%s model=%s",
+                    endpoint,
+                    request_id,
+                    request_model_name,
+                )
+                return Response(content="", status_code=499)
+            return None
+
+        async def prepare_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            engine, stream_mode = get_engine(provider, endpoint=endpoint, original_model=original_model)
+            attempt.state["failure_stage"] = "validation"
+
+            upstream_url = _normalize_messages_upstream_url(provider.get("base_url", ""))
+            if not upstream_url:
+                raise HTTPException(status_code=400, detail=f"{endpoint} requires provider base_url")
+
+            upstream_path = urlparse(upstream_url).path.rstrip("/")
+            is_messages_upstream = upstream_path.endswith("/v1/messages") or upstream_path.endswith("/messages")
+            if engine != "claude" and not is_messages_upstream:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{endpoint} only supports upstream engine: claude (got {engine})",
+                )
+            engine = "claude"
+
+            proxy = safe_get(config, "preferences", "proxy", default=None)
+            proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+            channel_id = f"{provider_name}"
+
+            attempt.state["upstream_url"] = upstream_url
+            attempt.state["channel_id"] = channel_id
+            attempt.state["engine"] = engine
+            attempt.state["proxy"] = proxy
+            attempt.state["stream_mode"] = stream_mode
+            attempt.state["failure_stage"] = "auth"
+
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+
+            timeout_value = get_preference(
+                app.state.provider_timeouts,
+                provider_name,
+                (original_model, request_model_name),
+                DEFAULT_TIMEOUT,
+            )
+            attempt.state["api_key"] = attempt.provider_api_key_raw
+            attempt.state["timeout_value"] = int(timeout_value)
+
+        async def execute_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            proxy = attempt.state["proxy"]
+            api_key = attempt.state["api_key"]
+            timeout_value = attempt.state["timeout_value"]
+            upstream_url = attempt.state["upstream_url"]
+            channel_id = attempt.state["channel_id"]
+
+            payload = dict(request_body)
+            payload["model"] = original_model
+            if attempt.state.get("stream_mode") is not None:
+                payload["stream"] = bool(attempt.state["stream_mode"])
+
+            apply_post_body_parameter_overrides(payload, provider, request_model_name)
+
+            headers = {
+                "Content-Type": "application/json",
+                "anthropic-version": http_request.headers.get("anthropic-version") or "2023-06-01",
+            }
+            anthropic_beta = http_request.headers.get("anthropic-beta")
+            if anthropic_beta:
+                headers["anthropic-beta"] = anthropic_beta
+            if api_key:
+                headers["x-api-key"] = str(api_key)
+            headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+
+            logger.info(
+                "provider: %-11s model: %-22s engine: %-13s role: %s",
+                channel_id[:11],
+                request_model_name,
+                "claude",
+                plan.role,
+            )
+            trace_logger.info(
+                "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
+                endpoint,
+                request_id,
+                channel_id[:11],
+                request_model_name,
+                "claude",
+                plan.role,
+                upstream_url,
+            )
+
+            attempt.state["failure_stage"] = "upstream"
+            attempt.state["track_channel_stats"] = True
+            _log_debug_request_headers(
+                "DEBUG upstream request headers",
+                headers,
+                endpoint=endpoint,
+                upstream_url=upstream_url,
+                provider=channel_id,
+                model=request_model_name,
+                actual_model=original_model,
+            )
+            _log_debug_request_body(
+                "DEBUG upstream request body",
+                payload,
+                endpoint=endpoint,
+                upstream_url=upstream_url,
+                provider=channel_id,
+                model=request_model_name,
+                actual_model=original_model,
+            )
+            json_payload = await asyncio.to_thread(json.dumps, payload)
+            wants_stream = bool(payload.get("stream"))
+
+            async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+                if wants_stream:
+                    stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                    upstream_resp = await stream_cm.__aenter__()
+                    response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+                    if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                        raw = await upstream_resp.aread()
+                        await stream_cm.__aexit__(None, None, None)
+                        last_error_response.clear()
+                        last_error_response.update(
+                            {
+                                "body": raw,
+                                "headers": response_headers,
+                            }
+                        )
+                        raise HTTPException(
+                            status_code=upstream_resp.status_code,
+                            detail=raw.decode("utf-8", errors="replace"),
+                        )
+
+                    upstream_iter = upstream_resp.aiter_raw()
+                    try:
+                        buffered_chunks = await _prime_passthrough_upstream_stream(
+                            upstream_iter,
+                            disconnect_event=disconnect_event,
+                        )
+                    except Exception:
+                        await stream_cm.__aexit__(None, None, None)
+                        raise
+
+                    if disconnect_event is not None and disconnect_event.is_set():
+                        await stream_cm.__aexit__(None, None, None)
+                        trace_logger.info(
+                            "%s downstream disconnect stage=before-stream-commit request_id=%s model=%s provider=%s",
+                            endpoint,
+                            request_id,
+                            request_model_name,
+                            provider_name,
+                        )
+                        return Response(content="", status_code=499)
+
+                    async def proxy_stream():
+                        try:
+                            for chunk in buffered_chunks:
+                                if disconnect_event is not None and disconnect_event.is_set():
+                                    trace_logger.info(
+                                        "%s downstream disconnect stage=after-stream-commit request_id=%s model=%s provider=%s",
+                                        endpoint,
+                                        request_id,
+                                        request_model_name,
+                                        provider_name,
+                                    )
+                                    return
+                                yield chunk
+                            async for chunk in upstream_iter:
+                                if disconnect_event is not None and disconnect_event.is_set():
+                                    trace_logger.info(
+                                        "%s downstream disconnect stage=after-stream-commit request_id=%s model=%s provider=%s",
+                                        endpoint,
+                                        request_id,
+                                        request_model_name,
+                                        provider_name,
+                                    )
+                                    break
+                                yield chunk
+                        finally:
+                            await stream_cm.__aexit__(None, None, None)
+
+                    background_tasks.add_task(
+                        update_channel_stats,
+                        current_info["request_id"],
+                        channel_id,
+                        request_model_name,
+                        current_info["api_key"],
+                        success=True,
+                        provider_api_key=attempt.provider_api_key_raw,
+                    )
+                    current_info["first_response_time"] = 0
+                    current_info["success"] = True
+                    current_info["provider"] = channel_id
+                    return StarletteStreamingResponse(
+                        proxy_stream(),
+                        status_code=upstream_resp.status_code,
+                        headers=response_headers,
+                        media_type=response_headers.get("content-type", "text/event-stream"),
+                    )
+
+                upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+                raw = upstream_resp.content
+                if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                    last_error_response.clear()
+                    last_error_response.update(
+                        {
+                            "body": raw,
+                            "headers": response_headers,
+                        }
+                    )
+                    raise HTTPException(
+                        status_code=upstream_resp.status_code,
+                        detail=raw.decode("utf-8", errors="replace"),
+                    )
+
+                background_tasks.add_task(
+                    update_channel_stats,
+                    current_info["request_id"],
+                    channel_id,
+                    request_model_name,
+                    current_info["api_key"],
+                    success=True,
+                    provider_api_key=attempt.provider_api_key_raw,
+                )
+                current_info["first_response_time"] = 0
+                current_info["success"] = True
+                current_info["provider"] = channel_id
+                return Response(
+                    content=raw,
+                    status_code=upstream_resp.status_code,
+                    headers=response_headers,
+                    media_type=response_headers.get("content-type", "application/json"),
+                )
+
+        def after_failure(attempt, exc, status_code, error_message):
+            if attempt.state.get("track_channel_stats"):
+                background_tasks.add_task(
+                    update_channel_stats,
+                    current_info["request_id"],
+                    attempt.state["channel_id"],
+                    request_model_name,
+                    current_info["api_key"],
+                    success=False,
+                    provider_api_key=attempt.provider_api_key_raw,
+                )
+
+            request_model, actual_model = _log_model_names(request_model_name, attempt.original_model)
+            trace_logger.error(
+                "%s upstream error status=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
+                endpoint,
+                status_code,
+                type(exc).__name__,
+                request_id,
+                request_model,
+                actual_model,
+                attempt.state.get("channel_id", attempt.provider_name),
+                attempt.provider_api_key_raw,
+                attempt.state.get("upstream_url", ""),
+                error_message,
+            )
+
+        def should_cool_down(exc, status_code, error_message, attempt):
+            _ = exc, error_message, attempt
+            return status_code not in (400, 413)
+
+        def build_error_response(status_code, error_message):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            if last_error_response.get("body") is not None:
+                headers = last_error_response.get("headers") or {}
+                return Response(
+                    content=last_error_response["body"],
+                    status_code=status_code,
+                    headers=headers,
+                    media_type=headers.get("content-type", "application/json"),
+                )
+            return build_upstream_error_response(
+                status_code=status_code,
+                error_message=error_message,
+                fallback_prefix="Error: Current provider response failed",
+            )
+
+        def build_final_response(completed_plan):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            return JSONResponse(
+                status_code=completed_plan.status_code,
+                content={"error": f"All {request_model_name} error: {completed_plan.error_message}"},
+            )
+
+        return await runner.run(
+            execute_attempt,
+            prepare_attempt=prepare_attempt,
+            before_next_attempt=before_next_attempt,
+            after_failure=after_failure,
+            build_error_response=build_error_response,
+            build_final_response=build_final_response,
+            should_cool_down=should_cool_down,
+        )
+
 model_handler = ModelRequestHandler()
 responses_handler = ResponsesRequestHandler()
+messages_handler = MessagesPassthroughHandler()
 
 security = HTTPBearer()
 
@@ -2458,6 +3045,20 @@ async def responses_compact_route(
     # if response_body is not None:
     #     print("print /v1/responses/compact:", response_body.decode("utf-8", errors="replace"))
     return response
+
+@app.post("/v1/messages", dependencies=[Depends(rate_limit_dependency)])
+async def messages_route(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    request: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await messages_handler.request_messages(
+        http_request,
+        request,
+        api_index,
+        background_tasks,
+    )
 
 # @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 # async def options_handler():

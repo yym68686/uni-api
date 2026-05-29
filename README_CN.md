@@ -86,6 +86,7 @@ providers:
     tools: true # 是否支持工具，如生成代码、生成文档等，默认是 true，选填
     preferences:
       post_body_parameter_overrides: # 支持自定义请求体参数
+        # 应用顺序：先应用全局参数和全局 __remove__，再应用模型专属参数和模型专属 __remove__，模型专属配置优先级更高
         __remove__: # 可选，删除顶层请求体参数；支持字符串或字符串列表。不配置则不删除
           - response_format
         claude-sonnet-4-5-think: # 给模型 claude-sonnet-4-5-think 添加自定义请求体参数
