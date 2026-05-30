@@ -1926,6 +1926,14 @@ def _responses_request_id(current_info: Any) -> str:
             return str(request_id)
     return "-"
 
+def _mask_secret_for_log(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    if len(raw) <= 10:
+        return "***"
+    return f"{raw[:4]}...{raw[-4:]}"
+
 def _log_responses_downstream_disconnect(
     endpoint: str,
     current_info: Any,
@@ -2929,7 +2937,7 @@ class MessagesPassthroughHandler:
                 request_model,
                 actual_model,
                 attempt.state.get("channel_id", attempt.provider_name),
-                attempt.provider_api_key_raw,
+                _mask_secret_for_log(attempt.provider_api_key_raw),
                 attempt.state.get("upstream_url", ""),
                 error_message,
             )
