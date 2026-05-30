@@ -12,7 +12,7 @@ import asyncio
 from asyncio import Semaphore
 import contextvars
 from time import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
@@ -997,6 +997,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                             moderated_content = "\n".join(request_model.input)
                         else:
                             moderated_content = request_model.input
+                    elif request_model.request_type == "video":
+                        moderated_content = request_model.get_last_text_message()
                     else:
                         logger.error(f"Unknown request type: {request_model.request_type}")
 
@@ -1845,6 +1847,27 @@ def _normalize_messages_upstream_url(base_url: str) -> str:
     if base.endswith("/v1/messages") or base.endswith("/messages"):
         return base
     return f"{base}/messages"
+
+CONTENT_GENERATION_TASKS_ENDPOINT = "/v1/contents/generations/tasks"
+
+def _normalize_content_generation_tasks_upstream_url(base_url: str, task_id: Optional[str] = None) -> str:
+    base = (base_url or "").strip()
+    if not base:
+        return base
+    base = base.rstrip("/")
+    parsed = urlparse(base)
+    path = parsed.path.rstrip("/")
+
+    if path.endswith("/contents/generations/tasks"):
+        tasks_url = base
+    elif path in ("", "/"):
+        tasks_url = f"{base}/api/v3/contents/generations/tasks"
+    else:
+        tasks_url = f"{base}/contents/generations/tasks"
+
+    if task_id is not None:
+        tasks_url = f"{tasks_url}/{quote(str(task_id), safe='')}"
+    return tasks_url
 
 HOP_BY_HOP_RESPONSE_HEADERS = {
     "connection",
@@ -2952,9 +2975,546 @@ class MessagesPassthroughHandler:
             should_cool_down=should_cool_down,
         )
 
+class ContentGenerationTaskHandler:
+    def __init__(self):
+        self.last_provider_indices = defaultdict(lambda: -1)
+        self.locks = defaultdict(asyncio.Lock)
+        self.task_routes: dict[str, dict[str, Any]] = {}
+        self.task_route_ttl_seconds = 7 * 24 * 60 * 60
+        self.max_task_routes = 10000
+
+    def _prune_task_routes(self) -> None:
+        if not self.task_routes:
+            return
+
+        now = time()
+        expired_ids = [
+            task_id
+            for task_id, route in self.task_routes.items()
+            if now - float(route.get("created_at", now)) > self.task_route_ttl_seconds
+        ]
+        for task_id in expired_ids:
+            self.task_routes.pop(task_id, None)
+
+        overflow = len(self.task_routes) - self.max_task_routes
+        if overflow <= 0:
+            return
+
+        oldest_task_ids = sorted(
+            self.task_routes,
+            key=lambda task_id: float(self.task_routes[task_id].get("created_at", now)),
+        )[:overflow]
+        for task_id in oldest_task_ids:
+            self.task_routes.pop(task_id, None)
+
+    def _remember_task_route(
+        self,
+        *,
+        task_id: str,
+        request_model_name: str,
+        original_model: str,
+        provider: dict,
+        provider_name: str,
+        provider_api_key_raw: Optional[str],
+        client_api_key: Optional[str],
+    ) -> None:
+        if not task_id:
+            return
+        self._prune_task_routes()
+        self.task_routes[task_id] = {
+            "created_at": time(),
+            "request_model_name": request_model_name,
+            "original_model": original_model,
+            "provider": provider,
+            "provider_name": provider_name,
+            "provider_api_key_raw": provider_api_key_raw,
+            "client_api_key": client_api_key,
+        }
+
+    def _resolve_task_route(self, task_id: str, client_api_key: Optional[str]) -> Optional[dict[str, Any]]:
+        route = self.task_routes.get(task_id)
+        if route is None:
+            return None
+        if route.get("client_api_key") and client_api_key and route.get("client_api_key") != client_api_key:
+            raise HTTPException(status_code=403, detail="Task belongs to a different API key")
+        return route
+
+    def _raw_response(
+        self,
+        upstream_resp: httpx.Response,
+        raw: bytes,
+    ) -> Response:
+        response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        return Response(
+            content=raw,
+            status_code=upstream_resp.status_code,
+            headers=response_headers,
+            media_type=response_headers.get("content-type", "application/json"),
+        )
+
+    def _is_non_retryable_client_error(self, status_code: int) -> bool:
+        return 400 <= status_code < 500 and status_code not in (401, 403, 408, 409, 425, 429)
+
+    async def _send_upstream(
+        self,
+        *,
+        method: str,
+        upstream_url: str,
+        headers: dict[str, str],
+        payload: Optional[dict[str, Any]],
+        proxy: Optional[str],
+        timeout_value: int,
+    ) -> httpx.Response:
+        async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+            if method == "POST":
+                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                return await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+            if method == "GET":
+                return await client.get(upstream_url, headers=headers, timeout=timeout_value)
+            if method == "DELETE":
+                return await client.delete(upstream_url, headers=headers, timeout=timeout_value)
+        raise HTTPException(status_code=405, detail=f"Unsupported method: {method}")
+
+    def _mark_result(
+        self,
+        *,
+        background_tasks: BackgroundTasks,
+        current_info: dict,
+        channel_id: str,
+        request_model_name: str,
+        success: bool,
+        provider_api_key_raw: Optional[str],
+    ) -> None:
+        if current_info is None:
+            return
+        current_info["first_response_time"] = 0 if success else -1
+        current_info["success"] = success
+        current_info["provider"] = channel_id if success else None
+        current_info["model"] = current_info.get("model") or request_model_name
+        background_tasks.add_task(
+            update_channel_stats,
+            current_info["request_id"],
+            channel_id,
+            request_model_name,
+            current_info["api_key"],
+            success=success,
+            provider_api_key=provider_api_key_raw,
+        )
+
+    async def _request_with_fixed_route(
+        self,
+        *,
+        method: str,
+        task_id: str,
+        route: dict[str, Any],
+        background_tasks: BackgroundTasks,
+        current_info: dict,
+    ) -> Response:
+        provider = route["provider"]
+        provider_name = route["provider_name"]
+        request_model_name = route["request_model_name"]
+        original_model = route["original_model"]
+        provider_api_key_raw = route.get("provider_api_key_raw")
+        proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
+        proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+        timeout_value = get_preference(
+            app.state.provider_timeouts,
+            provider_name,
+            (original_model, request_model_name),
+            DEFAULT_TIMEOUT,
+        )
+        upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
+        headers = {}
+        if provider_api_key_raw:
+            headers["Authorization"] = f"Bearer {provider_api_key_raw}"
+        headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+        channel_id = f"{provider_name}"
+
+        trace_logger.info(
+            "endpoint=%s method=%s request_id=%s provider=%-11s model=%-22s engine=%-13s upstream_url=%s",
+            CONTENT_GENERATION_TASKS_ENDPOINT,
+            method,
+            _responses_request_id(current_info),
+            channel_id[:11],
+            request_model_name,
+            "content-generation",
+            upstream_url,
+        )
+
+        try:
+            upstream_resp = await self._send_upstream(
+                method=method,
+                upstream_url=upstream_url,
+                headers=headers,
+                payload=None,
+                proxy=proxy,
+                timeout_value=int(timeout_value),
+            )
+            raw = upstream_resp.content
+            success = 200 <= upstream_resp.status_code < 300
+            self._mark_result(
+                background_tasks=background_tasks,
+                current_info=current_info,
+                channel_id=channel_id,
+                request_model_name=request_model_name,
+                success=success,
+                provider_api_key_raw=provider_api_key_raw,
+            )
+            if success and method == "DELETE":
+                self.task_routes.pop(task_id, None)
+            return self._raw_response(upstream_resp, raw)
+        except Exception:
+            self._mark_result(
+                background_tasks=background_tasks,
+                current_info=current_info,
+                channel_id=channel_id,
+                request_model_name=request_model_name,
+                success=False,
+                provider_api_key_raw=provider_api_key_raw,
+            )
+            raise
+
+    async def create_task(
+        self,
+        http_request: Request,
+        request_body: dict[str, Any],
+        api_index: int,
+        background_tasks: BackgroundTasks,
+    ):
+        if not isinstance(request_body, dict):
+            raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+        request_model_name = str(request_body.get("model") or "").strip()
+        if not request_model_name:
+            raise HTTPException(status_code=422, detail="Request body requires a model")
+        return await self._request_with_model_route(
+            http_request=http_request,
+            request_model_name=request_model_name,
+            request_body=request_body,
+            api_index=api_index,
+            background_tasks=background_tasks,
+            method="POST",
+            task_id=None,
+        )
+
+    async def get_or_delete_task(
+        self,
+        http_request: Request,
+        task_id: str,
+        api_index: int,
+        background_tasks: BackgroundTasks,
+        *,
+        method: str,
+        model: Optional[str] = None,
+    ):
+        current_info = request_info.get()
+        route = self._resolve_task_route(task_id, current_info.get("api_key"))
+        if route is not None:
+            return await self._request_with_fixed_route(
+                method=method,
+                task_id=task_id,
+                route=route,
+                background_tasks=background_tasks,
+                current_info=current_info,
+            )
+
+        request_model_name = str(model or "").strip()
+        if not request_model_name:
+            raise HTTPException(
+                status_code=404,
+                detail="Unknown content generation task id. Query with ?model=<model> if the task was created before this gateway instance learned the route.",
+            )
+
+        return await self._request_with_model_route(
+            http_request=http_request,
+            request_model_name=request_model_name,
+            request_body=None,
+            api_index=api_index,
+            background_tasks=background_tasks,
+            method=method,
+            task_id=task_id,
+        )
+
+    async def _request_with_model_route(
+        self,
+        *,
+        http_request: Request,
+        request_model_name: str,
+        request_body: Optional[dict[str, Any]],
+        api_index: int,
+        background_tasks: BackgroundTasks,
+        method: str,
+        task_id: Optional[str],
+    ):
+        _ = http_request
+        config = app.state.config
+        if not safe_get(config, "api_keys", api_index, "model"):
+            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+
+        current_info = request_info.get()
+        current_info["model"] = current_info.get("model") or request_model_name
+        disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
+        request_id = _responses_request_id(current_info)
+        plan = await RoutingPlan.create(
+            app,
+            request_model_name,
+            api_index,
+            self.last_provider_indices,
+            self.locks,
+            endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+            debug=is_debug,
+            provider_resolver=get_right_order_providers,
+        )
+        runner = UpstreamRunner(
+            plan,
+            endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+            debug=is_debug,
+        )
+        last_error_response: dict[str, Any] = {}
+
+        async def before_next_attempt():
+            if disconnect_event is not None and disconnect_event.is_set():
+                trace_logger.info(
+                    "%s downstream disconnect stage=before-provider-select request_id=%s model=%s",
+                    CONTENT_GENERATION_TASKS_ENDPOINT,
+                    request_id,
+                    request_model_name,
+                )
+                return Response(content="", status_code=499)
+            return None
+
+        async def prepare_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            engine, _ = get_engine(provider, endpoint=CONTENT_GENERATION_TASKS_ENDPOINT, original_model=original_model)
+            attempt.state["failure_stage"] = "validation"
+            if engine != "content-generation":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} only supports upstream engine: content-generation (got {engine})",
+                )
+
+            upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
+            if not upstream_url:
+                raise HTTPException(status_code=400, detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} requires provider base_url")
+
+            proxy = safe_get(config, "preferences", "proxy", default=None)
+            proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+            channel_id = f"{provider_name}"
+
+            attempt.state["upstream_url"] = upstream_url
+            attempt.state["channel_id"] = channel_id
+            attempt.state["engine"] = engine
+            attempt.state["proxy"] = proxy
+            attempt.state["failure_stage"] = "auth"
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+
+            timeout_value = get_preference(
+                app.state.provider_timeouts,
+                provider_name,
+                (original_model, request_model_name),
+                DEFAULT_TIMEOUT,
+            )
+            attempt.state["api_key"] = attempt.provider_api_key_raw
+            attempt.state["timeout_value"] = int(timeout_value)
+
+        async def execute_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            proxy = attempt.state["proxy"]
+            api_key = attempt.state["api_key"]
+            timeout_value = attempt.state["timeout_value"]
+            upstream_url = attempt.state["upstream_url"]
+            channel_id = attempt.state["channel_id"]
+
+            payload = None
+            if request_body is not None:
+                payload = dict(request_body)
+                payload["model"] = original_model
+                apply_post_body_parameter_overrides(payload, provider, request_model_name)
+
+            headers = {}
+            if method == "POST":
+                headers["Content-Type"] = "application/json"
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+
+            logger.info(
+                "provider: %-11s model: %-22s engine: %-13s role: %s",
+                channel_id[:11],
+                request_model_name,
+                "content-generation",
+                plan.role,
+            )
+            trace_logger.info(
+                "endpoint=%s method=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
+                CONTENT_GENERATION_TASKS_ENDPOINT,
+                method,
+                request_id,
+                channel_id[:11],
+                request_model_name,
+                "content-generation",
+                plan.role,
+                upstream_url,
+            )
+            attempt.state["failure_stage"] = "upstream"
+            attempt.state["track_channel_stats"] = True
+
+            _log_debug_request_headers(
+                "DEBUG upstream request headers",
+                headers,
+                endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+                upstream_url=upstream_url,
+                provider=channel_id,
+                model=request_model_name,
+                actual_model=original_model,
+            )
+            if payload is not None:
+                _log_debug_request_body(
+                    "DEBUG upstream request body",
+                    payload,
+                    endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+                    upstream_url=upstream_url,
+                    provider=channel_id,
+                    model=request_model_name,
+                    actual_model=original_model,
+                )
+
+            upstream_resp = await self._send_upstream(
+                method=method,
+                upstream_url=upstream_url,
+                headers=headers,
+                payload=payload,
+                proxy=proxy,
+                timeout_value=timeout_value,
+            )
+            raw = upstream_resp.content
+            if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                if self._is_non_retryable_client_error(upstream_resp.status_code):
+                    self._mark_result(
+                        background_tasks=background_tasks,
+                        current_info=current_info,
+                        channel_id=channel_id,
+                        request_model_name=request_model_name,
+                        success=False,
+                        provider_api_key_raw=attempt.provider_api_key_raw,
+                    )
+                    return self._raw_response(upstream_resp, raw)
+
+                last_error_response.clear()
+                last_error_response.update(
+                    {
+                        "body": raw,
+                        "headers": _copy_upstream_response_headers(upstream_resp.headers),
+                    }
+                )
+                raise HTTPException(
+                    status_code=upstream_resp.status_code,
+                    detail=raw.decode("utf-8", errors="replace"),
+                )
+
+            if method == "POST":
+                try:
+                    response_json = upstream_resp.json()
+                except Exception:
+                    response_json = None
+                if isinstance(response_json, dict) and response_json.get("id"):
+                    self._remember_task_route(
+                        task_id=str(response_json["id"]),
+                        request_model_name=request_model_name,
+                        original_model=original_model,
+                        provider=provider,
+                        provider_name=provider_name,
+                        provider_api_key_raw=attempt.provider_api_key_raw,
+                        client_api_key=current_info.get("api_key"),
+                    )
+            elif method == "DELETE" and task_id:
+                self.task_routes.pop(task_id, None)
+
+            self._mark_result(
+                background_tasks=background_tasks,
+                current_info=current_info,
+                channel_id=channel_id,
+                request_model_name=request_model_name,
+                success=True,
+                provider_api_key_raw=attempt.provider_api_key_raw,
+            )
+            return self._raw_response(upstream_resp, raw)
+
+        def after_failure(attempt, exc, status_code, error_message):
+            if attempt.state.get("track_channel_stats"):
+                background_tasks.add_task(
+                    update_channel_stats,
+                    current_info["request_id"],
+                    attempt.state["channel_id"],
+                    request_model_name,
+                    current_info["api_key"],
+                    success=False,
+                    provider_api_key=attempt.provider_api_key_raw,
+                )
+
+            request_model, actual_model = _log_model_names(request_model_name, attempt.original_model)
+            trace_logger.error(
+                "%s upstream error status=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
+                CONTENT_GENERATION_TASKS_ENDPOINT,
+                status_code,
+                type(exc).__name__,
+                request_id,
+                request_model,
+                actual_model,
+                attempt.state.get("channel_id", attempt.provider_name),
+                attempt.provider_api_key_raw,
+                attempt.state.get("upstream_url", ""),
+                error_message,
+            )
+
+        def should_cool_down(exc, status_code, error_message, attempt):
+            _ = exc, error_message, attempt
+            return status_code in (401, 403, 429) or status_code >= 500
+
+        def build_error_response(status_code, error_message):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            if last_error_response.get("body") is not None:
+                headers = last_error_response.get("headers") or {}
+                return Response(
+                    content=last_error_response["body"],
+                    status_code=status_code,
+                    headers=headers,
+                    media_type=headers.get("content-type", "application/json"),
+                )
+            return build_upstream_error_response(
+                status_code=status_code,
+                error_message=error_message,
+                fallback_prefix="Error: Current provider response failed",
+            )
+
+        def build_final_response(completed_plan):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            return JSONResponse(
+                status_code=completed_plan.status_code,
+                content={"error": f"All {request_model_name} error: {completed_plan.error_message}"},
+            )
+
+        return await runner.run(
+            execute_attempt,
+            prepare_attempt=prepare_attempt,
+            before_next_attempt=before_next_attempt,
+            after_failure=after_failure,
+            build_error_response=build_error_response,
+            build_final_response=build_final_response,
+            should_cool_down=should_cool_down,
+        )
+
 model_handler = ModelRequestHandler()
 responses_handler = ResponsesRequestHandler()
 messages_handler = MessagesPassthroughHandler()
+content_generation_tasks_handler = ContentGenerationTaskHandler()
 
 security = HTTPBearer()
 
@@ -3084,6 +3644,54 @@ async def images_generations(
     api_index: int = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/generations")
+
+@app.post("/v1/contents/generations/tasks", dependencies=[Depends(rate_limit_dependency)])
+async def content_generation_tasks_create(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    request_body: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await content_generation_tasks_handler.create_task(
+        http_request,
+        request_body,
+        api_index,
+        background_tasks,
+    )
+
+@app.get("/v1/contents/generations/tasks/{task_id}", dependencies=[Depends(rate_limit_dependency)])
+async def content_generation_tasks_get(
+    http_request: Request,
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    model: Optional[str] = Query(None),
+    api_index: int = Depends(verify_api_key),
+):
+    return await content_generation_tasks_handler.get_or_delete_task(
+        http_request,
+        task_id,
+        api_index,
+        background_tasks,
+        method="GET",
+        model=model,
+    )
+
+@app.delete("/v1/contents/generations/tasks/{task_id}", dependencies=[Depends(rate_limit_dependency)])
+async def content_generation_tasks_delete(
+    http_request: Request,
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    model: Optional[str] = Query(None),
+    api_index: int = Depends(verify_api_key),
+):
+    return await content_generation_tasks_handler.get_or_delete_task(
+        http_request,
+        task_id,
+        api_index,
+        background_tasks,
+        method="DELETE",
+        model=model,
+    )
 
 def _is_form_upload(value: Any) -> bool:
     return hasattr(value, "filename") and hasattr(value, "file")
