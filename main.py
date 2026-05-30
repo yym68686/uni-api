@@ -151,6 +151,13 @@ except Exception:
     VERSION = 'unknown'
 logger.info("VERSION: %s", VERSION)
 
+PUBLIC_HEALTH_PATHS = {"/healthz"}
+
+
+def _is_public_health_request(request: Request) -> bool:
+    return request.method in {"GET", "HEAD"} and request.url.path in PUBLIC_HEALTH_PATHS
+
+
 async def create_tables():
     if DISABLE_DATABASE:
         return
@@ -862,6 +869,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
         # 如果是 OPTIONS 请求，直接放行，由 CORSMiddleware 处理
         if request.method == "OPTIONS":
             return await call_next(request)
+        if _is_public_health_request(request):
+            return await call_next(request)
 
         start_time = time()
 
@@ -1097,6 +1106,8 @@ app.add_middleware(StatsMiddleware)
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
+    if _is_public_health_request(request):
+        return await call_next(request)
     runtime_api_list = get_runtime_api_list()
     if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
         app.state.models_list = build_api_key_models_map(app.state.config, runtime_api_list)
@@ -1105,6 +1116,12 @@ async def ensure_config(request: Request, call_next):
     if app and app.state.api_keys_db and not hasattr(app.state, "model_response_cache"):
         app.state.model_response_cache = build_api_key_model_response_cache(runtime_api_list, app.state.models_list)
     return await call_next(request)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok", "version": VERSION}
+
 
 class ClientManager:
     def __init__(self, pool_size=100):
