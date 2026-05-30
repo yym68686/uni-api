@@ -1611,6 +1611,13 @@ async def process_request(
                     first_element = await anext(wrapped_generator)
                     first_element = first_element.lstrip("data: ")
                     decoded_element = await asyncio.to_thread(json.loads, first_element)
+
+                    # 提取 usage 信息到 current_info
+                    usage_obj = decoded_element.get("usage") or {}
+                    current_info["prompt_tokens"] = usage_obj.get("prompt_tokens") or usage_obj.get("input_tokens") or 0
+                    current_info["completion_tokens"] = usage_obj.get("completion_tokens") or usage_obj.get("output_tokens") or 0
+                    current_info["total_tokens"] = usage_obj.get("total_tokens") or 0
+
                     encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
                     response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json")
 
