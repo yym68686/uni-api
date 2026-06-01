@@ -205,10 +205,10 @@ def test_content_generation_create_maps_model_and_remembers_task_route(monkeypat
             json={"id": "cgt-test"},
         ),
     )
-    handler = main.ContentGenerationTaskHandler()
+    handler = main.VideoTaskHandler()
     body = {
         "model": "seedance-video",
-        "content": [{"type": "text", "text": "小猫对着镜头打哈欠"}],
+        "prompt": "小猫对着镜头打哈欠",
         "duration": 5,
         "ratio": "16:9",
     }
@@ -223,15 +223,21 @@ def test_content_generation_create_maps_model_and_remembers_task_route(monkeypat
     )
 
     assert response.status_code == 200
-    assert json.loads(response.body) == {"id": "cgt-test"}
+    response_body = json.loads(response.body)
+    assert response_body["id"] == "cgt-test"
+    assert response_body["model"] == "seedance-video"
+    assert response_body["provider"] == "deyunai"
+    assert response_body["status"] == "queued"
     assert len(main.app.state.client_manager.calls) == 1
     call = main.app.state.client_manager.calls[0]
     assert call["method"] == "POST"
     assert call["url"] == "https://api.deyunai.com/api/v3/contents/generations/tasks"
     assert call["headers"]["Authorization"] == "Bearer ark-key"
     assert json.loads(call["content"]) == {
-        **body,
         "model": "doubao-seedance-1-0-pro-250528",
+        "content": [{"type": "text", "text": "小猫对着镜头打哈欠"}],
+        "duration": 5,
+        "ratio": "16:9",
     }
     assert handler.task_routes["cgt-test"]["provider_api_key_raw"] == "ark-key"
 
@@ -250,7 +256,7 @@ def test_content_generation_get_uses_remembered_provider_and_key(monkeypatch):
         ),
     }
     _set_content_generation_state(monkeypatch, responses)
-    handler = main.ContentGenerationTaskHandler()
+    handler = main.VideoTaskHandler()
 
     _run_with_request_info(
         handler.create_task(
@@ -274,7 +280,10 @@ def test_content_generation_get_uses_remembered_provider_and_key(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert json.loads(response.body)["status"] == "succeeded"
+    response_body = json.loads(response.body)
+    assert response_body["status"] == "succeeded"
+    assert response_body["provider"] == "deyunai"
+    assert response_body["video"]["url"] == "https://example.com/out.mp4"
     get_call = main.app.state.client_manager.calls[-1]
     assert get_call["method"] == "GET"
     assert get_call["url"] == "https://api.deyunai.com/api/v3/contents/generations/tasks/cgt-test"
@@ -295,7 +304,7 @@ def test_content_generation_delete_removes_remembered_route(monkeypatch):
         ),
     }
     _set_content_generation_state(monkeypatch, responses)
-    handler = main.ContentGenerationTaskHandler()
+    handler = main.VideoTaskHandler()
 
     _run_with_request_info(
         handler.create_task(
@@ -350,16 +359,16 @@ def test_lingjing_content_generation_uses_x_keys_and_normalizes_responses(monkey
         ),
     }
     _set_lingjing_state(monkeypatch, responses)
-    handler = main.ContentGenerationTaskHandler()
+    handler = main.VideoTaskHandler()
 
     create_response = _run_with_request_info(
         handler.create_task(
             SimpleNamespace(headers={}),
             {
                 "model": "seedance-2-0",
-                "content": [
-                    {"type": "text", "text": "一只橘猫在窗边晒太阳"},
-                    {"type": "image_url", "image_url": {"url": "asset://Asset-test"}, "role": "first_frame"},
+                "prompt": "一只橘猫在窗边晒太阳",
+                "resources": [
+                    {"type": "image", "url": "asset://Asset-test", "role": "first_frame"},
                 ],
                 "ratio": "16:9",
                 "duration": 5,
@@ -397,7 +406,8 @@ def test_lingjing_content_generation_uses_x_keys_and_normalizes_responses(monkey
     query_body = json.loads(query_response.body)
     assert query_response.status_code == 200
     assert query_body["status"] == "succeeded"
-    assert query_body["content"]["video_url"] == "https://example.com/out.mp4"
+    assert query_body["provider"] == "lingjing"
+    assert query_body["video"]["url"] == "https://example.com/out.mp4"
     query_call = main.app.state.client_manager.calls[-1]
     assert query_call["url"] == "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/query?taskId=task-lj"
     assert query_call["headers"]["X-Access-Key"] == "ak-test"

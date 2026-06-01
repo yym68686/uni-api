@@ -980,7 +980,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     else:
                         moderated_content = None
                 else:
-                    if request.url.path.startswith(LINGJING_OPENAPI_ENDPOINT_PREFIX):
+                    if _is_video_or_asset_request_path(request.url.path):
                         model = _lingjing_request_model_for_openapi(
                             parsed_body if isinstance(parsed_body, dict) else None,
                             request.query_params,
@@ -997,6 +997,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
                         if isinstance(parsed_body, dict):
                             moderated_content = str(safe_get(parsed_body, "taskParams", "input", "prompt", default="") or "").strip()
+                            if not moderated_content:
+                                moderated_content = _video_prompt_from_body(parsed_body)
                     else:
                         request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
                         request_model = request_model.data
@@ -1883,10 +1885,24 @@ def _normalize_messages_upstream_url(base_url: str) -> str:
         return base
     return f"{base}/messages"
 
-CONTENT_GENERATION_TASKS_ENDPOINT = "/v1/contents/generations/tasks"
+VIDEO_TASKS_ENDPOINT = "/v1/video/tasks"
+VIDEO_ASSETS_ENDPOINT = "/v1/assets"
+VIDEO_ASSET_GROUPS_ENDPOINT = "/v1/asset-groups"
+CONTENT_GENERATION_TASKS_ENDPOINT = VIDEO_TASKS_ENDPOINT
 LINGJING_OPENAPI_ENDPOINT_PREFIX = "/v1/openapi"
 LINGJING_UPSTREAM_OPENAPI_PREFIX = "/api/entrance/openapi"
 LINGJING_DEFAULT_REQUEST_MODEL = "seedance-2-0"
+
+def _is_video_or_asset_request_path(path: str) -> bool:
+    normalized = str(path or "").rstrip("/")
+    return (
+        normalized == VIDEO_TASKS_ENDPOINT
+        or normalized.startswith(f"{VIDEO_TASKS_ENDPOINT}/")
+        or normalized == VIDEO_ASSETS_ENDPOINT
+        or normalized.startswith(f"{VIDEO_ASSETS_ENDPOINT}/")
+        or normalized == VIDEO_ASSET_GROUPS_ENDPOINT
+        or normalized.startswith(f"{VIDEO_ASSET_GROUPS_ENDPOINT}/")
+    )
 
 def _normalize_content_generation_tasks_upstream_url(base_url: str, task_id: Optional[str] = None) -> str:
     base = (base_url or "").strip()
@@ -2020,6 +2036,46 @@ def _extract_url_from_content_part(part: dict[str, Any], type_name: str) -> str:
         return str(value.get("url") or "").strip()
     return ""
 
+def _video_provider_options(request_body: dict[str, Any], provider_name: str) -> dict[str, Any]:
+    options = request_body.get("provider_options")
+    if not isinstance(options, dict):
+        return {}
+
+    provider_options = options.get(provider_name)
+    if isinstance(provider_options, dict):
+        return dict(provider_options)
+
+    common_options = {
+        key: value
+        for key, value in options.items()
+        if not isinstance(value, dict)
+    }
+    return common_options
+
+def _video_requested_provider(request_body: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(request_body, dict):
+        return None
+    provider = request_body.get("provider")
+    if not provider and isinstance(request_body.get("route"), dict):
+        provider = request_body["route"].get("provider")
+    provider_name = str(provider or "").strip()
+    return provider_name or None
+
+def _video_prompt_from_body(request_body: dict[str, Any]) -> str:
+    prompt = str(request_body.get("prompt") or "").strip()
+    if prompt:
+        return prompt
+
+    prompt_parts: list[str] = []
+    content = request_body.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "").strip() == "text":
+                text = str(part.get("text") or "").strip()
+                if text:
+                    prompt_parts.append(text)
+    return "\n".join(prompt_parts).strip()
+
 def _lingjing_usage_from_role(role: Any, resource_type: str, resource_index: int) -> str:
     normalized = str(role or "").strip().lower()
     if normalized in {"first_frame", "last_frame", "reference", "keyframe", "source"}:
@@ -2030,6 +2086,46 @@ def _lingjing_usage_from_role(role: Any, resource_type: str, resource_index: int
         return "first_frame"
     return "reference"
 
+def _lingjing_resource_from_unified(resource: Any, resource_index: int) -> Optional[dict[str, Any]]:
+    if not isinstance(resource, dict):
+        return None
+
+    resource_type = str(resource.get("type") or "image").strip().lower()
+    if resource_type not in {"image", "video", "audio"}:
+        return None
+
+    usage = resource.get("usage", resource.get("role"))
+    source = resource.get("source")
+    if not isinstance(source, dict):
+        value = (
+            resource.get("url")
+            or resource.get("asset_id")
+            or resource.get("assetId")
+            or resource.get("value")
+        )
+        source = _lingjing_source_from_value(value)
+
+    normalized: dict[str, Any] = {
+        "type": resource_type,
+        "usage": _lingjing_usage_from_role(usage, resource_type, resource_index),
+        "source": source,
+    }
+    reference_key = resource.get("reference_key") or resource.get("referenceKey")
+    if reference_key:
+        normalized["reference_key"] = reference_key
+    return normalized
+
+def _lingjing_resources_from_unified(resources: Any) -> list[dict[str, Any]]:
+    if not isinstance(resources, list):
+        return []
+
+    normalized_resources: list[dict[str, Any]] = []
+    for resource in resources:
+        normalized = _lingjing_resource_from_unified(resource, len(normalized_resources))
+        if normalized:
+            normalized_resources.append(normalized)
+    return normalized_resources
+
 def _convert_content_generation_body_to_lingjing(
     request_body: dict[str, Any],
     *,
@@ -2038,6 +2134,8 @@ def _convert_content_generation_body_to_lingjing(
     if "taskParams" in request_body or "modelCode" in request_body:
         payload = dict(request_body)
         payload["modelCode"] = model_code
+        for key in ("model", "request_model", "provider", "provider_options", "route"):
+            payload.pop(key, None)
         return payload
 
     prompt_parts: list[str] = []
@@ -2090,15 +2188,85 @@ def _convert_content_generation_body_to_lingjing(
 
     for key in ("duration", "ratio", "resources", "generate_num", "prompt_optimizer"):
         if key in request_body and request_body.get(key) is not None:
-            input_payload[key] = request_body[key]
-    if "resources" not in input_payload and resources:
+            if key != "resources":
+                input_payload[key] = request_body[key]
+    unified_resources = _lingjing_resources_from_unified(request_body.get("resources"))
+    if unified_resources:
+        input_payload["resources"] = unified_resources
+    elif resources:
         input_payload["resources"] = resources
+    for key, value in _video_provider_options(request_body, "lingjing").items():
+        if value is not None:
+            input_payload[key] = value
     if "generate_audio" in request_body:
         input_payload["need_audio"] = bool(request_body.get("generate_audio"))
     if "need_audio" in request_body:
         input_payload["need_audio"] = bool(request_body.get("need_audio"))
+    if "audio" in request_body:
+        input_payload["need_audio"] = bool(request_body.get("audio"))
 
     return {"modelCode": model_code, "taskParams": {"input": input_payload}}
+
+def _content_part_from_resource(resource: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(resource, dict):
+        return None
+    resource_type = str(resource.get("type") or "image").strip().lower()
+    if resource_type not in {"image", "video", "audio"}:
+        return None
+    value = resource.get("url") or resource.get("value")
+    source = resource.get("source")
+    if not value and isinstance(source, dict):
+        value = source.get("value")
+    if not value:
+        asset_id = resource.get("asset_id") or resource.get("assetId")
+        if asset_id:
+            value = f"asset://{asset_id}"
+    if not value:
+        return None
+
+    key = f"{resource_type}_url"
+    part: dict[str, Any] = {
+        "type": key,
+        key: {"url": str(value)},
+    }
+    role = resource.get("role") or resource.get("usage")
+    if role:
+        part["role"] = role
+    return part
+
+def _convert_video_body_to_content_generation(
+    request_body: dict[str, Any],
+    *,
+    model_name: str,
+    provider_name: str,
+) -> dict[str, Any]:
+    payload = {
+        key: value
+        for key, value in request_body.items()
+        if key not in {"provider", "provider_options", "route", "prompt", "resources", "audio"}
+    }
+    payload["model"] = model_name
+
+    if not isinstance(payload.get("content"), list):
+        content: list[dict[str, Any]] = []
+        prompt = _video_prompt_from_body(request_body)
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+        for resource in request_body.get("resources") or []:
+            part = _content_part_from_resource(resource)
+            if part:
+                content.append(part)
+        if content:
+            payload["content"] = content
+
+    if "audio" in request_body and "generate_audio" not in payload:
+        payload["generate_audio"] = bool(request_body.get("audio"))
+
+    for key, value in _video_provider_options(request_body, provider_name).items():
+        if value is not None:
+            payload[key] = value
+
+    return payload
 
 def _lingjing_task_id_from_submit_response(obj: dict[str, Any]) -> Optional[str]:
     data = obj.get("data")
@@ -2172,6 +2340,130 @@ def _normalize_lingjing_content_generation_response(
         if data.get("external_error"):
             normalized["error"] = {"message": data.get("external_error")}
         return _json_bytes(normalized), upstream_task_id or None
+
+    return raw, None
+
+def _usage_to_video_usage(usage: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(usage, dict):
+        return None
+
+    total_tokens = usage.get("total_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    video_tokens = usage.get("video_tokens")
+    if video_tokens is None:
+        video_tokens = completion_tokens if completion_tokens is not None else total_tokens
+    if total_tokens is None:
+        total_tokens = video_tokens
+
+    normalized: dict[str, Any] = {}
+    if video_tokens is not None:
+        normalized["video_tokens"] = video_tokens
+        normalized["completion_tokens"] = video_tokens
+    if total_tokens is not None:
+        normalized["total_tokens"] = total_tokens
+    for key, value in usage.items():
+        normalized.setdefault(key, value)
+    return normalized or None
+
+def _normalize_video_task_response(
+    *,
+    method: str,
+    raw: bytes,
+    task_id: Optional[str],
+    request_model_name: str,
+    provider_name: str,
+    is_lingjing: bool,
+) -> tuple[bytes, Optional[str]]:
+    obj = _maybe_json_object(raw)
+    if not obj:
+        return raw, None
+
+    method_upper = method.upper()
+    if is_lingjing:
+        if method_upper == "POST":
+            upstream_task_id = _lingjing_task_id_from_submit_response(obj)
+            if not upstream_task_id:
+                return raw, None
+            return _json_bytes(
+                {
+                    "id": upstream_task_id,
+                    "model": request_model_name,
+                    "provider": provider_name,
+                    "status": "queued",
+                    "created_at": int(time()),
+                }
+            ), upstream_task_id
+
+        if method_upper == "GET":
+            data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+            upstream_task_id = str(data.get("task_id") or data.get("taskId") or task_id or "")
+            result_url = _first_lingjing_result_url(data.get("result"))
+            normalized: dict[str, Any] = {
+                "id": upstream_task_id,
+                "model": request_model_name,
+                "provider": provider_name,
+                "status": _lingjing_status_to_content_status(data.get("status")),
+                "video": {},
+            }
+            if result_url:
+                normalized["video"]["url"] = result_url
+            usage = _usage_to_video_usage(data.get("usage") if isinstance(data, dict) else None)
+            if usage:
+                normalized["usage"] = usage
+            if data.get("external_error"):
+                normalized["error"] = {"message": data.get("external_error")}
+            return _json_bytes(normalized), upstream_task_id or None
+
+        return raw, None
+
+    if method_upper == "POST":
+        upstream_task_id = obj.get("id")
+        if not upstream_task_id:
+            return raw, None
+        return _json_bytes(
+            {
+                "id": str(upstream_task_id),
+                "model": request_model_name,
+                "provider": provider_name,
+                "status": str(obj.get("status") or "queued"),
+                "created_at": obj.get("created_at") or int(time()),
+            }
+        ), str(upstream_task_id)
+
+    if method_upper == "GET":
+        upstream_task_id = str(obj.get("id") or task_id or "")
+        status = obj.get("status")
+        if not upstream_task_id or not status:
+            return raw, upstream_task_id or None
+
+        video: dict[str, Any] = {}
+        content = obj.get("content")
+        if isinstance(content, dict) and content.get("video_url"):
+            video["url"] = content.get("video_url")
+        if obj.get("duration") is not None:
+            video["duration"] = obj.get("duration")
+        if obj.get("resolution") is not None:
+            video["resolution"] = obj.get("resolution")
+        if obj.get("ratio") is not None:
+            video["ratio"] = obj.get("ratio")
+        fps = obj.get("fps", obj.get("framespersecond"))
+        if fps is not None:
+            video["fps"] = fps
+
+        normalized = {
+            "id": upstream_task_id,
+            "model": request_model_name,
+            "provider": provider_name,
+            "status": str(status),
+            "video": video,
+        }
+        usage = _usage_to_video_usage(obj.get("usage"))
+        if usage:
+            normalized["usage"] = usage
+        for key in ("created_at", "updated_at", "seed"):
+            if obj.get(key) is not None:
+                normalized[key] = obj[key]
+        return _json_bytes(normalized), upstream_task_id
 
     return raw, None
 
@@ -3313,7 +3605,7 @@ class MessagesPassthroughHandler:
             should_cool_down=should_cool_down,
         )
 
-class ContentGenerationTaskHandler:
+class VideoTaskHandler:
     def __init__(self):
         self.last_provider_indices = defaultdict(lambda: -1)
         self.locks = defaultdict(asyncio.Lock)
@@ -3376,6 +3668,40 @@ class ContentGenerationTaskHandler:
         if route.get("client_api_key") and client_api_key and route.get("client_api_key") != client_api_key:
             raise HTTPException(status_code=403, detail="Task belongs to a different API key")
         return route
+
+    def _provider_resolver(self, request_body: Optional[dict[str, Any]]):
+        requested_provider = _video_requested_provider(request_body)
+        if not requested_provider:
+            return get_right_order_providers
+
+        async def resolve_video_providers(
+            request_model_name: str,
+            config: dict,
+            api_index: int,
+            scheduling_algorithm: str,
+            api_list: list[str],
+            models_list: dict[str, list[str]],
+            **kwargs,
+        ):
+            providers = await get_right_order_providers(
+                request_model_name,
+                config,
+                api_index,
+                scheduling_algorithm,
+                api_list,
+                models_list,
+                **kwargs,
+            )
+            filtered = [
+                provider
+                for provider in providers
+                if str(provider.get("provider") or "").strip().lower() == requested_provider.lower()
+            ]
+            if not filtered:
+                raise HTTPException(status_code=404, detail=f"No available provider for video task: {requested_provider}")
+            return filtered
+
+        return resolve_video_providers
 
     def _raw_response(
         self,
@@ -3507,13 +3833,15 @@ class ContentGenerationTaskHandler:
             )
             raw = upstream_resp.content
             response_media_type = None
-            if is_lingjing:
-                raw, _ = _normalize_lingjing_content_generation_response(
-                    method=method,
-                    raw=raw,
-                    task_id=task_id,
-                    request_model_name=request_model_name,
-                )
+            raw, _ = _normalize_video_task_response(
+                method=method,
+                raw=raw,
+                task_id=task_id,
+                request_model_name=request_model_name,
+                provider_name=provider_name,
+                is_lingjing=is_lingjing,
+            )
+            if _maybe_json_object(raw):
                 response_media_type = "application/json"
             success = 200 <= upstream_resp.status_code < 300
             self._mark_result(
@@ -3626,7 +3954,7 @@ class ContentGenerationTaskHandler:
             self.locks,
             endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
             debug=is_debug,
-            provider_resolver=get_right_order_providers,
+            provider_resolver=self._provider_resolver(request_body),
         )
         runner = UpstreamRunner(
             plan,
@@ -3710,8 +4038,11 @@ class ContentGenerationTaskHandler:
                         model_code=str(original_model),
                     )
                 else:
-                    payload = dict(request_body)
-                    payload["model"] = original_model
+                    payload = _convert_video_body_to_content_generation(
+                        request_body,
+                        model_name=original_model,
+                        provider_name=provider_name,
+                    )
                     apply_post_body_parameter_overrides(payload, provider, request_model_name)
 
             if is_lingjing:
@@ -3775,24 +4106,26 @@ class ContentGenerationTaskHandler:
             )
             raw = upstream_resp.content
             response_media_type = None
-            if is_lingjing:
-                raw, lingjing_task_id = _normalize_lingjing_content_generation_response(
-                    method=method,
-                    raw=raw,
-                    task_id=task_id,
-                    request_model_name=request_model_name,
-                )
-                if method == "POST" and lingjing_task_id:
-                    self._remember_task_route(
-                        task_id=lingjing_task_id,
-                        request_model_name=request_model_name,
-                        original_model=original_model,
-                        provider=provider,
-                        provider_name=provider_name,
-                        provider_api_key_raw=attempt.provider_api_key_raw,
-                        client_api_key=current_info.get("api_key"),
-                    )
+            raw, normalized_task_id = _normalize_video_task_response(
+                method=method,
+                raw=raw,
+                task_id=task_id,
+                request_model_name=request_model_name,
+                provider_name=provider_name,
+                is_lingjing=is_lingjing,
+            )
+            if _maybe_json_object(raw):
                 response_media_type = "application/json"
+            if method == "POST" and normalized_task_id:
+                self._remember_task_route(
+                    task_id=normalized_task_id,
+                    request_model_name=request_model_name,
+                    original_model=original_model,
+                    provider=provider,
+                    provider_name=provider_name,
+                    provider_api_key_raw=attempt.provider_api_key_raw,
+                    client_api_key=current_info.get("api_key"),
+                )
             if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                 if self._is_non_retryable_client_error(upstream_resp.status_code):
                     self._mark_result(
@@ -3817,22 +4150,7 @@ class ContentGenerationTaskHandler:
                     detail=raw.decode("utf-8", errors="replace"),
                 )
 
-            if method == "POST" and not is_lingjing:
-                try:
-                    response_json = upstream_resp.json()
-                except Exception:
-                    response_json = None
-                if isinstance(response_json, dict) and response_json.get("id"):
-                    self._remember_task_route(
-                        task_id=str(response_json["id"]),
-                        request_model_name=request_model_name,
-                        original_model=original_model,
-                        provider=provider,
-                        provider_name=provider_name,
-                        provider_api_key_raw=attempt.provider_api_key_raw,
-                        client_api_key=current_info.get("api_key"),
-                    )
-            elif method == "DELETE" and task_id:
+            if method == "DELETE" and task_id:
                 self.task_routes.pop(task_id, None)
 
             self._mark_result(
@@ -3957,6 +4275,7 @@ class LingjingOpenapiHandler:
         *,
         method: str,
         openapi_path: str,
+        endpoint: str = LINGJING_OPENAPI_ENDPOINT_PREFIX,
     ) -> Response:
         method_upper = method.upper()
         payload = request_body if isinstance(request_body, dict) else None
@@ -3975,13 +4294,13 @@ class LingjingOpenapiHandler:
             api_index,
             self.last_provider_indices,
             self.locks,
-            endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+            endpoint=endpoint,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
         runner = UpstreamRunner(
             plan,
-            endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+            endpoint=endpoint,
             debug=is_debug,
         )
         last_error_response: dict[str, Any] = {}
@@ -3994,7 +4313,7 @@ class LingjingOpenapiHandler:
             if not _is_lingjing_provider(provider):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"{LINGJING_OPENAPI_ENDPOINT_PREFIX} only supports Lingjing providers",
+                    detail=f"{endpoint} only supports Lingjing providers",
                 )
 
             upstream_url = _normalize_lingjing_openapi_upstream_url(
@@ -4003,7 +4322,7 @@ class LingjingOpenapiHandler:
                 query=_lingjing_upstream_query(http_request.url.query),
             )
             if not upstream_url:
-                raise HTTPException(status_code=400, detail=f"{LINGJING_OPENAPI_ENDPOINT_PREFIX} requires provider base_url")
+                raise HTTPException(status_code=400, detail=f"{endpoint} requires provider base_url")
 
             proxy = safe_get(config, "preferences", "proxy", default=None)
             proxy = safe_get(provider, "preferences", "proxy", default=proxy)
@@ -4045,7 +4364,7 @@ class LingjingOpenapiHandler:
 
             trace_logger.info(
                 "endpoint=%s method=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
-                LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                endpoint,
                 method_upper,
                 request_id,
                 channel_id[:11],
@@ -4060,7 +4379,7 @@ class LingjingOpenapiHandler:
             _log_debug_request_headers(
                 "DEBUG upstream request headers",
                 headers,
-                endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                endpoint=endpoint,
                 upstream_url=upstream_url,
                 provider=channel_id,
                 model=request_model_name,
@@ -4070,7 +4389,7 @@ class LingjingOpenapiHandler:
                 _log_debug_request_body(
                     "DEBUG upstream request body",
                     outbound_payload,
-                    endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                    endpoint=endpoint,
                     upstream_url=upstream_url,
                     provider=channel_id,
                     model=request_model_name,
@@ -4129,7 +4448,7 @@ class LingjingOpenapiHandler:
                 )
             trace_logger.error(
                 "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
-                LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                endpoint,
                 status_code,
                 type(exc).__name__,
                 request_id,
@@ -4183,7 +4502,7 @@ class LingjingOpenapiHandler:
 model_handler = ModelRequestHandler()
 responses_handler = ResponsesRequestHandler()
 messages_handler = MessagesPassthroughHandler()
-content_generation_tasks_handler = ContentGenerationTaskHandler()
+video_task_handler = VideoTaskHandler()
 lingjing_openapi_handler = LingjingOpenapiHandler()
 
 security = HTTPBearer()
@@ -4315,29 +4634,29 @@ async def images_generations(
 ):
     return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/generations")
 
-@app.post("/v1/contents/generations/tasks", dependencies=[Depends(rate_limit_dependency)])
-async def content_generation_tasks_create(
+@app.post("/v1/video/tasks", dependencies=[Depends(rate_limit_dependency)])
+async def video_tasks_create(
     http_request: Request,
     background_tasks: BackgroundTasks,
     request_body: dict[str, Any] = Body(...),
     api_index: int = Depends(verify_api_key),
 ):
-    return await content_generation_tasks_handler.create_task(
+    return await video_task_handler.create_task(
         http_request,
         request_body,
         api_index,
         background_tasks,
     )
 
-@app.get("/v1/contents/generations/tasks/{task_id}", dependencies=[Depends(rate_limit_dependency)])
-async def content_generation_tasks_get(
+@app.get("/v1/video/tasks/{task_id}", dependencies=[Depends(rate_limit_dependency)])
+async def video_tasks_get(
     http_request: Request,
     task_id: str,
     background_tasks: BackgroundTasks,
     model: Optional[str] = Query(None),
     api_index: int = Depends(verify_api_key),
 ):
-    return await content_generation_tasks_handler.get_or_delete_task(
+    return await video_task_handler.get_or_delete_task(
         http_request,
         task_id,
         api_index,
@@ -4346,25 +4665,8 @@ async def content_generation_tasks_get(
         model=model,
     )
 
-@app.delete("/v1/contents/generations/tasks/{task_id}", dependencies=[Depends(rate_limit_dependency)])
-async def content_generation_tasks_delete(
-    http_request: Request,
-    task_id: str,
-    background_tasks: BackgroundTasks,
-    model: Optional[str] = Query(None),
-    api_index: int = Depends(verify_api_key),
-):
-    return await content_generation_tasks_handler.get_or_delete_task(
-        http_request,
-        task_id,
-        api_index,
-        background_tasks,
-        method="DELETE",
-        model=model,
-    )
-
-@app.post("/v1/openapi/material/asset-groups", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_material_asset_groups_create(
+@app.post("/v1/asset-groups", dependencies=[Depends(rate_limit_dependency)])
+async def asset_groups_create(
     http_request: Request,
     background_tasks: BackgroundTasks,
     request_body: dict[str, Any] = Body(...),
@@ -4377,10 +4679,11 @@ async def lingjing_material_asset_groups_create(
         background_tasks,
         method="POST",
         openapi_path="/material/asset-groups",
+        endpoint=VIDEO_ASSET_GROUPS_ENDPOINT,
     )
 
-@app.get("/v1/openapi/material/asset-groups/{group_id}", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_material_asset_group_get(
+@app.get("/v1/asset-groups/{group_id}", dependencies=[Depends(rate_limit_dependency)])
+async def asset_group_get(
     http_request: Request,
     group_id: str,
     background_tasks: BackgroundTasks,
@@ -4393,27 +4696,11 @@ async def lingjing_material_asset_group_get(
         background_tasks,
         method="GET",
         openapi_path=f"/material/asset-groups/{quote(group_id, safe='')}",
+        endpoint=VIDEO_ASSET_GROUPS_ENDPOINT,
     )
 
-@app.put("/v1/openapi/material/asset-groups/{group_id}", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_material_asset_group_update(
-    http_request: Request,
-    group_id: str,
-    background_tasks: BackgroundTasks,
-    request_body: dict[str, Any] = Body(...),
-    api_index: int = Depends(verify_api_key),
-):
-    return await lingjing_openapi_handler.request_openapi(
-        http_request,
-        request_body,
-        api_index,
-        background_tasks,
-        method="PUT",
-        openapi_path=f"/material/asset-groups/{quote(group_id, safe='')}",
-    )
-
-@app.post("/v1/openapi/material/assets/create", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_material_assets_create(
+@app.post("/v1/assets", dependencies=[Depends(rate_limit_dependency)])
+async def assets_create(
     http_request: Request,
     background_tasks: BackgroundTasks,
     request_body: dict[str, Any] = Body(...),
@@ -4426,10 +4713,11 @@ async def lingjing_material_assets_create(
         background_tasks,
         method="POST",
         openapi_path="/material/assets/create",
+        endpoint=VIDEO_ASSETS_ENDPOINT,
     )
 
-@app.get("/v1/openapi/material/assets/{asset_id}", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_material_asset_get(
+@app.get("/v1/assets/{asset_id}", dependencies=[Depends(rate_limit_dependency)])
+async def asset_get(
     http_request: Request,
     asset_id: str,
     background_tasks: BackgroundTasks,
@@ -4442,54 +4730,7 @@ async def lingjing_material_asset_get(
         background_tasks,
         method="GET",
         openapi_path=f"/material/assets/{quote(asset_id, safe='')}",
-    )
-
-@app.put("/v1/openapi/material/assets/{asset_id}", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_material_asset_update(
-    http_request: Request,
-    asset_id: str,
-    background_tasks: BackgroundTasks,
-    request_body: dict[str, Any] = Body(...),
-    api_index: int = Depends(verify_api_key),
-):
-    return await lingjing_openapi_handler.request_openapi(
-        http_request,
-        request_body,
-        api_index,
-        background_tasks,
-        method="PUT",
-        openapi_path=f"/material/assets/{quote(asset_id, safe='')}",
-    )
-
-@app.post("/v1/openapi/draw/task/submit", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_draw_task_submit(
-    http_request: Request,
-    background_tasks: BackgroundTasks,
-    request_body: dict[str, Any] = Body(...),
-    api_index: int = Depends(verify_api_key),
-):
-    return await lingjing_openapi_handler.request_openapi(
-        http_request,
-        request_body,
-        api_index,
-        background_tasks,
-        method="POST",
-        openapi_path="/draw/task/submit",
-    )
-
-@app.get("/v1/openapi/draw/task/query", dependencies=[Depends(rate_limit_dependency)])
-async def lingjing_draw_task_query(
-    http_request: Request,
-    background_tasks: BackgroundTasks,
-    api_index: int = Depends(verify_api_key),
-):
-    return await lingjing_openapi_handler.request_openapi(
-        http_request,
-        None,
-        api_index,
-        background_tasks,
-        method="GET",
-        openapi_path="/draw/task/query",
+        endpoint=VIDEO_ASSETS_ENDPOINT,
     )
 
 def _is_form_upload(value: Any) -> bool:
