@@ -408,6 +408,8 @@ def test_lingjing_content_generation_uses_x_keys_and_normalizes_responses(monkey
     assert query_body["status"] == "succeeded"
     assert query_body["provider"] == "lingjing"
     assert query_body["video"]["url"] == "https://example.com/out.mp4"
+    assert query_body["usage"]["video_tokens"] == 108900
+    assert query_body["usage"]["total_tokens"] == 108900
     query_call = main.app.state.client_manager.calls[-1]
     assert query_call["url"] == "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/query?taskId=task-lj"
     assert query_call["headers"]["X-Access-Key"] == "ak-test"

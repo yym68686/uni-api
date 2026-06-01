@@ -2365,6 +2365,44 @@ def _usage_to_video_usage(usage: Any) -> Optional[dict[str, Any]]:
         normalized.setdefault(key, value)
     return normalized or None
 
+def _positive_int_from_video_value(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(float(str(value).strip().rstrip("pP")))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+def _video_resolution_height(request_body: dict[str, Any]) -> int:
+    quality = request_body.get("quality")
+    if quality is None:
+        quality = request_body.get("resolution")
+    return _positive_int_from_video_value(quality) or 720
+
+def _estimated_video_usage_from_request(request_body: Optional[dict[str, Any]]) -> Optional[dict[str, int]]:
+    if not isinstance(request_body, dict):
+        return None
+
+    duration = _positive_int_from_video_value(request_body.get("duration")) or 5
+    fps = (
+        _positive_int_from_video_value(request_body.get("fps"))
+        or _positive_int_from_video_value(request_body.get("framespersecond"))
+        or 24
+    )
+    resolution_height = _video_resolution_height(request_body)
+
+    # Matches upstream token accounting for 720p Seedance 2.0 videos:
+    # 5 seconds * 24 fps => 108900 video tokens.
+    tokens_per_frame_720p = 907.5
+    resolution_scale = (resolution_height / 720) ** 2
+    video_tokens = max(1, int(round(duration * fps * tokens_per_frame_720p * resolution_scale)))
+    return {
+        "video_tokens": video_tokens,
+        "completion_tokens": video_tokens,
+        "total_tokens": video_tokens,
+    }
+
 def _normalize_video_task_response(
     *,
     method: str,
@@ -2373,6 +2411,7 @@ def _normalize_video_task_response(
     request_model_name: str,
     provider_name: str,
     is_lingjing: bool,
+    estimated_usage: Optional[dict[str, Any]] = None,
 ) -> tuple[bytes, Optional[str]]:
     obj = _maybe_json_object(raw)
     if not obj:
@@ -2408,6 +2447,8 @@ def _normalize_video_task_response(
             if result_url:
                 normalized["video"]["url"] = result_url
             usage = _usage_to_video_usage(data.get("usage") if isinstance(data, dict) else None)
+            if not usage and normalized["status"] == "succeeded":
+                usage = _usage_to_video_usage(estimated_usage)
             if usage:
                 normalized["usage"] = usage
             if data.get("external_error"):
@@ -2458,6 +2499,8 @@ def _normalize_video_task_response(
             "video": video,
         }
         usage = _usage_to_video_usage(obj.get("usage"))
+        if not usage and normalized["status"] == "succeeded":
+            usage = _usage_to_video_usage(estimated_usage)
         if usage:
             normalized["usage"] = usage
         for key in ("created_at", "updated_at", "seed"):
@@ -3647,6 +3690,7 @@ class VideoTaskHandler:
         provider_name: str,
         provider_api_key_raw: Optional[str],
         client_api_key: Optional[str],
+        estimated_usage: Optional[dict[str, Any]] = None,
     ) -> None:
         if not task_id:
             return
@@ -3659,6 +3703,7 @@ class VideoTaskHandler:
             "provider_name": provider_name,
             "provider_api_key_raw": provider_api_key_raw,
             "client_api_key": client_api_key,
+            "estimated_usage": estimated_usage,
         }
 
     def _resolve_task_route(self, task_id: str, client_api_key: Optional[str]) -> Optional[dict[str, Any]]:
@@ -3840,6 +3885,7 @@ class VideoTaskHandler:
                 request_model_name=request_model_name,
                 provider_name=provider_name,
                 is_lingjing=is_lingjing,
+                estimated_usage=route.get("estimated_usage"),
             )
             if _maybe_json_object(raw):
                 response_media_type = "application/json"
@@ -4125,6 +4171,7 @@ class VideoTaskHandler:
                     provider_name=provider_name,
                     provider_api_key_raw=attempt.provider_api_key_raw,
                     client_api_key=current_info.get("api_key"),
+                    estimated_usage=_estimated_video_usage_from_request(request_body),
                 )
             if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                 if self._is_non_retryable_client_error(upstream_resp.status_code):
