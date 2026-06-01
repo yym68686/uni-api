@@ -12,7 +12,7 @@ import asyncio
 from asyncio import Semaphore
 import contextvars
 from time import time
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
@@ -980,36 +980,54 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     else:
                         moderated_content = None
                 else:
-                    request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
-                    request_model = request_model.data
-                    model = request_model.model
-                    current_info["model"] = model
-
-                    try:
-                        await app.state.user_api_keys_rate_limit[final_api_key].next(model)
-                    except Exception:
-                        return JSONResponse(
-                            status_code=429,
-                            content={"error": "Too many requests"}
+                    if request.url.path.startswith(LINGJING_OPENAPI_ENDPOINT_PREFIX):
+                        model = _lingjing_request_model_for_openapi(
+                            parsed_body if isinstance(parsed_body, dict) else None,
+                            request.query_params,
                         )
+                        current_info["model"] = model
 
-                    if request_model.request_type == "chat":
-                        moderated_content = request_model.get_last_text_message()
-                    elif request_model.request_type == "image":
-                        moderated_content = request_model.prompt
-                    elif request_model.request_type == "tts":
-                        moderated_content = request_model.input
-                    elif request_model.request_type == "moderation":
-                        pass
-                    elif request_model.request_type == "embedding":
-                        if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
-                            moderated_content = "\n".join(request_model.input)
-                        else:
-                            moderated_content = request_model.input
-                    elif request_model.request_type == "video":
-                        moderated_content = request_model.get_last_text_message()
+                        try:
+                            await app.state.user_api_keys_rate_limit[final_api_key].next(model)
+                        except Exception:
+                            return JSONResponse(
+                                status_code=429,
+                                content={"error": "Too many requests"}
+                            )
+
+                        if isinstance(parsed_body, dict):
+                            moderated_content = str(safe_get(parsed_body, "taskParams", "input", "prompt", default="") or "").strip()
                     else:
-                        logger.error(f"Unknown request type: {request_model.request_type}")
+                        request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
+                        request_model = request_model.data
+                        model = request_model.model
+                        current_info["model"] = model
+
+                        try:
+                            await app.state.user_api_keys_rate_limit[final_api_key].next(model)
+                        except Exception:
+                            return JSONResponse(
+                                status_code=429,
+                                content={"error": "Too many requests"}
+                            )
+
+                        if request_model.request_type == "chat":
+                            moderated_content = request_model.get_last_text_message()
+                        elif request_model.request_type == "image":
+                            moderated_content = request_model.prompt
+                        elif request_model.request_type == "tts":
+                            moderated_content = request_model.input
+                        elif request_model.request_type == "moderation":
+                            pass
+                        elif request_model.request_type == "embedding":
+                            if isinstance(request_model.input, list) and len(request_model.input) > 0 and isinstance(request_model.input[0], str):
+                                moderated_content = "\n".join(request_model.input)
+                            else:
+                                moderated_content = request_model.input
+                        elif request_model.request_type == "video":
+                            moderated_content = request_model.get_last_text_message()
+                        else:
+                            logger.error(f"Unknown request type: {request_model.request_type}")
 
                 if enable_moderation and moderated_content:
                     background_tasks_for_moderation = BackgroundTasks()
@@ -1866,6 +1884,9 @@ def _normalize_messages_upstream_url(base_url: str) -> str:
     return f"{base}/messages"
 
 CONTENT_GENERATION_TASKS_ENDPOINT = "/v1/contents/generations/tasks"
+LINGJING_OPENAPI_ENDPOINT_PREFIX = "/v1/openapi"
+LINGJING_UPSTREAM_OPENAPI_PREFIX = "/api/entrance/openapi"
+LINGJING_DEFAULT_REQUEST_MODEL = "seedance-2-0"
 
 def _normalize_content_generation_tasks_upstream_url(base_url: str, task_id: Optional[str] = None) -> str:
     base = (base_url or "").strip()
@@ -1885,6 +1906,298 @@ def _normalize_content_generation_tasks_upstream_url(base_url: str, task_id: Opt
     if task_id is not None:
         tasks_url = f"{tasks_url}/{quote(str(task_id), safe='')}"
     return tasks_url
+
+def _is_lingjing_provider(provider: dict) -> bool:
+    if str(provider.get("engine") or "").strip().lower() == "lingjing":
+        return True
+    parsed = urlparse(str(provider.get("base_url") or ""))
+    return parsed.netloc.endswith("lingjingai.cn")
+
+def _normalize_lingjing_openapi_upstream_url(base_url: str, openapi_path: str, query: str = "") -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return base
+
+    path = "/" + str(openapi_path or "").strip("/")
+    if not path.startswith("/openapi/"):
+        path = "/openapi" + path
+
+    parsed = urlparse(base)
+    base_path = parsed.path.rstrip("/")
+    if base_path.endswith("/api/entrance/openapi"):
+        upstream_path = base_path + path[len("/openapi"):]
+    elif base_path.endswith("/api/entrance"):
+        upstream_path = base_path + path
+    else:
+        upstream_path = base_path + LINGJING_UPSTREAM_OPENAPI_PREFIX + path[len("/openapi"):]
+
+    url = urlunparse(parsed[:2] + (upstream_path,) + ("",) * 3)
+    return f"{url}?{query}" if query else url
+
+def _lingjing_upstream_query(raw_query: str) -> str:
+    pairs = parse_qsl(raw_query or "", keep_blank_values=True)
+    filtered = [(key, value) for key, value in pairs if key not in {"model", "request_model"}]
+    return urlencode(filtered, doseq=True)
+
+def _normalize_lingjing_draw_task_upstream_url(base_url: str, *, method: str, task_id: Optional[str] = None) -> str:
+    if method.upper() == "POST":
+        return _normalize_lingjing_openapi_upstream_url(base_url, "/draw/task/submit")
+    if method.upper() == "GET":
+        if not task_id:
+            return _normalize_lingjing_openapi_upstream_url(base_url, "/draw/task/query")
+        return _normalize_lingjing_openapi_upstream_url(
+            base_url,
+            "/draw/task/query",
+            query=f"taskId={quote(str(task_id), safe='')}",
+        )
+    return ""
+
+def _parse_lingjing_credentials(provider: dict, provider_api_key_raw: Optional[str]) -> tuple[str, str]:
+    access_key = str(safe_get(provider, "preferences", "access_key", default="") or "").strip()
+    secret_key = str(safe_get(provider, "preferences", "secret_key", default="") or "").strip()
+    raw = str(provider_api_key_raw or "").strip()
+
+    if (not access_key or not secret_key) and raw:
+        if raw.startswith("{"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    access_key = access_key or str(parsed.get("access_key") or parsed.get("accessKey") or "").strip()
+                    secret_key = secret_key or str(parsed.get("secret_key") or parsed.get("secretKey") or "").strip()
+            except Exception:
+                pass
+        for sep in (":", ",", "|"):
+            if access_key and secret_key:
+                break
+            if sep in raw:
+                left, right = raw.split(sep, 1)
+                access_key = access_key or left.strip()
+                secret_key = secret_key or right.strip()
+
+    if not access_key or not secret_key:
+        raise HTTPException(status_code=400, detail="Lingjing provider requires access and secret keys")
+    return access_key, secret_key
+
+def _lingjing_headers(
+    provider: dict,
+    provider_api_key_raw: Optional[str],
+    *,
+    include_content_type: bool = False,
+) -> dict[str, str]:
+    access_key, secret_key = _parse_lingjing_credentials(provider, provider_api_key_raw)
+    headers: dict[str, str] = {
+        "X-Access-Key": access_key,
+        "X-Secret-Key": secret_key,
+    }
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+    return headers
+
+def _json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+
+def _maybe_json_object(raw: bytes) -> Optional[dict[str, Any]]:
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+def _lingjing_source_from_value(value: Any) -> dict[str, Any]:
+    raw = str(value or "").strip()
+    if raw.startswith("asset://"):
+        return {"kind": "asset_id", "value": raw[len("asset://"):]}
+    if raw.startswith("Asset-"):
+        return {"kind": "asset_id", "value": raw}
+    return {"kind": "url", "value": raw}
+
+def _extract_url_from_content_part(part: dict[str, Any], type_name: str) -> str:
+    value = part.get(type_name)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return str(value.get("url") or "").strip()
+    return ""
+
+def _lingjing_usage_from_role(role: Any, resource_type: str, resource_index: int) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized in {"first_frame", "last_frame", "reference", "keyframe", "source"}:
+        return normalized
+    if normalized in {"reference_image", "reference_video", "reference_audio"}:
+        return "reference"
+    if resource_type == "image" and resource_index == 0:
+        return "first_frame"
+    return "reference"
+
+def _convert_content_generation_body_to_lingjing(
+    request_body: dict[str, Any],
+    *,
+    model_code: str,
+) -> dict[str, Any]:
+    if "taskParams" in request_body or "modelCode" in request_body:
+        payload = dict(request_body)
+        payload["modelCode"] = model_code
+        return payload
+
+    prompt_parts: list[str] = []
+    resources: list[dict[str, Any]] = []
+    content = request_body.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "").strip()
+            if part_type == "text":
+                text = str(part.get("text") or "").strip()
+                if text:
+                    prompt_parts.append(text)
+                continue
+
+            resource_type = ""
+            url = ""
+            if part_type == "image_url":
+                resource_type = "image"
+                url = _extract_url_from_content_part(part, "image_url")
+            elif part_type == "video_url":
+                resource_type = "video"
+                url = _extract_url_from_content_part(part, "video_url")
+            elif part_type == "audio_url":
+                resource_type = "audio"
+                url = _extract_url_from_content_part(part, "audio_url")
+
+            if resource_type and url:
+                resource: dict[str, Any] = {
+                    "type": resource_type,
+                    "usage": _lingjing_usage_from_role(part.get("role"), resource_type, len(resources)),
+                    "source": _lingjing_source_from_value(url),
+                }
+                reference_key = part.get("reference_key")
+                if reference_key:
+                    resource["reference_key"] = reference_key
+                resources.append(resource)
+
+    input_payload: dict[str, Any] = {
+        "prompt": str(request_body.get("prompt") or "\n".join(prompt_parts)).strip(),
+    }
+
+    quality = request_body.get("quality")
+    if quality is None:
+        resolution = str(request_body.get("resolution") or "").strip().lower()
+        quality = resolution[:-1] if resolution.endswith("p") else resolution
+    if quality:
+        input_payload["quality"] = str(quality)
+
+    for key in ("duration", "ratio", "resources", "generate_num", "prompt_optimizer"):
+        if key in request_body and request_body.get(key) is not None:
+            input_payload[key] = request_body[key]
+    if "resources" not in input_payload and resources:
+        input_payload["resources"] = resources
+    if "generate_audio" in request_body:
+        input_payload["need_audio"] = bool(request_body.get("generate_audio"))
+    if "need_audio" in request_body:
+        input_payload["need_audio"] = bool(request_body.get("need_audio"))
+
+    return {"modelCode": model_code, "taskParams": {"input": input_payload}}
+
+def _lingjing_task_id_from_submit_response(obj: dict[str, Any]) -> Optional[str]:
+    data = obj.get("data")
+    if isinstance(data, dict):
+        for key in ("taskId", "task_id"):
+            value = data.get(key)
+            if value:
+                return str(value)
+    return None
+
+def _lingjing_status_to_content_status(status: Any) -> str:
+    normalized = str(status or "").strip().upper()
+    if normalized == "SUCCESS":
+        return "succeeded"
+    if normalized == "CANCELED":
+        return "cancelled"
+    if normalized in {"FAIL", "FAILED", "UNKNOWN"}:
+        return "failed"
+    if normalized in {"WAITING", "QUEUED", "SUBMITTED", "RUNNING"}:
+        return "running"
+    return normalized.lower() if normalized else "running"
+
+def _first_lingjing_result_url(result: Any) -> Optional[str]:
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict) and item.get("url"):
+                return str(item["url"])
+    if isinstance(result, dict) and result.get("url"):
+        return str(result["url"])
+    return None
+
+def _normalize_lingjing_content_generation_response(
+    *,
+    method: str,
+    raw: bytes,
+    task_id: Optional[str],
+    request_model_name: str,
+) -> tuple[bytes, Optional[str]]:
+    obj = _maybe_json_object(raw)
+    if not obj:
+        return raw, None
+
+    if method.upper() == "POST":
+        upstream_task_id = _lingjing_task_id_from_submit_response(obj)
+        if not upstream_task_id:
+            return raw, None
+        return _json_bytes(
+            {
+                "id": upstream_task_id,
+                "model": request_model_name,
+                "status": "queued",
+                "created_at": int(time()),
+                "upstream": obj,
+            }
+        ), upstream_task_id
+
+    if method.upper() == "GET":
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        upstream_task_id = str(data.get("task_id") or task_id or "")
+        result_url = _first_lingjing_result_url(data.get("result"))
+        content: dict[str, Any] = {}
+        if result_url:
+            content["video_url"] = result_url
+        normalized: dict[str, Any] = {
+            "id": upstream_task_id,
+            "model": request_model_name,
+            "status": _lingjing_status_to_content_status(data.get("status")),
+            "content": content,
+            "upstream": obj,
+        }
+        if data.get("external_error"):
+            normalized["error"] = {"message": data.get("external_error")}
+        return _json_bytes(normalized), upstream_task_id or None
+
+    return raw, None
+
+def _lingjing_request_model_for_openapi(payload: Optional[dict[str, Any]], query_params: Any = None) -> str:
+    if query_params is not None:
+        raw_model = query_params.get("model")
+        if raw_model:
+            return str(raw_model).strip()
+
+    body = payload or {}
+    raw_model = body.get("model") or body.get("request_model")
+    if raw_model:
+        return str(raw_model).strip()
+
+    model_code = str(body.get("modelCode") or "").strip()
+    model_code_map = {
+        "sd_2_0": "seedance-2-0",
+        "sd_2_0_fast": "seedance-2-0-fast",
+    }
+    if model_code:
+        request_model = model_code_map.get(model_code)
+        if not request_model:
+            raise HTTPException(status_code=400, detail=f"Unsupported Lingjing modelCode: {model_code}")
+        return request_model
+
+    return LINGJING_DEFAULT_REQUEST_MODEL
 
 HOP_BY_HOP_RESPONSE_HEADERS = {
     "connection",
@@ -3068,13 +3381,16 @@ class ContentGenerationTaskHandler:
         self,
         upstream_resp: httpx.Response,
         raw: bytes,
+        media_type: Optional[str] = None,
     ) -> Response:
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        if media_type:
+            response_headers["content-type"] = media_type
         return Response(
             content=raw,
             status_code=upstream_resp.status_code,
             headers=response_headers,
-            media_type=response_headers.get("content-type", "application/json"),
+            media_type=media_type or response_headers.get("content-type", "application/json"),
         )
 
     def _is_non_retryable_client_error(self, status_code: int) -> bool:
@@ -3096,6 +3412,9 @@ class ContentGenerationTaskHandler:
                 return await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
             if method == "GET":
                 return await client.get(upstream_url, headers=headers, timeout=timeout_value)
+            if method == "PUT":
+                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                return await client.put(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
             if method == "DELETE":
                 return await client.delete(upstream_url, headers=headers, timeout=timeout_value)
         raise HTTPException(status_code=405, detail=f"Unsupported method: {method}")
@@ -3148,11 +3467,22 @@ class ContentGenerationTaskHandler:
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
-        upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
-        headers = {}
-        if provider_api_key_raw:
-            headers["Authorization"] = f"Bearer {provider_api_key_raw}"
-        headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+        is_lingjing = _is_lingjing_provider(provider)
+        if is_lingjing:
+            if method == "DELETE":
+                raise HTTPException(status_code=405, detail="Lingjing content generation tasks do not support DELETE")
+            upstream_url = _normalize_lingjing_draw_task_upstream_url(
+                provider.get("base_url", ""),
+                method=method,
+                task_id=task_id,
+            )
+            headers = _lingjing_headers(provider, provider_api_key_raw)
+        else:
+            upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
+            headers = {}
+            if provider_api_key_raw:
+                headers["Authorization"] = f"Bearer {provider_api_key_raw}"
+            headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
         channel_id = f"{provider_name}"
 
         trace_logger.info(
@@ -3176,6 +3506,15 @@ class ContentGenerationTaskHandler:
                 timeout_value=int(timeout_value),
             )
             raw = upstream_resp.content
+            response_media_type = None
+            if is_lingjing:
+                raw, _ = _normalize_lingjing_content_generation_response(
+                    method=method,
+                    raw=raw,
+                    task_id=task_id,
+                    request_model_name=request_model_name,
+                )
+                response_media_type = "application/json"
             success = 200 <= upstream_resp.status_code < 300
             self._mark_result(
                 background_tasks=background_tasks,
@@ -3187,7 +3526,7 @@ class ContentGenerationTaskHandler:
             )
             if success and method == "DELETE":
                 self.task_routes.pop(task_id, None)
-            return self._raw_response(upstream_resp, raw)
+            return self._raw_response(upstream_resp, raw, media_type=response_media_type)
         except Exception:
             self._mark_result(
                 background_tasks=background_tasks,
@@ -3319,7 +3658,16 @@ class ContentGenerationTaskHandler:
                     detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} only supports upstream engine: content-generation (got {engine})",
                 )
 
-            upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
+            if _is_lingjing_provider(provider):
+                if method == "DELETE":
+                    raise HTTPException(status_code=405, detail="Lingjing content generation tasks do not support DELETE")
+                upstream_url = _normalize_lingjing_draw_task_upstream_url(
+                    provider.get("base_url", ""),
+                    method=method,
+                    task_id=task_id,
+                )
+            else:
+                upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
             if not upstream_url:
                 raise HTTPException(status_code=400, detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} requires provider base_url")
 
@@ -3352,19 +3700,29 @@ class ContentGenerationTaskHandler:
             timeout_value = attempt.state["timeout_value"]
             upstream_url = attempt.state["upstream_url"]
             channel_id = attempt.state["channel_id"]
+            is_lingjing = _is_lingjing_provider(provider)
 
             payload = None
             if request_body is not None:
-                payload = dict(request_body)
-                payload["model"] = original_model
-                apply_post_body_parameter_overrides(payload, provider, request_model_name)
+                if is_lingjing:
+                    payload = _convert_content_generation_body_to_lingjing(
+                        request_body,
+                        model_code=str(original_model),
+                    )
+                else:
+                    payload = dict(request_body)
+                    payload["model"] = original_model
+                    apply_post_body_parameter_overrides(payload, provider, request_model_name)
 
-            headers = {}
-            if method == "POST":
-                headers["Content-Type"] = "application/json"
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+            if is_lingjing:
+                headers = _lingjing_headers(provider, api_key, include_content_type=method == "POST")
+            else:
+                headers = {}
+                if method == "POST":
+                    headers["Content-Type"] = "application/json"
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
 
             logger.info(
                 "provider: %-11s model: %-22s engine: %-13s role: %s",
@@ -3416,6 +3774,25 @@ class ContentGenerationTaskHandler:
                 timeout_value=timeout_value,
             )
             raw = upstream_resp.content
+            response_media_type = None
+            if is_lingjing:
+                raw, lingjing_task_id = _normalize_lingjing_content_generation_response(
+                    method=method,
+                    raw=raw,
+                    task_id=task_id,
+                    request_model_name=request_model_name,
+                )
+                if method == "POST" and lingjing_task_id:
+                    self._remember_task_route(
+                        task_id=lingjing_task_id,
+                        request_model_name=request_model_name,
+                        original_model=original_model,
+                        provider=provider,
+                        provider_name=provider_name,
+                        provider_api_key_raw=attempt.provider_api_key_raw,
+                        client_api_key=current_info.get("api_key"),
+                    )
+                response_media_type = "application/json"
             if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                 if self._is_non_retryable_client_error(upstream_resp.status_code):
                     self._mark_result(
@@ -3426,7 +3803,7 @@ class ContentGenerationTaskHandler:
                         success=False,
                         provider_api_key_raw=attempt.provider_api_key_raw,
                     )
-                    return self._raw_response(upstream_resp, raw)
+                    return self._raw_response(upstream_resp, raw, media_type=response_media_type)
 
                 last_error_response.clear()
                 last_error_response.update(
@@ -3440,7 +3817,7 @@ class ContentGenerationTaskHandler:
                     detail=raw.decode("utf-8", errors="replace"),
                 )
 
-            if method == "POST":
+            if method == "POST" and not is_lingjing:
                 try:
                     response_json = upstream_resp.json()
                 except Exception:
@@ -3466,7 +3843,7 @@ class ContentGenerationTaskHandler:
                 success=True,
                 provider_api_key_raw=attempt.provider_api_key_raw,
             )
-            return self._raw_response(upstream_resp, raw)
+            return self._raw_response(upstream_resp, raw, media_type=response_media_type)
 
         def after_failure(attempt, exc, status_code, error_message):
             if attempt.state.get("track_channel_stats"):
@@ -3536,10 +3913,278 @@ class ContentGenerationTaskHandler:
             should_cool_down=should_cool_down,
         )
 
+class LingjingOpenapiHandler:
+    def __init__(self):
+        self.last_provider_indices = defaultdict(lambda: -1)
+        self.locks = defaultdict(asyncio.Lock)
+
+    async def _send_upstream(
+        self,
+        *,
+        method: str,
+        upstream_url: str,
+        headers: dict[str, str],
+        payload: Optional[dict[str, Any]],
+        proxy: Optional[str],
+        timeout_value: int,
+    ) -> httpx.Response:
+        async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+            if method == "GET":
+                return await client.get(upstream_url, headers=headers, timeout=timeout_value)
+            if method == "POST":
+                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                return await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+            if method == "PUT":
+                json_payload = await asyncio.to_thread(json.dumps, payload or {})
+                return await client.put(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+        raise HTTPException(status_code=405, detail=f"Unsupported method: {method}")
+
+    def _raw_response(self, upstream_resp: httpx.Response) -> Response:
+        response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=response_headers,
+            media_type=response_headers.get("content-type", "application/json"),
+        )
+
+    async def request_openapi(
+        self,
+        http_request: Request,
+        request_body: Optional[dict[str, Any]],
+        api_index: int,
+        background_tasks: BackgroundTasks,
+        *,
+        method: str,
+        openapi_path: str,
+    ) -> Response:
+        method_upper = method.upper()
+        payload = request_body if isinstance(request_body, dict) else None
+        request_model_name = _lingjing_request_model_for_openapi(payload, http_request.query_params)
+        if not request_model_name:
+            raise HTTPException(status_code=422, detail="Request requires a model")
+
+        config = app.state.config
+        current_info = request_info.get()
+        current_info["model"] = current_info.get("model") or request_model_name
+        request_id = _responses_request_id(current_info)
+
+        plan = await RoutingPlan.create(
+            app,
+            request_model_name,
+            api_index,
+            self.last_provider_indices,
+            self.locks,
+            endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+            debug=is_debug,
+            provider_resolver=get_right_order_providers,
+        )
+        runner = UpstreamRunner(
+            plan,
+            endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+            debug=is_debug,
+        )
+        last_error_response: dict[str, Any] = {}
+
+        async def prepare_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            attempt.state["failure_stage"] = "validation"
+            if not _is_lingjing_provider(provider):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{LINGJING_OPENAPI_ENDPOINT_PREFIX} only supports Lingjing providers",
+                )
+
+            upstream_url = _normalize_lingjing_openapi_upstream_url(
+                provider.get("base_url", ""),
+                openapi_path,
+                query=_lingjing_upstream_query(http_request.url.query),
+            )
+            if not upstream_url:
+                raise HTTPException(status_code=400, detail=f"{LINGJING_OPENAPI_ENDPOINT_PREFIX} requires provider base_url")
+
+            proxy = safe_get(config, "preferences", "proxy", default=None)
+            proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+            channel_id = f"{provider_name}"
+
+            attempt.state["upstream_url"] = upstream_url
+            attempt.state["channel_id"] = channel_id
+            attempt.state["proxy"] = proxy
+            attempt.state["failure_stage"] = "auth"
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+
+            timeout_value = get_preference(
+                app.state.provider_timeouts,
+                provider_name,
+                (original_model, request_model_name),
+                DEFAULT_TIMEOUT,
+            )
+            attempt.state["api_key"] = attempt.provider_api_key_raw
+            attempt.state["timeout_value"] = int(timeout_value)
+
+        async def execute_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            proxy = attempt.state["proxy"]
+            api_key = attempt.state["api_key"]
+            timeout_value = attempt.state["timeout_value"]
+            upstream_url = attempt.state["upstream_url"]
+            channel_id = attempt.state["channel_id"]
+            headers = _lingjing_headers(provider, api_key, include_content_type=method_upper in {"POST", "PUT"})
+            outbound_payload = payload
+            if method_upper == "POST" and str(openapi_path or "").strip("/") == "draw/task/submit" and isinstance(payload, dict):
+                outbound_payload = dict(payload)
+                model_code = str(outbound_payload.get("modelCode") or "").strip()
+                if not model_code or model_code == request_model_name:
+                    outbound_payload["modelCode"] = original_model
+                outbound_payload.pop("model", None)
+                outbound_payload.pop("request_model", None)
+
+            trace_logger.info(
+                "endpoint=%s method=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
+                LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                method_upper,
+                request_id,
+                channel_id[:11],
+                request_model_name,
+                "lingjing",
+                plan.role,
+                upstream_url,
+            )
+            attempt.state["failure_stage"] = "upstream"
+            attempt.state["track_channel_stats"] = True
+
+            _log_debug_request_headers(
+                "DEBUG upstream request headers",
+                headers,
+                endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                upstream_url=upstream_url,
+                provider=channel_id,
+                model=request_model_name,
+                actual_model=original_model,
+            )
+            if outbound_payload is not None:
+                _log_debug_request_body(
+                    "DEBUG upstream request body",
+                    outbound_payload,
+                    endpoint=LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                    upstream_url=upstream_url,
+                    provider=channel_id,
+                    model=request_model_name,
+                    actual_model=original_model,
+                )
+
+            upstream_resp = await self._send_upstream(
+                method=method_upper,
+                upstream_url=upstream_url,
+                headers=headers,
+                payload=outbound_payload,
+                proxy=proxy,
+                timeout_value=timeout_value,
+            )
+            success = 200 <= upstream_resp.status_code < 300
+            current_info["first_response_time"] = 0 if success else -1
+            current_info["success"] = success
+            current_info["provider"] = channel_id if success else None
+            background_tasks.add_task(
+                update_channel_stats,
+                current_info["request_id"],
+                channel_id,
+                request_model_name,
+                current_info["api_key"],
+                success=success,
+                provider_api_key=attempt.provider_api_key_raw,
+            )
+
+            if not success:
+                if 400 <= upstream_resp.status_code < 500 and upstream_resp.status_code not in (408, 409, 425, 429):
+                    return self._raw_response(upstream_resp)
+                last_error_response.clear()
+                last_error_response.update(
+                    {
+                        "body": upstream_resp.content,
+                        "headers": _copy_upstream_response_headers(upstream_resp.headers),
+                    }
+                )
+                raise HTTPException(
+                    status_code=upstream_resp.status_code,
+                    detail=upstream_resp.content.decode("utf-8", errors="replace"),
+                )
+
+            return self._raw_response(upstream_resp)
+
+        def after_failure(attempt, exc, status_code, error_message):
+            if attempt.state.get("track_channel_stats"):
+                background_tasks.add_task(
+                    update_channel_stats,
+                    current_info["request_id"],
+                    attempt.state["channel_id"],
+                    request_model_name,
+                    current_info["api_key"],
+                    success=False,
+                    provider_api_key=attempt.provider_api_key_raw,
+                )
+            trace_logger.error(
+                "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                LINGJING_OPENAPI_ENDPOINT_PREFIX,
+                status_code,
+                type(exc).__name__,
+                request_id,
+                request_model_name,
+                attempt.state.get("channel_id", attempt.provider_name),
+                attempt.provider_api_key_raw,
+                attempt.state.get("upstream_url", ""),
+                error_message,
+            )
+
+        def should_cool_down(exc, status_code, error_message, attempt):
+            _ = exc, error_message, attempt
+            return status_code in (401, 403, 429) or status_code >= 500
+
+        def build_error_response(status_code, error_message):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            if last_error_response.get("body") is not None:
+                headers = last_error_response.get("headers") or {}
+                return Response(
+                    content=last_error_response["body"],
+                    status_code=status_code,
+                    headers=headers,
+                    media_type=headers.get("content-type", "application/json"),
+                )
+            return build_upstream_error_response(
+                status_code=status_code,
+                error_message=error_message,
+                fallback_prefix="Error: Current provider response failed",
+            )
+
+        def build_final_response(completed_plan):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            return JSONResponse(
+                status_code=completed_plan.status_code,
+                content={"error": f"All {request_model_name} error: {completed_plan.error_message}"},
+            )
+
+        return await runner.run(
+            execute_attempt,
+            prepare_attempt=prepare_attempt,
+            after_failure=after_failure,
+            build_error_response=build_error_response,
+            build_final_response=build_final_response,
+            should_cool_down=should_cool_down,
+        )
+
 model_handler = ModelRequestHandler()
 responses_handler = ResponsesRequestHandler()
 messages_handler = MessagesPassthroughHandler()
 content_generation_tasks_handler = ContentGenerationTaskHandler()
+lingjing_openapi_handler = LingjingOpenapiHandler()
 
 security = HTTPBearer()
 
@@ -3716,6 +4361,135 @@ async def content_generation_tasks_delete(
         background_tasks,
         method="DELETE",
         model=model,
+    )
+
+@app.post("/v1/openapi/material/asset-groups", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_material_asset_groups_create(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    request_body: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        request_body,
+        api_index,
+        background_tasks,
+        method="POST",
+        openapi_path="/material/asset-groups",
+    )
+
+@app.get("/v1/openapi/material/asset-groups/{group_id}", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_material_asset_group_get(
+    http_request: Request,
+    group_id: str,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        None,
+        api_index,
+        background_tasks,
+        method="GET",
+        openapi_path=f"/material/asset-groups/{quote(group_id, safe='')}",
+    )
+
+@app.put("/v1/openapi/material/asset-groups/{group_id}", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_material_asset_group_update(
+    http_request: Request,
+    group_id: str,
+    background_tasks: BackgroundTasks,
+    request_body: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        request_body,
+        api_index,
+        background_tasks,
+        method="PUT",
+        openapi_path=f"/material/asset-groups/{quote(group_id, safe='')}",
+    )
+
+@app.post("/v1/openapi/material/assets/create", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_material_assets_create(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    request_body: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        request_body,
+        api_index,
+        background_tasks,
+        method="POST",
+        openapi_path="/material/assets/create",
+    )
+
+@app.get("/v1/openapi/material/assets/{asset_id}", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_material_asset_get(
+    http_request: Request,
+    asset_id: str,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        None,
+        api_index,
+        background_tasks,
+        method="GET",
+        openapi_path=f"/material/assets/{quote(asset_id, safe='')}",
+    )
+
+@app.put("/v1/openapi/material/assets/{asset_id}", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_material_asset_update(
+    http_request: Request,
+    asset_id: str,
+    background_tasks: BackgroundTasks,
+    request_body: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        request_body,
+        api_index,
+        background_tasks,
+        method="PUT",
+        openapi_path=f"/material/assets/{quote(asset_id, safe='')}",
+    )
+
+@app.post("/v1/openapi/draw/task/submit", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_draw_task_submit(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    request_body: dict[str, Any] = Body(...),
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        request_body,
+        api_index,
+        background_tasks,
+        method="POST",
+        openapi_path="/draw/task/submit",
+    )
+
+@app.get("/v1/openapi/draw/task/query", dependencies=[Depends(rate_limit_dependency)])
+async def lingjing_draw_task_query(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key),
+):
+    return await lingjing_openapi_handler.request_openapi(
+        http_request,
+        None,
+        api_index,
+        background_tasks,
+        method="GET",
+        openapi_path="/draw/task/query",
     )
 
 def _is_form_upload(value: Any) -> bool:

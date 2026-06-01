@@ -78,6 +78,18 @@ class DummyClient:
         )
         return self._pick_response(url)
 
+    async def put(self, url, headers=None, content=None, timeout=None):
+        self.calls.append(
+            {
+                "method": "PUT",
+                "url": url,
+                "headers": headers,
+                "content": content,
+                "timeout": timeout,
+            }
+        )
+        return self._pick_response(url)
+
 
 class DummyClientManager:
     def __init__(self, responses):
@@ -120,6 +132,50 @@ def _set_content_generation_state(monkeypatch, responses):
     main.app.state.channel_manager = None
     main.app.state.client_manager = DummyClientManager(responses)
     return provider_name
+
+
+def _set_lingjing_state(monkeypatch, responses):
+    provider_name = "lingjing"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["lingjing-primary"]))
+    main.app.state.config = {
+        "providers": [
+            {
+                "provider": provider_name,
+                "engine": "lingjing",
+                "base_url": "https://api-llm.lingjingai.cn",
+                "api": ["lingjing-primary"],
+                "model": [
+                    {"sd_2_0": "seedance-2-0"},
+                ],
+                "preferences": {
+                    "access_key": "ak-test",
+                    "secret_key": "sk-test-upstream",
+                },
+            }
+        ],
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["seedance-2-0"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ],
+    }
+    main.app.state.api_list = ["sk-test"]
+    main.app.state.models_list = {"sk-test": ["seedance-2-0"]}
+    main.app.state.routing_index = None
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.channel_manager = None
+    main.app.state.client_manager = DummyClientManager(responses)
+    return provider_name
+
+
+def _request_with_query(query=""):
+    return SimpleNamespace(
+        headers={},
+        query_params={},
+        url=SimpleNamespace(query=query),
+    )
 
 
 def _run_with_request_info(coro):
@@ -267,3 +323,156 @@ def test_content_generation_delete_removes_remembered_route(monkeypatch):
     assert response.status_code == 200
     assert "cgt-test" not in handler.task_routes
     assert main.app.state.client_manager.calls[-1]["method"] == "DELETE"
+
+
+def test_lingjing_content_generation_uses_x_keys_and_normalizes_responses(monkeypatch):
+    responses = {
+        "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/submit": httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/submit"),
+            json={"code": 200, "msg": "OK", "data": {"taskId": "task-lj"}},
+        ),
+        "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/query?taskId=task-lj": httpx.Response(
+            200,
+            request=httpx.Request(
+                "GET",
+                "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/query?taskId=task-lj",
+            ),
+            json={
+                "code": 200,
+                "msg": "OK",
+                "data": {
+                    "task_id": "task-lj",
+                    "status": "SUCCESS",
+                    "result": [{"type": "video", "url": "https://example.com/out.mp4"}],
+                },
+            },
+        ),
+    }
+    _set_lingjing_state(monkeypatch, responses)
+    handler = main.ContentGenerationTaskHandler()
+
+    create_response = _run_with_request_info(
+        handler.create_task(
+            SimpleNamespace(headers={}),
+            {
+                "model": "seedance-2-0",
+                "content": [
+                    {"type": "text", "text": "一只橘猫在窗边晒太阳"},
+                    {"type": "image_url", "image_url": {"url": "asset://Asset-test"}, "role": "first_frame"},
+                ],
+                "ratio": "16:9",
+                "duration": 5,
+                "resolution": "720p",
+                "generate_audio": False,
+            },
+            0,
+            BackgroundTasks(),
+        )
+    )
+
+    assert create_response.status_code == 200
+    assert json.loads(create_response.body)["id"] == "task-lj"
+    submit_call = main.app.state.client_manager.calls[0]
+    assert submit_call["url"] == "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/submit"
+    assert submit_call["headers"]["X-Access-Key"] == "ak-test"
+    assert submit_call["headers"]["X-Secret-Key"] == "sk-test-upstream"
+    assert "Authorization" not in submit_call["headers"]
+    submit_body = json.loads(submit_call["content"])
+    assert submit_body["modelCode"] == "sd_2_0"
+    assert submit_body["taskParams"]["input"]["quality"] == "720"
+    assert submit_body["taskParams"]["input"]["resources"][0]["source"] == {"kind": "asset_id", "value": "Asset-test"}
+    assert handler.task_routes["task-lj"]["provider_api_key_raw"] == "lingjing-primary"
+
+    query_response = _run_with_request_info(
+        handler.get_or_delete_task(
+            SimpleNamespace(headers={}),
+            "task-lj",
+            0,
+            BackgroundTasks(),
+            method="GET",
+        )
+    )
+
+    query_body = json.loads(query_response.body)
+    assert query_response.status_code == 200
+    assert query_body["status"] == "succeeded"
+    assert query_body["content"]["video_url"] == "https://example.com/out.mp4"
+    query_call = main.app.state.client_manager.calls[-1]
+    assert query_call["url"] == "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/query?taskId=task-lj"
+    assert query_call["headers"]["X-Access-Key"] == "ak-test"
+    assert "Authorization" not in query_call["headers"]
+
+
+def test_lingjing_openapi_material_endpoint_proxies_raw_response(monkeypatch):
+    upstream_url = "https://api-llm.lingjingai.cn/api/entrance/openapi/material/asset-groups"
+    _set_lingjing_state(
+        monkeypatch,
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", upstream_url),
+            json={"code": 200, "data": {"id": "Group-test"}},
+        ),
+    )
+    handler = main.LingjingOpenapiHandler()
+    body = {"platform": "BYTEPLUS", "name": "codex-test"}
+
+    response = _run_with_request_info(
+        handler.request_openapi(
+            _request_with_query(),
+            body,
+            0,
+            BackgroundTasks(),
+            method="POST",
+            openapi_path="/material/asset-groups",
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"code": 200, "data": {"id": "Group-test"}}
+    call = main.app.state.client_manager.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == upstream_url
+    assert call["headers"]["X-Access-Key"] == "ak-test"
+    assert call["headers"]["X-Secret-Key"] == "sk-test-upstream"
+    assert "Authorization" not in call["headers"]
+    assert json.loads(call["content"]) == body
+
+
+def test_lingjing_openapi_draw_submit_accepts_request_model_alias(monkeypatch):
+    upstream_url = "https://api-llm.lingjingai.cn/api/entrance/openapi/draw/task/submit"
+    _set_lingjing_state(
+        monkeypatch,
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", upstream_url),
+            json={"code": 200, "data": {"taskId": "task-lj"}},
+        ),
+    )
+    handler = main.LingjingOpenapiHandler()
+
+    response = _run_with_request_info(
+        handler.request_openapi(
+            _request_with_query(),
+            {
+                "model": "seedance-2-0",
+                "taskParams": {"input": {"prompt": "测试视频", "quality": "480", "duration": 4, "ratio": "16:9"}},
+            },
+            0,
+            BackgroundTasks(),
+            method="POST",
+            openapi_path="/draw/task/submit",
+        )
+    )
+
+    assert response.status_code == 200
+    submit_body = json.loads(main.app.state.client_manager.calls[0]["content"])
+    assert submit_body["modelCode"] == "sd_2_0"
+    assert "model" not in submit_body
+
+
+def test_lingjing_upstream_query_strips_routing_only_model():
+    assert (
+        main._lingjing_upstream_query("platform=BYTEPLUS&model=seedance-2-0&request_model=seedance-2-0&taskId=abc")
+        == "platform=BYTEPLUS&taskId=abc"
+    )
