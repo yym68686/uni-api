@@ -3055,7 +3055,7 @@ class ResponsesRequestHandler:
                             error_message = str(raw)
                         raise HTTPException(status_code=upstream_resp.status_code, detail=error_message)
 
-                    upstream_iter = upstream_resp.aiter_raw()
+                    upstream_iter = upstream_resp.aiter_bytes()
                     try:
                         buffered_chunks, stream_committed = await _prime_responses_upstream_stream(
                             upstream_iter,

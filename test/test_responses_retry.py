@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import os
 import sys
@@ -142,6 +143,20 @@ class DummyStreamingUpstreamResponse:
             yield chunk
         if self._stream_error is not None:
             raise self._stream_error
+
+    async def aiter_bytes(self):
+        async for chunk in self.aiter_raw():
+            yield chunk
+
+
+class EncodedStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
+    def __init__(self, *, raw_chunks, decoded_chunks, status_code=200):
+        super().__init__(chunks=raw_chunks, status_code=status_code)
+        self._decoded_chunks = list(decoded_chunks)
+
+    async def aiter_bytes(self):
+        for chunk in self._decoded_chunks:
+            yield chunk
 
 
 def _responses_sse(event_name, payload):
@@ -934,6 +949,67 @@ def test_responses_stream_retries_next_provider_before_output(monkeypatch):
         "https://provider-a.example/v1/responses",
         "https://provider-b.example/v1/responses",
     ]
+
+
+def test_responses_stream_parses_decoded_upstream_bytes(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    decoded_chunks = [
+        _responses_sse("response.created", {"type": "response.created"}),
+        _responses_sse("response.in_progress", {"type": "response.in_progress"}),
+        _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-decoded"}),
+        _responses_sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+            },
+        ),
+        _responses_sse(None, "[DONE]"),
+    ]
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        EncodedStreamingUpstreamResponse(
+            raw_chunks=[gzip.compress(b"".join(decoded_chunks))],
+            decoded_chunks=decoded_chunks,
+        )
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+    )
+
+    assert response.status_code == 200
+    assert "hello-decoded" in body
+    assert len(main.app.state.client_manager.stream_calls) == 1
 
 
 def test_responses_stream_commits_on_keepalive_and_does_not_retry(monkeypatch):
