@@ -20,6 +20,7 @@ from core.utils import (
     update_initial_model,
     ThreadSafeCircularList,
     provider_api_circular_list,
+    is_sse_comment_frame,
 )
 
 class InMemoryRateLimiter:
@@ -423,7 +424,12 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
             and engine == "dalle"
             and first_item_str.lstrip().startswith("event:")
         )
-        if isinstance(first_item_str, str) and not first_item_str.startswith(": keepalive") and not is_named_sse_frame:
+        is_comment_sse_frame = (
+            isinstance(first_item_str, str)
+            and stream
+            and is_sse_comment_frame(first_item_str)
+        )
+        if isinstance(first_item_str, str) and not is_comment_sse_frame and not is_named_sse_frame:
             if first_item_str.startswith("data:"):
                 first_item_str = first_item_str.lstrip("data: ")
             if first_item_str.startswith("[DONE]"):
