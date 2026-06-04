@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Union, Optional, List, Any
+from typing import AsyncIterator, Dict, Union, Optional, List, Any
 from pydantic import ValidationError, BaseModel, field_serializer
 
 from starlette.responses import Response
@@ -138,7 +138,8 @@ class RequestTrace:
 class RuntimeGauges:
     def __init__(self) -> None:
         self.inflight_requests = 0
-        self.waiting_first_byte = 0
+        self.waiting_first_byte_requests: set[str] = set()
+        self.waiting_first_byte_untracked = 0
         self.event_loop_lag_ms = 0
         self.open_sockets: Optional[int] = None
         self.upstream_pool_in_use = 0
@@ -150,11 +151,41 @@ class RuntimeGauges:
     def end_inflight(self) -> None:
         self.inflight_requests = max(0, self.inflight_requests - 1)
 
-    def begin_waiting_first_byte(self) -> None:
-        self.waiting_first_byte += 1
+    def _request_info(self, current_info: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+        if isinstance(current_info, dict):
+            return current_info
+        try:
+            info = request_info.get()
+        except LookupError:
+            return None
+        return info if isinstance(info, dict) else None
 
-    def end_waiting_first_byte(self) -> None:
-        self.waiting_first_byte = max(0, self.waiting_first_byte - 1)
+    def _request_key(self, current_info: Optional[dict[str, Any]] = None) -> Optional[str]:
+        info = self._request_info(current_info)
+        if not info:
+            return None
+        key = str(info.get("request_id") or info.get("trace_id") or "").strip()
+        return key or None
+
+    def begin_waiting_first_byte(self, current_info: Optional[dict[str, Any]] = None) -> None:
+        info = self._request_info(current_info)
+        key = self._request_key(info)
+        if key:
+            self.waiting_first_byte_requests.add(key)
+            if info is not None:
+                info["_waiting_first_byte_active"] = True
+            return
+        self.waiting_first_byte_untracked += 1
+
+    def end_waiting_first_byte(self, current_info: Optional[dict[str, Any]] = None) -> None:
+        info = self._request_info(current_info)
+        key = self._request_key(info)
+        if key:
+            self.waiting_first_byte_requests.discard(key)
+            if info is not None:
+                info["_waiting_first_byte_active"] = False
+            return
+        self.waiting_first_byte_untracked = max(0, self.waiting_first_byte_untracked - 1)
 
     def begin_upstream_pool(self, trace: Optional[RequestTrace] = None) -> float:
         started_at = time()
@@ -178,7 +209,7 @@ class RuntimeGauges:
         return {
             "service": "uni-api-ember",
             "inflight_requests": self.inflight_requests,
-            "waiting_first_byte": self.waiting_first_byte,
+            "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
             "event_loop_lag_ms": self.event_loop_lag_ms,
             "open_sockets": self.open_sockets,
             "upstream_pool_in_use": self.upstream_pool_in_use,
@@ -244,7 +275,20 @@ def _mark_first_byte_observed(current_info: dict[str, Any]) -> None:
     if isinstance(trace, RequestTrace):
         trace.mark("upstream_first_chunk")
         current_info["timing_spans"] = trace.snapshot()
-    runtime_gauges.end_waiting_first_byte()
+    runtime_gauges.end_waiting_first_byte(current_info)
+
+
+async def _mark_first_byte_on_stream(generator: AsyncIterator[Any], current_info: dict[str, Any], *, skip_keepalive: bool = False):
+    try:
+        async for chunk in generator:
+            if skip_keepalive and isinstance(chunk, str) and chunk.startswith(": keepalive"):
+                yield chunk
+                continue
+            _mark_first_byte_observed(current_info)
+            yield chunk
+    finally:
+        if current_info.get("_waiting_first_byte_active") and not current_info.get("_first_byte_observed"):
+            runtime_gauges.end_waiting_first_byte(current_info)
 
 def _debug_json_body(body: Any) -> str:
     try:
@@ -1802,11 +1846,15 @@ async def process_request(
                 )
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
-                runtime_gauges.begin_waiting_first_byte()
+                runtime_gauges.begin_waiting_first_byte(current_info)
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
+                if first_response_time == 3.1415:
+                    wrapped_generator = _mark_first_byte_on_stream(wrapped_generator, current_info, skip_keepalive=True)
+                else:
+                    _mark_first_byte_observed(current_info)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             elif force_collect_codex_stream:
                 payload["stream"] = True
@@ -1831,11 +1879,13 @@ async def process_request(
                 )
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
-                runtime_gauges.begin_waiting_first_byte()
+                runtime_gauges.begin_waiting_first_byte(current_info)
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
+                if first_response_time != 3.1415:
+                    _mark_first_byte_observed(current_info)
                 json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
                 _mark_first_byte_observed(current_info)
                 response = StarletteStreamingResponse(iter([json_data]), media_type="application/json")
@@ -1860,11 +1910,12 @@ async def process_request(
                 )
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
-                runtime_gauges.begin_waiting_first_byte()
+                runtime_gauges.begin_waiting_first_byte(current_info)
                 generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, False, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
+                _mark_first_byte_observed(current_info)
 
                 # 处理音频和其他二进制响应
                 if endpoint == "/v1/audio/speech":
@@ -3299,13 +3350,13 @@ class ResponsesRequestHandler:
                     trace = current_info.get("trace") if isinstance(current_info, dict) else None
                     if isinstance(trace, RequestTrace):
                         trace.mark("upstream_send_start")
-                    runtime_gauges.begin_waiting_first_byte()
+                    runtime_gauges.begin_waiting_first_byte(current_info)
                     stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
                     upstream_resp = await stream_cm.__aenter__()
                     if isinstance(trace, RequestTrace):
                         trace.mark("upstream_headers_received")
                     if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
-                        runtime_gauges.end_waiting_first_byte()
+                        runtime_gauges.end_waiting_first_byte(current_info)
                         raw = await upstream_resp.aread()
                         await stream_cm.__aexit__(None, None, None)
                         try:
@@ -3323,11 +3374,11 @@ class ResponsesRequestHandler:
                         )
                         _mark_first_byte_observed(current_info)
                     except HTTPException:
-                        runtime_gauges.end_waiting_first_byte()
+                        runtime_gauges.end_waiting_first_byte(current_info)
                         await stream_cm.__aexit__(None, None, None)
                         raise
                     except RESPONSES_STREAM_NETWORK_ERRORS:
-                        runtime_gauges.end_waiting_first_byte()
+                        runtime_gauges.end_waiting_first_byte(current_info)
                         await stream_cm.__aexit__(None, None, None)
                         raise
 
@@ -3442,14 +3493,14 @@ class ResponsesRequestHandler:
                 trace = current_info.get("trace") if isinstance(current_info, dict) else None
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
-                runtime_gauges.begin_waiting_first_byte()
+                runtime_gauges.begin_waiting_first_byte(current_info)
                 try:
                     upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
                     if isinstance(trace, RequestTrace):
                         trace.mark("upstream_headers_received")
                     _mark_first_byte_observed(current_info)
                 except Exception:
-                    runtime_gauges.end_waiting_first_byte()
+                    runtime_gauges.end_waiting_first_byte(current_info)
                     raise
                 if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                     raw = await upstream_resp.aread()
