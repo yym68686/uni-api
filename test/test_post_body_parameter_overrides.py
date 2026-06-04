@@ -82,6 +82,39 @@ def test_codex_strips_response_format_from_post_body_overrides():
     assert "response_format" not in payload
 
 
+def test_codex_strips_nested_cache_control_from_chat_payload():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "hello",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        ],
+        stream=False,
+    )
+    provider = {
+        "provider": "codex",
+        "engine": "codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "account-id,refresh-token",
+        "model": ["gpt-5.4"],
+        "tools": True,
+    }
+
+    _, _, payload = asyncio.run(get_payload(request, "codex", provider, api_key="access-token"))
+
+    content_part = payload["input"][0]["content"][0]
+    assert content_part["text"] == "hello"
+    assert "cache_control" not in content_part
+
+
 def test_post_body_parameter_overrides_can_remove_global_fields():
     request = RequestModel(
         model="gpt-5.4",

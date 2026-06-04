@@ -566,6 +566,35 @@ def test_responses_codex_strips_response_format(monkeypatch):
     assert "response_format" not in sent_payload
 
 
+def test_responses_codex_strips_nested_cache_control(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(client_manager.post_calls) == 1
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    content_part = sent_payload["input"][0]["content"][0]
+    assert content_part["text"] == "hello"
+    assert "cache_control" not in content_part
+
+
 def test_responses_compact_codex_strips_store(monkeypatch):
     client_manager = _configure_responses_test(
         monkeypatch,
