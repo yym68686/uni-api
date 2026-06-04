@@ -68,6 +68,7 @@ from upstream import (
     UpstreamRunner,
     build_upstream_error_response,
 )
+from video import VideoAdapterError, get_video_adapter
 
 from utils import (
     safe_get,
@@ -92,6 +93,158 @@ def _env_flag(value: Optional[str]) -> bool:
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
 is_debug = _env_flag(os.getenv("DEBUG"))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
+
+_REQUEST_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def _normalize_request_id(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return str(uuid.uuid4())
+    normalized = _REQUEST_ID_RE.sub("-", raw)[:96].strip("-")
+    return normalized or str(uuid.uuid4())
+
+
+class RequestTrace:
+    def __init__(self, *, trace_id: str) -> None:
+        self.trace_id = _normalize_request_id(trace_id)
+        self.started_at = time()
+        self.spans: dict[str, int | str] = {}
+
+    def mark(self, stage: str) -> None:
+        name = str(stage or "").strip()
+        if name:
+            self.spans[name] = int((time() - self.started_at) * 1000)
+
+    def add_ms(self, name: str, value_ms: float) -> None:
+        key = str(name or "").strip()
+        if not key:
+            return
+        try:
+            self.spans[key] = max(0, int(round(float(value_ms))))
+        except (TypeError, ValueError):
+            return
+
+    def set_tag(self, name: str, value: Optional[str]) -> None:
+        key = str(name or "").strip()
+        text = str(value or "").strip()
+        if key and text:
+            self.spans[key] = text[:128]
+
+    def snapshot(self) -> dict[str, int | str]:
+        return dict(self.spans)
+
+
+class RuntimeGauges:
+    def __init__(self) -> None:
+        self.inflight_requests = 0
+        self.waiting_first_byte = 0
+        self.event_loop_lag_ms = 0
+        self.open_sockets: Optional[int] = None
+        self.upstream_pool_in_use = 0
+        self.upstream_pool_wait_ms = 0
+
+    def begin_inflight(self) -> None:
+        self.inflight_requests += 1
+
+    def end_inflight(self) -> None:
+        self.inflight_requests = max(0, self.inflight_requests - 1)
+
+    def begin_waiting_first_byte(self) -> None:
+        self.waiting_first_byte += 1
+
+    def end_waiting_first_byte(self) -> None:
+        self.waiting_first_byte = max(0, self.waiting_first_byte - 1)
+
+    def begin_upstream_pool(self, trace: Optional[RequestTrace] = None) -> float:
+        started_at = time()
+        self.upstream_pool_in_use += 1
+        wait_ms = int((time() - started_at) * 1000)
+        self.upstream_pool_wait_ms = wait_ms
+        if trace is not None:
+            trace.add_ms("upstream_pool_wait_ms", wait_ms)
+        return started_at
+
+    def end_upstream_pool(self) -> None:
+        self.upstream_pool_in_use = max(0, self.upstream_pool_in_use - 1)
+
+    async def record_event_loop_lag(self) -> None:
+        started_at = time()
+        await asyncio.sleep(0)
+        self.event_loop_lag_ms = int((time() - started_at) * 1000)
+
+    def snapshot(self) -> dict[str, Any]:
+        self.open_sockets = _open_socket_count()
+        return {
+            "service": "uni-api-ember",
+            "inflight_requests": self.inflight_requests,
+            "waiting_first_byte": self.waiting_first_byte,
+            "event_loop_lag_ms": self.event_loop_lag_ms,
+            "open_sockets": self.open_sockets,
+            "upstream_pool_in_use": self.upstream_pool_in_use,
+            "upstream_pool_wait_ms": self.upstream_pool_wait_ms,
+        }
+
+
+runtime_gauges = RuntimeGauges()
+
+
+def _open_socket_count() -> Optional[int]:
+    fd_dir = "/proc/self/fd"
+    if not os.path.isdir(fd_dir):
+        return None
+    count = 0
+    try:
+        for name in os.listdir(fd_dir):
+            try:
+                if os.readlink(os.path.join(fd_dir, name)).startswith("socket:"):
+                    count += 1
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return count
+
+
+def _current_trace() -> Optional[RequestTrace]:
+    try:
+        info = request_info.get()
+    except LookupError:
+        return None
+    trace = info.get("trace") if isinstance(info, dict) else None
+    return trace if isinstance(trace, RequestTrace) else None
+
+
+def _mark_stage(stage: str) -> None:
+    trace = _current_trace()
+    if trace is not None:
+        trace.mark(stage)
+
+
+def _trace_headers_for_upstream(current_info: dict[str, Any]) -> dict[str, str]:
+    trace_id = _normalize_request_id(str(current_info.get("trace_id") or ""))
+    request_id = _normalize_request_id(str(current_info.get("request_id") or ""))
+    return {
+        "x-request-id": trace_id,
+        "x-caller-app": "uni-api-ember",
+        "x-uni-api-ember-request-id": request_id,
+        "x-caller-request-id": request_id,
+    }
+
+
+def _add_trace_headers(headers: dict[str, Any], current_info: dict[str, Any]) -> None:
+    headers.update(_trace_headers_for_upstream(current_info))
+
+
+def _mark_first_byte_observed(current_info: dict[str, Any]) -> None:
+    if current_info.get("_first_byte_observed"):
+        return
+    current_info["_first_byte_observed"] = True
+    trace = current_info.get("trace")
+    if isinstance(trace, RequestTrace):
+        trace.mark("upstream_first_chunk")
+        current_info["timing_spans"] = trace.snapshot()
+    runtime_gauges.end_waiting_first_byte()
 
 def _debug_json_body(body: Any) -> str:
     try:
@@ -496,7 +649,7 @@ async def get_markdown_docs():
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
         token = await get_api_key(request)
-        logger.error(f"404 Error: {exc.detail} api_key: {token}")
+        logger.error(f"404 Error: {exc.detail} api_key: {_mask_secret_for_log(token)}")
     return JSONResponse(
         status_code=exc.status_code,
         content={"message": exc.detail},
@@ -614,6 +767,8 @@ async def update_stats(current_info):
                         for key, value in filtered_info.items():
                             if isinstance(value, str):
                                 filtered_info[key] = value.replace('\x00', '')
+                            elif key == "timing_spans" and isinstance(value, dict):
+                                filtered_info[key] = json.dumps(value, ensure_ascii=False, default=str)
 
                         new_request_stat = RequestStat(**filtered_info)
                         session.add(new_request_stat)
@@ -680,6 +835,10 @@ class LoggingStreamingResponse(Response):
         self.headers['transfer-encoding'] = 'chunked'
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
+        if isinstance(trace, RequestTrace):
+            trace.mark("downstream_response_start")
+            self.current_info["timing_spans"] = trace.snapshot()
         await send({
             'type': 'http.response.start',
             'status': self.status_code,
@@ -721,10 +880,22 @@ class LoggingStreamingResponse(Response):
 
             process_time = time() - self.current_info["start_time"]
             self.current_info["process_time"] = process_time
+            if isinstance(trace, RequestTrace):
+                trace.mark("stream_end")
+                trace.mark("usage_recorded")
+                self.current_info["timing_spans"] = trace.snapshot()
+                logger.info(
+                    "trace_span trace_id=%s request_id=%s endpoint=%s spans=%s",
+                    self.current_info.get("trace_id"),
+                    self.current_info.get("request_id"),
+                    self.current_info.get("endpoint"),
+                    self.current_info.get("timing_spans"),
+                )
             await update_stats(self.current_info)
 
     async def _logging_iterator(self):
         async for chunk in self.body_iterator:
+            _mark_first_byte_observed(self.current_info)
             if isinstance(chunk, str):
                 chunk = chunk.encode('utf-8')
             if self.current_info.get("endpoint").endswith("/v1/audio/speech"):
@@ -873,13 +1044,20 @@ class StatsMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         start_time = time()
+        trace_id = _normalize_request_id(request.headers.get("x-request-id"))
+        trace = RequestTrace(trace_id=trace_id)
+        trace.mark("request_received")
+        runtime_gauges.begin_inflight()
+        await runtime_gauges.record_event_loop_lag()
 
         # 根据token决定是否启用道德审查
         token = await get_api_key(request)
         if not token:
+            runtime_gauges.end_inflight()
             return JSONResponse(
                 status_code=403,
-                content={"error": "Invalid or missing API Key"}
+                content={"error": "Invalid or missing API Key"},
+                headers={"x-request-id": trace.trace_id},
             )
 
         enable_moderation = False  # 默认不开启道德审查
@@ -903,15 +1081,20 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 # print("app.state.paid_api_keys_states", safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None))
                 if safe_get(app.state.paid_api_keys_states, check_api_key, "enabled", default=None) is False and \
                     not request.url.path.startswith("/v1/token_usage"):
+                    runtime_gauges.end_inflight()
                     return JSONResponse(
                         status_code=429,
-                        content={"error": "Balance is insufficient, please check your account."}
+                        content={"error": "Balance is insufficient, please check your account."},
+                        headers={"x-request-id": trace.trace_id},
                     )
         else:
+            runtime_gauges.end_inflight()
             return JSONResponse(
                 status_code=403,
-                content={"error": "Invalid or missing API Key"}
+                content={"error": "Invalid or missing API Key"},
+                headers={"x-request-id": trace.trace_id},
             )
+        trace.mark("auth_done")
 
         # 在 app.state 中存储此请求的信息
         request_id = str(uuid.uuid4())
@@ -919,6 +1102,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
         # 初始化请求信息
         request_info_data = {
             "request_id": request_id,
+            "trace_id": trace.trace_id,
+            "trace": trace,
             "start_time": start_time,
             "endpoint": f"{request.method} {request.url.path}",
             "client_ip": get_client_ip(request),
@@ -932,7 +1117,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
             "text": None,
             "prompt_tokens": 0,
             "completion_tokens": 0,
-            "total_tokens": 0
+            "total_tokens": 0,
+            "timing_spans": trace.snapshot(),
         }
 
         # 设置请求信息到上下文
@@ -949,6 +1135,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 request_id=request_id,
             )
             parsed_body = await parse_request_body(request)
+            trace.mark("body_parsed")
             if parsed_body is not None:
                 _log_debug_request_body(
                     "DEBUG client request body",
@@ -1049,6 +1236,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                         )
 
             response = await call_next(request)
+            trace.mark("downstream_response_start")
+            response.headers["x-request-id"] = trace.trace_id
 
             if request.url.path.startswith("/v1") and not DISABLE_DATABASE:
                 if isinstance(response, (FastAPIStreamingResponse, StarletteStreamingResponse)) or type(response).__name__ == '_StreamingResponse':
@@ -1070,7 +1259,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
             # Let FastAPI's http_exception_handler format the response consistently.
             raise
         except ValidationError as e:
-            logger.error(f"API key: {token}, Invalid request body: {json.dumps(parsed_body, indent=2, ensure_ascii=False)}, errors: {e.errors()}")
+            logger.error("API key: %s, invalid request body: %s", _mask_secret_for_log(token), e.errors())
             content = await asyncio.to_thread(jsonable_encoder, {"detail": e.errors()})
             return JSONResponse(
                 status_code=422,
@@ -1091,6 +1280,16 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 disconnect_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await disconnect_task
+            trace.mark("stream_end")
+            current_info["timing_spans"] = trace.snapshot()
+            logger.info(
+                "trace_span trace_id=%s request_id=%s endpoint=%s spans=%s",
+                current_info.get("trace_id"),
+                current_info.get("request_id"),
+                current_info.get("endpoint"),
+                current_info.get("timing_spans"),
+            )
+            runtime_gauges.end_inflight()
             # print("current_request_info", current_request_info)
             request_info.reset(current_request_info)
 
@@ -1143,6 +1342,12 @@ async def healthz():
     return {"status": "ok", "version": VERSION}
 
 
+@app.get("/v1/observability/runtime", include_in_schema=False)
+async def observability_runtime():
+    await runtime_gauges.record_event_loop_lag()
+    return runtime_gauges.snapshot()
+
+
 class ClientManager:
     def __init__(self, pool_size=100):
         self.pool_size = pool_size
@@ -1154,6 +1359,12 @@ class ClientManager:
 
     @asynccontextmanager
     async def get_client(self, base_url, proxy=None, http2: Optional[bool] = None):
+        trace = _current_trace()
+        if trace is not None:
+            trace.mark("client_pool_acquire_start")
+        runtime_gauges.begin_upstream_pool(trace)
+        acquire_started_at = time()
+        acquired = False
         # 从base_url中提取主机名
         parsed_url = urlparse(base_url)
         host = parsed_url.netloc
@@ -1191,6 +1402,11 @@ class ClientManager:
                     self.clients[client_key] = httpx.AsyncClient(**client_config)
 
         try:
+            acquired = True
+            if trace is not None:
+                trace.mark("client_pool_acquire_end")
+                trace.add_ms("upstream_pool_wait_ms", (time() - acquire_started_at) * 1000)
+            runtime_gauges.end_upstream_pool()
             yield self.clients[client_key]
         except Exception as e:
             # if client_key in self.clients and "429" not in str(e):
@@ -1201,6 +1417,9 @@ class ClientManager:
             # httpx的连接池会自动处理单个连接的失败
             # logger.warning(f"Exception with client {client_key}: {type(e).__name__}: {e}")
             raise e
+        finally:
+            if not acquired:
+                runtime_gauges.end_upstream_pool()
 
     async def close(self):
         for client in self.clients.values():
@@ -1535,6 +1754,12 @@ async def process_request(
         request.stream = False
 
     channel_id = f"{provider['provider']}"
+    current_info = request_info.get()
+    trace = current_info.get("trace") if isinstance(current_info, dict) else None
+    if isinstance(trace, RequestTrace):
+        trace.mark("provider_selected")
+        trace.set_tag("provider", channel_id)
+        trace.set_tag("model", request.model)
     if engine != "moderation":
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
 
@@ -1545,8 +1770,10 @@ async def process_request(
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     if engine == "codex":
         force_codex_client_headers(headers)
+    _add_trace_headers(headers, current_info)
+    if isinstance(trace, RequestTrace):
+        trace.mark("provider_key_selected")
 
-    current_info = request_info.get()
     # print("proxy", proxy)
 
     try:
@@ -1573,7 +1800,12 @@ async def process_request(
                     model=request.model,
                     actual_model=original_model,
                 )
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_send_start")
+                runtime_gauges.begin_waiting_first_byte()
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
             elif force_collect_codex_stream:
@@ -1597,9 +1829,15 @@ async def process_request(
                     model=request.model,
                     actual_model=original_model,
                 )
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_send_start")
+                runtime_gauges.begin_waiting_first_byte()
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
+                _mark_first_byte_observed(current_info)
                 response = StarletteStreamingResponse(iter([json_data]), media_type="application/json")
             else:
                 _log_debug_request_headers(
@@ -1620,7 +1858,12 @@ async def process_request(
                     model=request.model,
                     actual_model=original_model,
                 )
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_send_start")
+                runtime_gauges.begin_waiting_first_byte()
                 generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, False, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
 
                 # 处理音频和其他二进制响应
@@ -1629,6 +1872,7 @@ async def process_request(
                         response = Response(content=wrapped_generator, media_type="audio/mpeg")
                 else:
                     first_element = await anext(wrapped_generator)
+                    _mark_first_byte_observed(current_info)
                     first_element = first_element.lstrip("data: ")
                     decoded_element = await asyncio.to_thread(json.loads, first_element)
                     encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
@@ -1816,7 +2060,7 @@ class ModelRequestHandler:
                 attempt.provider_name,
                 request_model,
                 actual_model,
-                attempt.provider_api_key_raw,
+                _mask_secret_for_log(attempt.provider_api_key_raw),
                 error_message,
             )
             if is_debug or status_code == 500:
@@ -2914,6 +3158,11 @@ class ResponsesRequestHandler:
             proxy = safe_get(config, "preferences", "proxy", default=None)
             proxy = safe_get(provider, "preferences", "proxy", default=proxy)
             channel_id = f"{provider_name}"
+            trace = current_info.get("trace") if isinstance(current_info, dict) else None
+            if isinstance(trace, RequestTrace):
+                trace.mark("provider_selected")
+                trace.set_tag("provider", channel_id)
+                trace.set_tag("model", request_model_name)
             commit_policy = safe_get(
                 provider,
                 "preferences",
@@ -2927,6 +3176,8 @@ class ResponsesRequestHandler:
             attempt.state["failure_stage"] = "auth"
 
             attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+            if isinstance(trace, RequestTrace):
+                trace.mark("provider_key_selected")
             api_key = attempt.provider_api_key_raw
             codex_account_id = None
             if engine == "codex" and attempt.provider_api_key_raw:
@@ -2981,6 +3232,7 @@ class ResponsesRequestHandler:
             headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
             if engine == "codex":
                 force_codex_client_headers(headers)
+            _add_trace_headers(headers, current_info)
 
             payload = request_data.model_dump(exclude_unset=True)
             payload["model"] = original_model
@@ -3044,9 +3296,16 @@ class ResponsesRequestHandler:
                 # if wants_compact:
                 #     print("request /v1/responses/compact:", json_payload)
                 if request_data.stream:
+                    trace = current_info.get("trace") if isinstance(current_info, dict) else None
+                    if isinstance(trace, RequestTrace):
+                        trace.mark("upstream_send_start")
+                    runtime_gauges.begin_waiting_first_byte()
                     stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
                     upstream_resp = await stream_cm.__aenter__()
+                    if isinstance(trace, RequestTrace):
+                        trace.mark("upstream_headers_received")
                     if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                        runtime_gauges.end_waiting_first_byte()
                         raw = await upstream_resp.aread()
                         await stream_cm.__aexit__(None, None, None)
                         try:
@@ -3062,10 +3321,13 @@ class ResponsesRequestHandler:
                             disconnect_event=disconnect_event,
                             commit_policy=commit_policy,
                         )
+                        _mark_first_byte_observed(current_info)
                     except HTTPException:
+                        runtime_gauges.end_waiting_first_byte()
                         await stream_cm.__aexit__(None, None, None)
                         raise
                     except RESPONSES_STREAM_NETWORK_ERRORS:
+                        runtime_gauges.end_waiting_first_byte()
                         await stream_cm.__aexit__(None, None, None)
                         raise
 
@@ -3104,6 +3366,7 @@ class ResponsesRequestHandler:
 
                         try:
                             for chunk in buffered_chunks:
+                                _mark_first_byte_observed(current_info)
                                 if disconnect_event is not None and disconnect_event.is_set():
                                     _log_responses_downstream_disconnect(
                                         endpoint,
@@ -3116,6 +3379,7 @@ class ResponsesRequestHandler:
                                 track_responses_events(chunk)
                                 yield chunk
                             async for chunk in upstream_iter:
+                                _mark_first_byte_observed(current_info)
                                 if disconnect_event is not None and disconnect_event.is_set():
                                     _log_responses_downstream_disconnect(
                                         endpoint,
@@ -3140,7 +3404,7 @@ class ResponsesRequestHandler:
                                 request_model,
                                 actual_model,
                                 provider_name,
-                                attempt.provider_api_key_raw,
+                                _mask_secret_for_log(attempt.provider_api_key_raw),
                                 upstream_url,
                                 error_text,
                             )
@@ -3175,7 +3439,18 @@ class ResponsesRequestHandler:
                     current_info["provider"] = channel_id
                     return StarletteStreamingResponse(proxy_stream(), media_type="text/event-stream")
 
-                upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                trace = current_info.get("trace") if isinstance(current_info, dict) else None
+                if isinstance(trace, RequestTrace):
+                    trace.mark("upstream_send_start")
+                runtime_gauges.begin_waiting_first_byte()
+                try:
+                    upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                    if isinstance(trace, RequestTrace):
+                        trace.mark("upstream_headers_received")
+                    _mark_first_byte_observed(current_info)
+                except Exception:
+                    runtime_gauges.end_waiting_first_byte()
+                    raise
                 if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                     raw = await upstream_resp.aread()
                     try:
@@ -3226,7 +3501,7 @@ class ResponsesRequestHandler:
                     request_model,
                     actual_model,
                     attempt.provider_name,
-                    attempt.provider_api_key_raw,
+                    _mask_secret_for_log(attempt.provider_api_key_raw),
                     upstream_url,
                     error_message,
                 )
@@ -3239,7 +3514,7 @@ class ResponsesRequestHandler:
                     request_model,
                     actual_model,
                     attempt.provider_name,
-                    attempt.provider_api_key_raw,
+                    _mask_secret_for_log(attempt.provider_api_key_raw),
                     upstream_url,
                     error_message,
                 )
@@ -3254,7 +3529,7 @@ class ResponsesRequestHandler:
                 request_model,
                 actual_model,
                 attempt.state.get("channel_id", attempt.provider_name),
-                attempt.provider_api_key_raw,
+                _mask_secret_for_log(attempt.provider_api_key_raw),
                 upstream_url,
                 error_message,
             )
@@ -3838,22 +4113,22 @@ class VideoTaskHandler:
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
-        is_lingjing = _is_lingjing_provider(provider)
-        if is_lingjing:
-            if method == "DELETE":
-                raise HTTPException(status_code=405, detail="Lingjing content generation tasks do not support DELETE")
-            upstream_url = _normalize_lingjing_draw_task_upstream_url(
-                provider.get("base_url", ""),
+        adapter = get_video_adapter(app.state.config, provider, provider_name)
+        try:
+            upstream_request = adapter.build_request(
                 method=method,
                 task_id=task_id,
+                request_body=None,
+                request_model_name=request_model_name,
+                original_model=original_model,
+                provider=provider,
+                provider_name=provider_name,
+                provider_api_key_raw=provider_api_key_raw,
             )
-            headers = _lingjing_headers(provider, provider_api_key_raw)
-        else:
-            upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
-            headers = {}
-            if provider_api_key_raw:
-                headers["Authorization"] = f"Bearer {provider_api_key_raw}"
-            headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+        except VideoAdapterError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        upstream_url = upstream_request.url
+        headers = upstream_request.headers
         channel_id = f"{provider_name}"
 
         trace_logger.info(
@@ -3869,26 +4144,24 @@ class VideoTaskHandler:
 
         try:
             upstream_resp = await self._send_upstream(
-                method=method,
+                method=upstream_request.method,
                 upstream_url=upstream_url,
                 headers=headers,
-                payload=None,
+                payload=upstream_request.payload,
                 proxy=proxy,
                 timeout_value=int(timeout_value),
             )
             raw = upstream_resp.content
-            response_media_type = None
-            raw, _ = _normalize_video_task_response(
+            normalized = adapter.normalize_response(
                 method=method,
                 raw=raw,
                 task_id=task_id,
                 request_model_name=request_model_name,
                 provider_name=provider_name,
-                is_lingjing=is_lingjing,
                 estimated_usage=route.get("estimated_usage"),
             )
-            if _maybe_json_object(raw):
-                response_media_type = "application/json"
+            raw = normalized.raw
+            response_media_type = normalized.media_type if _maybe_json_object(raw) else None
             success = 200 <= upstream_resp.status_code < 300
             self._mark_result(
                 background_tasks=background_tasks,
@@ -4032,29 +4305,37 @@ class VideoTaskHandler:
                     detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} only supports upstream engine: content-generation (got {engine})",
                 )
 
-            if _is_lingjing_provider(provider):
-                if method == "DELETE":
-                    raise HTTPException(status_code=405, detail="Lingjing content generation tasks do not support DELETE")
-                upstream_url = _normalize_lingjing_draw_task_upstream_url(
-                    provider.get("base_url", ""),
-                    method=method,
-                    task_id=task_id,
-                )
-            else:
-                upstream_url = _normalize_content_generation_tasks_upstream_url(provider.get("base_url", ""), task_id)
-            if not upstream_url:
-                raise HTTPException(status_code=400, detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} requires provider base_url")
-
             proxy = safe_get(config, "preferences", "proxy", default=None)
             proxy = safe_get(provider, "preferences", "proxy", default=proxy)
             channel_id = f"{provider_name}"
+            attempt.state["failure_stage"] = "auth"
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
 
-            attempt.state["upstream_url"] = upstream_url
+            adapter = get_video_adapter(config, provider, provider_name)
+            try:
+                upstream_request = adapter.build_request(
+                    method=method,
+                    task_id=task_id,
+                    request_body=request_body,
+                    request_model_name=request_model_name,
+                    original_model=original_model,
+                    provider=provider,
+                    provider_name=provider_name,
+                    provider_api_key_raw=attempt.provider_api_key_raw,
+                )
+            except VideoAdapterError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            if not upstream_request.url:
+                raise HTTPException(status_code=400, detail=f"{CONTENT_GENERATION_TASKS_ENDPOINT} requires provider base_url")
+            if upstream_request.payload is not None:
+                apply_post_body_parameter_overrides(upstream_request.payload, provider, request_model_name)
+
+            attempt.state["video_adapter"] = adapter
+            attempt.state["upstream_request"] = upstream_request
+            attempt.state["upstream_url"] = upstream_request.url
             attempt.state["channel_id"] = channel_id
             attempt.state["engine"] = engine
             attempt.state["proxy"] = proxy
-            attempt.state["failure_stage"] = "auth"
-            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
 
             timeout_value = get_preference(
                 app.state.provider_timeouts,
@@ -4070,36 +4351,13 @@ class VideoTaskHandler:
             provider_name = attempt.provider_name
             original_model = attempt.original_model
             proxy = attempt.state["proxy"]
-            api_key = attempt.state["api_key"]
             timeout_value = attempt.state["timeout_value"]
+            adapter = attempt.state["video_adapter"]
+            upstream_request = attempt.state["upstream_request"]
             upstream_url = attempt.state["upstream_url"]
             channel_id = attempt.state["channel_id"]
-            is_lingjing = _is_lingjing_provider(provider)
-
-            payload = None
-            if request_body is not None:
-                if is_lingjing:
-                    payload = _convert_content_generation_body_to_lingjing(
-                        request_body,
-                        model_code=str(original_model),
-                    )
-                else:
-                    payload = _convert_video_body_to_content_generation(
-                        request_body,
-                        model_name=original_model,
-                        provider_name=provider_name,
-                    )
-                    apply_post_body_parameter_overrides(payload, provider, request_model_name)
-
-            if is_lingjing:
-                headers = _lingjing_headers(provider, api_key, include_content_type=method == "POST")
-            else:
-                headers = {}
-                if method == "POST":
-                    headers["Content-Type"] = "application/json"
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
-                headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+            payload = upstream_request.payload
+            headers = upstream_request.headers
 
             logger.info(
                 "provider: %-11s model: %-22s engine: %-13s role: %s",
@@ -4143,7 +4401,7 @@ class VideoTaskHandler:
                 )
 
             upstream_resp = await self._send_upstream(
-                method=method,
+                method=upstream_request.method,
                 upstream_url=upstream_url,
                 headers=headers,
                 payload=payload,
@@ -4151,17 +4409,17 @@ class VideoTaskHandler:
                 timeout_value=timeout_value,
             )
             raw = upstream_resp.content
-            response_media_type = None
-            raw, normalized_task_id = _normalize_video_task_response(
+            normalized = adapter.normalize_response(
                 method=method,
                 raw=raw,
                 task_id=task_id,
                 request_model_name=request_model_name,
                 provider_name=provider_name,
-                is_lingjing=is_lingjing,
+                estimated_usage=_estimated_video_usage_from_request(request_body),
             )
-            if _maybe_json_object(raw):
-                response_media_type = "application/json"
+            raw = normalized.raw
+            normalized_task_id = normalized.task_id
+            response_media_type = normalized.media_type if _maybe_json_object(raw) else None
             if method == "POST" and normalized_task_id:
                 self._remember_task_route(
                     task_id=normalized_task_id,
@@ -4232,7 +4490,7 @@ class VideoTaskHandler:
                 request_model,
                 actual_model,
                 attempt.state.get("channel_id", attempt.provider_name),
-                attempt.provider_api_key_raw,
+                _mask_secret_for_log(attempt.provider_api_key_raw),
                 attempt.state.get("upstream_url", ""),
                 error_message,
             )
@@ -4501,7 +4759,7 @@ class LingjingOpenapiHandler:
                 request_id,
                 request_model_name,
                 attempt.state.get("channel_id", attempt.provider_name),
-                attempt.provider_api_key_raw,
+                _mask_secret_for_log(attempt.provider_api_key_raw),
                 attempt.state.get("upstream_url", ""),
                 error_message,
             )

@@ -170,6 +170,60 @@ def _set_lingjing_state(monkeypatch, responses):
     return provider_name
 
 
+def _set_callxyq_state(monkeypatch, responses):
+    provider_name = "callxyq"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["callxyq-key"]))
+    main.app.state.config = {
+        "providers": [
+            {
+                "provider": provider_name,
+                "base_url": "http://api.callxyq.xyz",
+                "api": ["callxyq-key"],
+                "model": [
+                    "sora-v3-fast",
+                    "gemini-veo-3.1-fast-generate-preview-4s",
+                ],
+                "preferences": {},
+            }
+        ],
+        "video_providers": [
+            {
+                "name": provider_name,
+                "adapter": "callxyq",
+                "base_url": "http://api.callxyq.xyz",
+                "auth": {"type": "bearer", "token": ""},
+                "models": {
+                    "sora-v3-fast": {"upstream_model": "sora-v3-fast", "protocol": "sora"},
+                    "gemini-veo-3.1-fast-generate-preview-4s": {
+                        "upstream_model": "gemini-veo-3.1-fast-generate-preview-4s",
+                        "protocol": "veo",
+                    },
+                },
+                "routes": {
+                    "create_task": {"method": "POST", "path": "/v1/videos"},
+                    "get_task": {"method": "GET", "path": "/v1/videos/{task_id}"},
+                },
+            }
+        ],
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["sora-v3-fast", "gemini-veo-3.1-fast-generate-preview-4s"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ],
+    }
+    main.app.state.api_list = ["sk-test"]
+    main.app.state.models_list = {
+        "sk-test": ["sora-v3-fast", "gemini-veo-3.1-fast-generate-preview-4s"],
+    }
+    main.app.state.routing_index = None
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.channel_manager = None
+    main.app.state.client_manager = DummyClientManager(responses)
+    return provider_name
+
+
 def _request_with_query(query=""):
     return SimpleNamespace(
         headers={},
@@ -488,3 +542,152 @@ def test_lingjing_upstream_query_strips_routing_only_model():
         main._lingjing_upstream_query("platform=BYTEPLUS&model=seedance-2-0&request_model=seedance-2-0&taskId=abc")
         == "platform=BYTEPLUS&taskId=abc"
     )
+
+
+def test_callxyq_sora_maps_resources_and_normalizes_query(monkeypatch):
+    responses = {
+        "http://api.callxyq.xyz/v1/videos": httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://api.callxyq.xyz/v1/videos"),
+            json={
+                "id": "task-callxyq",
+                "task_id": "task-callxyq",
+                "object": "video",
+                "model": "sora-v3-fast",
+                "status": "queued",
+                "progress": 0,
+                "created_at": 1778652525,
+                "seconds": "5",
+                "size": "1280x720",
+            },
+        ),
+        "http://api.callxyq.xyz/v1/videos/task-callxyq": httpx.Response(
+            200,
+            request=httpx.Request("GET", "http://api.callxyq.xyz/v1/videos/task-callxyq"),
+            json={
+                "id": "task-callxyq",
+                "object": "video",
+                "model": "sora-v3-fast",
+                "status": "completed",
+                "progress": 100,
+                "completed_at": 1778762107,
+                "seconds": "5",
+                "size": "1280x720",
+                "video_url": "https://example.com/result.mp4",
+            },
+        ),
+    }
+    _set_callxyq_state(monkeypatch, responses)
+    handler = main.VideoTaskHandler()
+
+    create_response = _run_with_request_info(
+        handler.create_task(
+            SimpleNamespace(headers={}),
+            {
+                "model": "sora-v3-fast",
+                "provider": "callxyq",
+                "prompt": "@Image1 里的角色跟随 @Audio1 节奏移动，镜头参考 @Video1",
+                "resources": [
+                    {"type": "image", "url": "https://example.com/character.png"},
+                    {"type": "video", "url": "https://example.com/motion.mp4"},
+                    {"type": "audio", "url": "https://example.com/music.mp3"},
+                ],
+                "ratio": "16:9",
+                "resolution": "720p",
+                "duration": 5,
+            },
+            0,
+            BackgroundTasks(),
+        )
+    )
+
+    assert create_response.status_code == 200
+    create_body = json.loads(create_response.body)
+    assert create_body == {
+        "id": "task-callxyq",
+        "model": "sora-v3-fast",
+        "provider": "callxyq",
+        "status": "queued",
+        "created_at": 1778652525,
+        "progress": 0,
+    }
+    submit_call = main.app.state.client_manager.calls[0]
+    assert submit_call["url"] == "http://api.callxyq.xyz/v1/videos"
+    assert submit_call["headers"]["Authorization"] == "Bearer callxyq-key"
+    submit_body = json.loads(submit_call["content"])
+    assert submit_body["model"] == "sora-v3-fast"
+    assert submit_body["aspect_ratio"] == "16:9"
+    assert submit_body["resolution"] == "720p"
+    assert submit_body["size"] == "1280x720"
+    assert submit_body["seconds"] == "5"
+    assert submit_body["image_url"] == "https://example.com/character.png"
+    assert submit_body["reference_video"] == "https://example.com/motion.mp4"
+    assert submit_body["reference_videos"] == ["https://example.com/motion.mp4"]
+    assert submit_body["audio_url"] == "https://example.com/music.mp3"
+    assert submit_body["video_config"] == {
+        "reference_mode": "image_reference",
+        "motion_has_audio": True,
+    }
+
+    query_response = _run_with_request_info(
+        handler.get_or_delete_task(
+            SimpleNamespace(headers={}),
+            "task-callxyq",
+            0,
+            BackgroundTasks(),
+            method="GET",
+        )
+    )
+
+    query_body = json.loads(query_response.body)
+    assert query_response.status_code == 200
+    assert query_body["status"] == "succeeded"
+    assert query_body["provider"] == "callxyq"
+    assert query_body["video"]["url"] == "https://example.com/result.mp4"
+    assert query_body["video"]["duration"] == 5
+    assert query_body["video"]["size"] == "1280x720"
+    assert query_body["usage"]["video_tokens"] == 108900
+    assert main.app.state.client_manager.calls[-1]["url"] == "http://api.callxyq.xyz/v1/videos/task-callxyq"
+
+
+def test_callxyq_veo_payload_uses_model_duration_and_images(monkeypatch):
+    _set_callxyq_state(
+        monkeypatch,
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://api.callxyq.xyz/v1/videos"),
+            json={"id": "task-veo", "status": "queued", "created_at": 1778652525},
+        ),
+    )
+    handler = main.VideoTaskHandler()
+
+    response = _run_with_request_info(
+        handler.create_task(
+            SimpleNamespace(headers={}),
+            {
+                "model": "gemini-veo-3.1-fast-generate-preview-4s",
+                "provider": "callxyq",
+                "prompt": "A small white cube slowly rotating on a clean gray table",
+                "ratio": "16:9",
+                "resolution": "720p",
+                "duration": 4,
+                "audio": False,
+                "resources": [
+                    {"type": "image", "url": "https://example.com/start.png"},
+                    {"type": "image", "url": "https://example.com/end.png"},
+                ],
+            },
+            0,
+            BackgroundTasks(),
+        )
+    )
+
+    assert response.status_code == 200
+    submit_body = json.loads(main.app.state.client_manager.calls[0]["content"])
+    assert submit_body == {
+        "model": "gemini-veo-3.1-fast-generate-preview-4s",
+        "prompt": "A small white cube slowly rotating on a clean gray table",
+        "size": "1280x720",
+        "generate_audio": False,
+        "images": ["https://example.com/start.png", "https://example.com/end.png"],
+    }

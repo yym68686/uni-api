@@ -14,6 +14,7 @@ class RequestStat(Base):
     __tablename__ = 'request_stats'
     id = Column(Integer, primary_key=True)
     request_id = Column(String)
+    trace_id = Column(String, index=True)
     endpoint = Column(String)
     client_ip = Column(String)
     process_time = Column(Float)
@@ -28,6 +29,7 @@ class RequestStat(Base):
     total_tokens = Column(Integer, default=0)
     prompt_price = Column(Float, default=0.0)
     completion_price = Column(Float, default=0.0)
+    timing_spans = Column(Text)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 class ChannelStat(Base):
