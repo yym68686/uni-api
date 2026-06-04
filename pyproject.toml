@@ -1,6 +1,6 @@
 [project]
 name = "uni-api"
-version = "1.7.105"
+version = "1.7.106"
 description = "Add your description here"
 readme = "README.md"
 license = { file = "LICENSE" }
