@@ -68,6 +68,11 @@ from upstream import (
     UpstreamRunner,
     build_upstream_error_response,
 )
+from fugue_observability import (
+    emit_uni_api_ember_request_observability,
+    start_fugue_observability_from_env,
+    stop_fugue_observability,
+)
 from video import VideoAdapterError, get_video_adapter
 
 from utils import (
@@ -95,6 +100,12 @@ is_debug = _env_flag(os.getenv("DEBUG"))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
 _REQUEST_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
+_W3C_TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_W3C_SPAN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_TRACEPARENT_RE = re.compile(
+    r"^(?P<version>[0-9a-f]{2})-(?P<trace_id>[0-9a-f]{32})-(?P<span_id>[0-9a-f]{16})-(?P<trace_flags>[0-9a-f]{2})(?:-.*)?$",
+    re.IGNORECASE,
+)
 
 
 def _normalize_request_id(value: Optional[str]) -> str:
@@ -105,11 +116,83 @@ def _normalize_request_id(value: Optional[str]) -> str:
     return normalized or str(uuid.uuid4())
 
 
+def _is_valid_w3c_trace_id(value: Optional[str]) -> bool:
+    trace_id = str(value or "").strip().lower()
+    return bool(_W3C_TRACE_ID_RE.match(trace_id)) and trace_id != "0" * 32
+
+
+def _is_valid_w3c_span_id(value: Optional[str]) -> bool:
+    span_id = str(value or "").strip().lower()
+    return bool(_W3C_SPAN_ID_RE.match(span_id)) and span_id != "0" * 16
+
+
+def _parse_traceparent(value: Optional[str]) -> dict[str, str]:
+    raw = str(value or "").strip()
+    match = _TRACEPARENT_RE.match(raw)
+    if not match:
+        return {}
+    version = match.group("version").lower()
+    trace_id = match.group("trace_id").lower()
+    span_id = match.group("span_id").lower()
+    trace_flags = match.group("trace_flags").lower()
+    if version == "ff" or not _is_valid_w3c_trace_id(trace_id) or not _is_valid_w3c_span_id(span_id):
+        return {}
+    return {
+        "trace_id": trace_id,
+        "parent_span_id": span_id,
+        "trace_flags": trace_flags,
+    }
+
+
+def _incoming_trace_context(headers: Any) -> dict[str, str]:
+    parsed = _parse_traceparent(headers.get("traceparent") if headers else None)
+    raw_legacy_request_id = str(headers.get("x-request-id") or "").strip() if headers else ""
+    legacy_request_id = _normalize_request_id(raw_legacy_request_id) if raw_legacy_request_id else ""
+    if parsed:
+        result = dict(parsed)
+        if legacy_request_id and legacy_request_id != result["trace_id"]:
+            result["x_request_id"] = legacy_request_id
+        tracestate = str(headers.get("tracestate") or "").strip() if headers else ""
+        if tracestate:
+            result["tracestate"] = tracestate[:512]
+        return result
+    if legacy_request_id:
+        return {"trace_id": legacy_request_id}
+    return {"trace_id": uuid.uuid4().hex}
+
+
+def _format_traceparent(trace_id: Optional[str], span_id: Optional[str], trace_flags: Optional[str] = None) -> Optional[str]:
+    safe_trace_id = str(trace_id or "").strip().lower()
+    safe_span_id = str(span_id or "").strip().lower()
+    if not _is_valid_w3c_trace_id(safe_trace_id) or not _is_valid_w3c_span_id(safe_span_id):
+        return None
+    safe_flags = str(trace_flags or "01").strip().lower()
+    if not re.match(r"^[0-9a-f]{2}$", safe_flags):
+        safe_flags = "01"
+    return f"00-{safe_trace_id}-{safe_span_id}-{safe_flags}"
+
+
 class RequestTrace:
-    def __init__(self, *, trace_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        trace_id: str,
+        parent_span_id: Optional[str] = None,
+        trace_flags: Optional[str] = None,
+        tracestate: Optional[str] = None,
+    ) -> None:
         self.trace_id = _normalize_request_id(trace_id)
+        self.span_id = secrets.token_hex(8)
+        self.parent_span_id = str(parent_span_id or "").strip().lower()
+        self.trace_flags = str(trace_flags or "01").strip().lower()
+        self.tracestate = str(tracestate or "").strip()
         self.started_at = time()
-        self.spans: dict[str, int | str] = {}
+        self.spans: dict[str, int | str] = {
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+        }
+        if self.parent_span_id:
+            self.spans["parent_span_id"] = self.parent_span_id
 
     def mark(self, stage: str) -> None:
         name = str(stage or "").strip()
@@ -255,12 +338,22 @@ def _mark_stage(stage: str) -> None:
 def _trace_headers_for_upstream(current_info: dict[str, Any]) -> dict[str, str]:
     trace_id = _normalize_request_id(str(current_info.get("trace_id") or ""))
     request_id = _normalize_request_id(str(current_info.get("request_id") or ""))
-    return {
+    headers = {
         "x-request-id": trace_id,
         "x-caller-app": "uni-api-ember",
         "x-uni-api-ember-request-id": request_id,
         "x-caller-request-id": request_id,
     }
+    trace = current_info.get("trace") if isinstance(current_info, dict) else None
+    span_id = getattr(trace, "span_id", None) or current_info.get("span_id")
+    trace_flags = getattr(trace, "trace_flags", None) or current_info.get("trace_flags")
+    traceparent = _format_traceparent(trace_id, span_id, trace_flags)
+    if traceparent:
+        headers["traceparent"] = traceparent
+    tracestate = str(current_info.get("tracestate") or "").strip()
+    if tracestate:
+        headers["tracestate"] = tracestate[:512]
+    return headers
 
 
 def _add_trace_headers(headers: dict[str, Any], current_info: dict[str, Any]) -> None:
@@ -289,6 +382,92 @@ async def _mark_first_byte_on_stream(generator: AsyncIterator[Any], current_info
     finally:
         if current_info.get("_waiting_first_byte_active") and not current_info.get("_first_byte_observed"):
             runtime_gauges.end_waiting_first_byte(current_info)
+
+
+def _message_role_summary(parsed_body: Any) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(parsed_body, dict):
+        return None, None
+
+    roles: list[str] = []
+
+    def append_role(value: Any) -> None:
+        role = str(value or "").strip()
+        if role and len(role) <= 64:
+            roles.append(role)
+
+    messages = parsed_body.get("messages")
+    if isinstance(messages, list):
+        for item in messages:
+            if isinstance(item, dict):
+                append_role(item.get("role"))
+
+    inputs = parsed_body.get("input")
+    if isinstance(inputs, list):
+        for item in inputs:
+            if isinstance(item, dict):
+                append_role(item.get("role"))
+
+    if not roles:
+        return None, None
+    counts: dict[str, int] = defaultdict(int)
+    for role in roles:
+        counts[role] += 1
+    ordered_counts = ",".join(f"{role}:{counts[role]}" for role in sorted(counts))
+    return "/".join(roles[:16]), ordered_counts[:256]
+
+
+def _record_plan_observability(current_info: dict[str, Any], plan: RoutingPlan) -> None:
+    if not isinstance(current_info, dict):
+        return
+    current_info["role"] = plan.role
+    current_info["planned_retry_count"] = max(0, int(plan.retry_count or 0))
+    current_info["matching_provider_count"] = max(0, int(plan.num_matching_providers or 0))
+
+
+def _record_retry_observability(attempt: Any, status_code: int, error_message: Any) -> None:
+    info = request_info.get()
+    if not isinstance(info, dict):
+        return
+    retry_count = int(info.get("retry_count") or 0) + 1
+    info["retry_count"] = retry_count
+    info["error_type"] = type(error_message).__name__ if not isinstance(error_message, str) else "upstream_retry"
+    trace = info.get("trace")
+    if isinstance(trace, RequestTrace):
+        trace.mark("retry_started")
+        trace.add_ms("retry_count", retry_count)
+        trace.add_ms("retry_status_code", status_code)
+        trace.set_tag("retry_provider", getattr(attempt, "provider_name", None))
+        trace.set_tag("retry_error_type", info.get("error_type"))
+        info["timing_spans"] = trace.snapshot()
+
+
+def _record_cooldown_observability(attempt: Any, status_code: int, error_message: Any) -> None:
+    _ = error_message
+    info = request_info.get()
+    if not isinstance(info, dict):
+        return
+    cooldown_count = int(info.get("cooldown_count") or 0) + 1
+    info["cooldown_count"] = cooldown_count
+    trace = info.get("trace")
+    if isinstance(trace, RequestTrace):
+        trace.add_ms("cooldown_count", cooldown_count)
+        trace.add_ms("cooldown_status_code", status_code)
+        trace.set_tag("cooldown_provider", getattr(attempt, "provider_name", None))
+        info["timing_spans"] = trace.snapshot()
+
+
+def _emit_request_observability(current_info: dict[str, Any]) -> None:
+    if not isinstance(current_info, dict) or current_info.get("_fugue_observability_emitted"):
+        return
+    current_info["_fugue_observability_emitted"] = True
+    try:
+        emit_uni_api_ember_request_observability(
+            current_info=current_info,
+            runtime_metrics=runtime_gauges.snapshot(),
+        )
+    except Exception:
+        logger.exception("Failed to enqueue Fugue request observability event")
+
 
 def _debug_json_body(body: Any) -> str:
     try:
@@ -619,9 +798,12 @@ async def lifespan(app: FastAPI):
             ERROR_TRIGGERS = []
         app.state.error_triggers = ERROR_TRIGGERS
 
+    await start_fugue_observability_from_env(service_version=VERSION)
+
     yield
     # 关闭时的代码
     # await app.state.client.aclose()
+    await stop_fugue_observability()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
 
@@ -880,6 +1062,7 @@ class LoggingStreamingResponse(Response):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
+        self.current_info["status_code"] = self.status_code
         if isinstance(trace, RequestTrace):
             trace.mark("downstream_response_start")
             self.current_info["timing_spans"] = trace.snapshot()
@@ -935,6 +1118,7 @@ class LoggingStreamingResponse(Response):
                     self.current_info.get("endpoint"),
                     self.current_info.get("timing_spans"),
                 )
+            _emit_request_observability(self.current_info)
             await update_stats(self.current_info)
 
     async def _logging_iterator(self):
@@ -1088,8 +1272,15 @@ class StatsMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         start_time = time()
-        trace_id = _normalize_request_id(request.headers.get("x-request-id"))
-        trace = RequestTrace(trace_id=trace_id)
+        incoming_trace = _incoming_trace_context(request.headers)
+        trace = RequestTrace(
+            trace_id=incoming_trace["trace_id"],
+            parent_span_id=incoming_trace.get("parent_span_id"),
+            trace_flags=incoming_trace.get("trace_flags"),
+            tracestate=incoming_trace.get("tracestate"),
+        )
+        if incoming_trace.get("x_request_id"):
+            trace.set_tag("x_request_id", incoming_trace.get("x_request_id"))
         trace.mark("request_received")
         runtime_gauges.begin_inflight()
         await runtime_gauges.record_event_loop_lag()
@@ -1147,6 +1338,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
         request_info_data = {
             "request_id": request_id,
             "trace_id": trace.trace_id,
+            "span_id": trace.span_id,
+            "parent_span_id": trace.parent_span_id,
+            "trace_flags": trace.trace_flags,
+            "tracestate": trace.tracestate,
+            "x_request_id": incoming_trace.get("x_request_id"),
             "trace": trace,
             "start_time": start_time,
             "endpoint": f"{request.method} {request.url.path}",
@@ -1180,6 +1376,12 @@ class StatsMiddleware(BaseHTTPMiddleware):
             )
             parsed_body = await parse_request_body(request)
             trace.mark("body_parsed")
+            if isinstance(parsed_body, dict):
+                current_info["stream"] = parsed_body.get("stream")
+                current_info["request_kind"] = request.url.path
+                message_roles, role_counts = _message_role_summary(parsed_body)
+                current_info["message_roles"] = message_roles
+                current_info["role_counts"] = role_counts
             if parsed_body is not None:
                 _log_debug_request_body(
                     "DEBUG client request body",
@@ -1203,6 +1405,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                             try:
                                 await app.state.user_api_keys_rate_limit[final_api_key].next(model)
                             except Exception:
+                                current_info["status_code"] = 429
+                                current_info["error_type"] = "rate_limited"
                                 return JSONResponse(
                                     status_code=429,
                                     content={"error": "Too many requests"}
@@ -1221,6 +1425,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                         try:
                             await app.state.user_api_keys_rate_limit[final_api_key].next(model)
                         except Exception:
+                            current_info["status_code"] = 429
+                            current_info["error_type"] = "rate_limited"
                             return JSONResponse(
                                 status_code=429,
                                 content={"error": "Too many requests"}
@@ -1239,6 +1445,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                         try:
                             await app.state.user_api_keys_rate_limit[final_api_key].next(model)
                         except Exception:
+                            current_info["status_code"] = 429
+                            current_info["error_type"] = "rate_limited"
                             return JSONResponse(
                                 status_code=429,
                                 content={"error": "Too many requests"}
@@ -1273,6 +1481,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                         current_info["process_time"] = process_time
                         current_info["is_flagged"] = is_flagged
                         current_info["text"] = moderated_content  # 仅在标记时记录文本
+                        current_info["status_code"] = 400
+                        current_info["error_type"] = "moderation_flagged"
                         await update_stats(current_info)
                         return JSONResponse(
                             status_code=400,
@@ -1282,9 +1492,11 @@ class StatsMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             trace.mark("downstream_response_start")
             response.headers["x-request-id"] = trace.trace_id
+            current_info["status_code"] = getattr(response, "status_code", 0) or 0
 
             if request.url.path.startswith("/v1") and not DISABLE_DATABASE:
                 if isinstance(response, (FastAPIStreamingResponse, StarletteStreamingResponse)) or type(response).__name__ == '_StreamingResponse':
+                    current_info["_defer_observability_until_stream_end"] = True
                     response = LoggingStreamingResponse(
                         content=response.body_iterator,
                         status_code=response.status_code,
@@ -1299,12 +1511,16 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
             return response
 
-        except HTTPException:
+        except HTTPException as e:
             # Let FastAPI's http_exception_handler format the response consistently.
+            current_info["status_code"] = getattr(e, "status_code", 500)
+            current_info["error_type"] = "http_exception"
             raise
         except ValidationError as e:
             logger.error("API key: %s, invalid request body: %s", _mask_secret_for_log(token), e.errors())
             content = await asyncio.to_thread(jsonable_encoder, {"detail": e.errors()})
+            current_info["status_code"] = 422
+            current_info["error_type"] = "validation_error"
             return JSONResponse(
                 status_code=422,
                 content=content
@@ -1314,6 +1530,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 import traceback
                 traceback.print_exc()
             logger.error(f"Error processing request: {str(e)}")
+            current_info["status_code"] = 500
+            current_info["error_type"] = type(e).__name__
             return JSONResponse(
                 status_code=500,
                 content={"error": f"Internal server error: {str(e)}"}
@@ -1325,6 +1543,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 with suppress(asyncio.CancelledError):
                     await disconnect_task
             trace.mark("stream_end")
+            current_info["process_time"] = time() - start_time
             current_info["timing_spans"] = trace.snapshot()
             logger.info(
                 "trace_span trace_id=%s request_id=%s endpoint=%s spans=%s",
@@ -1333,6 +1552,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 current_info.get("endpoint"),
                 current_info.get("timing_spans"),
             )
+            if not current_info.get("_defer_observability_until_stream_end"):
+                _emit_request_observability(current_info)
             runtime_gauges.end_inflight()
             # print("current_request_info", current_request_info)
             request_info.reset(current_request_info)
@@ -1800,6 +2021,9 @@ async def process_request(
     channel_id = f"{provider['provider']}"
     current_info = request_info.get()
     trace = current_info.get("trace") if isinstance(current_info, dict) else None
+    if isinstance(current_info, dict):
+        current_info["stream"] = bool(getattr(request, "stream", False))
+        current_info["role"] = role
     if isinstance(trace, RequestTrace):
         trace.mark("provider_selected")
         trace.set_tag("provider", channel_id)
@@ -1972,6 +2196,7 @@ class ModelRequestHandler:
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
+        _record_plan_observability(current_info, plan)
         exclude_error_rate_limit = [
             "BrokenResourceError",
             "Proxy connection timed out",
@@ -2138,6 +2363,8 @@ class ModelRequestHandler:
             exclude_error_substrings=exclude_error_rate_limit,
             rollback_rate_limit_errors=exclude_error_rate_limit,
             allow_channel_exclusion=True,
+            on_retry=_record_retry_observability,
+            on_cooldown=_record_cooldown_observability,
         )
 
 def _normalize_responses_upstream_url(base_url: str, engine: str) -> str:
@@ -3156,6 +3383,7 @@ class ResponsesRequestHandler:
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
+        _record_plan_observability(current_info, plan)
         runner = UpstreamRunner(
             plan,
             endpoint=endpoint,
@@ -3616,6 +3844,8 @@ class ResponsesRequestHandler:
             build_error_response=build_error_response,
             build_final_response=build_final_response,
             should_cool_down=should_cool_down,
+            on_retry=_record_retry_observability,
+            on_cooldown=_record_cooldown_observability,
         )
 
 class MessagesPassthroughHandler:
@@ -3655,6 +3885,7 @@ class MessagesPassthroughHandler:
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
+        _record_plan_observability(current_info, plan)
         runner = UpstreamRunner(
             plan,
             endpoint=endpoint,
@@ -3972,6 +4203,8 @@ class MessagesPassthroughHandler:
             build_error_response=build_error_response,
             build_final_response=build_final_response,
             should_cool_down=should_cool_down,
+            on_retry=_record_retry_observability,
+            on_cooldown=_record_cooldown_observability,
         )
 
 class VideoTaskHandler:
@@ -4326,6 +4559,7 @@ class VideoTaskHandler:
             debug=is_debug,
             provider_resolver=self._provider_resolver(request_body),
         )
+        _record_plan_observability(current_info, plan)
         runner = UpstreamRunner(
             plan,
             endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
@@ -4585,6 +4819,8 @@ class VideoTaskHandler:
             build_error_response=build_error_response,
             build_final_response=build_final_response,
             should_cool_down=should_cool_down,
+            on_retry=_record_retry_observability,
+            on_cooldown=_record_cooldown_observability,
         )
 
 class LingjingOpenapiHandler:
@@ -4654,6 +4890,7 @@ class LingjingOpenapiHandler:
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
+        _record_plan_observability(current_info, plan)
         runner = UpstreamRunner(
             plan,
             endpoint=endpoint,
@@ -4853,6 +5090,8 @@ class LingjingOpenapiHandler:
             build_error_response=build_error_response,
             build_final_response=build_final_response,
             should_cool_down=should_cool_down,
+            on_retry=_record_retry_observability,
+            on_cooldown=_record_cooldown_observability,
         )
 
 model_handler = ModelRequestHandler()

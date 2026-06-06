@@ -403,6 +403,10 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - TIMEOUT: Request timeout, default is 100 seconds. The timeout can control the time needed to switch to the next channel when one channel does not respond. Optional
 - DISABLE_DATABASE: Whether to disable the database, default is false, optional
 - DB_TYPE: Database type, default is sqlite, optional. Supports sqlite and postgres.
+- FUGUE_OBSERVABILITY_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT: Optional Fugue telemetry agent HTTP endpoint. When unset, Fugue observability export is disabled and request handling is unchanged.
+- FUGUE_OBSERVABILITY_SERVICE_NAME: Optional observability service name, default is `uni-api-ember`.
+- FUGUE_OBSERVABILITY_SAMPLE_RATE: Optional successful request observability sample rate, default is `1.0`. Errors are always eligible for export.
+- FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED, FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED, FUGUE_OBSERVABILITY_METRICS_ENABLED: Optional switches for Fugue request summaries, spans, and metrics. Export failure only drops observability data and does not fail business requests.
 
 When DB_TYPE is postgres, the following environment variables need to be set:
 

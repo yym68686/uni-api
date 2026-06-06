@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - main.py
+      - fugue_observability.py
       - db.py
       - routing.py
       - upstream.py

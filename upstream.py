@@ -329,13 +329,13 @@ async def maybe_cool_provider_api_key(
     original_model: str,
     endpoint: Optional[str] = None,
     exclude_error_substrings: Optional[list[str]] = None,
-) -> None:
+) -> bool:
     if not provider_api_key_raw or provider_name.startswith("sk-"):
-        return
+        return False
 
     api_key_count = provider_api_circular_list[provider_name].get_items_count()
     if api_key_count <= 1:
-        return
+        return False
 
     quota_cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=0)
     cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
@@ -371,25 +371,26 @@ async def maybe_cool_provider_api_key(
             provider_api_key_raw,
             cooling_time=effective_quota_cooldown,
         )
-        return
+        return True
 
     if rate_limit_cooling_time > 0:
         await provider_api_circular_list[provider_name].set_cooling(
             provider_api_key_raw,
             cooling_time=rate_limit_cooling_time,
         )
-        return
+        return True
 
     if int(cooling_time) <= 0:
-        return
+        return False
 
     if exclude_error_substrings and any(error in error_message for error in exclude_error_substrings):
-        return
+        return False
 
     await provider_api_circular_list[provider_name].set_cooling(
         provider_api_key_raw,
         cooling_time=int(cooling_time),
     )
+    return True
 
 
 def rollback_failed_rate_limit_record(
@@ -539,6 +540,8 @@ class UpstreamRunner:
         rollback_rate_limit_errors: Optional[list[str]] = None,
         allow_channel_exclusion: bool = False,
         should_cool_down=None,
+        on_retry=None,
+        on_cooldown=None,
     ) -> Any:
         while True:
             if before_next_attempt is not None:
@@ -560,6 +563,8 @@ class UpstreamRunner:
                 rollback_rate_limit_errors=rollback_rate_limit_errors,
                 allow_channel_exclusion=allow_channel_exclusion,
                 should_cool_down=should_cool_down,
+                on_retry=on_retry,
+                on_cooldown=on_cooldown,
             )
             if result.should_retry:
                 continue
@@ -588,6 +593,8 @@ class UpstreamRunner:
         rollback_rate_limit_errors: Optional[list[str]] = None,
         allow_channel_exclusion: bool = False,
         should_cool_down=None,
+        on_retry=None,
+        on_cooldown=None,
     ) -> UpstreamAttemptResult:
         try:
             if prepare_attempt is not None:
@@ -603,6 +610,8 @@ class UpstreamRunner:
                         exclude_error_substrings=exclude_error_substrings,
                         rollback_rate_limit_errors=rollback_rate_limit_errors,
                         should_cool_down=should_cool_down,
+                        on_retry=on_retry,
+                        on_cooldown=on_cooldown,
                         prepare_failure=True,
                     )
             response = await execute_attempt(attempt)
@@ -621,6 +630,8 @@ class UpstreamRunner:
                 rollback_rate_limit_errors=rollback_rate_limit_errors,
                 allow_channel_exclusion=allow_channel_exclusion,
                 should_cool_down=should_cool_down,
+                on_retry=on_retry,
+                on_cooldown=on_cooldown,
                 prepare_failure=False,
             )
 
@@ -635,6 +646,8 @@ class UpstreamRunner:
         rollback_rate_limit_errors: Optional[list[str]] = None,
         allow_channel_exclusion: bool = False,
         should_cool_down=None,
+        on_retry=None,
+        on_cooldown=None,
         prepare_failure: bool,
     ) -> UpstreamAttemptResult:
         status_code, error_message = normalize_provider_exception(exc)
@@ -666,7 +679,7 @@ class UpstreamRunner:
                 )
             )
         if should_cool_key:
-            await maybe_cool_provider_api_key(
+            cooled = await maybe_cool_provider_api_key(
                 attempt.provider,
                 attempt.provider_name,
                 attempt.provider_api_key_raw,
@@ -676,6 +689,8 @@ class UpstreamRunner:
                 endpoint=self.endpoint,
                 exclude_error_substrings=exclude_error_substrings,
             )
+            if cooled and on_cooldown is not None:
+                await _maybe_await(on_cooldown(attempt, status_code, error_message))
 
         if rollback_rate_limit_errors and not prepare_failure:
             rollback_failed_rate_limit_record(
@@ -698,6 +713,8 @@ class UpstreamRunner:
 
         if prepare_failure:
             if self.plan.auto_retry:
+                if on_retry is not None:
+                    await _maybe_await(on_retry(attempt, status_code, error_message))
                 return UpstreamAttemptResult(should_retry=True)
             return UpstreamAttemptResult(finalize=True)
 
@@ -709,6 +726,8 @@ class UpstreamRunner:
             endpoint=self.endpoint,
             original_model=attempt.original_model,
         ):
+            if on_retry is not None:
+                await _maybe_await(on_retry(attempt, status_code, error_message))
             return UpstreamAttemptResult(should_retry=True)
 
         if build_error_response is not None:
