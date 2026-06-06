@@ -716,6 +716,43 @@ def test_responses_split_summary_and_trace_logs(monkeypatch):
     assert any("upstream_url=https://example.com/v1/responses" in log for log in trace_logs)
 
 
+def test_responses_stdout_request_summary_log_can_be_disabled(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="gpt")
+    monkeypatch.setenv("STDOUT_REQUEST_SUMMARY_LOG_ENABLED", "false")
+
+    human_logs = []
+    trace_logs = []
+
+    def fake_human_info(msg, *args, **kwargs):
+        _ = kwargs
+        human_logs.append(msg % args if args else msg)
+
+    def fake_trace_info(msg, *args, **kwargs):
+        _ = kwargs
+        trace_logs.append(msg % args if args else msg)
+
+    monkeypatch.setattr(main.logger, "info", fake_human_info)
+    monkeypatch.setattr(main.trace_logger, "info", fake_trace_info)
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert not any(log.startswith("provider:") for log in human_logs)
+    assert any("endpoint=/v1/responses" in log and "request_id=req-test" in log for log in trace_logs)
+
+
+def test_stdout_request_summary_sample_rate_zero(monkeypatch):
+    monkeypatch.setenv("STDOUT_REQUEST_SUMMARY_LOG_ENABLED", "true")
+    monkeypatch.setenv("STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE", "0")
+
+    assert main._should_log_stdout_request_summary() is False
+
+
 def test_responses_gpt_keeps_max_output_tokens(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="gpt")
 

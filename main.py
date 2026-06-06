@@ -9,6 +9,7 @@ import string
 import secrets
 import tomllib
 import asyncio
+import random
 from asyncio import Semaphore
 import contextvars
 from time import time
@@ -94,6 +95,44 @@ from db import Base, RequestStat, ChannelStat, db_engine, async_session, DISABLE
 
 def _env_flag(value: Optional[str]) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _should_log_stdout_request_summary() -> bool:
+    if not _env_bool("STDOUT_REQUEST_SUMMARY_LOG_ENABLED", True):
+        return False
+    sample_rate = max(0.0, min(1.0, _env_float("STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE", 1.0)))
+    if sample_rate >= 1.0:
+        return True
+    if sample_rate <= 0.0:
+        return False
+    return random.random() <= sample_rate
+
+
+def _log_stdout_request_summary(provider: str, model: str, engine: str, role: str) -> None:
+    if not _should_log_stdout_request_summary():
+        return
+    logger.info(
+        "provider: %-11s model: %-22s engine: %-13s role: %s",
+        str(provider or "")[:11],
+        str(model or ""),
+        str(engine or "")[:13],
+        role,
+    )
+
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
 is_debug = _env_flag(os.getenv("DEBUG"))
@@ -2029,7 +2068,7 @@ async def process_request(
         trace.set_tag("provider", channel_id)
         trace.set_tag("model", request.model)
     if engine != "moderation":
-        logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
+        _log_stdout_request_summary(channel_id, request.model, engine, role)
 
     last_message_role = safe_get(request, "messages", -1, "role", default=None)
     url, headers, payload = await get_payload(request, engine, provider, api_key, endpoint=endpoint)
@@ -3531,13 +3570,7 @@ class ResponsesRequestHandler:
             if engine == "codex":
                 strip_unsupported_codex_payload_fields(payload, strip_store=wants_compact)
 
-            logger.info(
-                "provider: %-11s model: %-22s engine: %-13s role: %s",
-                channel_id[:11],
-                request_model_name,
-                engine[:13],
-                plan.role,
-            )
+            _log_stdout_request_summary(channel_id, request_model_name, engine, plan.role)
             trace_logger.info(
                 "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
                 endpoint,
@@ -3974,13 +4007,7 @@ class MessagesPassthroughHandler:
                 headers["x-api-key"] = str(api_key)
             headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
 
-            logger.info(
-                "provider: %-11s model: %-22s engine: %-13s role: %s",
-                channel_id[:11],
-                request_model_name,
-                "claude",
-                plan.role,
-            )
+            _log_stdout_request_summary(channel_id, request_model_name, "claude", plan.role)
             trace_logger.info(
                 "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
                 endpoint,
@@ -4644,13 +4671,7 @@ class VideoTaskHandler:
             payload = upstream_request.payload
             headers = upstream_request.headers
 
-            logger.info(
-                "provider: %-11s model: %-22s engine: %-13s role: %s",
-                channel_id[:11],
-                request_model_name,
-                "content-generation",
-                plan.role,
-            )
+            _log_stdout_request_summary(channel_id, request_model_name, "content-generation", plan.role)
             trace_logger.info(
                 "endpoint=%s method=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
                 CONTENT_GENERATION_TASKS_ENDPOINT,

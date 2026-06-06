@@ -405,6 +405,12 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - TIMEOUT: 请求超时时间，默认为 100 秒，超时时间可以控制当一个渠道没有响应时，切换下一个渠道需要的时间，选填。
 - DISABLE_DATABASE: 是否禁用数据库，默认为 false，选填。
 - DB_TYPE: 数据库类型，默认为 sqlite，选填。支持 sqlite 和 postgres。
+- FUGUE_OBSERVABILITY_ENDPOINT 或 OTEL_EXPORTER_OTLP_ENDPOINT: 可选 Fugue telemetry agent HTTP 端点。未设置时不启用 Fugue observability export，请求处理行为不变。
+- FUGUE_OBSERVABILITY_SERVICE_NAME: 可选观测服务名，默认 `uni-api-ember`。
+- FUGUE_OBSERVABILITY_SAMPLE_RATE: 可选成功请求观测采样率，默认 `1.0`。错误请求始终可被采集。
+- FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED、FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED、FUGUE_OBSERVABILITY_METRICS_ENABLED: 可选开关，用于控制 Fugue 请求摘要、spans 和 metrics。观测导出失败只会丢弃观测数据，不影响业务请求。
+- STDOUT_REQUEST_SUMMARY_LOG_ENABLED: 可选人类可读 stdout 请求摘要日志开关，默认 `true`。
+- STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: 可选人类可读 stdout 请求摘要日志采样率，默认 `1.0`。高并发压测时可以调低或关闭。
 
 当 DB_TYPE 为 postgres 时，需要设置以下环境变量：
 

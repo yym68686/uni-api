@@ -407,6 +407,8 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - FUGUE_OBSERVABILITY_SERVICE_NAME: Optional observability service name, default is `uni-api-ember`.
 - FUGUE_OBSERVABILITY_SAMPLE_RATE: Optional successful request observability sample rate, default is `1.0`. Errors are always eligible for export.
 - FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED, FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED, FUGUE_OBSERVABILITY_METRICS_ENABLED: Optional switches for Fugue request summaries, spans, and metrics. Export failure only drops observability data and does not fail business requests.
+- STDOUT_REQUEST_SUMMARY_LOG_ENABLED: Optional switch for human-readable stdout request summary logs, default is `true`.
+- STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
 
 When DB_TYPE is postgres, the following environment variables need to be set:
 
