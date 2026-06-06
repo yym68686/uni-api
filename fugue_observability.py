@@ -242,6 +242,11 @@ def build_uni_api_ember_request_telemetry(
     logs = [
         {
             "timestamp": _iso_timestamp(now),
+            "level": _event_level(status_code),
+            "service": service_name,
+            "trace_id": trace_id,
+            "request_id": request_id,
+            "event": "request_summary",
             "event_type": "request_summary",
             "source": service_name,
             "message": "uni-api-ember request finished",
@@ -596,6 +601,14 @@ def _status_class(status_code: int) -> str:
     if status_code <= 0:
         return "unknown"
     return f"{status_code // 100}xx"
+
+
+def _event_level(status_code: int) -> str:
+    if status_code >= 500:
+        return "error"
+    if status_code >= 400:
+        return "warning"
+    return "info"
 
 
 def _classify_error(status_code: int) -> str | None:

@@ -99,6 +99,15 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert "api_key_hash" in serialized
     assert "system/user" in serialized
 
+    log_event = telemetry["logs"][0]
+    assert log_event["level"] == "info"
+    assert log_event["service"] == "uni-api-ember"
+    assert log_event["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert log_event["request_id"] == "request_123"
+    assert log_event["event"] == "request_summary"
+    assert log_event["event_type"] == "request_summary"
+    assert log_event["message"] == "uni-api-ember request finished"
+
     stages = {
         event["attributes"]["stage"]
         for event in telemetry["traces"]
