@@ -35,6 +35,17 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
             "process_time": 1.25,
             "api_key": "sk-secret-api-key",
             "text": "this is request body content",
+            "authorization": "Bearer ember-secret-token",
+            "headers": {
+                "Authorization": "Bearer ember-secret-token",
+                "Cookie": "session=ember-cookie-secret",
+            },
+            "cookie": "session=ember-cookie-secret",
+            "database_url": "postgresql://user:pass@db/ember",
+            "body": {"input": "ember request body secret"},
+            "email": "ember@example.com",
+            "source_ip": "203.0.113.88",
+            "token": "ember-upstream-token-secret",
             "message_roles": "system/user",
             "role_counts": "system:1,user:1",
             "retry_count": 1,
@@ -51,6 +62,12 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
                 "retry_status_code": 503,
                 "retry_provider": "oaix",
                 "upstream_pool_wait_ms": 17,
+                "Authorization": "Bearer ember-secret-token",
+                "Cookie": "session=ember-cookie-secret",
+                "database_url": "postgresql://user:pass@db/ember",
+                "body": "ember request body secret",
+                "email": "ember@example.com",
+                "source_ip": "203.0.113.88",
                 "upstream_send_start": 30,
                 "upstream_headers_received": 90,
                 "upstream_first_chunk": 140,
@@ -69,6 +86,16 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     serialized = json.dumps(telemetry, sort_keys=True)
     assert "sk-secret-api-key" not in serialized
     assert "this is request body content" not in serialized
+    for secret in {
+        "Bearer ember-secret-token",
+        "ember-cookie-secret",
+        "postgresql://user:pass@db/ember",
+        "ember request body secret",
+        "ember@example.com",
+        "203.0.113.88",
+        "ember-upstream-token-secret",
+    }:
+        assert secret not in serialized
     assert "api_key_hash" in serialized
     assert "system/user" in serialized
 
