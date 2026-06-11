@@ -328,12 +328,15 @@ class RuntimeGauges:
 
     def snapshot(self) -> dict[str, Any]:
         self.open_sockets = _open_socket_count()
+        tcp_states = _tcp_state_counts()
         return {
             "service": "uni-api-ember",
             "inflight_requests": self.inflight_requests,
             "waiting_first_byte": len(self.waiting_first_byte_requests) + self.waiting_first_byte_untracked,
             "event_loop_lag_ms": self.event_loop_lag_ms,
             "open_sockets": self.open_sockets,
+            "tcp_states": tcp_states,
+            "tcp_close_wait": tcp_states.get("CLOSE_WAIT", 0),
             "upstream_pool_in_use": self.upstream_pool_in_use,
             "upstream_pool_wait_ms": self.upstream_pool_wait_ms,
         }
@@ -357,6 +360,210 @@ def _open_socket_count() -> Optional[int]:
     except OSError:
         return None
     return count
+
+
+_TCP_STATES = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2",
+    "06": "TIME_WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE_WAIT",
+    "09": "LAST_ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+}
+
+
+def _tcp_state_counts() -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for path in ("/proc/self/net/tcp", "/proc/self/net/tcp6"):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                rows = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            parts = row.split()
+            if len(parts) < 4:
+                continue
+            state = _TCP_STATES.get(parts[3].upper(), parts[3].upper())
+            counts[state] += 1
+    return dict(counts)
+
+
+async def _await_cleanup_safely(awaitable: Any, *, label: str) -> bool:
+    if awaitable is None or not hasattr(awaitable, "__await__"):
+        return True
+
+    current_task = asyncio.current_task()
+    uncancel = getattr(current_task, "uncancel", None)
+    if callable(uncancel):
+        while current_task is not None and current_task.cancelling():
+            uncancel()
+
+    cleanup_task = asyncio.ensure_future(awaitable)
+    try:
+        await asyncio.shield(cleanup_task)
+        return True
+    except asyncio.CancelledError as exc:
+        logger.warning(
+            "%s cleanup was cancelled; waiting for cleanup to finish",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        try:
+            await asyncio.shield(cleanup_task)
+        except BaseException as final_exc:
+            logger.warning(
+                "%s cleanup failed after cancellation",
+                label,
+                exc_info=(type(final_exc), final_exc, final_exc.__traceback__),
+            )
+            return False
+        return True
+    except BaseException as exc:
+        logger.warning(
+            "%s cleanup failed",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return False
+
+
+async def _call_cleanup_safely(cleanup: Callable[[], Any], *, label: str) -> bool:
+    try:
+        result = cleanup()
+    except BaseException as exc:
+        logger.warning(
+            "%s cleanup failed",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return False
+    return await _await_cleanup_safely(result, label=label)
+
+
+async def _force_release_httpcore_pool_request_safely(stream: Any) -> bool:
+    pool = getattr(stream, "_pool", None)
+    pool_request = getattr(stream, "_pool_request", None)
+    if pool is None or pool_request is None:
+        return True
+
+    requests = getattr(pool, "_requests", None)
+    if not isinstance(requests, list) or pool_request not in requests:
+        return True
+
+    try:
+        lock = getattr(pool, "_optional_thread_lock", None)
+        if lock is not None:
+            with lock:
+                if pool_request in requests:
+                    requests.remove(pool_request)
+                assign_requests = getattr(pool, "_assign_requests_to_connections", None)
+                closing = list(assign_requests()) if callable(assign_requests) else []
+        else:
+            if pool_request in requests:
+                requests.remove(pool_request)
+            assign_requests = getattr(pool, "_assign_requests_to_connections", None)
+            closing = list(assign_requests()) if callable(assign_requests) else []
+
+        close_connections = getattr(pool, "_close_connections", None)
+        if callable(close_connections):
+            return await _await_cleanup_safely(
+                close_connections(closing),
+                label="Upstream HTTP pool request",
+            )
+    except BaseException as exc:
+        logger.warning(
+            "Upstream HTTP pool request cleanup failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return False
+    return True
+
+
+async def _force_close_httpcore_stream_chain_safely(upstream_response: Any) -> bool:
+    stream = getattr(upstream_response, "stream", None)
+    candidates: list[Any] = []
+    current = stream
+    seen: set[int] = set()
+    while current is not None:
+        current_id = id(current)
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        candidates.append(current)
+        current = getattr(current, "_stream", None)
+
+    cleanup_ok = True
+    for candidate in candidates:
+        aclose = getattr(candidate, "aclose", None)
+        if callable(aclose):
+            cleanup_ok = await _call_cleanup_safely(
+                aclose,
+                label="Upstream HTTP response stream",
+            ) and cleanup_ok
+        cleanup_ok = await _force_release_httpcore_pool_request_safely(candidate) and cleanup_ok
+    return cleanup_ok
+
+
+async def _close_upstream_response_safely(upstream_response: Any | None) -> bool:
+    if upstream_response is None:
+        return True
+
+    cleanup_ok = True
+    aclose = getattr(upstream_response, "aclose", None)
+    if callable(aclose):
+        cleanup_ok = await _call_cleanup_safely(
+            aclose,
+            label="Upstream HTTP response",
+        ) and cleanup_ok
+    cleanup_ok = await _force_close_httpcore_stream_chain_safely(upstream_response) and cleanup_ok
+    return cleanup_ok
+
+
+async def _close_stream_cm_safely(stream_cm: Any | None) -> bool:
+    if stream_cm is None:
+        return True
+    close = getattr(stream_cm, "__aexit__", None)
+    if not callable(close):
+        return True
+    return await _await_cleanup_safely(
+        close(None, None, None),
+        label="Upstream stream context manager",
+    )
+
+
+async def _close_upstream_response_stream_safely(
+    stream_cm: Any | None,
+    upstream_response: Any | None,
+) -> bool:
+    cleanup_ok = await _close_upstream_response_safely(upstream_response)
+    cleanup_ok = await _close_stream_cm_safely(stream_cm) and cleanup_ok
+    return cleanup_ok
+
+
+async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int:
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    assign_requests = getattr(pool, "_assign_requests_to_connections", None)
+    close_connections = getattr(pool, "_close_connections", None)
+    if not callable(assign_requests) or not callable(close_connections):
+        return 0
+
+    lock = getattr(pool, "_optional_thread_lock", None)
+    if lock is not None:
+        with lock:
+            closing = list(assign_requests())
+    else:
+        closing = list(assign_requests())
+    if not closing:
+        return 0
+    await close_connections(closing)
+    return len(closing)
 
 
 def _current_trace() -> Optional[RequestTrace]:
@@ -1649,7 +1856,11 @@ async def healthz():
 @app.get("/v1/observability/runtime", include_in_schema=False)
 async def observability_runtime():
     await runtime_gauges.record_event_loop_lag()
-    return runtime_gauges.snapshot()
+    snapshot = runtime_gauges.snapshot()
+    client_manager = getattr(app.state, "client_manager", None)
+    if client_manager is not None and hasattr(client_manager, "snapshot"):
+        snapshot["upstream_http_clients"] = client_manager.snapshot()
+    return snapshot
 
 
 class ClientManager:
@@ -1657,9 +1868,46 @@ class ClientManager:
         self.pool_size = pool_size
         self.clients = {}  # {host_timeout_proxy: AsyncClient}
         self._client_locks = defaultdict(asyncio.Lock)
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self._last_sweep_closed_connections = 0
+        self._last_sweep_error: Optional[str] = None
+        self._last_sweep_at: Optional[datetime] = None
 
     async def init(self, default_config):
         self.default_config = default_config
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+
+    async def _maintenance_loop(self):
+        while True:
+            await asyncio.sleep(10)
+            await self.sweep_idle_connections()
+
+    async def sweep_idle_connections(self) -> int:
+        closed = 0
+        errors: list[str] = []
+        for key, client in list(self.clients.items()):
+            try:
+                closed += await _sweep_httpx_client_idle_connections(client)
+            except Exception as exc:
+                errors.append(f"{key}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    "Failed to sweep upstream HTTP client idle connections: key=%s",
+                    key,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+        self._last_sweep_closed_connections = closed
+        self._last_sweep_error = "; ".join(errors)[:512] if errors else None
+        self._last_sweep_at = datetime.now(timezone.utc)
+        return closed
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "client_count": len(self.clients),
+            "pool_size": self.pool_size,
+            "last_sweep_closed_connections": self._last_sweep_closed_connections,
+            "last_sweep_at": self._last_sweep_at.isoformat() if self._last_sweep_at else None,
+            "last_sweep_error": self._last_sweep_error,
+        }
 
     @asynccontextmanager
     async def get_client(self, base_url, proxy=None, http2: Optional[bool] = None):
@@ -1726,6 +1974,11 @@ class ClientManager:
                 runtime_gauges.end_upstream_pool()
 
     async def close(self):
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._maintenance_task
+            self._maintenance_task = None
         for client in self.clients.values():
             await client.aclose()
         self.clients.clear()
@@ -3719,7 +3972,7 @@ class ResponsesRequestHandler:
                     if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                         runtime_gauges.end_waiting_first_byte(current_info)
                         raw = await upstream_resp.aread()
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         try:
                             error_message = raw.decode("utf-8", errors="replace")
                         except Exception:
@@ -3737,15 +3990,19 @@ class ResponsesRequestHandler:
                         _mark_first_byte_observed(current_info)
                     except HTTPException:
                         runtime_gauges.end_waiting_first_byte(current_info)
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         raise
                     except RESPONSES_STREAM_NETWORK_ERRORS:
                         runtime_gauges.end_waiting_first_byte(current_info)
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+                        raise
+                    except BaseException:
+                        runtime_gauges.end_waiting_first_byte(current_info)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         raise
 
                     if disconnect_event is not None and disconnect_event.is_set():
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         _log_responses_downstream_disconnect(
                             endpoint,
                             current_info,
@@ -3836,7 +4093,7 @@ class ResponsesRequestHandler:
                                     usage_seen,
                                     upstream_url,
                                 )
-                            await stream_cm.__aexit__(None, None, None)
+                            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
 
                     schedule_channel_stats(
                         channel_id,
@@ -4219,7 +4476,7 @@ class MessagesPassthroughHandler:
                     response_headers = _copy_upstream_response_headers(upstream_resp.headers)
                     if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                         raw = await upstream_resp.aread()
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         last_error_response.clear()
                         last_error_response.update(
                             {
@@ -4238,12 +4495,12 @@ class MessagesPassthroughHandler:
                             upstream_iter,
                             disconnect_event=disconnect_event,
                         )
-                    except Exception:
-                        await stream_cm.__aexit__(None, None, None)
+                    except BaseException:
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         raise
 
                     if disconnect_event is not None and disconnect_event.is_set():
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
                         trace_logger.info(
                             "%s downstream disconnect stage=before-stream-commit request_id=%s model=%s provider=%s",
                             endpoint,
@@ -4278,7 +4535,7 @@ class MessagesPassthroughHandler:
                                     break
                                 yield chunk
                         finally:
-                            await stream_cm.__aexit__(None, None, None)
+                            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
 
                     background_tasks.add_task(
                         update_channel_stats,

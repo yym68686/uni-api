@@ -43,10 +43,16 @@ class DummyStreamContext:
 
     async def __aenter__(self):
         self.calls.append("enter")
+        if hasattr(self.response, "close_events"):
+            self.response.close_events.append("context_enter")
         return self.response
 
     async def __aexit__(self, exc_type, exc, tb):
         self.calls.append("exit")
+        if hasattr(self.response, "context_exit_calls"):
+            self.response.context_exit_calls += 1
+        if hasattr(self.response, "close_events"):
+            self.response.close_events.append("context_exit")
 
 
 class DummyClient:
@@ -129,6 +135,9 @@ class DummyStreamingUpstreamResponse:
         self._stream_error = stream_error
         self._json_data = json_data if json_data is not None else {"ok": True}
         self._raw_body = raw_body
+        self.close_calls = 0
+        self.context_exit_calls = 0
+        self.close_events = []
 
     async def aread(self):
         if self._raw_body is not None:
@@ -147,6 +156,10 @@ class DummyStreamingUpstreamResponse:
     async def aiter_bytes(self):
         async for chunk in self.aiter_raw():
             yield chunk
+
+    async def aclose(self):
+        self.close_calls += 1
+        self.close_events.append("response_aclose")
 
 
 class EncodedStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
@@ -1093,6 +1106,144 @@ def test_responses_stream_parses_decoded_upstream_bytes(monkeypatch):
     assert response.status_code == 200
     assert "hello-decoded" in body
     assert len(main.app.state.client_manager.stream_calls) == 1
+
+
+def test_responses_stream_closes_entered_upstream_response_before_context(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    upstream = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ]
+    )
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(upstream)
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+    )
+
+    assert response.status_code == 200
+    assert "hello" in body
+    assert upstream.close_calls == 1
+    assert upstream.context_exit_calls == 1
+    assert upstream.close_events[-2:] == ["response_aclose", "context_exit"]
+
+
+def test_responses_stream_retry_closes_failed_upstream_response(monkeypatch):
+    provider_a = "provider-a"
+    provider_b = "provider-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    upstream_a = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created", "provider": "a"}),
+            _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "a"}),
+        ],
+        stream_error=httpx.ReadTimeout(
+            "upstream stalled",
+            request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
+        ),
+    )
+    upstream_b = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created", "provider": "b"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-b"}),
+            _responses_sse(None, "[DONE]"),
+        ]
+    )
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-a.example/v1/responses": upstream_a,
+            "https://provider-b.example/v1/responses": upstream_b,
+        }
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+    )
+
+    assert response.status_code == 200
+    assert '"provider": "a"' not in body
+    assert '"provider": "b"' in body
+    assert upstream_a.close_events[-2:] == ["response_aclose", "context_exit"]
+    assert upstream_a.close_calls == 1
+    assert upstream_a.context_exit_calls == 1
+    assert upstream_b.close_calls == 1
+    assert upstream_b.context_exit_calls == 1
 
 
 def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
