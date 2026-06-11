@@ -566,6 +566,23 @@ def test_responses_codex_strips_response_format(monkeypatch):
     assert "response_format" not in sent_payload
 
 
+def test_responses_codex_strips_top_p(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            top_p=0.2,
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(client_manager.post_calls) == 1
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert "top_p" not in sent_payload
+
+
 def test_responses_codex_strips_nested_cache_control(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
 
