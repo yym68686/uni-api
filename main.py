@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Dict, Union, Optional, List, Any
+from typing import AsyncIterator, Dict, Union, Optional, List, Any, Awaitable, Callable
 from pydantic import ValidationError, BaseModel, field_serializer
 
 from starlette.responses import Response
@@ -2255,7 +2255,6 @@ class ModelRequestHandler:
             debug=is_debug,
             clear_provider_auth_cache=lambda provider_api_key_raw: _codex_oauth_cache.pop(provider_api_key_raw, None),
         )
-
         async def before_next_attempt():
             if disconnect_event is not None and disconnect_event.is_set():
                 return Response(content="", status_code=499)
@@ -3213,6 +3212,51 @@ RESPONSES_FAILURE_STATUS_BY_TYPE = {
 def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
     return parse_sse_event(raw_event)
 
+RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset(
+    {
+        "response.created",
+        "response.in_progress",
+        "response.queued",
+        "keepalive",
+    }
+)
+
+def _encode_responses_sse_event(event_type: str, payload: Any) -> bytes:
+    return (
+        f"event: {event_type}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    ).encode("utf-8")
+
+def _raw_responses_sse_event_bytes(raw_event: str) -> bytes:
+    return raw_event.encode("utf-8") + b"\n\n"
+
+def _build_responses_stream_keepalive_event() -> bytes:
+    return _encode_responses_sse_event(
+        "keepalive",
+        {"type": "keepalive", "sequence_number": 0},
+    )
+
+def _build_responses_stream_error_event(status_code: int, error_message: Any) -> bytes:
+    return _encode_responses_sse_event(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "message": str(error_message),
+                "status_code": int(status_code),
+            },
+        },
+    )
+
+def _stream_error_event_from_response(response: Any) -> bytes:
+    status_code = int(getattr(response, "status_code", 500) or 500)
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        message = body.decode("utf-8", errors="replace")
+    else:
+        message = str(body or f"Upstream request failed with status {status_code}")
+    return _build_responses_stream_error_event(status_code, message)
+
 def _responses_usage_from_payload(payload: Any) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
@@ -3266,8 +3310,8 @@ def _responses_stream_event_has_real_output(event_type: str, payload: Any) -> bo
     return False
 
 def _responses_stream_event_commits(event_type: str, payload: Any, commit_policy: str) -> bool:
-    if event_type == "keepalive":
-        return True
+    if event_type in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+        return False
 
     completed_with_usage = event_type == "response.completed" and _responses_usage_from_payload(payload) is not None
     if commit_policy == "completed_usage":
@@ -3343,10 +3387,12 @@ async def _prime_responses_upstream_stream(
     *,
     disconnect_event: Optional[asyncio.Event] = None,
     commit_policy: str = "real_output",
+    precommit_keepalive_callback: Optional[Callable[[Optional[bytes]], Awaitable[bool]]] = None,
 ) -> tuple[list[bytes], bool]:
     """
-    Buffer structural Responses events until we see a keepalive, substantive
-    output event, or completed response with usage.
+    Buffer structural Responses events until we see substantive output or a
+    completed response with usage. Optional precommit keepalive emission does
+    not commit the real Responses stream.
     """
     buffered_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -3368,10 +3414,10 @@ async def _prime_responses_upstream_stream(
                 raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
             raise HTTPException(status_code=502, detail="Responses upstream closed before substantive output")
 
-        buffered_chunks.append(chunk)
         decoded_chunk = decoder.decode(chunk)
+        raw_events = sse_parser.feed(decoded_chunk)
 
-        for raw_event in sse_parser.feed(decoded_chunk):
+        for event_index, raw_event in enumerate(raw_events):
             if not raw_event.strip():
                 continue
 
@@ -3386,7 +3432,22 @@ async def _prime_responses_upstream_stream(
             if semantic_failure is not None:
                 raise semantic_failure
 
+            event_bytes = _raw_responses_sse_event_bytes(raw_event)
+            if event_type == "keepalive" and precommit_keepalive_callback is not None:
+                handled = await precommit_keepalive_callback(event_bytes)
+                if not handled:
+                    buffered_chunks.append(event_bytes)
+            else:
+                if event_type == "response.created" and precommit_keepalive_callback is not None:
+                    await precommit_keepalive_callback(None)
+                buffered_chunks.append(event_bytes)
+
             if _responses_stream_event_commits(event_type, event_payload, commit_policy):
+                for remaining_raw_event in raw_events[event_index + 1:]:
+                    if remaining_raw_event.strip():
+                        buffered_chunks.append(_raw_responses_sse_event_bytes(remaining_raw_event))
+                if sse_parser.pending_text:
+                    buffered_chunks.append(sse_parser.pending_text.encode("utf-8"))
                 return buffered_chunks, True
 
             continue
@@ -3429,6 +3490,45 @@ class ResponsesRequestHandler:
             debug=is_debug,
             clear_provider_auth_cache=lambda provider_api_key_raw: _codex_oauth_cache.pop(provider_api_key_raw, None),
         )
+        stream_output_queue: Optional[asyncio.Queue] = None
+        stream_done_sentinel = object()
+        stream_body_started = False
+        stream_keepalive_sent = False
+        stream_stats_tasks: list[asyncio.Task] = []
+
+        async def emit_stream_chunk(chunk: Any) -> None:
+            nonlocal stream_body_started
+            if stream_output_queue is None:
+                return
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            if not isinstance(chunk, (bytes, bytearray)):
+                chunk = str(chunk).encode("utf-8")
+            stream_body_started = True
+            await stream_output_queue.put(bytes(chunk))
+
+        async def emit_precommit_keepalive(upstream_keepalive: Optional[bytes]) -> bool:
+            nonlocal stream_keepalive_sent
+            if stream_output_queue is None:
+                return False
+            if stream_keepalive_sent:
+                return True
+            await emit_stream_chunk(upstream_keepalive or _build_responses_stream_keepalive_event())
+            stream_keepalive_sent = True
+            return True
+
+        def schedule_channel_stats(channel_id: str, *, success: bool, provider_api_key: Optional[str]) -> None:
+            args = (
+                current_info["request_id"],
+                channel_id,
+                request_model_name,
+                current_info["api_key"],
+            )
+            kwargs = {"success": success, "provider_api_key": provider_api_key}
+            if stream_output_queue is not None:
+                stream_stats_tasks.append(asyncio.create_task(update_channel_stats(*args, **kwargs)))
+            else:
+                background_tasks.add_task(update_channel_stats, *args, **kwargs)
 
         async def before_next_attempt():
             if disconnect_event is not None and disconnect_event.is_set():
@@ -3632,6 +3732,7 @@ class ResponsesRequestHandler:
                             upstream_iter,
                             disconnect_event=disconnect_event,
                             commit_policy=commit_policy,
+                            precommit_keepalive_callback=emit_precommit_keepalive if stream_output_queue is not None else None,
                         )
                         _mark_first_byte_observed(current_info)
                     except HTTPException:
@@ -3737,18 +3838,18 @@ class ResponsesRequestHandler:
                                 )
                             await stream_cm.__aexit__(None, None, None)
 
-                    background_tasks.add_task(
-                        update_channel_stats,
-                        current_info["request_id"],
+                    schedule_channel_stats(
                         channel_id,
-                        request_model_name,
-                        current_info["api_key"],
                         success=True,
                         provider_api_key=attempt.provider_api_key_raw,
                     )
                     current_info["first_response_time"] = 0
                     current_info["success"] = True
                     current_info["provider"] = channel_id
+                    if stream_output_queue is not None:
+                        async for chunk in proxy_stream():
+                            await emit_stream_chunk(chunk)
+                        return Response(status_code=204)
                     return StarletteStreamingResponse(proxy_stream(), media_type="text/event-stream")
 
                 trace = current_info.get("trace") if isinstance(current_info, dict) else None
@@ -3776,12 +3877,8 @@ class ResponsesRequestHandler:
                 if semantic_failure is not None:
                     raise semantic_failure
 
-                background_tasks.add_task(
-                    update_channel_stats,
-                    current_info["request_id"],
+                schedule_channel_stats(
                     channel_id,
-                    request_model_name,
-                    current_info["api_key"],
                     success=True,
                     provider_api_key=attempt.provider_api_key_raw,
                 )
@@ -3792,12 +3889,8 @@ class ResponsesRequestHandler:
 
         def after_failure(attempt, exc, status_code, error_message):
             if attempt.state.get("track_channel_stats"):
-                background_tasks.add_task(
-                    update_channel_stats,
-                    current_info["request_id"],
+                schedule_channel_stats(
                     attempt.state["channel_id"],
-                    request_model_name,
-                    current_info["api_key"],
                     success=False,
                     provider_api_key=attempt.provider_api_key_raw,
                 )
@@ -3869,17 +3962,94 @@ class ResponsesRequestHandler:
                 content={"error": f"All {request_model_name} error: {completed_plan.error_message}"},
             )
 
-        return await runner.run(
-            execute_attempt,
-            prepare_attempt=prepare_attempt,
-            before_next_attempt=before_next_attempt,
-            after_failure=after_failure,
-            build_error_response=build_error_response,
-            build_final_response=build_final_response,
-            should_cool_down=should_cool_down,
-            on_retry=_record_retry_observability,
-            on_cooldown=_record_cooldown_observability,
-        )
+        async def run_responses_attempts():
+            return await runner.run(
+                execute_attempt,
+                prepare_attempt=prepare_attempt,
+                before_next_attempt=before_next_attempt,
+                after_failure=after_failure,
+                build_error_response=build_error_response,
+                build_final_response=build_final_response,
+                should_cool_down=should_cool_down,
+                on_retry=_record_retry_observability,
+                on_cooldown=_record_cooldown_observability,
+            )
+
+        if request_data.stream:
+            stream_output_queue = asyncio.Queue()
+
+            async def stream_worker() -> None:
+                try:
+                    response = await run_responses_attempts()
+                    if isinstance(response, Response):
+                        if response.status_code == 204:
+                            return
+                        if hasattr(response, "body_iterator"):
+                            async for chunk in response.body_iterator:
+                                await emit_stream_chunk(chunk)
+                            return
+                        if not stream_body_started:
+                            await stream_output_queue.put(response)
+                            return
+                        if response.status_code != 499:
+                            await emit_stream_chunk(_stream_error_event_from_response(response))
+                            await emit_stream_chunk(b"data: [DONE]\n\n")
+                    elif response is not None:
+                        await emit_stream_chunk(response)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    trace_logger.error(
+                        "%s stream worker failed request_id=%s model=%s error_type=%s: %s",
+                        endpoint,
+                        request_id,
+                        request_model_name,
+                        type(exc).__name__,
+                        str(exc) or type(exc).__name__,
+                    )
+                    if not stream_body_started:
+                        await stream_output_queue.put(
+                            JSONResponse(
+                                status_code=500,
+                                content={"error": str(exc) or type(exc).__name__},
+                            )
+                        )
+                    else:
+                        await emit_stream_chunk(_build_responses_stream_error_event(500, str(exc) or type(exc).__name__))
+                        await emit_stream_chunk(b"data: [DONE]\n\n")
+                finally:
+                    if stream_stats_tasks:
+                        await asyncio.gather(*stream_stats_tasks, return_exceptions=True)
+                    await stream_output_queue.put(stream_done_sentinel)
+
+            worker_task = asyncio.create_task(stream_worker())
+            first_item = await stream_output_queue.get()
+            if first_item is stream_done_sentinel:
+                return Response(content="", status_code=204)
+            if isinstance(first_item, Response):
+                with suppress(asyncio.CancelledError):
+                    await worker_task
+                return first_item
+
+            async def stream_body():
+                try:
+                    yield first_item
+                    while True:
+                        item = await stream_output_queue.get()
+                        if item is stream_done_sentinel:
+                            break
+                        yield item
+                finally:
+                    if disconnect_event is not None:
+                        disconnect_event.set()
+                    if not worker_task.done():
+                        worker_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await worker_task
+
+            return StarletteStreamingResponse(stream_body(), media_type="text/event-stream")
+
+        return await run_responses_attempts()
 
 class MessagesPassthroughHandler:
     def __init__(self):
