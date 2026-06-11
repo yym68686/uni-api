@@ -19,7 +19,8 @@ _TRACE_ENDPOINT = "/v1/traces"
 _LOG_ENDPOINT = "/v1/logs"
 _METRIC_ENDPOINT = "/v1/metrics"
 _DEFAULT_SERVICE_NAME = "uni-api-ember"
-_DEFAULT_QUEUE_MAX_SIZE = 1000
+_DEFAULT_QUEUE_MAX_SIZE = 10000
+_DEFAULT_EXPORT_WORKER_COUNT = 4
 _DEFAULT_EXPORT_TIMEOUT_SECONDS = 2.0
 _DEFAULT_SAMPLE_RATE = 1.0
 
@@ -44,6 +45,7 @@ class FugueObservabilityConfig:
     service_name: str = _DEFAULT_SERVICE_NAME
     service_version: str | None = None
     queue_max_size: int = _DEFAULT_QUEUE_MAX_SIZE
+    export_worker_count: int = _DEFAULT_EXPORT_WORKER_COUNT
     export_timeout_seconds: float = _DEFAULT_EXPORT_TIMEOUT_SECONDS
     sample_rate: float = _DEFAULT_SAMPLE_RATE
     identity_attrs: dict[str, str] = field(default_factory=dict)
@@ -60,25 +62,38 @@ class FugueObservabilityClient:
     def __init__(self, config: FugueObservabilityConfig) -> None:
         self.config = config
         self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] | None = None
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: list[asyncio.Task[None]] = []
         self._client: httpx.AsyncClient | None = None
         self._dropped = 0
         self._export_errors = 0
 
     async def start(self) -> None:
-        if not self.config.enabled or self._task is not None:
+        if not self.config.enabled or self._tasks:
             return
         self._queue = asyncio.Queue(maxsize=max(1, int(self.config.queue_max_size)))
         self._client = httpx.AsyncClient(timeout=self.config.export_timeout_seconds)
-        self._task = asyncio.create_task(self._worker(), name="uni-api-ember-fugue-observability-exporter")
-        logger.info("Fugue observability exporter enabled for service=%s", self.config.service_name)
+        worker_count = max(1, int(self.config.export_worker_count))
+        self._tasks = [
+            asyncio.create_task(
+                self._worker(),
+                name=f"uni-api-ember-fugue-observability-exporter-{index}",
+            )
+            for index in range(worker_count)
+        ]
+        logger.info(
+            "Fugue observability exporter enabled for service=%s workers=%s queue_max_size=%s",
+            self.config.service_name,
+            worker_count,
+            self.config.queue_max_size,
+        )
 
     async def stop(self) -> None:
-        task = self._task
-        self._task = None
-        if task is not None:
+        tasks = self._tasks
+        self._tasks = []
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         client = self._client
         self._client = None
         if client is not None:
@@ -171,6 +186,7 @@ def fugue_observability_config_from_env(*, service_version: str | None = None) -
         service_name=_env_text("FUGUE_OBSERVABILITY_SERVICE_NAME") or _DEFAULT_SERVICE_NAME,
         service_version=_env_text("FUGUE_OBSERVABILITY_SERVICE_VERSION") or service_version,
         queue_max_size=_env_int("FUGUE_OBSERVABILITY_QUEUE_MAX_SIZE", _DEFAULT_QUEUE_MAX_SIZE),
+        export_worker_count=_env_int("FUGUE_OBSERVABILITY_EXPORT_WORKERS", _DEFAULT_EXPORT_WORKER_COUNT),
         export_timeout_seconds=_env_float(
             "FUGUE_OBSERVABILITY_EXPORT_TIMEOUT_SECONDS",
             _DEFAULT_EXPORT_TIMEOUT_SECONDS,
