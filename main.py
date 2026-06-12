@@ -2439,7 +2439,8 @@ async def process_request(
                     if isinstance(wrapped_generator, bytes):
                         response = Response(content=wrapped_generator, media_type="audio/mpeg")
                 else:
-                    first_element = await anext(wrapped_generator)
+                    async with aclosing(wrapped_generator):
+                        first_element = await anext(wrapped_generator)
                     _mark_first_byte_observed(current_info)
                     first_element = first_element.lstrip("data: ")
                     decoded_element = await asyncio.to_thread(json.loads, first_element)
