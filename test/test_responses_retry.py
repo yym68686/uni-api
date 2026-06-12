@@ -13,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
 from core.models import ResponsesRequest
+from upstream import should_retry_provider
 
 
 class DummyCircularList:
@@ -413,6 +414,30 @@ def test_responses_bad_request_does_not_retry_all_keys(monkeypatch):
     assert len(client_manager.stream_calls) == 1
     assert keys.next_calls == [("gpt-5.4", "key-1")]
     assert keys.cooling_calls == []
+
+
+def test_responses_missing_persisted_item_404_does_not_retry():
+    upstream_error = {
+        "error": {
+            "message": (
+                "Item with id 'rs_0dc02c5b394c2253016a2c446c9e148191a6595865d06c6054' not found. "
+                "Items are not persisted when `store` is set to false. Try again with `store` set to true, "
+                "or remove this item from your input."
+            ),
+            "type": "invalid_request_error",
+            "param": "input",
+            "code": None,
+        }
+    }
+
+    assert not should_retry_provider(
+        True,
+        404,
+        {"base_url": "http://oaix.example/v1/responses"},
+        error_message=json.dumps(upstream_error),
+        endpoint="/v1/responses",
+        original_model="gpt-5.5",
+    )
 
 
 def test_responses_codex_chatgpt_model_unsupported_retries_next_key(monkeypatch):

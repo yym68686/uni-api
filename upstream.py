@@ -188,6 +188,21 @@ def _is_codex_chatgpt_model_unsupported_error(
     return "model is not supported when using codex with a chatgpt account" in haystack
 
 
+def _is_missing_persisted_responses_item_error(status_code: int, details: Any) -> bool:
+    if status_code != 404:
+        return False
+
+    _, error_type, message, raw = _extract_error_details_parts(details)
+    haystack = " ".join(part for part in (error_type, message, raw) if part).lower()
+    return (
+        "invalid_request_error" in haystack
+        and "item with id" in haystack
+        and "not found" in haystack
+        and "items are not persisted when" in haystack
+        and "store" in haystack
+    )
+
+
 def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
     if status_code not in (401, 403, 402):
         return False
@@ -316,6 +331,8 @@ def should_retry_provider(
         return False
     if _is_codex_chatgpt_model_unsupported_error(status_code, error_message, provider, endpoint, original_model):
         return True
+    if _is_missing_persisted_responses_item_error(status_code, error_message):
+        return False
     return status_code not in (400, 413) or urlparse(provider.get("base_url", "")).netloc == "models.inference.ai.azure.com"
 
 
