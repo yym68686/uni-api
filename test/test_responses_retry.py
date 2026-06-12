@@ -657,7 +657,7 @@ def test_responses_codex_strips_nested_cache_control(monkeypatch):
     assert "cache_control" not in content_part
 
 
-def test_responses_codex_strips_store_false_reasoning_items(monkeypatch):
+def test_responses_codex_strips_store_false_reasoning_ids(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
 
     response = _run_responses_request(
@@ -693,11 +693,15 @@ def test_responses_codex_strips_store_false_reasoning_items(monkeypatch):
     input_items = sent_payload["input"]
     assert [item["type"] for item in input_items] == [
         "message",
+        "reasoning",
         "image_generation_call",
         "function_call_output",
     ]
-    assert all(item.get("id") != "rs_0dc02c5b394c2253016a2c446c9e148191a6595865d06c6054" for item in input_items)
-    assert input_items[1]["id"] == "ig_123"
+    reasoning_item = input_items[1]
+    assert "id" not in reasoning_item
+    assert reasoning_item["summary"] == []
+    assert reasoning_item["encrypted_content"] == "encrypted-reasoning"
+    assert input_items[2]["id"] == "ig_123"
     assert sent_payload["store"] is False
 
 
