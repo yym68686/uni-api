@@ -619,12 +619,13 @@ def _mark_first_byte_observed(current_info: dict[str, Any]) -> None:
 
 async def _mark_first_byte_on_stream(generator: AsyncIterator[Any], current_info: dict[str, Any], *, skip_keepalive: bool = False):
     try:
-        async for chunk in generator:
-            if skip_keepalive and isinstance(chunk, str) and chunk.startswith(": keepalive"):
+        async with aclosing(generator):
+            async for chunk in generator:
+                if skip_keepalive and isinstance(chunk, str) and chunk.startswith(": keepalive"):
+                    yield chunk
+                    continue
+                _mark_first_byte_observed(current_info)
                 yield chunk
-                continue
-            _mark_first_byte_observed(current_info)
-            yield chunk
     finally:
         if current_info.get("_waiting_first_byte_active") and not current_info.get("_first_byte_observed"):
             runtime_gauges.end_waiting_first_byte(current_info)
