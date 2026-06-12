@@ -130,3 +130,64 @@ async def _fetch_response_stream_closes_selected_provider_stream(monkeypatch):
 
 def test_fetch_response_stream_closes_selected_provider_stream(monkeypatch):
     asyncio.run(_fetch_response_stream_closes_selected_provider_stream(monkeypatch))
+
+
+class _FakeConnection:
+    def __init__(self):
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _FakePoolRequest:
+    def __init__(self, connection):
+        self.connection = connection
+
+
+class _FakePool:
+    def __init__(self, request, connection):
+        self._requests = [request]
+        self._connections = [connection]
+        self._optional_thread_lock = None
+
+    def _assign_requests_to_connections(self):
+        return []
+
+    async def _close_connections(self, closing):
+        for connection in closing:
+            await connection.aclose()
+
+
+class _FakePoolStream:
+    def __init__(self, pool, request):
+        self._pool = pool
+        self._pool_request = request
+
+
+async def _force_release_closes_assigned_connection(force_release):
+    connection = _FakeConnection()
+    request = _FakePoolRequest(connection)
+    pool = _FakePool(request, connection)
+    stream = _FakePoolStream(pool, request)
+
+    result = await force_release(stream)
+
+    assert result is True
+    assert request not in pool._requests
+    assert connection not in pool._connections
+    assert connection.closed
+
+
+def test_main_force_release_closes_assigned_connection():
+    asyncio.run(_force_release_closes_assigned_connection(main._force_release_httpcore_pool_request_safely))
+
+
+def test_core_force_release_closes_assigned_connection():
+    async def force_release(stream):
+        return await response_module._force_release_httpcore_pool_request_safely(
+            stream,
+            label="test upstream stream",
+        )
+
+    asyncio.run(_force_release_closes_assigned_connection(force_release))

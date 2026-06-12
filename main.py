@@ -506,22 +506,34 @@ async def _force_release_httpcore_pool_request_safely(stream: Any) -> bool:
         return True
 
     requests = getattr(pool, "_requests", None)
-    if not isinstance(requests, list) or pool_request not in requests:
+    pool_connections = getattr(pool, "_connections", None)
+    connection = getattr(pool_request, "connection", None)
+    if not isinstance(requests, list):
+        requests = []
+    if pool_request not in requests and connection is None:
         return True
 
     try:
+        closing: list[Any] = []
         lock = getattr(pool, "_optional_thread_lock", None)
         if lock is not None:
             with lock:
                 if pool_request in requests:
                     requests.remove(pool_request)
+                if isinstance(pool_connections, list) and connection in pool_connections:
+                    pool_connections.remove(connection)
                 assign_requests = getattr(pool, "_assign_requests_to_connections", None)
-                closing = list(assign_requests()) if callable(assign_requests) else []
+                closing = list(assign_requests()) if callable(assign_requests) else closing
         else:
             if pool_request in requests:
                 requests.remove(pool_request)
+            if isinstance(pool_connections, list) and connection in pool_connections:
+                pool_connections.remove(connection)
             assign_requests = getattr(pool, "_assign_requests_to_connections", None)
-            closing = list(assign_requests()) if callable(assign_requests) else []
+            closing = list(assign_requests()) if callable(assign_requests) else closing
+
+        if connection is not None and all(candidate is not connection for candidate in closing):
+            closing.append(connection)
 
         close_connections = getattr(pool, "_close_connections", None)
         if callable(close_connections):
@@ -529,6 +541,15 @@ async def _force_release_httpcore_pool_request_safely(stream: Any) -> bool:
                 close_connections(closing),
                 label="Upstream HTTP pool request",
             )
+        cleanup_ok = True
+        for connection_to_close in closing:
+            aclose = getattr(connection_to_close, "aclose", None)
+            if callable(aclose):
+                cleanup_ok = await _call_cleanup_safely(
+                    aclose,
+                    label="Upstream HTTP pool request connection",
+                ) and cleanup_ok
+        return cleanup_ok
     except BaseException as exc:
         logger.warning(
             "Upstream HTTP pool request cleanup failed",
