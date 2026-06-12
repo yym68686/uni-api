@@ -162,6 +162,13 @@ class DummyStreamingUpstreamResponse:
         self.close_events.append("response_aclose")
 
 
+class BlockingStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
+    async def aiter_raw(self):
+        for chunk in self._chunks:
+            yield chunk
+        await asyncio.Event().wait()
+
+
 class EncodedStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
     def __init__(self, *, raw_chunks, decoded_chunks, status_code=200):
         super().__init__(chunks=raw_chunks, status_code=status_code)
@@ -1161,6 +1168,82 @@ def test_responses_stream_closes_entered_upstream_response_before_context(monkey
     )
 
     assert response.status_code == 200
+    assert "hello" in body
+    assert upstream.close_calls == 1
+    assert upstream.context_exit_calls == 1
+    assert upstream.close_events[-2:] == ["response_aclose", "context_exit"]
+
+
+def test_responses_stream_closes_upstream_when_downstream_closes_after_commit(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    upstream = BlockingStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+        ]
+    )
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(upstream)
+    request_token = main.request_info.set(
+        {
+            "request_id": "req-test",
+            "api_key": "sk-test",
+            "disconnect_event": None,
+        }
+    )
+
+    async def _run():
+        handler = main.ResponsesRequestHandler()
+        response = await handler.request_responses(
+            http_request=SimpleNamespace(headers={}),
+            request_data=ResponsesRequest(
+                model="gpt-5.4",
+                input=[{"role": "user", "content": "hello"}],
+                stream=True,
+            ),
+            api_index=0,
+            background_tasks=BackgroundTasks(),
+        )
+        chunks = []
+        body_iterator = response.body_iterator
+        for _ in range(3):
+            chunk = await anext(body_iterator)
+            chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk))
+        await asyncio.sleep(0)
+        await body_iterator.aclose()
+        await asyncio.sleep(0)
+        return "".join(chunks)
+
+    try:
+        body = asyncio.run(_run())
+    finally:
+        main.request_info.reset(request_token)
+
     assert "hello" in body
     assert upstream.close_calls == 1
     assert upstream.context_exit_calls == 1

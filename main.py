@@ -15,7 +15,7 @@ import contextvars
 from time import time
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from collections import defaultdict
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Dict, Union, Optional, List, Any, Awaitable, Callable
 from pydantic import ValidationError, BaseModel, field_serializer
@@ -4104,8 +4104,9 @@ class ResponsesRequestHandler:
                     current_info["success"] = True
                     current_info["provider"] = channel_id
                     if stream_output_queue is not None:
-                        async for chunk in proxy_stream():
-                            await emit_stream_chunk(chunk)
+                        async with aclosing(proxy_stream()) as upstream_body:
+                            async for chunk in upstream_body:
+                                await emit_stream_chunk(chunk)
                         return Response(status_code=204)
                     return StarletteStreamingResponse(proxy_stream(), media_type="text/event-stream")
 
@@ -4242,8 +4243,9 @@ class ResponsesRequestHandler:
                         if response.status_code == 204:
                             return
                         if hasattr(response, "body_iterator"):
-                            async for chunk in response.body_iterator:
-                                await emit_stream_chunk(chunk)
+                            async with aclosing(response.body_iterator):
+                                async for chunk in response.body_iterator:
+                                    await emit_stream_chunk(chunk)
                             return
                         if not stream_body_started:
                             await stream_output_queue.put(response)
