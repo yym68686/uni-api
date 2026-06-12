@@ -64,6 +64,28 @@ jobs:
         NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
         echo "New version: $NEW_VERSION"
         sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
+        NEW_VERSION="$NEW_VERSION" python - <<'PY'
+        from pathlib import Path
+        import os
+
+        lock_path = Path("uv.lock")
+        lines = lock_path.read_text().splitlines()
+        in_uni_api_package = False
+        for index, line in enumerate(lines):
+            if line == "[[package]]":
+                in_uni_api_package = False
+                continue
+            if line == 'name = "uni-api"':
+                in_uni_api_package = True
+                continue
+            if in_uni_api_package and line.startswith("version = "):
+                lines[index] = f'version = "{os.environ["NEW_VERSION"]}"'
+                break
+        else:
+            raise SystemExit("uni-api package version not found in uv.lock")
+
+        lock_path.write_text("\n".join(lines) + "\n")
+        PY
         echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
     - name: Commit version bump
@@ -72,7 +94,7 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add pyproject.toml
+        git add pyproject.toml uv.lock
         git commit -m "📖 Bump version to ${{ steps.bump_version.outputs.new_version }} [skip ci]"
         git push
 
