@@ -286,6 +286,83 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     else:
         return first_response_task, "timeout"
 
+async def _close_async_iterator_safely(iterator, channel_id, reason):
+    close = getattr(iterator, "aclose", None)
+    if not callable(close):
+        return
+
+    try:
+        close_result = close()
+    except RuntimeError as exc:
+        logger.debug(
+            "provider: %s async iterator close skipped during %s: %s",
+            channel_id,
+            reason,
+            exc,
+        )
+        return
+    except BaseException as exc:
+        logger.warning(
+            "provider: %s async iterator close failed during %s",
+            channel_id,
+            reason,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+
+    if close_result is None or not hasattr(close_result, "__await__"):
+        return
+
+    current_task = asyncio.current_task()
+    uncancel = getattr(current_task, "uncancel", None)
+    if callable(uncancel):
+        while current_task is not None and current_task.cancelling():
+            uncancel()
+
+    close_task = asyncio.ensure_future(close_result)
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError as exc:
+        logger.debug(
+            "provider: %s async iterator close cancelled during %s; waiting for cleanup",
+            channel_id,
+            reason,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        try:
+            await asyncio.shield(close_task)
+        except BaseException as final_exc:
+            logger.warning(
+                "provider: %s async iterator close failed after cancellation during %s",
+                channel_id,
+                reason,
+                exc_info=(type(final_exc), final_exc, final_exc.__traceback__),
+            )
+    except BaseException as exc:
+        logger.warning(
+            "provider: %s async iterator close failed during %s",
+            channel_id,
+            reason,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+async def _cancel_pending_task_safely(task, channel_id, reason):
+    if task is None or not hasattr(task, "cancel") or not hasattr(task, "done") or task.done():
+        return
+
+    task.cancel()
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        return
+    except BaseException as exc:
+        logger.debug(
+            "provider: %s pending task cleanup failed during %s",
+            channel_id,
+            reason,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
 def _infer_openai_like_error_status(error_obj, default_status=500):
     if not isinstance(error_obj, dict):
         return default_status
@@ -357,49 +434,55 @@ def _infer_openai_like_error_status(error_obj, default_status=500):
 async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None, last_message_role=None):
 
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
-        # print("type(first_item)", type(first_item))
-        # print("first_item", ensure_string(first_item))
-        if first_item:
-            yield await ensure_string(first_item)
+        try:
+            # print("type(first_item)", type(first_item))
+            # print("first_item", ensure_string(first_item))
+            if first_item:
+                yield await ensure_string(first_item)
 
-        # 如果需要心跳机制但不使用嵌套生成器方式
-        if with_keepalive:
-            yield ": keepalive\n\n"
-            while True:
+            # 如果需要心跳机制但不使用嵌套生成器方式
+            if with_keepalive:
+                yield ": keepalive\n\n"
+                while True:
+                    try:
+                        item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
+                        if status == "timeout":
+                            wait_task = item
+                            yield ": keepalive\n\n"
+                        else:
+                            yield await ensure_string(item)
+                            wait_task = None
+                    except asyncio.CancelledError:
+                        # 处理客户端断开连接
+                        logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
+                        break
+                    except Exception:
+                        # 捕获任何其他异常
+                        # import traceback
+                        # error_stack = traceback.format_exc()
+                        # error_message = error_stack.split("\n")[-2]
+                        # logger.info(f"provider: {channel_id:<11} keepalive loop: {error_message}")
+                        break
+            else:
+                # 原始的逻辑，当不需要心跳时
                 try:
-                    item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
-                    if status == "timeout":
-                        yield ": keepalive\n\n"
-                    else:
+                    async for item in generator:
                         yield await ensure_string(item)
-                        wait_task = None
                 except asyncio.CancelledError:
-                    # 处理客户端断开连接
-                    logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
-                    break
-                except Exception:
-                    # 捕获任何其他异常
-                    # import traceback
-                    # error_stack = traceback.format_exc()
-                    # error_message = error_stack.split("\n")[-2]
-                    # logger.info(f"provider: {channel_id:<11} keepalive loop: {error_message}")
-                    break
-        else:
-            # 原始的逻辑，当不需要心跳时
-            try:
-                async for item in generator:
-                    yield await ensure_string(item)
-            except asyncio.CancelledError:
-                # 客户端断开连接是正常行为，不需要记录错误日志
-                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
-                return
-            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.WriteError, httpx.ProtocolError, h2.exceptions.ProtocolError) as e:
-                # 网络错误
-                logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
-                yield "data: [DONE]\n\n"
-                return
+                    # 客户端断开连接是正常行为，不需要记录错误日志
+                    logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
+                    return
+                except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.WriteError, httpx.ProtocolError, h2.exceptions.ProtocolError) as e:
+                    # 网络错误
+                    logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
+                    yield "data: [DONE]\n\n"
+                    return
+        finally:
+            await _cancel_pending_task_safely(wait_task, channel_id, "error_handling_wrapper")
+            await _close_async_iterator_safely(generator, channel_id, "error_handling_wrapper")
 
     start_time = time_module.time()
+    first_item_str = None
     try:
         # 创建一个任务来获取第一个响应，但不直接中断生成器
         if keepalive_interval and stream:
@@ -415,6 +498,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         # logger.info("first_item_str: %s :%s", type(first_item_str), first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
             if identify_audio_format(first_item_str) in ["MP3", "MP3 with ID3", "OPUS", "AAC (ADIF)", "AAC (ADTS)", "FLAC", "WAV"]:
+                await _close_async_iterator_safely(generator, channel_id, "direct bytes response")
                 return first_item, first_response_time
             else:
                 first_item_str = first_item_str.decode("utf-8")
@@ -463,6 +547,7 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         if isinstance(first_item_str, dict) and safe_get(first_item_str, "base_resp", "status_msg", default=None) == "success":
             full_audio_hex = safe_get(first_item_str, "data", "audio", default=None)
             audio_bytes = bytes.fromhex(full_audio_hex)
+            await _close_async_iterator_safely(generator, channel_id, "direct audio response")
             return audio_bytes, first_response_time
 
         if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
@@ -513,9 +598,13 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
         return new_generator(first_item), first_response_time
 
     except StopAsyncIteration:
+        await _close_async_iterator_safely(generator, channel_id, "empty first response")
         # 502 Bad Gateway 是一个更合适的状态码，因为它表明作为代理或网关的服务器从上游服务器收到了无效的响应。
         logger.warning(f"provider: {channel_id:<11} empty response [{type(first_item_str)}]: {first_item_str}")
         raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
+    except BaseException:
+        await _close_async_iterator_safely(generator, channel_id, "first response handling")
+        raise
 
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []

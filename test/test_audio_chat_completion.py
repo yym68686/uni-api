@@ -77,8 +77,14 @@ async def _stream_comment_frame_does_not_raise_empty_response(comment_frame: str
 
 
 async def _stream_invalid_non_comment_frame_still_raises_bad_gateway():
+    closed = False
+
     async def gen():
-        yield "oops\n\n"
+        nonlocal closed
+        try:
+            yield "oops\n\n"
+        finally:
+            closed = True
 
     with pytest.raises(HTTPException) as excinfo:
         await error_handling_wrapper(
@@ -91,6 +97,60 @@ async def _stream_invalid_non_comment_frame_still_raises_bad_gateway():
         )
     assert excinfo.value.status_code == 502
     assert excinfo.value.detail == "Upstream server returned an empty response."
+    assert closed
+
+
+async def _stream_wrapper_closes_upstream_generator_when_consumer_closes():
+    closed = False
+
+    async def gen():
+        nonlocal closed
+        try:
+            yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+            await asyncio.Event().wait()
+        finally:
+            closed = True
+
+    wrapped, _ = await error_handling_wrapper(
+        gen(),
+        channel_id="test",
+        engine="codex",
+        stream=True,
+        error_triggers=[],
+        last_message_role="user",
+    )
+    first = await wrapped.__anext__()
+    assert '"content":"ok"' in first
+
+    await wrapped.aclose()
+    assert closed
+
+
+async def _stream_wrapper_cancels_pending_keepalive_read_when_consumer_closes():
+    closed = False
+
+    async def gen():
+        nonlocal closed
+        try:
+            await asyncio.Event().wait()
+            yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+        finally:
+            closed = True
+
+    wrapped, _ = await error_handling_wrapper(
+        gen(),
+        channel_id="test",
+        engine="codex",
+        stream=True,
+        error_triggers=[],
+        keepalive_interval=0.001,
+        last_message_role="user",
+    )
+    first = await wrapped.__anext__()
+    assert first == ": keepalive\n\n"
+
+    await wrapped.aclose()
+    assert closed
 
 
 def test_audio_chat_completion_non_stream_not_empty():
@@ -109,8 +169,18 @@ def test_stream_invalid_non_comment_frame_still_raises_bad_gateway():
     asyncio.run(_stream_invalid_non_comment_frame_still_raises_bad_gateway())
 
 
+def test_stream_wrapper_closes_upstream_generator_when_consumer_closes():
+    asyncio.run(_stream_wrapper_closes_upstream_generator_when_consumer_closes())
+
+
+def test_stream_wrapper_cancels_pending_keepalive_read_when_consumer_closes():
+    asyncio.run(_stream_wrapper_cancels_pending_keepalive_read_when_consumer_closes())
+
+
 if __name__ == "__main__":
     test_audio_chat_completion_non_stream_not_empty()
     test_stream_bare_sse_comment_frame_does_not_raise_empty_response()
     test_stream_named_sse_comment_frame_does_not_raise_empty_response()
     test_stream_invalid_non_comment_frame_still_raises_bad_gateway()
+    test_stream_wrapper_closes_upstream_generator_when_consumer_closes()
+    test_stream_wrapper_cancels_pending_keepalive_read_when_consumer_closes()
