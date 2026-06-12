@@ -377,6 +377,37 @@ _TCP_STATES = {
 }
 
 
+_BACKGROUND_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _drain_current_task_cancellation() -> None:
+    current_task = asyncio.current_task()
+    uncancel = getattr(current_task, "uncancel", None)
+    if callable(uncancel):
+        while current_task is not None and current_task.cancelling():
+            uncancel()
+
+
+def _track_background_cleanup_task(task: asyncio.Task[Any], *, label: str) -> None:
+    _BACKGROUND_CLEANUP_TASKS.add(task)
+
+    def _cleanup_done(done: asyncio.Task[Any]) -> None:
+        _BACKGROUND_CLEANUP_TASKS.discard(done)
+        if done.cancelled():
+            logger.warning("%s cleanup task was cancelled after detach", label)
+            return
+        try:
+            done.result()
+        except BaseException as exc:
+            logger.warning(
+                "%s cleanup failed after detach",
+                label,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    task.add_done_callback(_cleanup_done)
+
+
 def _tcp_state_counts() -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
     for path in ("/proc/self/net/tcp", "/proc/self/net/tcp6"):
@@ -398,11 +429,7 @@ async def _await_cleanup_safely(awaitable: Any, *, label: str) -> bool:
     if awaitable is None or not hasattr(awaitable, "__await__"):
         return True
 
-    current_task = asyncio.current_task()
-    uncancel = getattr(current_task, "uncancel", None)
-    if callable(uncancel):
-        while current_task is not None and current_task.cancelling():
-            uncancel()
+    _drain_current_task_cancellation()
 
     cleanup_task = asyncio.ensure_future(awaitable)
     try:
@@ -414,8 +441,26 @@ async def _await_cleanup_safely(awaitable: Any, *, label: str) -> bool:
             label,
             exc_info=(type(exc), exc, exc.__traceback__),
         )
+        _drain_current_task_cancellation()
         try:
             await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as final_exc:
+            _drain_current_task_cancellation()
+            logger.warning(
+                "%s cleanup was cancelled again; detached cleanup will continue",
+                label,
+                exc_info=(type(final_exc), final_exc, final_exc.__traceback__),
+            )
+            _track_background_cleanup_task(cleanup_task, label=label)
+            return True
+        except GeneratorExit as final_exc:
+            logger.warning(
+                "%s cleanup was interrupted by generator close; detached cleanup will continue",
+                label,
+                exc_info=(type(final_exc), final_exc, final_exc.__traceback__),
+            )
+            _track_background_cleanup_task(cleanup_task, label=label)
+            return True
         except BaseException as final_exc:
             logger.warning(
                 "%s cleanup failed after cancellation",
@@ -423,6 +468,14 @@ async def _await_cleanup_safely(awaitable: Any, *, label: str) -> bool:
                 exc_info=(type(final_exc), final_exc, final_exc.__traceback__),
             )
             return False
+        return True
+    except GeneratorExit as exc:
+        logger.warning(
+            "%s cleanup was interrupted by generator close; detached cleanup will continue",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        _track_background_cleanup_task(cleanup_task, label=label)
         return True
     except BaseException as exc:
         logger.warning(
@@ -1343,14 +1396,27 @@ class LoggingStreamingResponse(Response):
             except Exception as e:
                 logger.error(f"Error sending error message: {str(e)}")
         finally:
-            await send({
-                'type': 'http.response.body',
-                'body': b'',
-                'more_body': False,
-            })
             if hasattr(self.body_iterator, 'aclose') and not self._closed:
-                await self.body_iterator.aclose()
+                await _call_cleanup_safely(
+                    self.body_iterator.aclose,
+                    label="Downstream streaming body iterator",
+                )
                 self._closed = True
+
+            final_send_cancelled: asyncio.CancelledError | None = None
+            try:
+                await send({
+                    'type': 'http.response.body',
+                    'body': b'',
+                    'more_body': False,
+                })
+            except asyncio.CancelledError as exc:
+                final_send_cancelled = exc
+            except Exception as exc:
+                logger.warning(
+                    "Error sending final streaming response body",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
             process_time = time() - self.current_info["start_time"]
             self.current_info["process_time"] = process_time
@@ -1367,6 +1433,8 @@ class LoggingStreamingResponse(Response):
                 )
             _emit_request_observability(self.current_info)
             await update_stats(self.current_info)
+            if final_send_cancelled is not None:
+                raise final_send_cancelled
 
     async def _logging_iterator(self):
         async for chunk in self.body_iterator:
@@ -1454,7 +1522,10 @@ class LoggingStreamingResponse(Response):
         if not self._closed:
             self._closed = True
             if hasattr(self.body_iterator, 'aclose'):
-                await self.body_iterator.aclose()
+                await _call_cleanup_safely(
+                    self.body_iterator.aclose,
+                    label="Downstream streaming body iterator",
+                )
 
 async def get_api_key(request: Request):
     token = None
