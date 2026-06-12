@@ -625,15 +625,40 @@ async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int
     pool = getattr(transport, "_pool", None)
     assign_requests = getattr(pool, "_assign_requests_to_connections", None)
     close_connections = getattr(pool, "_close_connections", None)
+    pool_connections = getattr(pool, "_connections", None)
     if not callable(assign_requests) or not callable(close_connections):
+        return 0
+    if not isinstance(pool_connections, list):
         return 0
 
     lock = getattr(pool, "_optional_thread_lock", None)
+    closing: list[Any] = []
+
+    def collect_connection(connection: Any) -> None:
+        if all(candidate is not connection for candidate in closing):
+            closing.append(connection)
+
     if lock is not None:
         with lock:
-            closing = list(assign_requests())
+            for connection in list(pool_connections):
+                is_closed = getattr(connection, "is_closed", None)
+                has_expired = getattr(connection, "has_expired", None)
+                if (callable(is_closed) and is_closed()) or (callable(has_expired) and has_expired()):
+                    if connection in pool_connections:
+                        pool_connections.remove(connection)
+                    collect_connection(connection)
+            for connection in assign_requests():
+                collect_connection(connection)
     else:
-        closing = list(assign_requests())
+        for connection in list(pool_connections):
+            is_closed = getattr(connection, "is_closed", None)
+            has_expired = getattr(connection, "has_expired", None)
+            if (callable(is_closed) and is_closed()) or (callable(has_expired) and has_expired()):
+                if connection in pool_connections:
+                    pool_connections.remove(connection)
+                collect_connection(connection)
+        for connection in assign_requests():
+            collect_connection(connection)
     if not closing:
         return 0
     await close_connections(closing)

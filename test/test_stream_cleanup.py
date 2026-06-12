@@ -191,3 +191,62 @@ def test_core_force_release_closes_assigned_connection():
         )
 
     asyncio.run(_force_release_closes_assigned_connection(force_release))
+
+
+class _FakeSweepConnection:
+    def __init__(self, *, closed=False, expired=False):
+        self._closed = closed
+        self._expired = expired
+        self.aclose_called = False
+
+    def is_closed(self):
+        return self._closed
+
+    def has_expired(self):
+        return self._expired
+
+    async def aclose(self):
+        self.aclose_called = True
+
+
+class _FakeSweepPool:
+    def __init__(self, connections):
+        self._connections = list(connections)
+        self._optional_thread_lock = None
+
+    def _assign_requests_to_connections(self):
+        return []
+
+    async def _close_connections(self, closing):
+        for connection in closing:
+            await connection.aclose()
+
+
+class _FakeSweepTransport:
+    def __init__(self, pool):
+        self._pool = pool
+
+
+class _FakeSweepClient:
+    def __init__(self, pool):
+        self._transport = _FakeSweepTransport(pool)
+
+
+async def _sweep_closes_connections_that_httpcore_assign_would_drop():
+    closed = _FakeSweepConnection(closed=True)
+    expired = _FakeSweepConnection(expired=True)
+    healthy = _FakeSweepConnection()
+    pool = _FakeSweepPool([closed, expired, healthy])
+    client = _FakeSweepClient(pool)
+
+    result = await main._sweep_httpx_client_idle_connections(client)
+
+    assert result == 2
+    assert closed.aclose_called
+    assert expired.aclose_called
+    assert not healthy.aclose_called
+    assert pool._connections == [healthy]
+
+
+def test_sweep_httpx_client_idle_connections_closes_closed_connections():
+    asyncio.run(_sweep_closes_connections_that_httpcore_assign_would_drop())
