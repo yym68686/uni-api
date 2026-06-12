@@ -193,10 +193,38 @@ def test_core_force_release_closes_assigned_connection():
     asyncio.run(_force_release_closes_assigned_connection(force_release))
 
 
+class _FakeSweepSocket:
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+class _FakeSweepNetworkStream:
+    def __init__(self, socket):
+        self._socket = socket
+
+    def get_extra_info(self, name):
+        if name == "socket":
+            return self._socket
+        return None
+
+
+class _FakeSweepInnerConnection:
+    def __init__(self, socket):
+        self._network_stream = _FakeSweepNetworkStream(socket)
+
+
 class _FakeSweepConnection:
-    def __init__(self, *, closed=False, expired=False):
+    def __init__(self, *, closed=False, expired=False, socket_fd=None):
         self._closed = closed
         self._expired = expired
+        self._connection = (
+            _FakeSweepInnerConnection(_FakeSweepSocket(socket_fd))
+            if socket_fd is not None
+            else None
+        )
         self.aclose_called = False
 
     def is_closed(self):
@@ -250,3 +278,28 @@ async def _sweep_closes_connections_that_httpcore_assign_would_drop():
 
 def test_sweep_httpx_client_idle_connections_closes_closed_connections():
     asyncio.run(_sweep_closes_connections_that_httpcore_assign_would_drop())
+
+
+async def _sweep_closes_kernel_close_wait_connections():
+    close_wait = _FakeSweepConnection(socket_fd=123)
+    healthy = _FakeSweepConnection(socket_fd=456)
+    pool = _FakeSweepPool([close_wait, healthy])
+    client = _FakeSweepClient(pool)
+
+    result = await main._sweep_httpx_client_idle_connections(client)
+
+    assert result == 1
+    assert close_wait.aclose_called
+    assert not healthy.aclose_called
+    assert pool._connections == [healthy]
+
+
+def test_sweep_httpx_client_idle_connections_closes_kernel_close_wait_connections(monkeypatch):
+    monkeypatch.setattr(main, "_tcp_close_wait_socket_inodes", lambda: {"inode-close-wait"})
+    monkeypatch.setattr(
+        main,
+        "_socket_inode_for_fd",
+        lambda fd: "inode-close-wait" if fd == 123 else "inode-established",
+    )
+
+    asyncio.run(_sweep_closes_kernel_close_wait_connections())
