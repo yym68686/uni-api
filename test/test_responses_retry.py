@@ -657,6 +657,50 @@ def test_responses_codex_strips_nested_cache_control(monkeypatch):
     assert "cache_control" not in content_part
 
 
+def test_responses_codex_strips_store_false_reasoning_items(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[
+                {"type": "message", "role": "user", "content": "make the image 2k"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_0dc02c5b394c2253016a2c446c9e148191a6595865d06c6054",
+                    "summary": [],
+                    "encrypted_content": "encrypted-reasoning",
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "ig_123",
+                    "status": "completed",
+                    "result": "image-b64",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+            store=False,
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(client_manager.post_calls) == 1
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    input_items = sent_payload["input"]
+    assert [item["type"] for item in input_items] == [
+        "message",
+        "image_generation_call",
+        "function_call_output",
+    ]
+    assert all(item.get("id") != "rs_0dc02c5b394c2253016a2c446c9e148191a6595865d06c6054" for item in input_items)
+    assert input_items[1]["id"] == "ig_123"
+    assert sent_payload["store"] is False
+
+
 def test_responses_compact_codex_strips_store(monkeypatch):
     client_manager = _configure_responses_test(
         monkeypatch,
