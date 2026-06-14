@@ -74,18 +74,12 @@ from fugue_observability import (
     start_fugue_observability_from_env,
     stop_fugue_observability,
 )
-from request_review import (
-    RequestReviewDispatcher,
-    build_review_event,
-    is_request_review_enabled,
-)
 from video import VideoAdapterError, get_video_adapter
 
 from utils import (
     safe_get,
     load_config,
     update_config,
-    save_api_yaml,
     post_all_models,
     InMemoryRateLimiter,
     error_handling_wrapper,
@@ -1071,32 +1065,6 @@ async def refresh_runtime_state(app: FastAPI) -> None:
             await update_paid_api_keys_states(app, paid_key)
 
 
-def _save_config_if_local(config: dict[str, Any]) -> None:
-    if os.environ.get("CONFIG_URL"):
-        logger.warning("CONFIG_URL is set; api_config/update changed runtime config but skipped api.yaml persistence")
-        return
-    save_api_yaml(config)
-
-
-def _merge_preferences(existing: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    merged_preferences = dict(existing.get("preferences") or {})
-    incoming_preferences = updates.get("preferences") or {}
-    if not isinstance(incoming_preferences, dict):
-        return merged_preferences
-
-    for key, value in incoming_preferences.items():
-        if key == "request_review" and isinstance(value, dict):
-            merged_request_review = dict(merged_preferences.get("request_review") or {})
-            for review_key, review_value in value.items():
-                if review_key == "api_key" and not str(review_value or "").strip():
-                    continue
-                merged_request_review[review_key] = review_value
-            merged_preferences["request_review"] = merged_request_review
-        else:
-            merged_preferences[key] = value
-    return merged_preferences
-
-
 def get_runtime_api_list() -> list[str]:
     runtime_api_list = getattr(app.state, "api_list", None)
     if runtime_api_list:
@@ -1229,18 +1197,12 @@ async def lifespan(app: FastAPI):
             ERROR_TRIGGERS = []
         app.state.error_triggers = ERROR_TRIGGERS
 
-    if app and not hasattr(app.state, "request_review_dispatcher"):
-        app.state.request_review_dispatcher = RequestReviewDispatcher.from_env()
-        await app.state.request_review_dispatcher.start()
-
     await start_fugue_observability_from_env(service_version=VERSION)
 
     yield
     # 关闭时的代码
     # await app.state.client.aclose()
     await stop_fugue_observability()
-    if hasattr(app.state, "request_review_dispatcher"):
-        await app.state.request_review_dispatcher.stop()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
 
@@ -1322,14 +1284,14 @@ request_info = contextvars.ContextVar('request_info', default={})
 
 async def parse_request_body(request: Request):
     if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
-        body_bytes = await request.body()
         try:
+            body_bytes = await request.body()
             if not body_bytes:
-                return None, body_bytes
-            return await asyncio.to_thread(json.loads, body_bytes), body_bytes
+                return None
+            return await asyncio.to_thread(json.loads, body_bytes)
         except json.JSONDecodeError:
-            return None, body_bytes
-    return None, b""
+            return None
+    return None
 
 def _messages_request_last_text(parsed_body: Any) -> Optional[str]:
     if not isinstance(parsed_body, dict):
@@ -1715,27 +1677,6 @@ async def monitor_disconnect(request: Request, disconnect_event: asyncio.Event) 
     except Exception:
         disconnect_event.set()
 
-
-def _enqueue_request_review(request: Request, current_info: dict[str, Any], parsed_body: Any, raw_body: bytes) -> None:
-    if request.method != "POST":
-        return
-    if request.url.path.startswith("/v1/api_config"):
-        return
-    if not raw_body:
-        return
-    dispatcher = getattr(app.state, "request_review_dispatcher", None)
-    if dispatcher is None or not is_request_review_enabled(app.state.config):
-        return
-    event = build_review_event(
-        request=request,
-        current_info=current_info,
-        raw_body=raw_body,
-        parsed_body=parsed_body,
-        max_payload_bytes=getattr(dispatcher, "max_payload_bytes", 1 << 20),
-    )
-    if dispatcher.enqueue(app.state.config, event):
-        current_info["request_review_enqueued"] = True
-
 class StatsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -1850,7 +1791,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 endpoint=request.url.path,
                 request_id=request_id,
             )
-            parsed_body, raw_body = await parse_request_body(request)
+            parsed_body = await parse_request_body(request)
             trace.mark("body_parsed")
             if isinstance(parsed_body, dict):
                 current_info["stream"] = parsed_body.get("stream")
@@ -1866,7 +1807,6 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     endpoint=request.url.path,
                     request_id=request_id,
                 )
-            _enqueue_request_review(request, current_info, parsed_body, raw_body)
             if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
                 disconnect_event = asyncio.Event()
                 current_info["disconnect_event"] = disconnect_event
@@ -6311,47 +6251,12 @@ async def api_config(api_index: int = Depends(verify_admin_api_key)):
 async def api_config_update(api_index: int = Depends(verify_admin_api_key), config: dict = Body(...)):
     if "providers" in config:
         app.state.config["providers"] = config["providers"]
-    if "preferences" in config:
-        app.state.config["preferences"] = _merge_preferences(app.state.config, config)
-
-    app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
-        app.state.config,
-        use_config_url=False,
-    )
-    await refresh_runtime_state(app)
-    _save_config_if_local(app.state.config)
+        app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
+            app.state.config,
+            use_config_url=False,
+        )
+        await refresh_runtime_state(app)
     return JSONResponse(content={"message": "API config updated"})
-
-
-@app.post("/v1/api_config/request_review/test", dependencies=[Depends(rate_limit_dependency)])
-async def api_config_request_review_test(
-    api_index: int = Depends(verify_admin_api_key),
-    config: dict = Body(...),
-):
-    preferences = config.get("preferences") if isinstance(config, dict) else {}
-    request_review = preferences.get("request_review") if isinstance(preferences, dict) else {}
-    if not isinstance(request_review, dict):
-        raise HTTPException(status_code=400, detail="request_review configuration is required")
-
-    dispatcher = getattr(app.state, "request_review_dispatcher", None)
-    if dispatcher is None:
-        raise HTTPException(status_code=503, detail="request review dispatcher unavailable")
-
-    base_url = str(request_review.get("base_url") or "").strip()
-    api_key = str(request_review.get("api_key") or "").strip()
-    if not base_url or not api_key:
-        raise HTTPException(status_code=400, detail="request_review base_url and api_key are required")
-
-    try:
-        status_code, response_text = await dispatcher.send_test(base_url, api_key)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"request review test failed: {type(exc).__name__}") from exc
-
-    return JSONResponse(content={
-        "message": "review test delivered",
-        "statusCode": status_code,
-        "response": response_text,
-    })
 
 # Pydantic Models for Token Usage Response
 class TokenUsageEntry(BaseModel):
