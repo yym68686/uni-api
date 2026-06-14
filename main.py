@@ -4400,6 +4400,7 @@ class ResponsesRequestHandler:
                 after_failure=after_failure,
                 build_error_response=build_error_response,
                 build_final_response=build_final_response,
+                allow_channel_exclusion=True,
                 should_cool_down=should_cool_down,
                 on_retry=_record_retry_observability,
                 on_cooldown=_record_cooldown_observability,

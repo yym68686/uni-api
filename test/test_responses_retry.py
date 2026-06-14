@@ -1697,6 +1697,12 @@ def test_responses_stream_retries_next_provider_on_semantic_failure(monkeypatch)
         ]
     }
     main.app.state.provider_timeouts = {"global": {"default": 30}}
+    monkeypatch.setattr(
+        main.app.state,
+        "channel_manager",
+        main.ChannelManager(cooldown_period=300),
+        raising=False,
+    )
     main.app.state.client_manager = DummyClientManager(
         {
             "https://provider-a.example/v1/responses": DummyStreamingUpstreamResponse(
@@ -1756,6 +1762,9 @@ def test_responses_stream_retries_next_provider_on_semantic_failure(monkeypatch)
         "https://provider-a.example/v1/responses",
         "https://provider-b.example/v1/responses",
     ]
+    assert asyncio.run(
+        main.app.state.channel_manager.is_model_excluded(provider_a, "gpt-5.4", 300)
+    )
 
 
 def test_responses_stream_does_not_retry_after_output_started(monkeypatch):
