@@ -203,6 +203,47 @@ def test_client_manager_reuses_single_client_under_concurrency(monkeypatch):
     asyncio.run(run_test())
 
 
+def test_client_manager_separates_proxy_and_http2_keys(monkeypatch):
+    created_clients = []
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            created_clients.append(self)
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", FakeAsyncClient)
+
+    async def run_test():
+        manager = main.ClientManager(pool_size=4)
+        await manager.init(
+            {
+                "headers": {"User-Agent": "test"},
+                "http2": True,
+                "verify": True,
+                "follow_redirects": True,
+            }
+        )
+
+        async with manager.get_client("https://example.com/v1/chat/completions", proxy=None, http2=True) as client_a:
+            pass
+        async with manager.get_client("https://example.com/v1/chat/completions", proxy="socks5h://127.0.0.1:1080", http2=True) as client_b:
+            pass
+        async with manager.get_client("https://example.com/v1/chat/completions", proxy=None, http2=False) as client_c:
+            pass
+
+        assert len({id(client_a), id(client_b), id(client_c)}) == 3
+        assert manager.snapshot()["client_count"] == 3
+        await manager.close()
+        assert manager.clients == {}
+        assert all(client.closed for client in created_clients)
+
+    asyncio.run(run_test())
+
+
 def test_process_request_uses_http1_client_for_codex_chat(monkeypatch):
     class DummyClient:
         pass

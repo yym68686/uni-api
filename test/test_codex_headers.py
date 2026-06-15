@@ -45,7 +45,7 @@ def test_force_codex_client_headers_removes_stale_case_variants():
 
 
 def test_responses_route_overrides_stale_client_codex_version_header():
-    main_source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+    main_source = (Path(__file__).resolve().parents[1] / "uni_api" / "runtime.py").read_text()
 
     assert 'headers.setdefault("Version", CODEX_CLI_VERSION)' in main_source
     assert 'headers.setdefault("Version", http_request.headers.get("Version") or CODEX_CLI_VERSION)' not in main_source

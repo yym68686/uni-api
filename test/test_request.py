@@ -65,18 +65,19 @@ async def test_gemini_payload():
     assert payload["tools"][0]["function_declarations"][0]["name"] == "clock-time____getCurrentTime____standalone"
     assert payload["tools"][0]["function_declarations"][0]["description"] == "获取当前时间"
 
-    # 验证消息内容
-    assert len(payload["contents"]) == 2
-    assert payload["contents"][0]["role"] == "system"
-    assert payload["contents"][1]["role"] == "user"
+    # 验证消息内容：system 消息映射到 Vertex/Gemini 原生 system_instruction
+    assert len(payload["contents"]) == 1
+    assert payload["contents"][0]["role"] == "user"
+    assert "system_instruction" in payload
+    assert "Clock Time" in payload["system_instruction"]["parts"][0]["text"]
 
     # 验证其他参数
-    assert payload["temperature"] == 1.3
-    assert payload["top_p"] == 1.0
+    assert payload["generationConfig"]["temperature"] == 1.3
+    assert payload["generationConfig"]["top_p"] == 1.0
 
     # 验证安全设置
     assert "safetySettings" in payload
-    assert len(payload["safetySettings"]) == 4
+    assert len(payload["safetySettings"]) == 5
 
     # 验证工具配置
     assert "tool_config" in payload

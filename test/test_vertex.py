@@ -1,5 +1,11 @@
 import json
 import base64
+import pytest
+
+pytestmark = pytest.mark.credentials
+
+pytest.skip("requires Vertex credentials and external Google services", allow_module_level=True)
+
 import time
 import httpx
 from cryptography.hazmat.primitives import hashes

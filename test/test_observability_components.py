@@ -1,0 +1,116 @@
+from datetime import datetime, timezone
+
+from uni_api.observability.request_context import (
+    RequestContext,
+    get_request_info,
+    request_info,
+    reset_request_info,
+    set_request_info,
+)
+from uni_api.api.health import observability_runtime_response
+from uni_api.observability.paid_keys import compute_paid_api_key_state
+from uni_api.observability.telemetry import emit_request_observability
+
+
+def test_request_context_wraps_shared_contextvar():
+    token = set_request_info({"request_id": "req-1"})
+    try:
+        assert get_request_info()["request_id"] == "req-1"
+        assert request_info.get()["request_id"] == "req-1"
+    finally:
+        reset_request_info(token)
+
+
+def test_request_context_round_trips_known_fields_and_extras():
+    context = RequestContext(
+        request_id="req-1",
+        trace_id="trace-1",
+        endpoint="POST /v1/chat/completions",
+        api_key="sk-test",
+        extras={"trace": object(), "stream": True},
+    )
+
+    payload = context.to_dict()
+    restored = RequestContext.from_dict(payload)
+
+    assert restored.request_id == "req-1"
+    assert restored.endpoint == "POST /v1/chat/completions"
+    assert restored.extras["stream"] is True
+    assert "trace" in restored.extras
+
+
+def test_telemetry_adapter_delegates_to_fugue_emit(monkeypatch):
+    calls = []
+
+    def fake_emit(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("uni_api.observability.telemetry.emit_uni_api_ember_request_observability", fake_emit)
+
+    emit_request_observability({"request_id": "req-1"}, {"inflight_requests": 1})
+
+    assert calls == [
+        {
+            "current_info": {"request_id": "req-1"},
+            "runtime_metrics": {"inflight_requests": 1},
+        }
+    ]
+
+
+def test_debug_header_pairs_masks_sensitive_headers():
+    import main
+
+    pairs = main._debug_header_pairs(
+        {
+            "Authorization": "Bearer sk-test-secret-value",
+            "x-api-key": "sk-test-secret-value",
+            "X-Trace-Id": "trace-1",
+        }
+    )
+
+    values = {item["name"].lower(): item["value"] for item in pairs}
+    assert values["authorization"] == "Bear...alue"
+    assert values["x-api-key"] == "sk-t...alue"
+    assert values["x-trace-id"] == "trace-1"
+    assert "sk-test-secret-value" not in str(pairs)
+
+
+async def test_observability_runtime_includes_background_task_snapshots():
+    class RuntimeGauges:
+        async def record_event_loop_lag(self):
+            return None
+
+        def snapshot(self):
+            return {"event_loop_lag_ms": 0}
+
+    payload = await observability_runtime_response(
+        RuntimeGauges(),
+        stream_cleanup_snapshot=lambda: {"pending": 1, "done": 0, "total": 1},
+        provider_key_pools_snapshot=lambda: {"total": 2, "reordering_task_active": 1},
+    )
+
+    assert payload["stream_cleanup_tasks"]["pending"] == 1
+    assert payload["provider_key_pools"]["reordering_task_active"] == 1
+
+
+async def test_paid_api_key_state_computes_enabled_from_cost_and_credits():
+    async def fake_total_cost(**kwargs):
+        assert kwargs["filter_api_key"] == "sk-paid"
+        return 0.75
+
+    async def fake_usage(**kwargs):
+        assert kwargs["filter_api_key"] == "sk-paid"
+        return [{"model": "gpt-4.1", "total_tokens": 10}]
+
+    state, total_cost = await compute_paid_api_key_state(
+        credits=1.0,
+        created_at=datetime.now(timezone.utc),
+        paid_key="sk-paid",
+        compute_total_cost=fake_total_cost,
+        get_usage_data=fake_usage,
+    )
+
+    assert total_cost == 0.75
+    assert state is not None
+    assert state.enabled is True
+    assert state.to_dict()["all_tokens_info"][0]["total_tokens"] == 10

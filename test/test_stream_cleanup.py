@@ -5,8 +5,13 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
-import core.response as response_module
+import uni_api.providers.responses as response_module
 from core.utils import collect_openai_chat_completion_from_streaming_sse
+from uni_api.streaming.cleanup import (
+    background_stream_cleanup_snapshot,
+    track_background_stream_cleanup_task,
+    wait_background_stream_cleanup_tasks,
+)
 
 
 async def _mark_first_byte_wrapper_closes_inner_generator():
@@ -92,6 +97,42 @@ async def _logging_response_closes_body_when_final_send_is_cancelled():
 
 def test_logging_response_closes_body_when_final_send_is_cancelled():
     asyncio.run(_logging_response_closes_body_when_final_send_is_cancelled())
+
+
+async def _logging_response_records_stats_after_stream_finishes():
+    recorded = []
+
+    async def body():
+        yield 'data: {"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}\n\n'
+
+    async def update_stats(current_info):
+        recorded.append(dict(current_info))
+
+    async def send(message):
+        return None
+
+    response = main.LoggingStreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        current_info={
+            "start_time": 0,
+            "endpoint": "POST /v1/chat/completions",
+            "request_id": "request",
+            "trace_id": "trace",
+        },
+        update_stats=update_stats,
+    )
+
+    await response({}, None, send)
+
+    assert len(recorded) == 1
+    assert recorded[0]["prompt_tokens"] == 2
+    assert recorded[0]["completion_tokens"] == 3
+    assert recorded[0]["total_tokens"] == 5
+
+
+def test_logging_response_records_stats_after_stream_finishes():
+    asyncio.run(_logging_response_records_stats_after_stream_finishes())
 
 
 async def _fetch_response_stream_closes_selected_provider_stream(monkeypatch):
@@ -181,6 +222,29 @@ async def _force_release_closes_assigned_connection(force_release):
 
 def test_main_force_release_closes_assigned_connection():
     asyncio.run(_force_release_closes_assigned_connection(main._force_release_httpcore_pool_request_safely))
+
+
+async def _wait_background_stream_cleanup_tasks_observes_and_clears_detached_task():
+    completed = False
+
+    async def cleanup():
+        nonlocal completed
+        await asyncio.sleep(0)
+        completed = True
+
+    task = asyncio.create_task(cleanup())
+    track_background_stream_cleanup_task(task, label="test")
+
+    assert background_stream_cleanup_snapshot()["pending"] >= 1
+    snapshot = await wait_background_stream_cleanup_tasks(timeout=1.0)
+
+    assert completed is True
+    assert snapshot["pending"] == 0
+    assert snapshot["completed_during_wait"] >= 1
+
+
+def test_wait_background_stream_cleanup_tasks_observes_and_clears_detached_task():
+    asyncio.run(_wait_background_stream_cleanup_tasks_observes_and_clears_detached_task())
 
 
 def test_core_force_release_closes_assigned_connection():

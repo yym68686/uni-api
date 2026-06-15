@@ -1,0 +1,38 @@
+name: Unit Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint syntax
+        run: uv run python -m compileall -q main.py utils.py upstream.py core uni_api
+
+      - name: Run offline unit tests
+        run: uv run pytest -q
+

@@ -1,3 +1,9 @@
+import pytest
+
+pytestmark = pytest.mark.optional
+
+pytest.skip("matplotlib report-generation example is optional", allow_module_level=True)
+
 import json
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta

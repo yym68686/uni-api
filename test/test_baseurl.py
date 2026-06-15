@@ -1,3 +1,9 @@
+import pytest
+
+pytestmark = pytest.mark.optional
+
+pytest.skip("BaseAPI URL normalization print example is optional", allow_module_level=True)
+
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

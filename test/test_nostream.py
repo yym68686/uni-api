@@ -1,3 +1,9 @@
+import pytest
+
+pytestmark = pytest.mark.integration
+
+pytest.skip("requires a running local service and performs real HTTP requests", allow_module_level=True)
+
 import requests
 import base64
 import json

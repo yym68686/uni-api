@@ -355,7 +355,8 @@ def test_messages_debug_logs_final_upstream_request_headers_and_body(monkeypatch
     upstream_header_logs = [log for log in logs if log.startswith("DEBUG upstream request headers")]
     assert len(upstream_header_logs) == 1
     assert '"name": "x-api-key"' in upstream_header_logs[0]
-    assert '"value": "upstream-key"' in upstream_header_logs[0]
+    assert '"value": "upst...-key"' in upstream_header_logs[0]
+    assert '"value": "upstream-key"' not in upstream_header_logs[0]
     assert '"name": "anthropic-beta"' in upstream_header_logs[0]
     assert '"value": "debug-beta"' in upstream_header_logs[0]
 
