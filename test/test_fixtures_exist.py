@@ -11,10 +11,8 @@ def test_adapter_sse_and_config_fixtures_exist():
 
 
 def test_autouse_state_isolation_fixture_is_defined():
-    import inspect
-    import test.conftest as conftest
-
-    source = inspect.getsource(conftest.isolated_main_app_state)
+    source = (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
+    assert "def isolated_main_app_state" in source
     assert "main.app.state" in source
     assert "current.clear()" in source
     assert "current.update(before)" in source

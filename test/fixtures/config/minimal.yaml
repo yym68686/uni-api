@@ -1,0 +1,11 @@
+providers:
+  - provider: openai-a
+    base_url: https://api.example.com/v1/chat/completions
+    api: upstream-key
+    model:
+      - gpt-4.1
+api_keys:
+  - api: sk-test
+    model:
+      - all
+

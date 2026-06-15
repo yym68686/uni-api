@@ -10,6 +10,8 @@ on:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    env:
+      DISABLE_DATABASE: "true"
 
     steps:
       - name: Checkout repository
@@ -35,4 +37,3 @@ jobs:
 
       - name: Run offline unit tests
         run: uv run pytest -q
-

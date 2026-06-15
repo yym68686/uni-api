@@ -1,0 +1,38 @@
+{
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "inlineData": {
+                "mimeType": "audio/L16;codec=pcm;rate=24000",
+                "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOH/AAAAAOH/AADh/wAAAAAAAAAA4f/h/+H/AADh/wAA4f/h/wAAAADh/wAAAAAAAOH/AADh/wAA4f8AAOH/4f/h/+H/AADh/+H/AADh/wAA4f/h/wAAAADh/wAAAADh/wAAAAAAAOH/4f8AAOH/4f8AAOH/4f/h/wAA4f/h/+H/4f/h/+H/4f/h/wAA4f/h/wAA4f/h/+H/4f/h/+H/4f/h/wAA4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/8H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/wAA4f8AAOH/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f8AAOH/4f8AAOH/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4f/h/+H/4"
+              }
+            }
+          ],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "index": 0
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 8,
+      "candidatesTokenCount": 49,
+      "totalTokenCount": 57,
+      "promptTokensDetails": [
+        {
+          "modality": "TEXT",
+          "tokenCount": 8
+        }
+      ],
+      "candidatesTokensDetails": [
+        {
+          "modality": "AUDIO",
+          "tokenCount": 49
+        }
+      ]
+    },
+    "modelVersion": "gemini-2.5-flash-preview-tts",
+    "responseId": "uPFXafWHObyez7IP7s2k6Qg"
+  }
