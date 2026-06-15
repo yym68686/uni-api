@@ -1477,12 +1477,34 @@ def strip_codex_image_generation_defaults(payload: dict, model: str) -> dict:
         payload.pop("include", None)
     return payload
 
+def _codex_system_messages_to_instructions(request: RequestModel) -> str:
+    instructions: list[str] = []
+    for msg in request.messages or []:
+        role = (getattr(msg, "role", None) or "").strip()
+        if role != "system":
+            continue
+
+        content_value = getattr(msg, "content", None)
+        if isinstance(content_value, str):
+            if content_value:
+                instructions.append(content_value)
+        elif isinstance(content_value, list):
+            text_parts: list[str] = []
+            for item in content_value:
+                if getattr(item, "type", None) == "text" and getattr(item, "text", None):
+                    text_parts.append(str(item.text))
+            if text_parts:
+                instructions.append("\n".join(text_parts))
+    return "\n\n".join(instructions)
+
 def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dict) -> list[dict]:
     input_items: list[dict] = []
 
     for msg in request.messages or []:
         role = (getattr(msg, "role", None) or "").strip()
         if not role:
+            continue
+        if role == "system":
             continue
 
         # Tool results are top-level items in Codex/Responses format.
@@ -1513,7 +1535,6 @@ def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dic
             )
             continue
 
-        codex_role = "developer" if role == "system" else role
         part_type = "output_text" if role == "assistant" else "input_text"
 
         content_parts: list[dict] = []
@@ -1543,7 +1564,7 @@ def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dic
 
         message_item = {
             "type": "message",
-            "role": codex_role,
+            "role": role,
             "content": content_parts,
         }
         message_item.update(_get_extra_fields(msg))
@@ -1582,7 +1603,7 @@ async def get_codex_payload(request, engine, provider, api_key=None):
 
     payload: dict = {
         "model": original_model,
-        "instructions": "",
+        "instructions": _codex_system_messages_to_instructions(request),
         "input": _codex_chat_messages_to_responses_input(request, provider),
         # CLIProxyAPI defaults that Codex commonly expects.
         "parallel_tool_calls": True,

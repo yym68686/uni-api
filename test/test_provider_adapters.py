@@ -116,6 +116,41 @@ async def test_codex_adapter_builds_responses_request_from_chat_shape():
     assert upstream_request.payload["input"][0]["content"][0]["type"] == "input_text"
 
 
+async def test_codex_adapter_moves_system_messages_into_instructions():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[
+            {"role": "system", "content": "First instruction."},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Second instruction."},
+        ],
+        stream=False,
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.4"],
+        "tools": True,
+    }
+
+    upstream_request = await codex_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="codex",
+            original_model="gpt-5.4",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    assert upstream_request.payload["instructions"] == "First instruction.\n\nSecond instruction."
+    assert [item["role"] for item in upstream_request.payload["input"] if item["type"] == "message"] == ["user"]
+    assert all(item["role"] != "developer" for item in upstream_request.payload["input"] if item["type"] == "message")
+
+
 async def test_search_adapter_builds_jina_request_from_chat_query():
     request = RequestModel(
         model="search",

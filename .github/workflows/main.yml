@@ -13,6 +13,8 @@ on:
       - utils.py
       - core/**
       - core
+      - uni_api/**
+      - uni_api
       - static/**
       - Dockerfile
       - .dockerignore
