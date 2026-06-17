@@ -3,7 +3,10 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import secrets
+import shutil
+import subprocess
 import sys
 import threading
 import urllib.parse
@@ -50,6 +53,96 @@ def _gen_pkce() -> tuple[str, str]:
 def _gen_state() -> str:
     # Match CLIProxyAPI: 16 random bytes hex-encoded.
     return secrets.token_hex(16)
+
+
+def _read_response_text(response: Any) -> str:
+    chunks: list[bytes] = []
+    while True:
+        raw = response.read(65536)
+        if not raw:
+            break
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        chunks.append(bytes(raw))
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _redact_token_response_text(text: str, *, limit: int = 1000) -> str:
+    redacted = re.sub(
+        r'("(?:access_token|refresh_token|id_token)"\s*:\s*")[^"]*',
+        r"\1<redacted>",
+        text,
+    )
+    if len(redacted) > limit:
+        return redacted[:limit] + f"... <truncated {len(redacted) - limit} chars>"
+    return redacted
+
+
+def _post_token_form_with_curl(body: bytes, timeout: int = 30) -> tuple[int, str]:
+    if not shutil.which("curl"):
+        raise FileNotFoundError("curl not found")
+
+    status_marker = "\n__CODEX_OAUTH_HTTP_STATUS__:"
+    proc = subprocess.run(
+        [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            str(timeout),
+            "--request",
+            "POST",
+            "--header",
+            "Content-Type: application/x-www-form-urlencoded",
+            "--header",
+            "Accept: application/json",
+            "--data-binary",
+            "@-",
+            "--write-out",
+            f"{status_marker}%{{http_code}}",
+            OPENAI_TOKEN_URL,
+        ],
+        input=body,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    output = proc.stdout.decode("utf-8", errors="replace")
+    stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+    if status_marker not in output:
+        detail = stderr or _redact_token_response_text(output)
+        raise RuntimeError(f"token exchange failed: curl exit {proc.returncode}: {detail}")
+
+    raw, status_text = output.rsplit(status_marker, 1)
+    try:
+        status = int(status_text.strip())
+    except ValueError as e:
+        raise RuntimeError(f"token exchange failed: invalid curl HTTP status: {status_text!r}") from e
+
+    if proc.returncode != 0 and not raw:
+        raise RuntimeError(f"token exchange failed: curl exit {proc.returncode}: {stderr}")
+    return status, raw
+
+
+def _post_token_form_with_urllib(body: bytes, timeout: int = 30) -> tuple[int, str]:
+    req = urllib.request.Request(
+        OPENAI_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, _read_response_text(resp)
+    except urllib.error.HTTPError as e:
+        raw = _read_response_text(e) if hasattr(e, "read") else str(e)
+        return int(getattr(e, "code", 0) or 0), raw
 
 
 def _jwt_claims_no_verify(id_token: str) -> dict:
@@ -312,29 +405,20 @@ def _exchange_code_for_tokens(code: str, code_verifier: str, redirect_uri: str) 
         "code_verifier": code_verifier,
     }
     body = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(
-        OPENAI_TOKEN_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            if resp.status != 200:
-                raise RuntimeError(f"token exchange failed: status {resp.status}: {raw}")
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"token exchange failed: status {getattr(e, 'code', 'unknown')}: {raw}") from e
+        status, raw = _post_token_form_with_curl(body)
+    except (FileNotFoundError, OSError):
+        status, raw = _post_token_form_with_urllib(body)
+
+    if status != 200:
+        raise RuntimeError(f"token exchange failed: status {status}: {_redact_token_response_text(raw)}")
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"token exchange returned non-JSON: {raw}") from e
+        detail = _redact_token_response_text(raw)
+        raise RuntimeError(f"token exchange returned incomplete/non-JSON response ({len(raw)} bytes): {detail}") from e
 
 
 def _render_login_outputs(account_id: str, refresh_token: str, sub2api_payload: dict) -> str:
