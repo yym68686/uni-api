@@ -3103,6 +3103,7 @@ class ResponsesRequestExecution:
     runner: UpstreamRunner
     last_error_response: dict[str, Any] = field(default_factory=dict)
     stream_output_queue: Optional[asyncio.Queue[Any]] = None
+    stream_response_headers: dict[str, str] = field(default_factory=dict)
     stream_done_sentinel: object = field(default_factory=object)
     stream_body_started: bool = False
     stream_keepalive_sent: bool = False
@@ -3192,6 +3193,7 @@ class ResponsesRequestExecution:
         return StarletteStreamingResponse(
             self._stream_body(worker_task, first_item),
             media_type="text/event-stream",
+            headers=self.stream_response_headers,
         )
 
     async def _stream_worker(self) -> None:
@@ -3202,6 +3204,7 @@ class ResponsesRequestExecution:
                 if response.status_code == 204:
                     return
                 if hasattr(response, "body_iterator"):
+                    self.stream_response_headers = dict(response.headers)
                     async with aclosing(response.body_iterator):
                         async for chunk in response.body_iterator:
                             await self._emit_stream_chunk(chunk)
@@ -3530,9 +3533,11 @@ class ResponsesRequestExecution:
             return Response(content="", status_code=499)
 
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
+        response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         return StarletteStreamingResponse(
             self._proxy_responses_stream(attempt, buffered_chunks, upstream_iter, stream_cm, upstream_resp, stream_committed),
             media_type="text/event-stream",
+            headers=response_headers,
         )
 
     async def _proxy_responses_stream(
@@ -3654,7 +3659,8 @@ class ResponsesRequestExecution:
             raise semantic_failure
 
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
-        return JSONResponse(status_code=upstream_resp.status_code, content=data)
+        response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        return JSONResponse(status_code=upstream_resp.status_code, content=data, headers=response_headers)
 
     def _mark_success(self, channel_id: str, provider_api_key: Optional[str]) -> None:
         self._schedule_channel_stats(channel_id, success=True, provider_api_key=provider_api_key)

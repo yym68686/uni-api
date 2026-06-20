@@ -130,8 +130,9 @@ class SequencedDummyClientManager:
 
 
 class DummyStreamingUpstreamResponse:
-    def __init__(self, *, chunks=None, stream_error=None, status_code=200, json_data=None, raw_body=None):
+    def __init__(self, *, chunks=None, stream_error=None, status_code=200, json_data=None, raw_body=None, headers=None):
         self.status_code = status_code
+        self.headers = headers or {}
         self._chunks = list(chunks or [])
         self._stream_error = stream_error
         self._json_data = json_data if json_data is not None else {"ok": True}
@@ -2002,6 +2003,64 @@ def test_responses_non_stream_retries_next_provider_on_semantic_failure(monkeypa
         "https://provider-a.example/v1/responses",
         "https://provider-b.example/v1/responses",
     ]
+
+
+def test_responses_non_stream_preserves_oaix_response_headers(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    upstream_response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "https://example.com/v1/responses"),
+        headers={
+            "X-OAIX-Request-ID": "req_123",
+            "X-OAIX-Token-ID": "8662",
+            "X-OAIX-Token-Owner-User-ID": "63910",
+        },
+        json={"id": "resp_ok"},
+    )
+    main.app.state.client_manager = DummyClientManager(upstream_response)
+
+    response = _run_responses_request(
+        ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=False)
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-oaix-request-id"] == "req_123"
+    assert response.headers["x-oaix-token-id"] == "8662"
+    assert response.headers["x-oaix-token-owner-user-id"] == "63910"
+
+
+def test_responses_stream_preserves_oaix_response_headers(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    upstream_response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ],
+        headers={
+            "X-OAIX-Request-ID": "req_stream",
+            "X-OAIX-Token-ID": "8662",
+            "X-OAIX-Token-Owner-User-ID": "63910",
+        },
+    )
+    main.app.state.client_manager = DummyClientManager(upstream_response)
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=True)
+    )
+
+    assert "hello" in body
+    assert response.status_code == 200
+    assert response.headers["x-oaix-request-id"] == "req_stream"
+    assert response.headers["x-oaix-token-id"] == "8662"
+    assert response.headers["x-oaix-token-owner-user-id"] == "63910"
 
 
 def test_responses_non_stream_rate_limit_cools_current_key_and_tries_next_key(monkeypatch):
