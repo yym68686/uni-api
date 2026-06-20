@@ -92,6 +92,18 @@ def _gemini_response_modalities(original_model: str, request_modalities: list[st
 def _get_extra_fields(obj) -> dict:
     return getattr(obj, 'model_extra', None) or {}
 
+def _remove_key_recursive(value, key: str) -> None:
+    if isinstance(value, dict):
+        value.pop(key, None)
+        for nested in value.values():
+            _remove_key_recursive(nested, key)
+    elif isinstance(value, list):
+        for item in value:
+            _remove_key_recursive(item, key)
+
+def _strip_gemini_unsupported_fields(payload: dict) -> None:
+    _remove_key_recursive(payload, "reasoning_content")
+
 def _build_input_audio_item(item):
     input_audio = getattr(item, "input_audio", None)
     if not input_audio or not getattr(input_audio, "data", None):
@@ -614,6 +626,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         original_model,
         include_service_tier=True,
     )
+    _strip_gemini_unsupported_fields(payload)
 
     return url, headers, payload
 
@@ -851,6 +864,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
             }
             payload.setdefault("model", original_model)
 
+    _strip_gemini_unsupported_fields(payload)
     return url, headers, payload
 
 async def get_vertex_claude_payload(request, engine, provider, api_key=None):
