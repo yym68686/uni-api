@@ -46,7 +46,7 @@ ResponseHeadersSink = Callable[[Any], None]
 
 
 def _capture_response_headers(response_headers_sink: ResponseHeadersSink | None, headers: Any) -> None:
-    if response_headers_sink is not None:
+    if response_headers_sink is not None and headers is not None:
         response_headers_sink(headers)
 
 
@@ -486,7 +486,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, timeout, resp
     output_tokens = 0
     try:
         async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
-            _capture_response_headers(response_headers_sink, response.headers)
+            _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
             error_message = await check_response(response, "fetch_gpt_response_stream")
             if error_message:
                 yield error_message
@@ -967,7 +967,7 @@ async def _fetch_search_response(client, url, headers, payload, timeout, respons
         response = await client.post(url, headers=headers, json=payload, timeout=timeout)
     else:
         response = await client.get(url, headers=headers, params=payload, timeout=timeout)
-    _capture_response_headers(response_headers_sink, response.headers)
+    _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
     return response
 
 
@@ -977,16 +977,16 @@ async def _fetch_post_response(client, url, headers, payload, timeout, response_
         data, files = multipart_payload
         multipart_headers, multipart_content = _build_multipart_content(headers, data, files)
         response = await client.post(url, headers=multipart_headers, content=multipart_content, timeout=timeout)
-        _capture_response_headers(response_headers_sink, response.headers)
+        _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
         return response
     if payload.get("file"):
         file = payload.pop("file")
         response = await client.post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
-        _capture_response_headers(response_headers_sink, response.headers)
+        _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
         return response
     json_payload = await asyncio.to_thread(json.dumps, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
-    _capture_response_headers(response_headers_sink, response.headers)
+    _capture_response_headers(response_headers_sink, getattr(response, "headers", None))
     return response
 
 
