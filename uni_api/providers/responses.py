@@ -6,7 +6,7 @@ import uuid
 import asyncio
 from datetime import datetime
 from urllib.parse import urlparse
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from core.log_config import logger
 from uni_api.serialization import json
@@ -41,6 +41,13 @@ from uni_api.streaming.responses_events import (
     normalize_optional_text as _normalize_optional_text,
     stream_responses_to_chat_completions as _stream_responses_to_chat_completions,
 )
+
+ResponseHeadersSink = Callable[[Any], None]
+
+
+def _capture_response_headers(response_headers_sink: ResponseHeadersSink | None, headers: Any) -> None:
+    if response_headers_sink is not None:
+        response_headers_sink(headers)
 
 
 def _normalize_search_item_defaults(item: dict) -> dict:
@@ -465,7 +472,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
 
     yield "data: [DONE]" + end_of_line
 
-async def fetch_gpt_response_stream(client, url, headers, payload, timeout):
+async def fetch_gpt_response_stream(client, url, headers, payload, timeout, response_headers_sink: ResponseHeadersSink | None = None):
     timestamp = int(datetime.timestamp(datetime.now()))
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -479,6 +486,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, timeout):
     output_tokens = 0
     try:
         async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+            _capture_response_headers(response_headers_sink, response.headers)
             error_message = await check_response(response, "fetch_gpt_response_stream")
             if error_message:
                 yield error_message
@@ -949,28 +957,37 @@ def _build_multipart_content(headers: dict, data: list, files: list) -> tuple[di
     return request_headers, b"".join(chunks)
 
 
-async def _fetch_search_response(client, url, headers, payload, timeout):
+async def _fetch_search_response(client, url, headers, payload, timeout, response_headers_sink: ResponseHeadersSink | None = None):
     content_type = None
     for key in ("Content-Type", "content-type"):
         if key in (headers or {}):
             content_type = headers.get(key)
             break
     if content_type and "application/json" in str(content_type).lower():
-        return await client.post(url, headers=headers, json=payload, timeout=timeout)
-    return await client.get(url, headers=headers, params=payload, timeout=timeout)
+        response = await client.post(url, headers=headers, json=payload, timeout=timeout)
+    else:
+        response = await client.get(url, headers=headers, params=payload, timeout=timeout)
+    _capture_response_headers(response_headers_sink, response.headers)
+    return response
 
 
-async def _fetch_post_response(client, url, headers, payload, timeout):
+async def _fetch_post_response(client, url, headers, payload, timeout, response_headers_sink: ResponseHeadersSink | None = None):
     multipart_payload = _pop_multipart_payload(payload)
     if multipart_payload is not None:
         data, files = multipart_payload
         multipart_headers, multipart_content = _build_multipart_content(headers, data, files)
-        return await client.post(url, headers=multipart_headers, content=multipart_content, timeout=timeout)
+        response = await client.post(url, headers=multipart_headers, content=multipart_content, timeout=timeout)
+        _capture_response_headers(response_headers_sink, response.headers)
+        return response
     if payload.get("file"):
         file = payload.pop("file")
-        return await client.post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
+        response = await client.post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
+        _capture_response_headers(response_headers_sink, response.headers)
+        return response
     json_payload = await asyncio.to_thread(json.dumps, payload)
-    return await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    _capture_response_headers(response_headers_sink, response.headers)
+    return response
 
 
 async def _yield_search_response(response, url):
@@ -1168,9 +1185,9 @@ async def _yield_embedding_response(response, model):
     }
 
 
-async def fetch_response(client, url, headers, payload, engine, model, timeout=200):
+async def fetch_response(client, url, headers, payload, engine, model, timeout=200, response_headers_sink: ResponseHeadersSink | None = None):
     if engine == "search":
-        response = await _fetch_search_response(client, url, headers, payload, timeout)
+        response = await _fetch_search_response(client, url, headers, payload, timeout, response_headers_sink=response_headers_sink)
         error_message = await check_response(response, "fetch_response")
         if error_message:
             yield error_message
@@ -1179,7 +1196,7 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
             yield item
         return
 
-    response = await _fetch_post_response(client, url, headers, payload, timeout)
+    response = await _fetch_post_response(client, url, headers, payload, timeout, response_headers_sink=response_headers_sink)
     error_message = await check_response(response, "fetch_response")
     if error_message:
         yield error_message
@@ -1294,7 +1311,7 @@ async def fetch_dalle_response_stream(client, url, headers, payload, timeout=200
         async for chunk in response.aiter_text():
             yield chunk
 
-async def fetch_response_stream(client, url, headers, payload, engine, model, timeout=200):
+async def fetch_response_stream(client, url, headers, payload, engine, model, timeout=200, response_headers_sink: ResponseHeadersSink | None = None):
     if engine == "gemini" or engine == "vertex-gemini":
         stream = fetch_gemini_response_stream(client, url, headers, payload, model, timeout)
     elif engine == "claude" or engine == "vertex-claude":
@@ -1302,7 +1319,7 @@ async def fetch_response_stream(client, url, headers, payload, engine, model, ti
     elif engine == "aws":
         stream = fetch_aws_response_stream(client, url, headers, payload, model, timeout)
     elif engine in ("gpt", "codex", "openrouter", "azure-databricks"):
-        stream = fetch_gpt_response_stream(client, url, headers, payload, timeout)
+        stream = fetch_gpt_response_stream(client, url, headers, payload, timeout, response_headers_sink=response_headers_sink)
     elif engine == "azure":
         stream = fetch_azure_response_stream(client, url, headers, payload, timeout)
     elif engine == "cloudflare":

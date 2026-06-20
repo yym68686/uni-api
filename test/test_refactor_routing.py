@@ -257,8 +257,8 @@ def test_process_request_uses_http1_client_for_codex_chat(monkeypatch):
             self.calls.append({"base_url": base_url, "proxy": proxy, "http2": http2})
             yield DummyClient()
 
-    async def fake_fetch_response_stream(client, url, headers, payload, engine, model, timeout):
-        _ = (client, url, headers, payload, engine, model, timeout)
+    async def fake_fetch_response_stream(client, url, headers, payload, engine, model, timeout, response_headers_sink=None):
+        _ = (client, url, headers, payload, engine, model, timeout, response_headers_sink)
         yield (
             'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,'
             '"model":"gpt-image-2","choices":[{"index":0,"delta":{"role":"assistant"},'

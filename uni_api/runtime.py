@@ -1729,6 +1729,10 @@ async def process_request(
         async with app.state.client_manager.get_client(url, proxy, http2=False if engine == "codex" else None) as client:
             downstream_stream = bool(getattr(request, "stream", None))
             force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
+            upstream_response_headers: dict[str, str] = {}
+
+            def capture_upstream_response_headers(headers: Any) -> None:
+                upstream_response_headers.update(_copy_upstream_response_headers(headers))
 
             if downstream_stream and not force_collect_codex_stream:
                 _log_debug_request_headers(
@@ -1752,7 +1756,16 @@ async def process_request(
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
                 runtime_gauges.begin_waiting_first_byte(current_info)
-                generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
+                generator = fetch_response_stream(
+                    client,
+                    url,
+                    headers,
+                    payload,
+                    engine,
+                    original_model,
+                    timeout_value,
+                    response_headers_sink=capture_upstream_response_headers,
+                )
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
@@ -1760,7 +1773,7 @@ async def process_request(
                     wrapped_generator = _mark_first_byte_on_stream(wrapped_generator, current_info, skip_keepalive=True)
                 else:
                     _mark_first_byte_observed(current_info)
-                response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")
+                response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream", headers=upstream_response_headers)
             elif force_collect_codex_stream:
                 payload["stream"] = True
                 headers["Accept"] = "text/event-stream"
@@ -1785,7 +1798,16 @@ async def process_request(
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
                 runtime_gauges.begin_waiting_first_byte(current_info)
-                generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value)
+                generator = fetch_response_stream(
+                    client,
+                    url,
+                    headers,
+                    payload,
+                    engine,
+                    original_model,
+                    timeout_value,
+                    response_headers_sink=capture_upstream_response_headers,
+                )
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
@@ -1793,7 +1815,7 @@ async def process_request(
                     _mark_first_byte_observed(current_info)
                 json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
                 _mark_first_byte_observed(current_info)
-                response = StarletteStreamingResponse(iter([json_data]), media_type="application/json")
+                response = StarletteStreamingResponse(iter([json_data]), media_type="application/json", headers=upstream_response_headers)
             else:
                 _log_debug_request_headers(
                     "DEBUG upstream request headers",
@@ -1816,7 +1838,16 @@ async def process_request(
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_send_start")
                 runtime_gauges.begin_waiting_first_byte(current_info)
-                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
+                generator = fetch_response(
+                    client,
+                    url,
+                    headers,
+                    payload,
+                    engine,
+                    original_model,
+                    timeout_value,
+                    response_headers_sink=capture_upstream_response_headers,
+                )
                 if isinstance(trace, RequestTrace):
                     trace.mark("upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, False, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
@@ -1825,7 +1856,7 @@ async def process_request(
                 # 处理音频和其他二进制响应
                 if endpoint == "/v1/audio/speech":
                     if isinstance(wrapped_generator, bytes):
-                        response = Response(content=wrapped_generator, media_type="audio/mpeg")
+                        response = Response(content=wrapped_generator, media_type="audio/mpeg", headers=upstream_response_headers)
                 else:
                     async with aclosing(wrapped_generator):
                         first_element = await anext(wrapped_generator)
@@ -1833,7 +1864,7 @@ async def process_request(
                     first_element = first_element.lstrip("data: ")
                     decoded_element = await asyncio.to_thread(json.loads, first_element)
                     encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
-                    response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json")
+                    response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json", headers=upstream_response_headers)
 
             # 更新成功计数和首次响应时间
             background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
