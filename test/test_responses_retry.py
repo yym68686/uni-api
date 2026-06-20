@@ -729,6 +729,47 @@ def test_responses_compact_codex_strips_store(monkeypatch):
     assert "store" not in sent_payload
 
 
+def test_responses_compact_large_payload_uses_timeout_floor_and_records_attempt(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.provider_timeouts = {"global": {"gpt-5.4": 20, "default": 30}}
+    monkeypatch.setattr(main, "RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES", 64)
+    monkeypatch.setattr(main, "RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT", 120)
+
+    current_info = {
+        "request_id": "req-large-compact",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+        "trace": main.RequestTrace(trace_id="req-large-compact"),
+    }
+    request_token = main.request_info.set(current_info)
+    try:
+        handler = main.ResponsesRequestHandler()
+        response = asyncio.run(
+            handler.request_responses(
+                http_request=SimpleNamespace(headers={}),
+                request_data=ResponsesRequest(
+                    model="gpt-5.4",
+                    input=[{"role": "user", "content": "x" * 128}],
+                ),
+                api_index=0,
+                background_tasks=BackgroundTasks(),
+                endpoint="/v1/responses/compact",
+            )
+        )
+    finally:
+        main.request_info.reset(request_token)
+
+    assert response.status_code == 200
+    assert client_manager.post_calls[0]["timeout"] == 120
+    attempt = current_info["upstream_attempts"][0]
+    assert attempt["provider"] == "codex-provider"
+    assert attempt["payload_bytes"] > 64
+    assert attempt["timeout_seconds"] == 120
+    assert attempt["timeout_adjusted_from_seconds"] == 20
+    assert attempt["status_code"] == 200
+    assert attempt["success"] is True
+
+
 def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatch):
     provider_name = "provider-a"
     monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))

@@ -188,6 +188,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _should_log_stdout_request_summary() -> bool:
     if not _env_bool("STDOUT_REQUEST_SUMMARY_LOG_ENABLED", True):
         return False
@@ -212,6 +219,14 @@ def _log_stdout_request_summary(provider: str, model: str, engine: str, role: st
 
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
+RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES = max(
+    0,
+    _env_int("RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES", 8 * 1024 * 1024),
+)
+RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT = max(
+    0,
+    _env_int("RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT", 120),
+)
 is_debug = _env_flag(os.getenv("DEBUG"))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
@@ -3393,10 +3408,12 @@ class ResponsesRequestExecution:
         proxy = attempt.state["proxy"]
         headers = self._build_headers(attempt)
         payload = self._build_payload(attempt)
+        json_payload = await asyncio.to_thread(json.dumps, payload)
+        self._apply_large_compact_timeout_floor(attempt, len(json_payload.encode("utf-8")))
+        self._record_upstream_attempt_start(attempt)
         self._log_attempt(attempt, headers, payload)
 
         async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
-            json_payload = await asyncio.to_thread(json.dumps, payload)
             if self.request_data.stream:
                 return await self._execute_stream_attempt(client, attempt, headers, json_payload)
             return await self._execute_non_stream_attempt(client, attempt, headers, json_payload)
@@ -3442,19 +3459,98 @@ class ResponsesRequestExecution:
             strip_unsupported_codex_payload_fields(payload, strip_store=attempt.state["wants_compact"])
         return payload
 
+    def _apply_large_compact_timeout_floor(self, attempt: Any, payload_bytes: int) -> None:
+        attempt.state["payload_bytes"] = max(0, int(payload_bytes))
+        configured_timeout = int(attempt.state.get("timeout_value") or DEFAULT_TIMEOUT)
+        if (
+            not attempt.state.get("wants_compact")
+            or RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES <= 0
+            or RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT <= 0
+            or payload_bytes <= RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES
+            or configured_timeout >= RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT
+        ):
+            attempt.state["timeout_value"] = configured_timeout
+            return
+        attempt.state["timeout_value"] = RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT
+        attempt.state["timeout_adjusted_from"] = configured_timeout
+
+    def _record_upstream_attempt_start(self, attempt: Any) -> None:
+        attempts = self.current_info.get("upstream_attempts")
+        if not isinstance(attempts, list):
+            attempts = []
+            self.current_info["upstream_attempts"] = attempts
+        if len(attempts) >= 16:
+            attempt.state["observability_attempt_index"] = None
+            return
+
+        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
+        started_ms = None
+        if isinstance(trace, RequestTrace):
+            started_ms = max(0, int((time() - trace.started_at) * 1000))
+            trace.add_ms("upstream_payload_bytes", attempt.state.get("payload_bytes", 0))
+            trace.add_ms("upstream_timeout_seconds", attempt.state.get("timeout_value", 0))
+            if attempt.state.get("timeout_adjusted_from") is not None:
+                trace.add_ms("upstream_timeout_adjusted_from_seconds", attempt.state["timeout_adjusted_from"])
+
+        upstream_host = urlparse(str(attempt.state.get("upstream_url") or "")).netloc
+        entry = {
+            "index": len(attempts) + 1,
+            "endpoint": self.endpoint,
+            "provider": attempt.state.get("channel_id", attempt.provider_name),
+            "model": self.request_model_name,
+            "actual_model": attempt.original_model,
+            "engine": attempt.state.get("engine"),
+            "upstream_host": upstream_host,
+            "payload_bytes": int(attempt.state.get("payload_bytes") or 0),
+            "timeout_seconds": int(attempt.state.get("timeout_value") or 0),
+            "wants_compact": bool(attempt.state.get("wants_compact")),
+            "stream": bool(self.request_data.stream),
+        }
+        if started_ms is not None:
+            entry["started_ms"] = started_ms
+        if attempt.state.get("timeout_adjusted_from") is not None:
+            entry["timeout_adjusted_from_seconds"] = int(attempt.state["timeout_adjusted_from"])
+        attempts.append(entry)
+        attempt.state["observability_attempt_index"] = len(attempts) - 1
+
+    def _record_upstream_attempt_result(
+        self,
+        attempt: Any,
+        *,
+        status_code: int,
+        success: bool,
+        error_type: Optional[str] = None,
+    ) -> None:
+        attempts = self.current_info.get("upstream_attempts")
+        index = attempt.state.get("observability_attempt_index")
+        if not isinstance(attempts, list) or not isinstance(index, int) or index < 0 or index >= len(attempts):
+            return
+        entry = attempts[index]
+        if not isinstance(entry, dict):
+            return
+        entry["status_code"] = int(status_code)
+        entry["success"] = bool(success)
+        if error_type:
+            entry["error_type"] = str(error_type)[:80]
+        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
+        if isinstance(trace, RequestTrace) and isinstance(entry.get("started_ms"), int):
+            entry["duration_ms"] = max(0, int((time() - trace.started_at) * 1000) - int(entry["started_ms"]))
+
     def _log_attempt(self, attempt: Any, headers: dict[str, str], payload: dict[str, Any]) -> None:
         channel_id = attempt.state["channel_id"]
         upstream_url = attempt.state["upstream_url"]
         engine = attempt.state["engine"]
         _log_stdout_request_summary(channel_id, self.request_model_name, engine, self.plan.role)
         trace_logger.info(
-            "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
+            "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s timeout_seconds=%s payload_bytes=%s upstream_url=%s",
             self.endpoint,
             self.request_id,
             channel_id[:11],
             self.request_model_name,
             engine[:13],
             self.plan.role,
+            attempt.state.get("timeout_value"),
+            attempt.state.get("payload_bytes"),
             upstream_url,
         )
         attempt.state["failure_stage"] = "upstream"
@@ -3532,6 +3628,7 @@ class ResponsesRequestExecution:
             )
             return Response(content="", status_code=499)
 
+        self._record_upstream_attempt_result(attempt, status_code=upstream_resp.status_code, success=True)
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         return StarletteStreamingResponse(
@@ -3658,6 +3755,7 @@ class ResponsesRequestExecution:
         if semantic_failure is not None:
             raise semantic_failure
 
+        self._record_upstream_attempt_result(attempt, status_code=upstream_resp.status_code, success=True)
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         return JSONResponse(status_code=upstream_resp.status_code, content=data, headers=response_headers)
@@ -3669,6 +3767,12 @@ class ResponsesRequestExecution:
         self.current_info["provider"] = channel_id
 
     def _after_failure(self, attempt: Any, exc: Exception, status_code: int, error_message: Any) -> None:
+        self._record_upstream_attempt_result(
+            attempt,
+            status_code=status_code,
+            success=False,
+            error_type=type(exc).__name__,
+        )
         if attempt.state.get("track_channel_stats"):
             self._schedule_channel_stats(
                 attempt.state["channel_id"],

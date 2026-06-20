@@ -290,6 +290,7 @@ def build_uni_api_ember_request_telemetry(
             ),
         }
     ]
+    logs.extend(_upstream_attempt_log_events(now, service_name, base, current_info))
 
     traces = []
     for stage, stage_ms, stage_attrs in _stage_rows(spans, duration_ms):
@@ -334,6 +335,65 @@ def build_uni_api_ember_request_telemetry(
         },
     )
     return {"logs": logs, "traces": traces, "metrics": metrics}
+
+
+def _upstream_attempt_log_events(
+    timestamp: datetime,
+    service_name: str,
+    base: dict[str, str],
+    current_info: dict[str, Any],
+) -> list[dict[str, Any]]:
+    attempts = current_info.get("upstream_attempts")
+    if not isinstance(attempts, list):
+        return []
+
+    events: list[dict[str, Any]] = []
+    for raw_attempt in attempts[:16]:
+        if not isinstance(raw_attempt, dict):
+            continue
+        attempt_status = _safe_int(raw_attempt.get("status_code"), 0)
+        attempt_provider = _safe_text(raw_attempt.get("provider"))
+        attempt_error_type = _safe_text(raw_attempt.get("error_type"), max_len=80)
+        timeout_adjusted_from = _optional_int_text(raw_attempt.get("timeout_adjusted_from_seconds"))
+        started_ms = _optional_int_text(raw_attempt.get("started_ms"))
+        duration_ms = _optional_int_text(raw_attempt.get("duration_ms"))
+        events.append(
+            {
+                "timestamp": _iso_timestamp(timestamp),
+                "level": _event_level(attempt_status),
+                "service": service_name,
+                "trace_id": base.get("trace_id"),
+                "request_id": base.get("request_id"),
+                "event": "upstream_attempt",
+                "event_type": "upstream_attempt",
+                "source": service_name,
+                "message": "uni-api-ember upstream attempt",
+                "attributes": _drop_empty(
+                    {
+                        **base,
+                        "provider": attempt_provider,
+                        "channel": attempt_provider,
+                        "model": _safe_text(raw_attempt.get("model")) or base.get("model"),
+                        "actual_model": _safe_text(raw_attempt.get("actual_model")),
+                        "engine": _safe_text(raw_attempt.get("engine")),
+                        "upstream_host": _safe_text(raw_attempt.get("upstream_host")),
+                        "attempt_index": _int_text(_safe_int(raw_attempt.get("index"), 0)),
+                        "attempt_status_code": _int_text(attempt_status),
+                        "attempt_status_class": _status_class(attempt_status),
+                        "attempt_success": _bool_text(_safe_bool(raw_attempt.get("success"))),
+                        "attempt_error_type": attempt_error_type,
+                        "payload_bytes": _int_text(_safe_int(raw_attempt.get("payload_bytes"), 0)),
+                        "timeout_seconds": _int_text(_safe_int(raw_attempt.get("timeout_seconds"), 0)),
+                        "timeout_adjusted_from_seconds": timeout_adjusted_from,
+                        "wants_compact": _bool_text(_safe_bool(raw_attempt.get("wants_compact"))),
+                        "stream": _bool_text(_safe_bool(raw_attempt.get("stream"))),
+                        "started_ms": started_ms,
+                        "duration_ms": duration_ms,
+                    }
+                ),
+            }
+        )
+    return events
 
 
 def _stage_rows(spans: dict[str, Any], duration_ms: int | None) -> list[tuple[str, int, dict[str, str]]]:
@@ -607,6 +667,12 @@ def _int_text(value: Any) -> str | None:
         return str(max(0, int(value)))
     except (TypeError, ValueError):
         return None
+
+
+def _optional_int_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _int_text(value)
 
 
 def _iso_timestamp(value: datetime) -> str:

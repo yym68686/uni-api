@@ -74,6 +74,28 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
                 "downstream_response_start": 145,
                 "stream_end": 1250,
             },
+            "upstream_attempts": [
+                {
+                    "index": 1,
+                    "endpoint": "/v1/responses/compact",
+                    "provider": "fugue-codex",
+                    "model": "gpt-5.4",
+                    "actual_model": "gpt-5.4",
+                    "engine": "codex",
+                    "upstream_host": "oaix.internal",
+                    "payload_bytes": 29658219,
+                    "timeout_seconds": 120,
+                    "timeout_adjusted_from_seconds": 20,
+                    "wants_compact": True,
+                    "stream": False,
+                    "started_ms": 31,
+                    "duration_ms": 20061,
+                    "status_code": 504,
+                    "success": False,
+                    "error_type": "ReadTimeout",
+                    "error_message": "Bearer ember-secret-token",
+                }
+            ],
         },
         runtime_metrics={
             "inflight_requests": 12,
@@ -107,6 +129,14 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert log_event["event"] == "request_summary"
     assert log_event["event_type"] == "request_summary"
     assert log_event["message"] == "uni-api-ember request finished"
+    attempt_event = next(event for event in telemetry["logs"] if event["event"] == "upstream_attempt")
+    attempt_attrs = attempt_event["attributes"]
+    assert attempt_attrs["provider"] == "fugue-codex"
+    assert attempt_attrs["attempt_status_code"] == "504"
+    assert attempt_attrs["attempt_error_type"] == "ReadTimeout"
+    assert attempt_attrs["payload_bytes"] == "29658219"
+    assert attempt_attrs["timeout_seconds"] == "120"
+    assert attempt_attrs["timeout_adjusted_from_seconds"] == "20"
 
     stages = {
         event["attributes"]["stage"]
