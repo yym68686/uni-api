@@ -1054,6 +1054,53 @@ api_keys:
 
 通过合理配置 `model_timeout`，可以避免出现某些渠道请求超时报错的情况。如果你遇到 `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}` 错误，请尝试增加对应模型的超时时间。
 
+- 如何给不同端点、流式 / 非流式、不同模型设置不同超时？
+
+如果超时策略需要依赖端点、是否流式、provider、engine、模型、HTTP method 或 role，请使用 `timeout_policy`。`model_timeout` 仍然保留，作为向后兼容的 fallback；`timeout_policy` 是更精确的规则系统。
+
+```yaml
+preferences:
+  model_timeout:
+    default: 30
+    gpt-5.5: 20
+  timeout_policy:
+    default:
+      first_byte: 30
+    rules:
+      - match:
+          endpoint: /v1/responses/compact
+          stream: false
+          model: gpt-5.5
+        timeout:
+          first_byte: 120
+          total: 300
+      - match:
+          endpoint: /v1/responses
+          stream: true
+          model: gpt-5.5
+        timeout:
+          first_byte: 60
+          idle: 120
+
+providers:
+  - provider: openai
+    preferences:
+      timeout_policy:
+        rules:
+          - match:
+              endpoint: /v1/responses/compact
+              stream: false
+              model: gpt-5.5
+            timeout:
+              first_byte: 180
+```
+
+支持的 `match` 字段包括：`endpoint`、`stream`、`method`、`engine`、`provider`、`model`、`request_model`、`upstream_model`、`role`。其中 `model` 会同时匹配请求模型名和真实上游模型名；`*` 匹配任意值；以 `*` 结尾的字符串表示前缀匹配。
+
+支持的 timeout 字段包括：`connect`、`write`、`pool`、`first_byte`、`idle`、`total`。当前 HTTP upstream 调用仍然使用现有 httpx scalar timeout 参数；uni-api 会优先把 `first_byte` 映射到这个 scalar timeout，其次回退到 `total`，再回退到 `idle`。其它字段先作为统一配置形态保留，方便后续接入更细粒度的 HTTP timeout。
+
+解析顺序是：全局 `timeout_policy.default` → provider `timeout_policy.default` → 命中维度最多的全局 `timeout_policy.rules` → 命中维度最多的 provider `timeout_policy.rules`。如果没有任何 timeout policy 设置有效值，uni-api 会继续回退到 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`。
+
 - api_key_rate_limit 是怎么工作的？我如何给多个模型设置相同的频率限制？
 
 如果你想同时给 gemini-1.5-pro-latest，gemini-1.5-pro，gemini-1.5-pro-001，gemini-1.5-pro-002 这四个模型设置相同的频率限制，可以这样设置：

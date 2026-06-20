@@ -224,6 +224,7 @@ def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None)
         ]
     }
     main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.timeout_policy = main.init_timeout_policy({})
 
     upstream_response = httpx.Response(
         200,
@@ -729,11 +730,27 @@ def test_responses_compact_codex_strips_store(monkeypatch):
     assert "store" not in sent_payload
 
 
-def test_responses_compact_large_payload_uses_timeout_floor_and_records_attempt(monkeypatch):
+def test_responses_compact_non_stream_uses_timeout_policy_and_records_attempt(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
     main.app.state.provider_timeouts = {"global": {"gpt-5.4": 20, "default": 30}}
-    monkeypatch.setattr(main, "RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES", 64)
-    monkeypatch.setattr(main, "RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT", 120)
+    main.app.state.timeout_policy = main.init_timeout_policy(
+        {
+            "preferences": {
+                "timeout_policy": {
+                    "rules": [
+                        {
+                            "match": {
+                                "endpoint": "/v1/responses/compact",
+                                "stream": False,
+                                "model": "gpt-5.4",
+                            },
+                            "timeout": {"first_byte": 120, "total": 300},
+                        }
+                    ]
+                }
+            }
+        }
+    )
 
     current_info = {
         "request_id": "req-large-compact",
@@ -749,7 +766,7 @@ def test_responses_compact_large_payload_uses_timeout_floor_and_records_attempt(
                 http_request=SimpleNamespace(headers={}),
                 request_data=ResponsesRequest(
                     model="gpt-5.4",
-                    input=[{"role": "user", "content": "x" * 128}],
+                    input=[{"role": "user", "content": "hello"}],
                 ),
                 api_index=0,
                 background_tasks=BackgroundTasks(),
@@ -763,9 +780,10 @@ def test_responses_compact_large_payload_uses_timeout_floor_and_records_attempt(
     assert client_manager.post_calls[0]["timeout"] == 120
     attempt = current_info["upstream_attempts"][0]
     assert attempt["provider"] == "codex-provider"
-    assert attempt["payload_bytes"] > 64
+    assert attempt["payload_bytes"] > 0
     assert attempt["timeout_seconds"] == 120
     assert attempt["timeout_adjusted_from_seconds"] == 20
+    assert attempt["timeout_policy_sources"] == ["global.rules[0]"]
     assert attempt["status_code"] == 200
     assert attempt["success"] is True
 

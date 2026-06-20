@@ -119,6 +119,7 @@ from uni_api.api.video import (
 from uni_api.app_state import AppRuntimeSnapshot
 import uni_api.config.legacy_loader as legacy_config_loader
 from uni_api.config.compiler import compile_runtime_config
+from uni_api.config.timeout_policy import apply_timeout_policy, init_timeout_policy
 from uni_api.observability.paid_keys import compute_paid_api_key_state
 from uni_api.observability.request_context import (
     get_request_info,
@@ -219,14 +220,6 @@ def _log_stdout_request_summary(provider: str, model: str, engine: str, role: st
 
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
-RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES = max(
-    0,
-    _env_int("RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES", 8 * 1024 * 1024),
-)
-RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT = max(
-    0,
-    _env_int("RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT", 120),
-)
 is_debug = _env_flag(os.getenv("DEBUG"))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
@@ -1004,6 +997,7 @@ async def refresh_runtime_state(app: FastAPI) -> None:
         ),
         admin_api_key=_build_admin_api_keys(api_keys_db),
         provider_timeouts=init_preference(config, "model_timeout", DEFAULT_TIMEOUT),
+        timeout_policy=init_timeout_policy(config),
         keepalive_interval=init_preference(config, "keepalive_interval", 99999),
     )
 
@@ -1014,6 +1008,7 @@ async def refresh_runtime_state(app: FastAPI) -> None:
     app.state.global_rate_limit = runtime_snapshot.global_rate_limit
     app.state.admin_api_key = runtime_snapshot.admin_api_key
     app.state.provider_timeouts = runtime_snapshot.provider_timeouts
+    app.state.timeout_policy = runtime_snapshot.timeout_policy
     app.state.keepalive_interval = runtime_snapshot.keepalive_interval
     app.state.models_list = runtime_config.api_key_allowed_models
     app.state.routing_index = runtime_config.routing_index
@@ -2002,6 +1997,24 @@ class ModelRequestHandler:
                     original_request_model,
                     DEFAULT_TIMEOUT,
                 )
+                engine_for_timeout, stream_mode_for_timeout = get_engine(
+                    provider,
+                    endpoint=endpoint,
+                    original_model=original_model,
+                )
+                timeout_resolution = apply_timeout_policy(
+                    base_timeout=int(local_timeout_value),
+                    timeout_policy=getattr(app.state, "timeout_policy", {}),
+                    provider_name=provider_name,
+                    endpoint=routing_endpoint,
+                    method="POST",
+                    stream=bool(stream_mode_for_timeout) if stream_mode_for_timeout is not None else bool(getattr(request_data, "stream", False)),
+                    engine=engine_for_timeout,
+                    original_model=original_model,
+                    request_model=request_model_name,
+                    role=plan.role,
+                )
+                local_timeout_value = int(timeout_resolution["timeout_value"])
                 local_provider_num_matching_providers = 1
 
             local_timeout_value = local_timeout_value * local_provider_num_matching_providers
@@ -3374,13 +3387,28 @@ class ResponsesRequestExecution:
             (original_model, self.request_model_name),
             DEFAULT_TIMEOUT,
         )
+        timeout_resolution = apply_timeout_policy(
+            base_timeout=int(timeout_value),
+            timeout_policy=getattr(app.state, "timeout_policy", {}),
+            provider_name=provider_name,
+            endpoint=self.endpoint,
+            method="POST",
+            stream=bool(self.request_data.stream),
+            engine=engine,
+            original_model=original_model,
+            request_model=self.request_model_name,
+            role=self.plan.role,
+        )
         attempt.state.update(
             {
                 "proxy": proxy,
                 "api_key": api_key,
                 "codex_account_id": codex_account_id,
                 "wants_compact": wants_compact,
-                "timeout_value": int(timeout_value),
+                "timeout_value": int(timeout_resolution["timeout_value"]),
+                "timeout_policy": timeout_resolution["timeout_policy"],
+                "timeout_policy_sources": timeout_resolution["timeout_policy_sources"],
+                "timeout_adjusted_from": timeout_resolution["timeout_adjusted_from"],
             }
         )
 
@@ -3409,7 +3437,7 @@ class ResponsesRequestExecution:
         headers = self._build_headers(attempt)
         payload = self._build_payload(attempt)
         json_payload = await asyncio.to_thread(json.dumps, payload)
-        self._apply_large_compact_timeout_floor(attempt, len(json_payload.encode("utf-8")))
+        attempt.state["payload_bytes"] = len(json_payload.encode("utf-8"))
         self._record_upstream_attempt_start(attempt)
         self._log_attempt(attempt, headers, payload)
 
@@ -3459,21 +3487,6 @@ class ResponsesRequestExecution:
             strip_unsupported_codex_payload_fields(payload, strip_store=attempt.state["wants_compact"])
         return payload
 
-    def _apply_large_compact_timeout_floor(self, attempt: Any, payload_bytes: int) -> None:
-        attempt.state["payload_bytes"] = max(0, int(payload_bytes))
-        configured_timeout = int(attempt.state.get("timeout_value") or DEFAULT_TIMEOUT)
-        if (
-            not attempt.state.get("wants_compact")
-            or RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES <= 0
-            or RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT <= 0
-            or payload_bytes <= RESPONSES_COMPACT_LARGE_BODY_TIMEOUT_BYTES
-            or configured_timeout >= RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT
-        ):
-            attempt.state["timeout_value"] = configured_timeout
-            return
-        attempt.state["timeout_value"] = RESPONSES_COMPACT_LARGE_BODY_MIN_TIMEOUT
-        attempt.state["timeout_adjusted_from"] = configured_timeout
-
     def _record_upstream_attempt_start(self, attempt: Any) -> None:
         attempts = self.current_info.get("upstream_attempts")
         if not isinstance(attempts, list):
@@ -3510,6 +3523,8 @@ class ResponsesRequestExecution:
             entry["started_ms"] = started_ms
         if attempt.state.get("timeout_adjusted_from") is not None:
             entry["timeout_adjusted_from_seconds"] = int(attempt.state["timeout_adjusted_from"])
+        if attempt.state.get("timeout_policy_sources"):
+            entry["timeout_policy_sources"] = list(attempt.state["timeout_policy_sources"])
         attempts.append(entry)
         attempt.state["observability_attempt_index"] = len(attempts) - 1
 
@@ -3972,8 +3987,21 @@ class MessagesPassthroughHandler:
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
+        timeout_resolution = apply_timeout_policy(
+            base_timeout=int(timeout_value),
+            timeout_policy=getattr(app.state, "timeout_policy", {}),
+            provider_name=provider_name,
+            endpoint=endpoint,
+            method="POST",
+            stream=bool(stream_mode) if stream_mode is not None else bool((ctx["request_body"] or {}).get("stream")),
+            engine="claude",
+            original_model=original_model,
+            request_model=request_model_name,
+            role=ctx["plan"].role,
+        )
         attempt.state["api_key"] = attempt.provider_api_key_raw
-        attempt.state["timeout_value"] = int(timeout_value)
+        attempt.state["timeout_value"] = int(timeout_resolution["timeout_value"])
+        attempt.state["timeout_policy_sources"] = timeout_resolution["timeout_policy_sources"]
 
     async def _messages_execute_attempt(self, attempt: Any, ctx: dict[str, Any]):
         provider = attempt.provider
@@ -4404,6 +4432,17 @@ class VideoTaskHandler:
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
+        timeout_resolution = apply_timeout_policy(
+            base_timeout=int(timeout_value),
+            timeout_policy=getattr(app.state, "timeout_policy", {}),
+            provider_name=provider_name,
+            endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+            method=method,
+            stream=False,
+            engine="content-generation",
+            original_model=original_model,
+            request_model=request_model_name,
+        )
         adapter = _video_adapter_for(provider, provider_name)
         try:
             upstream_request = adapter.build_request(
@@ -4440,7 +4479,7 @@ class VideoTaskHandler:
                 headers=headers,
                 payload=upstream_request.payload,
                 proxy=proxy,
-                timeout_value=int(timeout_value),
+                timeout_value=int(timeout_resolution["timeout_value"]),
             )
             raw = upstream_resp.content
             normalized = adapter.normalize_response(
@@ -4663,6 +4702,18 @@ class VideoTaskHandler:
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
+        timeout_resolution = apply_timeout_policy(
+            base_timeout=int(timeout_value),
+            timeout_policy=getattr(app.state, "timeout_policy", {}),
+            provider_name=provider_name,
+            endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+            method=ctx["method"],
+            stream=False,
+            engine=engine,
+            original_model=original_model,
+            request_model=request_model_name,
+            role=ctx["plan"].role,
+        )
         attempt.state.update(
             {
                 "video_adapter": adapter,
@@ -4672,7 +4723,8 @@ class VideoTaskHandler:
                 "engine": engine,
                 "proxy": proxy,
                 "api_key": attempt.provider_api_key_raw,
-                "timeout_value": int(timeout_value),
+                "timeout_value": int(timeout_resolution["timeout_value"]),
+                "timeout_policy_sources": timeout_resolution["timeout_policy_sources"],
             }
         )
 
@@ -4984,8 +5036,21 @@ class LingjingOpenapiHandler:
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
+        timeout_resolution = apply_timeout_policy(
+            base_timeout=int(timeout_value),
+            timeout_policy=getattr(app.state, "timeout_policy", {}),
+            provider_name=provider_name,
+            endpoint=endpoint,
+            method=ctx["method_upper"],
+            stream=False,
+            engine="lingjing",
+            original_model=original_model,
+            request_model=request_model_name,
+            role=ctx["plan"].role,
+        )
         attempt.state["api_key"] = attempt.provider_api_key_raw
-        attempt.state["timeout_value"] = int(timeout_value)
+        attempt.state["timeout_value"] = int(timeout_resolution["timeout_value"])
+        attempt.state["timeout_policy_sources"] = timeout_resolution["timeout_policy_sources"]
 
     async def _lingjing_execute_attempt(self, attempt: Any, ctx: dict[str, Any]) -> Response:
         headers = _lingjing_headers(

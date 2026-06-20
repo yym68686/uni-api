@@ -1050,6 +1050,53 @@ In practice, this means that the keys under `model_timeout` / `keepalive_interva
 
 By tuning `model_timeout` and `keepalive_interval` based on this matching behavior, you can avoid unnecessary timeouts and better control how long uni-api waits on each provider. If you encounter the error `{'error': '500', 'details': 'fetch_response_stream Read Response Timeout'}`, try increasing the timeout for the corresponding model (or its prefix) instead of only changing the global TIMEOUT.
 
+- How should I configure different timeouts for different endpoints or streaming modes?
+
+Use `timeout_policy` when timeout depends on endpoint, stream mode, provider, engine, model, method, or role. `model_timeout` is still supported as the backward-compatible fallback; `timeout_policy` is the more precise rule system.
+
+```yaml
+preferences:
+  model_timeout:
+    default: 30
+    gpt-5.5: 20
+  timeout_policy:
+    default:
+      first_byte: 30
+    rules:
+      - match:
+          endpoint: /v1/responses/compact
+          stream: false
+          model: gpt-5.5
+        timeout:
+          first_byte: 120
+          total: 300
+      - match:
+          endpoint: /v1/responses
+          stream: true
+          model: gpt-5.5
+        timeout:
+          first_byte: 60
+          idle: 120
+
+providers:
+  - provider: openai
+    preferences:
+      timeout_policy:
+        rules:
+          - match:
+              endpoint: /v1/responses/compact
+              stream: false
+              model: gpt-5.5
+            timeout:
+              first_byte: 180
+```
+
+Supported `match` keys are `endpoint`, `stream`, `method`, `engine`, `provider`, `model`, `request_model`, `upstream_model`, and `role`. `model` matches either the request model or upstream model. `*` matches any value, and a value ending in `*` is treated as a prefix match.
+
+Supported timeout keys are `connect`, `write`, `pool`, `first_byte`, `idle`, and `total`. Current HTTP upstream calls still use the existing scalar httpx timeout parameter; uni-api maps `first_byte` to that scalar first, then falls back to `total`, then `idle`. The other fields are reserved so the same config shape can support more granular HTTP timeout handling later.
+
+Resolution order is: global `timeout_policy.default` → provider `timeout_policy.default` → most specific global `timeout_policy.rules` match → most specific provider `timeout_policy.rules` match. If no timeout policy sets a value, uni-api falls back to provider/global `model_timeout`, then `TIMEOUT`.
+
 - How does api_key_rate_limit work? How do I set the same rate limit for multiple models?
 
 If you want to set the same frequency limit for the four models gemini-1.5-pro-latest, gemini-1.5-pro, gemini-1.5-pro-001, gemini-1.5-pro-002 simultaneously, you can set it like this:

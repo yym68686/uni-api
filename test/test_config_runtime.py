@@ -97,6 +97,63 @@ def test_compile_runtime_config_builds_hot_path_indexes():
     assert runtime.keepalive_interval_index["openai-a"]["gpt-4.1"] == 10
 
 
+def test_timeout_policy_matches_most_specific_provider_rule():
+    policy = main.init_timeout_policy(
+        {
+            "preferences": {
+                "timeout_policy": {
+                    "default": {"first_byte": 30},
+                    "rules": [
+                        {
+                            "match": {"endpoint": "/v1/responses/compact"},
+                            "timeout": {"first_byte": 90},
+                        }
+                    ],
+                }
+            },
+            "providers": [
+                {
+                    "provider": "openai-a",
+                    "preferences": {
+                        "timeout_policy": {
+                            "rules": [
+                                {
+                                    "match": {
+                                        "endpoint": "/v1/responses/compact",
+                                        "stream": False,
+                                        "model": "gpt-5.5",
+                                    },
+                                    "timeout": {"first_byte": 120},
+                                }
+                            ]
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+    resolved = main.apply_timeout_policy(
+        base_timeout=20,
+        timeout_policy=policy,
+        provider_name="openai-a",
+        endpoint="/v1/responses/compact",
+        method="POST",
+        stream=False,
+        engine="codex",
+        original_model="gpt-5.5",
+        request_model="gpt-5.5",
+    )
+
+    assert resolved["timeout_value"] == 120
+    assert resolved["timeout_adjusted_from"] == 20
+    assert resolved["timeout_policy_sources"] == [
+        "global.default",
+        "global.rules[0]",
+        "provider.rules[0]",
+    ]
+
+
 def test_compile_runtime_config_resolves_wildcard_and_nested_api_keys():
     config = validate_config_data(
         {
@@ -263,6 +320,16 @@ async def test_refresh_runtime_state_replaces_snapshot_atomically(monkeypatch):
                     }
                 ],
                 "api_keys": [{"api": "sk-test", "model": ["all"]}],
+                "preferences": {
+                    "timeout_policy": {
+                        "rules": [
+                            {
+                                "match": {"endpoint": "/v1/responses", "stream": True},
+                                "timeout": {"first_byte": 60},
+                            }
+                        ]
+                    }
+                },
             },
             api_keys_db=[{"api": "sk-test", "role": "admin"}],
             api_list=["sk-test"],
@@ -274,6 +341,8 @@ async def test_refresh_runtime_state_replaces_snapshot_atomically(monkeypatch):
 
     assert app.state.runtime_config is first_snapshot.runtime_config
     assert app.state.admin_api_key == ["sk-test"]
+    assert app.state.timeout_policy is first_snapshot.timeout_policy
+    assert first_snapshot.timeout_policy["global"]["rules"][0]["timeout"]["first_byte"] == 60
 
     def fail_compile(*args, **kwargs):
         raise RuntimeError("compile failed")

@@ -14,4 +14,5 @@ class AppRuntimeSnapshot:
     global_rate_limit: list[tuple[int, int]]
     admin_api_key: list[str]
     provider_timeouts: dict[str, Any]
+    timeout_policy: dict[str, Any]
     keepalive_interval: dict[str, Any]
