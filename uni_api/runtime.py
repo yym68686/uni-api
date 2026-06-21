@@ -322,7 +322,10 @@ class RequestTrace:
     def mark(self, stage: str) -> None:
         name = str(stage or "").strip()
         if name:
-            self.spans[name] = int((time() - self.started_at) * 1000)
+            elapsed_ms = int((time() - self.started_at) * 1000)
+            if name != "request_received":
+                elapsed_ms = max(1, elapsed_ms)
+            self.spans[name] = elapsed_ms
 
     def add_ms(self, name: str, value_ms: float) -> None:
         key = str(name or "").strip()

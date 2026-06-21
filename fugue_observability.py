@@ -416,6 +416,9 @@ def _stage_rows(spans: dict[str, Any], duration_ms: int | None) -> list[tuple[st
         elif stage == "stream_end" and _span_ms(spans, stage) <= 0 and duration_ms is not None:
             stage_ms = max(0, int(duration_ms))
             attrs = {}
+        elif stage == "upstream_first_chunk":
+            stage_ms = _span_ms(spans, stage)
+            attrs = {}
         else:
             stage_ms = _stage_delta_ms(spans, stage, previous_stage)
             attrs = {}

@@ -142,6 +142,10 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         event["attributes"]["stage"]
         for event in telemetry["traces"]
     }
+    stage_ms = {
+        event["attributes"]["stage"]: event["attributes"]["stage_ms"]
+        for event in telemetry["traces"]
+    }
     assert {
         "request_received",
         "body_parsed",
@@ -155,6 +159,8 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         "downstream_response_start",
         "stream_end",
     }.issubset(stages)
+    assert stage_ms["upstream_first_chunk"] == "140"
+    assert stage_ms["downstream_response_start"] == "5"
 
     for metric in telemetry["metrics"]:
         attrs = metric["attributes"]
@@ -199,3 +205,15 @@ def test_missing_trace_headers_generate_w3c_trace_id():
     incoming = main._incoming_trace_context({})
 
     assert re.match(r"^[0-9a-f]{32}$", incoming["trace_id"])
+
+
+def test_request_trace_uses_nonzero_ms_for_observed_stages(monkeypatch):
+    trace = main.RequestTrace(trace_id="4bf92f3577b34da6a3ce929d0e0e4736")
+    monkeypatch.setattr(main, "time", lambda: trace.started_at)
+
+    trace.mark("request_received")
+    trace.mark("upstream_first_chunk")
+
+    spans = trace.snapshot()
+    assert spans["request_received"] == 0
+    assert spans["upstream_first_chunk"] == 1
