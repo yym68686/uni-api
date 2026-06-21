@@ -1893,6 +1893,7 @@ async def process_request(
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
             current_info["provider"] = channel_id
+            setattr(response, "current_info", current_info)
             return response
 
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
@@ -3343,8 +3344,12 @@ class ResponsesRequestExecution:
 
     async def run(self):
         if self.request_data.stream:
-            return await self._run_stream()
-        return await self._run_attempts()
+            response = await self._run_stream()
+        else:
+            response = await self._run_attempts()
+        if isinstance(response, Response):
+            setattr(response, "current_info", self.current_info)
+        return response
 
     async def _run_attempts(self):
         return await self.runner.run(

@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+from types import SimpleNamespace
+
+from starlette.responses import StreamingResponse
 
 from uni_api.observability.request_context import (
     RequestContext,
@@ -114,3 +117,50 @@ async def test_paid_api_key_state_computes_enabled_from_cost_and_credits():
     assert state is not None
     assert state.enabled is True
     assert state.to_dict()["all_tokens_info"][0]["total_tokens"] == 10
+
+
+async def test_streaming_observability_wrap_merges_response_current_info():
+    import main
+
+    async def update_stats(info):
+        _ = info
+
+    outer_trace = main.RequestTrace(trace_id="outer")
+    inner_trace = main.RequestTrace(trace_id="inner")
+    inner_trace.mark("provider_selected")
+    inner_info = {
+        "request_id": "inner-req",
+        "api_key": "sk-test",
+        "trace": inner_trace,
+        "timing_spans": inner_trace.snapshot(),
+    }
+    outer_info = {
+        "request_id": "outer-req",
+        "api_key": "sk-test",
+        "trace": outer_trace,
+        "timing_spans": outer_trace.snapshot(),
+    }
+    response = StreamingResponse(iter([b"data: ok\n\n"]), media_type="text/event-stream")
+    response.current_info = inner_info
+    middleware = object.__new__(main.StatsMiddleware)
+    middleware.dependencies = SimpleNamespace(
+        database_disabled=False,
+        logging_response_class=main.LoggingStreamingResponse,
+        mark_first_byte_observed=lambda info: None,
+        emit_request_observability=lambda info: None,
+        update_stats=update_stats,
+        debug=False,
+    )
+
+    wrapped = await middleware._wrap_response_for_observability(
+        SimpleNamespace(url=SimpleNamespace(path="/v1/responses")),
+        response,
+        outer_info,
+        outer_trace,
+    )
+
+    assert wrapped.current_info is outer_info
+    assert outer_info["request_id"] == "inner-req"
+    assert outer_info["trace"] is inner_trace
+    assert outer_info["timing_spans"]["provider_selected"] >= 1
+    assert wrapped.headers["x-request-id"] == "inner"

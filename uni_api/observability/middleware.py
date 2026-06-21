@@ -247,6 +247,12 @@ class StatsMiddleware(BaseHTTPMiddleware):
 
     async def _wrap_response_for_observability(self, request: Request, response, current_info: dict[str, Any], trace):
         deps = self.dependencies
+        response_info = getattr(response, "current_info", None)
+        if isinstance(response_info, dict) and response_info is not current_info:
+            current_info.update(response_info)
+        response_trace = current_info.get("trace") if isinstance(current_info, dict) else None
+        if response_trace is not None and hasattr(response_trace, "mark") and hasattr(response_trace, "trace_id"):
+            trace = response_trace
         trace.mark("downstream_response_start")
         response.headers["x-request-id"] = trace.trace_id
         current_info["status_code"] = getattr(response, "status_code", 0) or 0
