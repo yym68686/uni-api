@@ -146,12 +146,45 @@ def test_timeout_policy_matches_most_specific_provider_rule():
     )
 
     assert resolved["timeout_value"] == 120
+    assert resolved["first_byte_timeout"] == 120
+    assert resolved["idle_timeout"] is None
+    assert resolved["total_timeout"] is None
     assert resolved["timeout_adjusted_from"] == 20
     assert resolved["timeout_policy_sources"] == [
         "global.default",
         "global.rules[0]",
         "provider.rules[0]",
     ]
+
+    idle_only = main.apply_timeout_policy(
+        base_timeout=20,
+        timeout_policy=main.init_timeout_policy(
+            {
+                "preferences": {
+                    "timeout_policy": {
+                        "rules": [
+                            {
+                                "match": {"endpoint": "/v1/responses", "stream": True},
+                                "timeout": {"idle": 60},
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        provider_name="openai-a",
+        endpoint="/v1/responses",
+        method="POST",
+        stream=True,
+        engine="codex",
+        original_model="gpt-5.5",
+        request_model="gpt-5.5",
+    )
+
+    assert idle_only["timeout_value"] == 60
+    assert idle_only["first_byte_timeout"] == 20
+    assert idle_only["idle_timeout"] == 60
+    assert idle_only["total_timeout"] is None
 
 
 def test_compile_runtime_config_resolves_wildcard_and_nested_api_keys():

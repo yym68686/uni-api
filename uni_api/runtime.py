@@ -3,6 +3,7 @@ import re
 import json
 import uuid
 import codecs
+import functools
 from dataclasses import dataclass, field
 import httpx
 import string
@@ -2756,6 +2757,130 @@ def _copy_upstream_response_headers(headers: Any) -> dict[str, str]:
         copied[str(key)] = str(value)
     return copied
 
+
+def _optional_positive_timeout(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return None
+    if timeout <= 0:
+        return None
+    return timeout
+
+
+def _httpx_timeout_from_policy(
+    timeout_resolution: dict[str, Any],
+    *,
+    stream: bool,
+    default_connect: float = 15.0,
+    default_write: float = 30.0,
+) -> Optional[httpx.Timeout]:
+    policy = dict(timeout_resolution.get("timeout_policy") or {})
+    if stream and not any(policy.get(key) is not None for key in ("connect", "write", "pool", "idle")):
+        return None
+    connect_timeout = _optional_positive_timeout(policy.get("connect")) or default_connect
+    write_timeout = _optional_positive_timeout(policy.get("write")) or default_write
+    pool_timeout = _optional_positive_timeout(policy.get("pool"))
+    if stream:
+        read_timeout = _optional_positive_timeout(policy.get("idle"))
+    else:
+        read_timeout = (
+            _optional_positive_timeout(policy.get("idle"))
+            or _optional_positive_timeout(policy.get("total"))
+            or _optional_positive_timeout(timeout_resolution.get("timeout_value"))
+        )
+    return httpx.Timeout(
+        timeout=None,
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=pool_timeout,
+    )
+
+
+async def _await_first_byte_deadline(
+    awaitable: Awaitable[Any],
+    *,
+    timeout_seconds: Any = None,
+    deadline: Optional[float] = None,
+    total_timeout_seconds: Any = None,
+    total_deadline: Optional[float] = None,
+    satisfied: Optional[Callable[[], bool]] = None,
+) -> Any:
+    timeout = _optional_positive_timeout(timeout_seconds)
+    total_timeout = _optional_positive_timeout(total_timeout_seconds)
+    if deadline is None:
+        if timeout is None:
+            if total_deadline is None:
+                return await awaitable
+        else:
+            deadline = asyncio.get_running_loop().time() + timeout
+    if deadline is None and total_deadline is None:
+        return await awaitable
+    task = asyncio.create_task(awaitable)
+    loop = asyncio.get_running_loop()
+    first_byte_timeout_for_message = timeout if timeout is not None else (
+        max(0.0, deadline - loop.time()) if deadline is not None else None
+    )
+    total_timeout_for_message = total_timeout if total_timeout is not None else (
+        max(0.0, total_deadline - loop.time()) if total_deadline is not None else None
+    )
+    try:
+        while True:
+            first_byte_satisfied = satisfied is not None and satisfied()
+            active_deadlines: list[tuple[str, float, Optional[float]]] = []
+            if not first_byte_satisfied and deadline is not None:
+                active_deadlines.append(("first byte", deadline, first_byte_timeout_for_message))
+            if total_deadline is not None:
+                active_deadlines.append(("total response", total_deadline, total_timeout_for_message))
+            if not active_deadlines:
+                return await task
+            timeout_label, active_deadline, timeout_for_message = min(active_deadlines, key=lambda item: item[1])
+            remaining = active_deadline - loop.time()
+            if remaining <= 0:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                raise asyncio.TimeoutError(timeout_label)
+            done, _ = await asyncio.wait({task}, timeout=min(0.05, remaining))
+            if task in done:
+                return task.result()
+    except asyncio.TimeoutError as exc:
+        timeout_label = exc.args[0] if exc.args else "first byte"
+        timeout_for_message = (
+            total_timeout_for_message if timeout_label == "total response" else first_byte_timeout_for_message
+        )
+        timeout_for_message = timeout_for_message if timeout_for_message is not None else 0
+        raise httpx.ReadTimeout(
+            f"Request timed out waiting for {timeout_label} after {timeout_for_message:g} seconds",
+            request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
+        ) from exc
+
+
+async def _await_stream_next_with_total_deadline(
+    upstream_iter: Any,
+    *,
+    total_deadline: Optional[float],
+    total_timeout_seconds: Any,
+) -> bytes:
+    if total_deadline is None:
+        return await upstream_iter.__anext__()
+    remaining = total_deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise httpx.ReadTimeout(
+            f"Request timed out waiting for total response after {float(total_timeout_seconds):g} seconds",
+            request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
+        )
+    try:
+        return await asyncio.wait_for(upstream_iter.__anext__(), timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        raise httpx.ReadTimeout(
+            f"Request timed out waiting for total response after {float(total_timeout_seconds):g} seconds",
+            request=httpx.Request("POST", "https://uni-api.local/upstream-timeout"),
+        ) from exc
+
 async def _prime_passthrough_upstream_stream(
     upstream_iter,
     *,
@@ -2873,6 +2998,19 @@ def _build_responses_stream_keepalive_event() -> bytes:
         "keepalive",
         {"type": "keepalive", "sequence_number": 0},
     )
+
+
+def _is_oaix_precommit_keepalive(chunk: bytes) -> bool:
+    try:
+        event_type, payload = _extract_responses_stream_event(chunk.decode("utf-8", errors="replace").strip())
+    except Exception:
+        return False
+    if event_type != "keepalive" or not isinstance(payload, dict):
+        return False
+    if set(payload.keys()) != {"type", "sequence_number"}:
+        return False
+    return payload.get("type") == "keepalive" and payload.get("sequence_number") == 0
+
 
 def _build_responses_stream_error_event(status_code: int, error_message: Any) -> bytes:
     return _encode_responses_sse_event(
@@ -3306,7 +3444,14 @@ class ResponsesRequestExecution:
         self.stream_body_started = True
         await self.stream_output_queue.put(bytes(chunk))
 
-    async def _emit_precommit_keepalive(self, upstream_keepalive: Optional[bytes]) -> bool:
+    async def _emit_precommit_keepalive(
+        self,
+        upstream_keepalive: Optional[bytes],
+        *,
+        passthrough: bool = False,
+    ) -> bool:
+        if self.stream_output_queue is None:
+            return False
         if self.stream_keepalive_sent:
             return True
         chunk = upstream_keepalive or _build_responses_stream_keepalive_event()
@@ -3314,8 +3459,13 @@ class ResponsesRequestExecution:
             chunk = chunk.encode("utf-8")
         if not isinstance(chunk, (bytes, bytearray)):
             chunk = str(chunk).encode("utf-8")
-        self.stream_precommit_chunks.append(bytes(chunk))
+        chunk_bytes = bytes(chunk)
         self.stream_keepalive_sent = True
+        if passthrough and upstream_keepalive is not None and _is_oaix_precommit_keepalive(chunk_bytes):
+            await self._emit_stream_chunk(chunk_bytes)
+            _mark_first_byte_observed(self.current_info)
+            return True
+        self.stream_precommit_chunks.append(chunk_bytes)
         return True
 
     def _schedule_channel_stats(self, channel_id: str, *, success: bool, provider_api_key: Optional[str]) -> None:
@@ -3332,6 +3482,9 @@ class ResponsesRequestExecution:
             self.background_tasks.add_task(update_channel_stats, *args, **kwargs)
 
     async def _before_next_attempt(self):
+        if self.stream_output_queue is not None and not self.stream_body_started:
+            self.stream_precommit_chunks.clear()
+            self.stream_keepalive_sent = False
         if self.disconnect_event is not None and self.disconnect_event.is_set():
             _log_responses_downstream_disconnect(
                 self.endpoint,
@@ -3415,6 +3568,13 @@ class ResponsesRequestExecution:
                 "codex_account_id": codex_account_id,
                 "wants_compact": wants_compact,
                 "timeout_value": int(timeout_resolution["timeout_value"]),
+                "upstream_timeout": _httpx_timeout_from_policy(
+                    timeout_resolution,
+                    stream=bool(self.request_data.stream),
+                ),
+                "first_byte_timeout": int(timeout_resolution["first_byte_timeout"]),
+                "idle_timeout": timeout_resolution["idle_timeout"],
+                "total_timeout": timeout_resolution["total_timeout"],
                 "timeout_policy": timeout_resolution["timeout_policy"],
                 "timeout_policy_sources": timeout_resolution["timeout_policy_sources"],
                 "timeout_adjusted_from": timeout_resolution["timeout_adjusted_from"],
@@ -3603,14 +3763,34 @@ class ResponsesRequestExecution:
         if isinstance(trace, RequestTrace):
             trace.mark("upstream_send_start")
         runtime_gauges.begin_waiting_first_byte(self.current_info)
-        stream_cm = client.stream(
-            "POST",
-            attempt.state["upstream_url"],
-            headers=headers,
-            content=json_payload,
-            timeout=attempt.state["timeout_value"],
+        first_byte_timeout = _optional_positive_timeout(attempt.state.get("first_byte_timeout"))
+        first_byte_deadline = (
+            asyncio.get_running_loop().time() + first_byte_timeout
+            if first_byte_timeout is not None
+            else None
         )
-        upstream_resp = await stream_cm.__aenter__()
+        total_timeout = _optional_positive_timeout(attempt.state.get("total_timeout"))
+        total_deadline = (
+            asyncio.get_running_loop().time() + total_timeout
+            if total_timeout is not None
+            else None
+        )
+        stream_kwargs = {
+            "method": "POST",
+            "url": attempt.state["upstream_url"],
+            "headers": headers,
+            "content": json_payload,
+        }
+        if attempt.state.get("upstream_timeout") is not None:
+            stream_kwargs["timeout"] = attempt.state["upstream_timeout"]
+        stream_cm = client.stream(**stream_kwargs)
+        upstream_resp = await _await_first_byte_deadline(
+            stream_cm.__aenter__(),
+            timeout_seconds=first_byte_timeout,
+            deadline=first_byte_deadline,
+            total_timeout_seconds=total_timeout,
+            total_deadline=total_deadline,
+        )
         if isinstance(trace, RequestTrace):
             trace.mark("upstream_headers_received")
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
@@ -3619,13 +3799,28 @@ class ResponsesRequestExecution:
             await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
             raise HTTPException(status_code=upstream_resp.status_code, detail=raw.decode("utf-8", errors="replace"))
 
+        if self.stream_output_queue is not None:
+            self.stream_response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         upstream_iter = upstream_resp.aiter_bytes()
         try:
-            buffered_chunks, stream_committed = await _prime_responses_upstream_stream(
-                upstream_iter,
-                disconnect_event=self.disconnect_event,
-                commit_policy=attempt.state.get("responses_stream_commit_policy", "real_output"),
-                precommit_keepalive_callback=self._emit_precommit_keepalive if self.stream_output_queue is not None else None,
+            precommit_keepalive_callback = None
+            if self.stream_output_queue is not None:
+                precommit_keepalive_callback = functools.partial(
+                    self._emit_precommit_keepalive,
+                    passthrough=attempt.state.get("engine") == "codex",
+                )
+            buffered_chunks, stream_committed = await _await_first_byte_deadline(
+                _prime_responses_upstream_stream(
+                    upstream_iter,
+                    disconnect_event=self.disconnect_event,
+                    commit_policy=attempt.state.get("responses_stream_commit_policy", "real_output"),
+                    precommit_keepalive_callback=precommit_keepalive_callback,
+                ),
+                timeout_seconds=first_byte_timeout,
+                deadline=first_byte_deadline,
+                total_timeout_seconds=total_timeout,
+                total_deadline=total_deadline,
+                satisfied=lambda: self.stream_body_started,
             )
             _mark_first_byte_observed(self.current_info)
         except HTTPException:
@@ -3656,7 +3851,16 @@ class ResponsesRequestExecution:
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
         return StarletteStreamingResponse(
-            self._proxy_responses_stream(attempt, buffered_chunks, upstream_iter, stream_cm, upstream_resp, stream_committed),
+            self._proxy_responses_stream(
+                attempt,
+                buffered_chunks,
+                upstream_iter,
+                stream_cm,
+                upstream_resp,
+                stream_committed,
+                total_deadline=total_deadline,
+                total_timeout_seconds=total_timeout,
+            ),
             media_type="text/event-stream",
             headers=response_headers,
         )
@@ -3669,6 +3873,9 @@ class ResponsesRequestExecution:
         stream_cm: Any,
         upstream_resp: Any,
         stream_committed: bool,
+        *,
+        total_deadline: Optional[float] = None,
+        total_timeout_seconds: Any = None,
     ):
         completed_seen = False
         usage_seen = False
@@ -3697,7 +3904,15 @@ class ResponsesRequestExecution:
                     return
                 track_responses_events(chunk)
                 yield chunk
-            async for chunk in upstream_iter:
+            while True:
+                try:
+                    chunk = await _await_stream_next_with_total_deadline(
+                        upstream_iter,
+                        total_deadline=total_deadline,
+                        total_timeout_seconds=total_timeout_seconds,
+                    )
+                except StopAsyncIteration:
+                    break
                 _mark_first_byte_observed(self.current_info)
                 if self._downstream_disconnected(attempt, stage="after-stream-commit"):
                     break

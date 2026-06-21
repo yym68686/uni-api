@@ -1097,7 +1097,7 @@ providers:
 
 支持的 `match` 字段包括：`endpoint`、`stream`、`method`、`engine`、`provider`、`model`、`request_model`、`upstream_model`、`role`。其中 `model` 会同时匹配请求模型名和真实上游模型名；`*` 匹配任意值；以 `*` 结尾的字符串表示前缀匹配。
 
-支持的 timeout 字段包括：`connect`、`write`、`pool`、`first_byte`、`idle`、`total`。当前 HTTP upstream 调用仍然使用现有 httpx scalar timeout 参数；uni-api 会优先把 `first_byte` 映射到这个 scalar timeout，其次回退到 `total`，再回退到 `idle`。其它字段先作为统一配置形态保留，方便后续接入更细粒度的 HTTP timeout。
+支持的 timeout 字段包括：`connect`、`write`、`pool`、`first_byte`、`idle`、`total`。对于 `/v1/responses` 流式调用，每个字段只承担自己的职责：`first_byte` 限制从发起上游请求到收到上游 headers 或第一个上游 stream event 的时间；`idle` 是唯一会映射成 httpx read timeout、限制上游 chunk 间隔的字段；`total` 限制整条上游流的总生命周期。如果没有配置 `first_byte`，uni-api 会使用 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`，作为首字 fallback。除非显式配置 `idle`，uni-api 不会默认设置流式 idle timeout。
 
 解析顺序是：全局 `timeout_policy.default` → provider `timeout_policy.default` → 命中维度最多的全局 `timeout_policy.rules` → 命中维度最多的 provider `timeout_policy.rules`。如果没有任何 timeout policy 设置有效值，uni-api 会继续回退到 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`。
 

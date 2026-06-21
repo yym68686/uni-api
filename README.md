@@ -1093,7 +1093,7 @@ providers:
 
 Supported `match` keys are `endpoint`, `stream`, `method`, `engine`, `provider`, `model`, `request_model`, `upstream_model`, and `role`. `model` matches either the request model or upstream model. `*` matches any value, and a value ending in `*` is treated as a prefix match.
 
-Supported timeout keys are `connect`, `write`, `pool`, `first_byte`, `idle`, and `total`. Current HTTP upstream calls still use the existing scalar httpx timeout parameter; uni-api maps `first_byte` to that scalar first, then falls back to `total`, then `idle`. The other fields are reserved so the same config shape can support more granular HTTP timeout handling later.
+Supported timeout keys are `connect`, `write`, `pool`, `first_byte`, `idle`, and `total`. For `/v1/responses` streaming calls, each key has one responsibility: `first_byte` limits the time until upstream headers or the first upstream stream event; `idle` is the only field that becomes an httpx read timeout between upstream chunks; `total` limits the full upstream stream lifetime. If `first_byte` is not set, uni-api uses provider/global `model_timeout`, then `TIMEOUT`, as the first-byte fallback. uni-api does not install a default streaming idle timeout unless `idle` is explicitly configured.
 
 Resolution order is: global `timeout_policy.default` → provider `timeout_policy.default` → most specific global `timeout_policy.rules` match → most specific provider `timeout_policy.rules` match. If no timeout policy sets a value, uni-api falls back to provider/global `model_timeout`, then `TIMEOUT`.
 

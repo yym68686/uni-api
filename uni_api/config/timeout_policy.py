@@ -101,8 +101,16 @@ def apply_timeout_policy(
     elif timeout_values.get("idle") is not None:
         selected = int(timeout_values["idle"])
     adjusted_from = int(base_timeout) if selected != int(base_timeout) else None
+    first_byte_timeout = (
+        int(timeout_values["first_byte"])
+        if timeout_values.get("first_byte") is not None
+        else int(base_timeout)
+    )
     return {
         "timeout_value": selected,
+        "first_byte_timeout": first_byte_timeout,
+        "idle_timeout": timeout_values.get("idle"),
+        "total_timeout": timeout_values.get("total"),
         "timeout_policy": timeout_values,
         "timeout_policy_sources": list(resolved.get("sources") or []),
         "timeout_adjusted_from": adjusted_from,

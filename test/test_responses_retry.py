@@ -179,6 +179,13 @@ class YieldingStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
                 await asyncio.sleep(0)
 
 
+class DelayedFirstChunkStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
+    async def aiter_raw(self):
+        await asyncio.sleep(0.02)
+        async for chunk in super().aiter_raw():
+            yield chunk
+
+
 class EncodedStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
     def __init__(self, *, raw_chunks, decoded_chunks, status_code=200):
         super().__init__(chunks=raw_chunks, status_code=status_code)
@@ -267,19 +274,24 @@ def _run_responses_request(request, *, endpoint="/v1/responses", http_headers=No
         main.request_info.reset(request_token)
 
 
-def _run_responses_request_with_stream_body(request, *, endpoint="/v1/responses"):
-    request_token = main.request_info.set(
-        {
-            "request_id": "req-test",
-            "api_key": "sk-test",
-            "disconnect_event": None,
-        }
-    )
+def _run_responses_request_with_stream_body(
+    request,
+    *,
+    endpoint="/v1/responses",
+    current_info=None,
+    http_headers=None,
+):
+    request_info_value = current_info or {
+        "request_id": "req-test",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    request_token = main.request_info.set(request_info_value)
 
     async def _run():
         handler = main.ResponsesRequestHandler()
         response = await handler.request_responses(
-            http_request=SimpleNamespace(headers={}),
+            http_request=SimpleNamespace(headers=http_headers or {}),
             request_data=request,
             api_index=0,
             background_tasks=BackgroundTasks(),
@@ -1510,11 +1522,11 @@ def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
     main.app.state.client_manager = DummyClientManager(
         {
             "https://provider-a.example/v1/responses": DummyStreamingUpstreamResponse(
-                chunks=[
-                    _responses_sse("response.created", {"type": "response.created", "provider": "a"}),
-                    _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "a"}),
-                    _responses_sse("keepalive", {"type": "keepalive", "sequence_number": 3, "provider": "a"}),
-                ],
+                    chunks=[
+                        _responses_sse("response.created", {"type": "response.created", "provider": "a"}),
+                        _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "a"}),
+                        _responses_sse("keepalive", {"type": "keepalive", "sequence_number": 0}),
+                    ],
                 headers={
                     "X-OAIX-Request-ID": "req_provider_a",
                     "X-OAIX-Token-ID": "111",
@@ -1632,7 +1644,10 @@ def test_responses_stream_forwards_initial_upstream_keepalive_once_and_retries(m
     )
 
     assert response.status_code == 200
-    assert body.startswith('event: keepalive\ndata: {"type": "keepalive", "sequence_number": 0}')
+    first_event = body.split("\n\n", 1)[0]
+    assert first_event.startswith("event: keepalive\ndata: ")
+    assert '"type":"keepalive"' in first_event
+    assert '"sequence_number":0' in first_event
     assert body.count("event: keepalive") == 1
     assert '"provider": "a"' not in body
     assert '"provider": "b"' in body
@@ -2175,6 +2190,99 @@ def test_responses_stream_preserves_oaix_headers_after_precommit_yield(monkeypat
     assert response.headers["x-oaix-request-id"] == "req_yield"
     assert response.headers["x-oaix-token-id"] == "8685"
     assert response.headers["x-oaix-token-owner-user-id"] == "51851"
+
+
+def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.provider_timeouts = {"global": {"gpt-5.4": 20, "default": 30}}
+    upstream_response = DelayedFirstChunkStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("keepalive", {"type": "keepalive", "sequence_number": 0}),
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ],
+        headers={
+            "X-OAIX-Request-ID": "req_keepalive",
+            "X-OAIX-Token-ID": "8686",
+        },
+    )
+    client_manager = DummyClientManager(upstream_response)
+    main.app.state.client_manager = client_manager
+    current_info = {
+        "request_id": "req-keepalive",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+        "trace": main.RequestTrace(trace_id="req-keepalive"),
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-oaix-request-id"] == "req_keepalive"
+    assert response.headers["x-oaix-token-id"] == "8686"
+    assert body.startswith("event: keepalive\ndata: ")
+    assert '"type": "keepalive"' in body.split("\n\n", 1)[0]
+    assert '"sequence_number": 0' in body.split("\n\n", 1)[0]
+    assert body.index("event: keepalive") < body.index("event: response.created")
+    assert body.index("event: response.created") < body.index("event: response.output_text.delta")
+    assert client_manager.stream_calls[0]["timeout"] is None
+    assert current_info["timing_spans"]["upstream_first_chunk"] >= 1
+
+
+def test_responses_stream_uses_explicit_idle_as_httpx_read_timeout(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    main.app.state.provider_timeouts = {"global": {"gpt-5.4": 20, "default": 30}}
+    main.app.state.timeout_policy = main.init_timeout_policy(
+        {
+            "preferences": {
+                "timeout_policy": {
+                    "rules": [
+                        {
+                            "match": {"endpoint": "/v1/responses", "stream": True, "model": "gpt-5.4"},
+                            "timeout": {"first_byte": 20, "idle": 120, "total": 300},
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    upstream_response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ],
+    )
+    client_manager = DummyClientManager(upstream_response)
+    main.app.state.client_manager = client_manager
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=True)
+    )
+
+    assert response.status_code == 200
+    assert "hello" in body
+    timeout = client_manager.stream_calls[0]["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 120
 
 
 def test_responses_non_stream_rate_limit_cools_current_key_and_tries_next_key(monkeypatch):
