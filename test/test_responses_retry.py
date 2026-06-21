@@ -171,6 +171,14 @@ class BlockingStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
         await asyncio.Event().wait()
 
 
+class YieldingStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
+    async def aiter_raw(self):
+        for index, chunk in enumerate(self._chunks):
+            yield chunk
+            if index == 0:
+                await asyncio.sleep(0)
+
+
 class EncodedStreamingUpstreamResponse(DummyStreamingUpstreamResponse):
     def __init__(self, *, raw_chunks, decoded_chunks, status_code=200):
         super().__init__(chunks=raw_chunks, status_code=status_code)
@@ -1507,6 +1515,11 @@ def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
                     _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "a"}),
                     _responses_sse("keepalive", {"type": "keepalive", "sequence_number": 3, "provider": "a"}),
                 ],
+                headers={
+                    "X-OAIX-Request-ID": "req_provider_a",
+                    "X-OAIX-Token-ID": "111",
+                    "X-OAIX-Token-Owner-User-ID": "222",
+                },
                 stream_error=httpx.ReadTimeout(
                     "upstream stalled",
                     request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
@@ -1518,7 +1531,12 @@ def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
                     _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "b"}),
                     _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-b"}),
                     _responses_sse(None, "[DONE]"),
-                ]
+                ],
+                headers={
+                    "X-OAIX-Request-ID": "req_provider_b",
+                    "X-OAIX-Token-ID": "333",
+                    "X-OAIX-Token-Owner-User-ID": "444",
+                },
             ),
         }
     )
@@ -1532,6 +1550,9 @@ def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
     )
 
     assert response.status_code == 200
+    assert response.headers["x-oaix-request-id"] == "req_provider_b"
+    assert response.headers["x-oaix-token-id"] == "333"
+    assert response.headers["x-oaix-token-owner-user-id"] == "444"
     assert body.startswith('event: keepalive\ndata: {"type":"keepalive","sequence_number":0}')
     assert body.count("event: keepalive") == 1
     assert '"provider": "a"' not in body
@@ -2120,6 +2141,40 @@ def test_responses_stream_preserves_oaix_response_headers(monkeypatch):
     assert response.headers["x-oaix-request-id"] == "req_stream"
     assert response.headers["x-oaix-token-id"] == "8662"
     assert response.headers["x-oaix-token-owner-user-id"] == "63910"
+
+
+def test_responses_stream_preserves_oaix_headers_after_precommit_yield(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    upstream_response = YieldingStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ],
+        headers={
+            "X-OAIX-Request-ID": "req_yield",
+            "X-OAIX-Token-ID": "8685",
+            "X-OAIX-Token-Owner-User-ID": "51851",
+        },
+    )
+    main.app.state.client_manager = DummyClientManager(upstream_response)
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=True)
+    )
+
+    assert "hello" in body
+    assert response.status_code == 200
+    assert response.headers["x-oaix-request-id"] == "req_yield"
+    assert response.headers["x-oaix-token-id"] == "8685"
+    assert response.headers["x-oaix-token-owner-user-id"] == "51851"
 
 
 def test_responses_non_stream_rate_limit_cools_current_key_and_tries_next_key(monkeypatch):

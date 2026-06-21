@@ -3135,6 +3135,7 @@ class ResponsesRequestExecution:
     stream_done_sentinel: object = field(default_factory=object)
     stream_body_started: bool = False
     stream_keepalive_sent: bool = False
+    stream_precommit_chunks: list[bytes] = field(default_factory=list)
     stream_stats_tasks: list[asyncio.Task[Any]] = field(default_factory=list)
 
     @classmethod
@@ -3233,11 +3234,15 @@ class ResponsesRequestExecution:
                     return
                 if hasattr(response, "body_iterator"):
                     self.stream_response_headers = dict(response.headers)
+                    for chunk in self.stream_precommit_chunks:
+                        await self._emit_stream_chunk(chunk)
+                    self.stream_precommit_chunks.clear()
                     async with aclosing(response.body_iterator):
                         async for chunk in response.body_iterator:
                             await self._emit_stream_chunk(chunk)
                     return
                 if not self.stream_body_started:
+                    self.stream_precommit_chunks.clear()
                     await self.stream_output_queue.put(response)
                     return
                 if response.status_code != 499:
@@ -3283,6 +3288,7 @@ class ResponsesRequestExecution:
         )
         error_message = str(exc) or type(exc).__name__
         if not self.stream_body_started:
+            self.stream_precommit_chunks.clear()
             await self.stream_output_queue.put(
                 JSONResponse(status_code=500, content={"error": error_message})
             )
@@ -3301,11 +3307,14 @@ class ResponsesRequestExecution:
         await self.stream_output_queue.put(bytes(chunk))
 
     async def _emit_precommit_keepalive(self, upstream_keepalive: Optional[bytes]) -> bool:
-        if self.stream_output_queue is None:
-            return False
         if self.stream_keepalive_sent:
             return True
-        await self._emit_stream_chunk(upstream_keepalive or _build_responses_stream_keepalive_event())
+        chunk = upstream_keepalive or _build_responses_stream_keepalive_event()
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        if not isinstance(chunk, (bytes, bytearray)):
+            chunk = str(chunk).encode("utf-8")
+        self.stream_precommit_chunks.append(bytes(chunk))
         self.stream_keepalive_sent = True
         return True
 
