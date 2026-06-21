@@ -9,6 +9,7 @@ from starlette.types import Receive, Scope, Send
 
 from core.log_config import logger
 from core.utils import safe_get
+from uni_api.observability.spans import merge_timing_spans
 from uni_api.serialization import json
 from uni_api.streaming.cleanup import call_cleanup_safely
 from uni_api.streaming.sse import is_sse_comment_frame
@@ -53,7 +54,7 @@ class LoggingStreamingResponse(Response):
         self.current_info["status_code"] = self.status_code
         if self._is_trace(trace):
             trace.mark("downstream_response_start")
-            self.current_info["timing_spans"] = trace.snapshot()
+            merge_timing_spans(self.current_info, trace.snapshot())
         await send(
             {
                 "type": "http.response.start",
@@ -108,10 +109,11 @@ class LoggingStreamingResponse(Response):
                 )
 
             self.current_info["process_time"] = time() - self.current_info["start_time"]
-            if self._is_trace(trace):
-                trace.mark("stream_end")
-                trace.mark("usage_recorded")
-                self.current_info["timing_spans"] = trace.snapshot()
+            final_trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else trace
+            if self._is_trace(final_trace):
+                final_trace.mark("stream_end")
+                final_trace.mark("usage_recorded")
+                merge_timing_spans(self.current_info, final_trace.snapshot())
                 logger.info(
                     "trace_span trace_id=%s request_id=%s endpoint=%s spans=%s",
                     self.current_info.get("trace_id"),

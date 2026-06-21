@@ -126,6 +126,7 @@ from uni_api.observability.request_context import (
     get_request_info,
     request_info,
 )
+from uni_api.observability.spans import merge_timing_spans
 from uni_api.observability.telemetry import emit_request_observability
 from uni_api.observability.middleware import (
     StatsMiddleware,
@@ -351,6 +352,13 @@ def _coerce_request_trace(current_info: dict[str, Any]) -> Optional[RequestTrace
         return None
     trace = current_info.get("trace")
     if isinstance(trace, RequestTrace):
+        spans = current_info.get("timing_spans")
+        if isinstance(spans, dict):
+            for key, value in spans.items():
+                name = str(key or "").strip()
+                if name and name not in trace.spans:
+                    trace.spans[name] = int(value) if isinstance(value, float) else value
+        merge_timing_spans(current_info, trace.snapshot())
         return trace
     trace_id = str(current_info.get("trace_id") or current_info.get("request_id") or "").strip()
     if not trace_id:
@@ -372,8 +380,64 @@ def _coerce_request_trace(current_info: dict[str, Any]) -> Optional[RequestTrace
             elif isinstance(value, float):
                 trace.spans[name] = int(value)
     current_info["trace"] = trace
-    current_info["timing_spans"] = trace.snapshot()
+    merge_timing_spans(current_info, trace.snapshot())
     return trace
+
+
+def _fallback_stage_elapsed_ms(current_info: dict[str, Any], stage: str) -> int:
+    if stage == "request_received":
+        return 0
+    start_time = current_info.get("start_time") if isinstance(current_info, dict) else None
+    if isinstance(start_time, (int, float)):
+        return max(1, int((time() - float(start_time)) * 1000))
+    return 1
+
+
+def _mark_current_info_stage(current_info: dict[str, Any], stage: str) -> None:
+    name = str(stage or "").strip()
+    if not isinstance(current_info, dict) or not name:
+        return
+    trace = _coerce_request_trace(current_info)
+    if isinstance(trace, RequestTrace):
+        trace.mark(name)
+        merge_timing_spans(current_info, trace.snapshot())
+        return
+    spans = dict(current_info.get("timing_spans") or {})
+    spans[name] = _fallback_stage_elapsed_ms(current_info, name)
+    merge_timing_spans(current_info, spans)
+
+
+def _set_current_info_trace_tag(current_info: dict[str, Any], name: str, value: Optional[str]) -> None:
+    key = str(name or "").strip()
+    text = str(value or "").strip()
+    if not isinstance(current_info, dict) or not key or not text:
+        return
+    trace = _coerce_request_trace(current_info)
+    if isinstance(trace, RequestTrace):
+        trace.set_tag(key, text)
+        merge_timing_spans(current_info, trace.snapshot())
+        return
+    spans = dict(current_info.get("timing_spans") or {})
+    spans[key] = text[:128]
+    merge_timing_spans(current_info, spans)
+
+
+def _add_current_info_trace_ms(current_info: dict[str, Any], name: str, value_ms: Any) -> None:
+    key = str(name or "").strip()
+    if not isinstance(current_info, dict) or not key:
+        return
+    trace = _coerce_request_trace(current_info)
+    if isinstance(trace, RequestTrace):
+        trace.add_ms(key, value_ms)
+        merge_timing_spans(current_info, trace.snapshot())
+        return
+    try:
+        value = max(0, int(round(float(value_ms))))
+    except (TypeError, ValueError):
+        return
+    spans = dict(current_info.get("timing_spans") or {})
+    spans[key] = value
+    merge_timing_spans(current_info, spans)
 
 
 class RuntimeGauges:
@@ -688,6 +752,12 @@ def _mark_stage(stage: str) -> None:
     trace = _current_trace()
     if trace is not None:
         trace.mark(stage)
+        try:
+            info = get_request_info()
+        except LookupError:
+            return
+        if isinstance(info, dict):
+            merge_timing_spans(info, trace.snapshot())
 
 
 def _trace_headers_for_upstream(current_info: dict[str, Any]) -> dict[str, str]:
@@ -719,10 +789,7 @@ def _mark_first_byte_observed(current_info: dict[str, Any]) -> None:
     if current_info.get("_first_byte_observed"):
         return
     current_info["_first_byte_observed"] = True
-    trace = _coerce_request_trace(current_info)
-    if isinstance(trace, RequestTrace):
-        trace.mark("upstream_first_chunk")
-        current_info["timing_spans"] = trace.snapshot()
+    _mark_current_info_stage(current_info, "upstream_first_chunk")
     runtime_gauges.end_waiting_first_byte(current_info)
 
 
@@ -787,14 +854,11 @@ def _record_retry_observability(attempt: Any, status_code: int, error_message: A
     retry_count = int(info.get("retry_count") or 0) + 1
     info["retry_count"] = retry_count
     info["error_type"] = type(error_message).__name__ if not isinstance(error_message, str) else "upstream_retry"
-    trace = info.get("trace")
-    if isinstance(trace, RequestTrace):
-        trace.mark("retry_started")
-        trace.add_ms("retry_count", retry_count)
-        trace.add_ms("retry_status_code", status_code)
-        trace.set_tag("retry_provider", getattr(attempt, "provider_name", None))
-        trace.set_tag("retry_error_type", info.get("error_type"))
-        info["timing_spans"] = trace.snapshot()
+    _mark_current_info_stage(info, "retry_started")
+    _add_current_info_trace_ms(info, "retry_count", retry_count)
+    _add_current_info_trace_ms(info, "retry_status_code", status_code)
+    _set_current_info_trace_tag(info, "retry_provider", getattr(attempt, "provider_name", None))
+    _set_current_info_trace_tag(info, "retry_error_type", info.get("error_type"))
 
 
 def _record_cooldown_observability(attempt: Any, status_code: int, error_message: Any) -> None:
@@ -804,12 +868,9 @@ def _record_cooldown_observability(attempt: Any, status_code: int, error_message
         return
     cooldown_count = int(info.get("cooldown_count") or 0) + 1
     info["cooldown_count"] = cooldown_count
-    trace = info.get("trace")
-    if isinstance(trace, RequestTrace):
-        trace.add_ms("cooldown_count", cooldown_count)
-        trace.add_ms("cooldown_status_code", status_code)
-        trace.set_tag("cooldown_provider", getattr(attempt, "provider_name", None))
-        info["timing_spans"] = trace.snapshot()
+    _add_current_info_trace_ms(info, "cooldown_count", cooldown_count)
+    _add_current_info_trace_ms(info, "cooldown_status_code", status_code)
+    _set_current_info_trace_tag(info, "cooldown_provider", getattr(attempt, "provider_name", None))
 
 
 def _emit_request_observability(current_info: dict[str, Any]) -> None:
@@ -1765,15 +1826,13 @@ async def process_request(
     if isinstance(current_info, dict):
         current_info["stream"] = bool(getattr(request, "stream", False))
         current_info["role"] = role
-    if isinstance(trace, RequestTrace):
-        trace.mark("provider_selected")
-        trace.set_tag("provider", channel_id)
-        trace.set_tag("model", request.model)
+        _mark_current_info_stage(current_info, "provider_selected")
+        _set_current_info_trace_tag(current_info, "provider", channel_id)
+        _set_current_info_trace_tag(current_info, "model", request.model)
     if engine != "moderation":
         _log_stdout_request_summary(channel_id, request.model, engine, role)
     _add_trace_headers(headers, current_info)
-    if isinstance(trace, RequestTrace):
-        trace.mark("provider_key_selected")
+    _mark_current_info_stage(current_info, "provider_key_selected")
 
     # print("proxy", proxy)
 
@@ -1805,8 +1864,7 @@ async def process_request(
                     model=request.model,
                     actual_model=original_model,
                 )
-                if isinstance(trace, RequestTrace):
-                    trace.mark("upstream_send_start")
+                _mark_current_info_stage(current_info, "upstream_send_start")
                 runtime_gauges.begin_waiting_first_byte(current_info)
                 generator = fetch_response_stream(
                     client,
@@ -1818,8 +1876,7 @@ async def process_request(
                     timeout_value,
                     response_headers_sink=capture_upstream_response_headers,
                 )
-                if isinstance(trace, RequestTrace):
-                    trace.mark("upstream_headers_received")
+                _mark_current_info_stage(current_info, "upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 if first_response_time == 3.1415:
                     wrapped_generator = _mark_first_byte_on_stream(wrapped_generator, current_info, skip_keepalive=True)
@@ -1847,8 +1904,7 @@ async def process_request(
                     model=request.model,
                     actual_model=original_model,
                 )
-                if isinstance(trace, RequestTrace):
-                    trace.mark("upstream_send_start")
+                _mark_current_info_stage(current_info, "upstream_send_start")
                 runtime_gauges.begin_waiting_first_byte(current_info)
                 generator = fetch_response_stream(
                     client,
@@ -1860,8 +1916,7 @@ async def process_request(
                     timeout_value,
                     response_headers_sink=capture_upstream_response_headers,
                 )
-                if isinstance(trace, RequestTrace):
-                    trace.mark("upstream_headers_received")
+                _mark_current_info_stage(current_info, "upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, True, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 if first_response_time != 3.1415:
                     _mark_first_byte_observed(current_info)
@@ -1887,8 +1942,7 @@ async def process_request(
                     model=request.model,
                     actual_model=original_model,
                 )
-                if isinstance(trace, RequestTrace):
-                    trace.mark("upstream_send_start")
+                _mark_current_info_stage(current_info, "upstream_send_start")
                 runtime_gauges.begin_waiting_first_byte(current_info)
                 generator = fetch_response(
                     client,
@@ -1900,8 +1954,7 @@ async def process_request(
                     timeout_value,
                     response_headers_sink=capture_upstream_response_headers,
                 )
-                if isinstance(trace, RequestTrace):
-                    trace.mark("upstream_headers_received")
+                _mark_current_info_stage(current_info, "upstream_headers_received")
                 wrapped_generator, first_response_time = await error_handling_wrapper(generator, channel_id, engine, False, app.state.error_triggers, keepalive_interval=keepalive_interval, last_message_role=last_message_role)
                 _mark_first_byte_observed(current_info)
 
@@ -3565,11 +3618,9 @@ class ResponsesRequestExecution:
         proxy = safe_get(self.config, "preferences", "proxy", default=None)
         proxy = safe_get(provider, "preferences", "proxy", default=proxy)
         channel_id = f"{provider_name}"
-        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
-        if isinstance(trace, RequestTrace):
-            trace.mark("provider_selected")
-            trace.set_tag("provider", channel_id)
-            trace.set_tag("model", self.request_model_name)
+        _mark_current_info_stage(self.current_info, "provider_selected")
+        _set_current_info_trace_tag(self.current_info, "provider", channel_id)
+        _set_current_info_trace_tag(self.current_info, "model", self.request_model_name)
 
         commit_policy = safe_get(provider, "preferences", "responses_stream_commit_policy", default="real_output")
         attempt.state.update(
@@ -3582,8 +3633,7 @@ class ResponsesRequestExecution:
             }
         )
         attempt.provider_api_key_raw = await self.runner.select_provider_api_key(attempt)
-        if isinstance(trace, RequestTrace):
-            trace.mark("provider_key_selected")
+        _mark_current_info_stage(self.current_info, "provider_key_selected")
 
         api_key = attempt.provider_api_key_raw
         codex_account_id = None
@@ -3715,7 +3765,7 @@ class ResponsesRequestExecution:
             attempt.state["observability_attempt_index"] = None
             return
 
-        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
+        trace = _coerce_request_trace(self.current_info)
         started_ms = None
         if isinstance(trace, RequestTrace):
             started_ms = max(0, int((time() - trace.started_at) * 1000))
@@ -3723,6 +3773,9 @@ class ResponsesRequestExecution:
             trace.add_ms("upstream_timeout_seconds", attempt.state.get("timeout_value", 0))
             if attempt.state.get("timeout_adjusted_from") is not None:
                 trace.add_ms("upstream_timeout_adjusted_from_seconds", attempt.state["timeout_adjusted_from"])
+            merge_timing_spans(self.current_info, trace.snapshot())
+        elif isinstance(self.current_info.get("start_time"), (int, float)):
+            started_ms = max(0, int((time() - float(self.current_info["start_time"])) * 1000))
 
         upstream_host = urlparse(str(attempt.state.get("upstream_url") or "")).netloc
         entry = {
@@ -3766,9 +3819,14 @@ class ResponsesRequestExecution:
         entry["success"] = bool(success)
         if error_type:
             entry["error_type"] = str(error_type)[:80]
-        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
+        trace = _coerce_request_trace(self.current_info)
         if isinstance(trace, RequestTrace) and isinstance(entry.get("started_ms"), int):
             entry["duration_ms"] = max(0, int((time() - trace.started_at) * 1000) - int(entry["started_ms"]))
+        elif isinstance(self.current_info.get("start_time"), (int, float)) and isinstance(entry.get("started_ms"), int):
+            entry["duration_ms"] = max(
+                0,
+                int((time() - float(self.current_info["start_time"])) * 1000) - int(entry["started_ms"]),
+            )
 
     def _log_attempt(self, attempt: Any, headers: dict[str, str], payload: dict[str, Any]) -> None:
         channel_id = attempt.state["channel_id"]
@@ -3809,9 +3867,7 @@ class ResponsesRequestExecution:
         )
 
     async def _execute_stream_attempt(self, client: Any, attempt: Any, headers: dict[str, str], json_payload: str):
-        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
-        if isinstance(trace, RequestTrace):
-            trace.mark("upstream_send_start")
+        _mark_current_info_stage(self.current_info, "upstream_send_start")
         runtime_gauges.begin_waiting_first_byte(self.current_info)
         first_byte_timeout = _optional_positive_timeout(attempt.state.get("first_byte_timeout"))
         first_byte_deadline = (
@@ -3841,8 +3897,7 @@ class ResponsesRequestExecution:
             total_timeout_seconds=total_timeout,
             total_deadline=total_deadline,
         )
-        if isinstance(trace, RequestTrace):
-            trace.mark("upstream_headers_received")
+        _mark_current_info_stage(self.current_info, "upstream_headers_received")
         if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
             runtime_gauges.end_waiting_first_byte(self.current_info)
             raw = await upstream_resp.aread()
@@ -4018,9 +4073,7 @@ class ResponsesRequestExecution:
         )
 
     async def _execute_non_stream_attempt(self, client: Any, attempt: Any, headers: dict[str, str], json_payload: str):
-        trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
-        if isinstance(trace, RequestTrace):
-            trace.mark("upstream_send_start")
+        _mark_current_info_stage(self.current_info, "upstream_send_start")
         runtime_gauges.begin_waiting_first_byte(self.current_info)
         try:
             upstream_resp = await client.post(
@@ -4029,8 +4082,7 @@ class ResponsesRequestExecution:
                 content=json_payload,
                 timeout=attempt.state["timeout_value"],
             )
-            if isinstance(trace, RequestTrace):
-                trace.mark("upstream_headers_received")
+            _mark_current_info_stage(self.current_info, "upstream_headers_received")
             _mark_first_byte_observed(self.current_info)
         except Exception:
             runtime_gauges.end_waiting_first_byte(self.current_info)

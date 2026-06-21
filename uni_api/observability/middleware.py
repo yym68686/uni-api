@@ -25,6 +25,7 @@ from uni_api.observability.request_context import (
     set_request_info,
 )
 from uni_api.observability.request_inspection import inspect_request_body
+from uni_api.observability.spans import merge_timing_spans
 from uni_api.streaming.logging_response import LoggingStreamingResponse
 
 
@@ -254,6 +255,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
         if response_trace is not None and hasattr(response_trace, "mark") and hasattr(response_trace, "trace_id"):
             trace = response_trace
         trace.mark("downstream_response_start")
+        merge_timing_spans(current_info, trace.snapshot())
         response.headers["x-request-id"] = trace.trace_id
         current_info["status_code"] = getattr(response, "status_code", 0) or 0
         if not request.url.path.startswith("/v1") or deps.database_disabled:
@@ -386,7 +388,7 @@ class StatsMiddleware(BaseHTTPMiddleware):
                     await disconnect_task
             trace.mark("stream_end")
             current_info["process_time"] = time() - start_time
-            current_info["timing_spans"] = trace.snapshot()
+            merge_timing_spans(current_info, trace.snapshot())
             logger.info(
                 "trace_span trace_id=%s request_id=%s endpoint=%s spans=%s",
                 current_info.get("trace_id"),

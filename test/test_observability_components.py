@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from time import time
 from types import SimpleNamespace
 
 from starlette.responses import StreamingResponse
@@ -164,3 +165,65 @@ async def test_streaming_observability_wrap_merges_response_current_info():
     assert outer_info["trace"] is inner_trace
     assert outer_info["timing_spans"]["provider_selected"] >= 1
     assert wrapped.headers["x-request-id"] == "inner"
+
+
+async def test_logging_streaming_response_preserves_handler_timing_spans():
+    import main
+
+    async def body():
+        yield b"data: ok\n\n"
+
+    emitted = []
+    updated = []
+    trace = main.RequestTrace(trace_id="trace-stream")
+    trace.mark("request_received")
+    current_info = {
+        "request_id": "req-stream",
+        "trace_id": "trace-stream",
+        "endpoint": "POST /v1/responses",
+        "api_key": "sk-test",
+        "start_time": time(),
+        "trace": trace,
+        "timing_spans": {
+            "request_received": 0,
+            "provider_selected": 12,
+            "provider_key_selected": 14,
+            "upstream_send_start": 20,
+            "upstream_headers_received": 45,
+            "upstream_first_chunk": 80,
+        },
+    }
+
+    async def update_stats(info):
+        updated.append(dict(info))
+
+    response = main.LoggingStreamingResponse(
+        body(),
+        status_code=200,
+        media_type="text/event-stream",
+        current_info=current_info,
+        mark_first_byte_observed=lambda info: None,
+        emit_request_observability=lambda info: emitted.append(dict(info)),
+        update_stats=update_stats,
+        trace_type=main.RequestTrace,
+    )
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await response({"type": "http", "method": "POST", "path": "/v1/responses"}, receive, send)
+
+    spans = emitted[0]["timing_spans"]
+    assert spans["provider_selected"] == 12
+    assert spans["provider_key_selected"] == 14
+    assert spans["upstream_send_start"] == 20
+    assert spans["upstream_headers_received"] == 45
+    assert spans["upstream_first_chunk"] == 80
+    assert spans["downstream_response_start"] >= 1
+    assert spans["stream_end"] >= 1
+    assert updated
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
