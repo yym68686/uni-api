@@ -19,7 +19,7 @@ def test_chat_route_reuses_fastapi_validated_request_object():
     assert "RequestModel.model_validate" not in source
     assert "model_validate" not in source + handler_source
     assert "RequestModel(" not in source
-    assert "model_handler.request_model(request, api_index, background_tasks)" in handler_source
+    assert "model_handler.request_model(" in handler_source
 
 
 def test_upstream_retry_loop_does_not_rebuild_full_request_models():

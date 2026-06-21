@@ -20,22 +20,33 @@ async def search_response(
         messages=[{"role": "user", "content": query}],
         stream=False,
     )
+    state = getattr(http_request, "state", None)
+    current_info = getattr(state, "uni_api_request_info", None)
     return await model_handler.request_model(
         search_request,
         api_index,
         background_tasks,
         endpoint=str(http_request.url.path),
+        current_info=current_info if isinstance(current_info, dict) else None,
     )
 
 
 async def chat_completions_response(
     *,
     model_handler: Any,
+    http_request: Request | None = None,
     request: RequestModel,
     background_tasks: BackgroundTasks,
     api_index: int,
 ):
-    return await model_handler.request_model(request, api_index, background_tasks)
+    state = getattr(http_request, "state", None)
+    current_info = getattr(state, "uni_api_request_info", None)
+    return await model_handler.request_model(
+        request,
+        api_index,
+        background_tasks,
+        current_info=current_info if isinstance(current_info, dict) else None,
+    )
 
 
 async def responses_api_response(
@@ -70,4 +81,3 @@ async def messages_response(
         api_index,
         background_tasks,
     )
-

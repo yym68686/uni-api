@@ -327,6 +327,8 @@ class StatsMiddleware(BaseHTTPMiddleware):
         )
         current_request_info = set_request_info(request_info_data)
         current_info = get_request_info()
+        request.state.uni_api_request_info = current_info
+        request.state.uni_api_trace = trace
         disconnect_task: Optional[asyncio.Task] = None
         try:
             parsed_body = await self._parse_and_log_body(request, current_info["request_id"], trace)

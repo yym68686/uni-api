@@ -252,18 +252,20 @@ def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None)
 
 
 def _run_responses_request(request, *, endpoint="/v1/responses", http_headers=None):
-    request_token = main.request_info.set(
-        {
-            "request_id": "req-test",
-            "api_key": "sk-test",
-            "disconnect_event": None,
-        }
-    )
+    request_info_value = {
+        "request_id": "req-test",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+    request_token = main.request_info.set(request_info_value)
     try:
         handler = main.ResponsesRequestHandler()
         return asyncio.run(
             handler.request_responses(
-                http_request=SimpleNamespace(headers=http_headers or {}),
+                http_request=SimpleNamespace(
+                    headers=http_headers or {},
+                    state=SimpleNamespace(uni_api_request_info=request_info_value),
+                ),
                 request_data=request,
                 api_index=0,
                 background_tasks=BackgroundTasks(),
@@ -291,7 +293,10 @@ def _run_responses_request_with_stream_body(
     async def _run():
         handler = main.ResponsesRequestHandler()
         response = await handler.request_responses(
-            http_request=SimpleNamespace(headers=http_headers or {}),
+            http_request=SimpleNamespace(
+                headers=http_headers or {},
+                state=SimpleNamespace(uni_api_request_info=request_info_value),
+            ),
             request_data=request,
             api_index=0,
             background_tasks=BackgroundTasks(),
@@ -2238,6 +2243,66 @@ def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):
     assert body.index("event: response.created") < body.index("event: response.output_text.delta")
     assert client_manager.stream_calls[0]["timeout"] is None
     assert current_info["timing_spans"]["upstream_first_chunk"] >= 1
+
+
+def test_responses_stream_observability_uses_request_state_current_info(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    upstream_response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ]
+    )
+    main.app.state.client_manager = DummyClientManager(upstream_response)
+    state_info = {
+        "request_id": "req-state",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+        "trace": main.RequestTrace(trace_id="req-state"),
+    }
+    context_info = {
+        "request_id": "req-context",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+        "trace": main.RequestTrace(trace_id="req-context"),
+    }
+    request_token = main.request_info.set(context_info)
+
+    async def run_test():
+        handler = main.ResponsesRequestHandler()
+        response = await handler.request_responses(
+            http_request=SimpleNamespace(
+                headers={},
+                state=SimpleNamespace(uni_api_request_info=state_info),
+            ),
+            request_data=ResponsesRequest(model="gpt-5.4", input=["hello world"], stream=True),
+            api_index=0,
+            background_tasks=BackgroundTasks(),
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+        return b"".join(chunks).decode("utf-8")
+
+    try:
+        body = asyncio.run(run_test())
+    finally:
+        main.request_info.reset(request_token)
+
+    assert "hello" in body
+    assert state_info["provider"] == "codex-provider"
+    assert state_info["timing_spans"]["provider_selected"] >= 1
+    assert state_info["timing_spans"]["upstream_headers_received"] >= 1
+    assert state_info["timing_spans"]["upstream_first_chunk"] >= 1
+    assert context_info.get("provider") is None
 
 
 def test_responses_stream_uses_explicit_idle_as_httpx_read_timeout(monkeypatch):

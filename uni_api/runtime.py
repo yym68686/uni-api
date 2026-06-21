@@ -648,6 +648,12 @@ def _current_trace() -> Optional[RequestTrace]:
     return trace if isinstance(trace, RequestTrace) else None
 
 
+def _request_state_current_info(http_request: Optional[Request]) -> Optional[dict[str, Any]]:
+    state = getattr(http_request, "state", None)
+    info = getattr(state, "uni_api_request_info", None)
+    return info if isinstance(info, dict) else None
+
+
 def _mark_stage(stage: str) -> None:
     trace = _current_trace()
     if trace is not None:
@@ -1695,6 +1701,7 @@ async def process_request(
     timeout_value=DEFAULT_TIMEOUT,
     keepalive_interval=None,
     provider_api_key_raw: Optional[str] = None,
+    current_info: Optional[dict[str, Any]] = None,
 ):
     timeout_value = int(timeout_value)
     provider_registry = getattr(app.state, "provider_registry", None)
@@ -1722,7 +1729,8 @@ async def process_request(
     payload = prepared.payload
     last_message_role = prepared.last_message_role
 
-    current_info = get_request_info()
+    if not isinstance(current_info, dict):
+        current_info = get_request_info()
     trace = current_info.get("trace") if isinstance(current_info, dict) else None
     if isinstance(current_info, dict):
         current_info["stream"] = bool(getattr(request, "stream", False))
@@ -1902,13 +1910,15 @@ class ModelRequestHandler:
         api_index: int,
         background_tasks: BackgroundTasks,
         endpoint=None,
+        current_info: Optional[dict[str, Any]] = None,
     ):
         config = app.state.config
         request_model_name = request_data.model
         if not api_key_has_model_rules(app, api_index):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
-        current_info = get_request_info()
+        if not isinstance(current_info, dict):
+            current_info = get_request_info()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_total_tokens = estimate_request_total_tokens(request_data)
         routing_endpoint = endpoint or "/v1/chat/completions"
@@ -2042,6 +2052,7 @@ class ModelRequestHandler:
                     local_timeout_value,
                     keepalive_interval,
                     provider_api_key_raw=attempt.provider_api_key_raw,
+                    current_info=current_info,
                 )
             )
             disconnect_task: Optional[asyncio.Task] = None
@@ -2089,7 +2100,6 @@ class ModelRequestHandler:
                 traceback.print_exc()
 
         def build_final_response(completed_plan):
-            current_info = get_request_info()
             if isinstance(current_info, dict):
                 current_info["first_response_time"] = -1
                 current_info["success"] = False
@@ -3295,7 +3305,7 @@ class ResponsesRequestExecution:
         if not api_key_has_model_rules(app, api_index):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
-        current_info = get_request_info()
+        current_info = _request_state_current_info(http_request) or get_request_info()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
         plan = await RoutingPlan.create(
@@ -5475,9 +5485,15 @@ async def jina_search(
     )
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def chat_completions_route(request: RequestModel, background_tasks: BackgroundTasks, api_index: int = Depends(verify_api_key)):
+async def chat_completions_route(
+    http_request: Request,
+    request: RequestModel,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key),
+):
     return await chat_completions_response(
         model_handler=model_handler,
+        http_request=http_request,
         request=request,
         background_tasks=background_tasks,
         api_index=api_index,
