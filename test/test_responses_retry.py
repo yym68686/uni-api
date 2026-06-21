@@ -2264,15 +2264,17 @@ def test_responses_stream_observability_uses_request_state_current_info(monkeypa
     main.app.state.client_manager = DummyClientManager(upstream_response)
     state_info = {
         "request_id": "req-state",
+        "trace_id": "11111111111111111111111111111111",
         "api_key": "sk-test",
         "disconnect_event": None,
-        "trace": main.RequestTrace(trace_id="req-state"),
+        "timing_spans": {"request_received": 0, "body_parsed": 5},
     }
     context_info = {
         "request_id": "req-context",
+        "trace_id": "22222222222222222222222222222222",
         "api_key": "sk-test",
         "disconnect_event": None,
-        "trace": main.RequestTrace(trace_id="req-context"),
+        "timing_spans": {"request_received": 0, "body_parsed": 9},
     }
     request_token = main.request_info.set(context_info)
 
@@ -2299,6 +2301,8 @@ def test_responses_stream_observability_uses_request_state_current_info(monkeypa
 
     assert "hello" in body
     assert state_info["provider"] == "codex-provider"
+    assert isinstance(state_info["trace"], main.RequestTrace)
+    assert state_info["timing_spans"]["body_parsed"] == 5
     assert state_info["timing_spans"]["provider_selected"] >= 1
     assert state_info["timing_spans"]["upstream_headers_received"] >= 1
     assert state_info["timing_spans"]["upstream_first_chunk"] >= 1

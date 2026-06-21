@@ -346,6 +346,36 @@ class RequestTrace:
         return dict(self.spans)
 
 
+def _coerce_request_trace(current_info: dict[str, Any]) -> Optional[RequestTrace]:
+    if not isinstance(current_info, dict):
+        return None
+    trace = current_info.get("trace")
+    if isinstance(trace, RequestTrace):
+        return trace
+    trace_id = str(current_info.get("trace_id") or current_info.get("request_id") or "").strip()
+    if not trace_id:
+        return None
+    trace = RequestTrace(
+        trace_id=trace_id,
+        parent_span_id=current_info.get("parent_span_id"),
+        trace_flags=current_info.get("trace_flags"),
+        tracestate=current_info.get("tracestate"),
+    )
+    spans = current_info.get("timing_spans")
+    if isinstance(spans, dict):
+        for key, value in spans.items():
+            name = str(key or "").strip()
+            if not name:
+                continue
+            if isinstance(value, (int, str)):
+                trace.spans[name] = value
+            elif isinstance(value, float):
+                trace.spans[name] = int(value)
+    current_info["trace"] = trace
+    current_info["timing_spans"] = trace.snapshot()
+    return trace
+
+
 class RuntimeGauges:
     def __init__(self) -> None:
         self.inflight_requests = 0
@@ -689,7 +719,7 @@ def _mark_first_byte_observed(current_info: dict[str, Any]) -> None:
     if current_info.get("_first_byte_observed"):
         return
     current_info["_first_byte_observed"] = True
-    trace = current_info.get("trace")
+    trace = _coerce_request_trace(current_info)
     if isinstance(trace, RequestTrace):
         trace.mark("upstream_first_chunk")
         current_info["timing_spans"] = trace.snapshot()
@@ -1731,7 +1761,7 @@ async def process_request(
 
     if not isinstance(current_info, dict):
         current_info = get_request_info()
-    trace = current_info.get("trace") if isinstance(current_info, dict) else None
+    trace = _coerce_request_trace(current_info)
     if isinstance(current_info, dict):
         current_info["stream"] = bool(getattr(request, "stream", False))
         current_info["role"] = role
@@ -1920,6 +1950,7 @@ class ModelRequestHandler:
 
         if not isinstance(current_info, dict):
             current_info = get_request_info()
+        _coerce_request_trace(current_info)
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_total_tokens = estimate_request_total_tokens(request_data)
         routing_endpoint = endpoint or "/v1/chat/completions"
@@ -3307,6 +3338,7 @@ class ResponsesRequestExecution:
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
         current_info = _request_state_current_info(http_request) or get_request_info()
+        _coerce_request_trace(current_info)
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
         plan = await RoutingPlan.create(
