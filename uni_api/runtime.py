@@ -132,6 +132,7 @@ from uni_api.observability.middleware import (
     StatsMiddleware,
     StatsMiddlewareDependencies,
 )
+from uni_api.middleware.request_decompression import RequestBodyDecompressionMiddleware
 from uni_api.persistence.repositories import StatsRepository
 from uni_api.providers import ProviderRegistry
 from uni_api.providers.execution import prepare_provider_request
@@ -1622,6 +1623,8 @@ app.add_middleware(
         debug=is_debug,
     ),
 )
+
+app.add_middleware(RequestBodyDecompressionMiddleware)
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
