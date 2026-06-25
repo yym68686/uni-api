@@ -28,6 +28,7 @@ async def search_response(
         background_tasks,
         endpoint=str(http_request.url.path),
         current_info=current_info if isinstance(current_info, dict) else None,
+        http_request=http_request,
     )
 
 
@@ -46,6 +47,7 @@ async def chat_completions_response(
         api_index,
         background_tasks,
         current_info=current_info if isinstance(current_info, dict) else None,
+        http_request=http_request,
     )
 
 

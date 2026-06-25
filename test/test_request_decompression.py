@@ -108,7 +108,8 @@ def test_main_app_accepts_zstd_chat_completion_request(monkeypatch):
         main.app.state.api_list,
     )
 
-    async def fake_request_model(request, api_index, background_tasks, endpoint=None, current_info=None):
+    async def fake_request_model(request, api_index, background_tasks, endpoint=None, current_info=None, http_request=None):
+        _ = http_request
         assert api_index == 0
         assert endpoint is None
         assert current_info["model"] == "gpt-5.5"

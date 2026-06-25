@@ -351,8 +351,9 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
         keepalive_interval=None,
         provider_api_key_raw=None,
         current_info=None,
+        http_request=None,
     ):
-        _ = current_info
+        _ = current_info, http_request
         assert provider_api_key_raw == "provider-key-1"
         return Response(content=b"ok", media_type="application/json")
 
@@ -422,8 +423,9 @@ def test_model_request_handler_error_log_includes_request_and_actual_model(monke
         keepalive_interval=None,
         provider_api_key_raw=None,
         current_info=None,
+        http_request=None,
     ):
-        _ = current_info
+        _ = current_info, http_request
         raise HTTPException(status_code=502, detail="bad gateway")
 
     error_logs = []

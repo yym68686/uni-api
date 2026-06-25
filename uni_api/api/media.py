@@ -14,25 +14,79 @@ from core.models import (
 from uni_api.api.media_parsers import build_audio_transcription_request, parse_image_edit_request
 
 
-async def image_generation_response(model_handler: Any, request: ImageGenerationRequest, api_index: int, background_tasks: Any):
-    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/generations")
+async def image_generation_response(
+    model_handler: Any,
+    request: ImageGenerationRequest,
+    api_index: int,
+    background_tasks: Any,
+    http_request: Request | None = None,
+):
+    return await model_handler.request_model(
+        request,
+        api_index,
+        background_tasks,
+        endpoint="/v1/images/generations",
+        http_request=http_request,
+    )
 
 
 async def image_edit_response(model_handler: Any, http_request: Request, api_index: int, background_tasks: Any):
     request = await parse_image_edit_request(http_request)
-    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/edits")
+    return await model_handler.request_model(
+        request,
+        api_index,
+        background_tasks,
+        endpoint="/v1/images/edits",
+        http_request=http_request,
+    )
 
 
-async def embeddings_response(model_handler: Any, request: EmbeddingRequest, api_index: int, background_tasks: Any):
-    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/embeddings")
+async def embeddings_response(
+    model_handler: Any,
+    request: EmbeddingRequest,
+    api_index: int,
+    background_tasks: Any,
+    http_request: Request | None = None,
+):
+    return await model_handler.request_model(
+        request,
+        api_index,
+        background_tasks,
+        endpoint="/v1/embeddings",
+        http_request=http_request,
+    )
 
 
-async def audio_speech_response(model_handler: Any, request: TextToSpeechRequest, api_index: int, background_tasks: Any):
-    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/audio/speech")
+async def audio_speech_response(
+    model_handler: Any,
+    request: TextToSpeechRequest,
+    api_index: int,
+    background_tasks: Any,
+    http_request: Request | None = None,
+):
+    return await model_handler.request_model(
+        request,
+        api_index,
+        background_tasks,
+        endpoint="/v1/audio/speech",
+        http_request=http_request,
+    )
 
 
-async def moderation_response(model_handler: Any, request: ModerationRequest, api_index: int, background_tasks: Any):
-    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/moderations")
+async def moderation_response(
+    model_handler: Any,
+    request: ModerationRequest,
+    api_index: int,
+    background_tasks: Any,
+    http_request: Request | None = None,
+):
+    return await model_handler.request_model(
+        request,
+        api_index,
+        background_tasks,
+        endpoint="/v1/moderations",
+        http_request=http_request,
+    )
 
 
 async def audio_transcription_response(
@@ -62,4 +116,5 @@ async def audio_transcription_response(
         api_index,
         background_tasks,
         endpoint="/v1/audio/transcriptions",
+        http_request=http_request,
     )

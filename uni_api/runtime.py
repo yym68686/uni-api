@@ -2001,6 +2001,7 @@ class ModelRequestHandler:
         background_tasks: BackgroundTasks,
         endpoint=None,
         current_info: Optional[dict[str, Any]] = None,
+        http_request: Optional[Request] = None,
     ):
         config = app.state.config
         request_model_name = request_data.model
@@ -5661,11 +5662,12 @@ async def list_models(api_index: int = Depends(verify_api_key)):
 
 @app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
 async def images_generations(
+    http_request: Request,
     request: ImageGenerationRequest,
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)
 ):
-    return await image_generation_response(model_handler, request, api_index, background_tasks)
+    return await image_generation_response(model_handler, request, api_index, background_tasks, http_request=http_request)
 
 @app.post("/v1/video/tasks", dependencies=[Depends(rate_limit_dependency)])
 async def video_tasks_create(
@@ -5773,27 +5775,30 @@ async def images_edits(
 
 @app.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
 async def embeddings(
+    http_request: Request,
     request: EmbeddingRequest,
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)
 ):
-    return await embeddings_response(model_handler, request, api_index, background_tasks)
+    return await embeddings_response(model_handler, request, api_index, background_tasks, http_request=http_request)
 
 @app.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
 async def audio_speech(
+    http_request: Request,
     request: TextToSpeechRequest,
     background_tasks: BackgroundTasks,
     api_index: str = Depends(verify_api_key)
 ):
-    return await audio_speech_response(model_handler, request, api_index, background_tasks)
+    return await audio_speech_response(model_handler, request, api_index, background_tasks, http_request=http_request)
 
 @app.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(
+    http_request: Request,
     request: ModerationRequest,
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)
 ):
-    return await moderation_response(model_handler, request, api_index, background_tasks)
+    return await moderation_response(model_handler, request, api_index, background_tasks, http_request=http_request)
 
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
 async def audio_transcriptions(
