@@ -38,6 +38,7 @@ from uni_api.providers.payloads import (
     force_codex_client_headers,
     strip_unsupported_codex_payload_fields,
 )
+from uni_api.providers.header_passthrough import apply_provider_preference_headers
 from uni_api.providers.responses import fetch_response, fetch_response_stream
 from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, ImageEditRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, EmbeddingRequest
 from core.utils import (
@@ -1796,6 +1797,7 @@ async def process_request(
     keepalive_interval=None,
     provider_api_key_raw: Optional[str] = None,
     current_info: Optional[dict[str, Any]] = None,
+    http_request: Optional[Request] = None,
 ):
     timeout_value = int(timeout_value)
     provider_registry = getattr(app.state, "provider_registry", None)
@@ -1812,6 +1814,7 @@ async def process_request(
         provider_registry=provider_registry,
         select_provider_api_key_raw=select_provider_api_key_raw,
         resolve_codex_upstream_auth=_resolve_codex_upstream_auth,
+        http_request=http_request,
     )
     original_model = prepared.original_model
     engine = prepared.engine
@@ -2141,6 +2144,7 @@ class ModelRequestHandler:
                     keepalive_interval,
                     provider_api_key_raw=attempt.provider_api_key_raw,
                     current_info=current_info,
+                    http_request=http_request,
                 )
             )
             disconnect_task: Optional[asyncio.Task] = None
@@ -3734,7 +3738,7 @@ class ResponsesRequestExecution:
             headers.setdefault("Accept", "text/event-stream" if self.request_data.stream else "application/json")
             if codex_account_id:
                 headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
-        headers.update(safe_get(attempt.provider, "preferences", "headers", default={}) or {})
+        apply_provider_preference_headers(headers, attempt.provider, http_request=self.http_request)
         if engine == "codex":
             force_codex_client_headers(headers)
         _add_trace_headers(headers, self.current_info)
@@ -4366,7 +4370,7 @@ class MessagesPassthroughHandler:
             headers["anthropic-beta"] = anthropic_beta
         if api_key:
             headers["x-api-key"] = str(api_key)
-        headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+        apply_provider_preference_headers(headers, provider, http_request=http_request)
         return headers
 
     def _messages_log_attempt(self, ctx: dict[str, Any], attempt: Any, payload: dict[str, Any], headers: dict[str, str]) -> None:

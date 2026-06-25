@@ -1127,6 +1127,41 @@ def test_responses_codex_forces_current_client_headers_after_overrides(monkeypat
     assert "version" not in sent_headers
 
 
+def test_responses_applies_configured_passthrough_request_headers(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={
+            "headers": {
+                "X-OAIX-Selection-Mode": "marketplace",
+                "X-OAIX-Exclude-Owner": "stale-owner",
+            },
+            "passthrough_request_headers": [
+                "X-OAIX-Act-As-User",
+                "X-OAIX-Selection-Mode",
+                "X-OAIX-Exclude-Owner",
+            ],
+        },
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        ),
+        http_headers={
+            "X-OAIX-Act-As-User": "1",
+            "x-oaix-selection-mode": "marketplace",
+        },
+    )
+
+    assert response.status_code == 200
+    sent_headers = client_manager.post_calls[0]["headers"]
+    assert sent_headers["X-OAIX-Act-As-User"] == "1"
+    assert sent_headers["X-OAIX-Selection-Mode"] == "marketplace"
+    assert "X-OAIX-Exclude-Owner" not in sent_headers
+
+
 def test_responses_stream_retries_next_provider_before_output(monkeypatch):
     provider_a = "provider-a"
     provider_b = "provider-b"

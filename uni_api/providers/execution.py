@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from core.utils import get_engine, get_model_dict, safe_get
 from uni_api.providers.base import ProviderRequestContext
+from uni_api.providers.header_passthrough import apply_provider_preference_headers
 from uni_api.providers.payloads import force_codex_client_headers
 from uni_api.providers.registry import ProviderRegistry
 
@@ -37,6 +38,7 @@ async def prepare_provider_request(
     provider_registry: ProviderRegistry,
     select_provider_api_key_raw: Callable[[dict[str, Any], str, list[str]], Awaitable[Optional[str]]],
     resolve_codex_upstream_auth: Callable[[str, Optional[str], Optional[str]], Awaitable[tuple[Optional[str], Optional[str]]]],
+    http_request: Any | None = None,
 ) -> PreparedProviderRequest:
     model_dict = provider.get("_model_dict_cache") or get_model_dict(provider)
     original_model = model_dict[request.model]
@@ -88,7 +90,7 @@ async def prepare_provider_request(
     headers = dict(upstream_request.headers)
     if engine == "codex" and codex_account_id:
         headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
-    headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+    apply_provider_preference_headers(headers, provider, http_request=http_request)
     if engine == "codex":
         force_codex_client_headers(headers)
 
