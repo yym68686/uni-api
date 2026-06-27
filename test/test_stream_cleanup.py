@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 
@@ -8,6 +9,7 @@ import main
 import uni_api.providers.responses as response_module
 from core.utils import collect_openai_chat_completion_from_streaming_sse
 from uni_api.streaming.cleanup import (
+    await_stream_cleanup_safely,
     background_stream_cleanup_snapshot,
     track_background_stream_cleanup_task,
     wait_background_stream_cleanup_tasks,
@@ -171,6 +173,35 @@ async def _fetch_response_stream_closes_selected_provider_stream(monkeypatch):
 
 def test_fetch_response_stream_closes_selected_provider_stream(monkeypatch):
     asyncio.run(_fetch_response_stream_closes_selected_provider_stream(monkeypatch))
+
+
+async def _await_stream_cleanup_logs_cancel_without_traceback(caplog):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+
+    task = asyncio.create_task(await_stream_cleanup_safely(cleanup(), label="test cleanup"))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await task is True
+    cancellation_records = [
+        record
+        for record in caplog.records
+        if "test cleanup cleanup was cancelled" in record.message
+    ]
+    assert cancellation_records
+    assert all(record.exc_info is None for record in cancellation_records)
+
+
+def test_await_stream_cleanup_logs_cancel_without_traceback(caplog):
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(_await_stream_cleanup_logs_cancel_without_traceback(caplog))
 
 
 class _FakeConnection:

@@ -75,22 +75,20 @@ async def await_stream_cleanup_safely(awaitable: Any, *, label: str) -> bool:
     try:
         await asyncio.shield(cleanup_task)
         return True
-    except asyncio.CancelledError as exc:
+    except asyncio.CancelledError:
         logger.warning(
             "%s cleanup was cancelled; waiting for cleanup to finish",
             label,
-            exc_info=(type(exc), exc, exc.__traceback__),
         )
         drain_current_task_cancellation()
         try:
             await asyncio.shield(cleanup_task)
             return True
-        except asyncio.CancelledError as final_exc:
+        except asyncio.CancelledError:
             drain_current_task_cancellation()
             logger.warning(
                 "%s cleanup was cancelled again; detached cleanup will continue",
                 label,
-                exc_info=(type(final_exc), final_exc, final_exc.__traceback__),
             )
             track_background_stream_cleanup_task(cleanup_task, label=label)
             return True
