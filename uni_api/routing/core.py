@@ -3,6 +3,7 @@ import bisect
 import inspect
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Optional
@@ -147,6 +148,78 @@ def _provider_excludes_endpoint(provider: dict, endpoint: Optional[str]) -> bool
         _normalize_endpoint_path(excluded_endpoint) == normalized_endpoint
         for excluded_endpoint in excluded_endpoints
     )
+
+
+_BYTE_LIMIT_RE = re.compile(
+    r"^\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[kmgt]?i?b?|bytes?)?\s*$",
+    re.IGNORECASE,
+)
+
+_BYTE_UNITS = {
+    "": 1,
+    "b": 1,
+    "byte": 1,
+    "bytes": 1,
+    "k": 1000,
+    "kb": 1000,
+    "ki": 1024,
+    "kib": 1024,
+    "m": 1000**2,
+    "mb": 1000**2,
+    "mi": 1024**2,
+    "mib": 1024**2,
+    "g": 1000**3,
+    "gb": 1000**3,
+    "gi": 1024**3,
+    "gib": 1024**3,
+    "t": 1000**4,
+    "tb": 1000**4,
+    "ti": 1024**4,
+    "tib": 1024**4,
+}
+
+
+def _parse_byte_limit(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        limit = int(value)
+        return limit if limit > 0 else None
+    if isinstance(value, str):
+        raw = value.strip().replace("_", "")
+        if not raw:
+            return None
+        match = _BYTE_LIMIT_RE.match(raw)
+        if not match:
+            return None
+        unit = (match.group("unit") or "").lower()
+        multiplier = _BYTE_UNITS.get(unit)
+        if multiplier is None:
+            return None
+        limit = int(float(match.group("number")) * multiplier)
+        return limit if limit > 0 else None
+    return None
+
+
+def _provider_request_body_limit(provider: dict) -> Optional[int]:
+    value = safe_get(provider, "preferences", "max_request_body_bytes", default=None)
+    if value is None:
+        value = provider.get("max_request_body_bytes")
+    limit = _parse_byte_limit(value)
+    if value is not None and limit is None:
+        logger.warning(
+            "Ignoring invalid max_request_body_bytes for provider %s: %r",
+            provider.get("provider"),
+            value,
+        )
+    return limit
+
+
+def _provider_accepts_request_body(provider: dict, request_body_bytes: Optional[int]) -> bool:
+    if not request_body_bytes or request_body_bytes <= 0:
+        return True
+    limit = _provider_request_body_limit(provider)
+    return limit is None or int(request_body_bytes) <= limit
 
 
 @lru_cache(maxsize=512)
@@ -350,6 +423,7 @@ async def get_right_order_providers(
     endpoint: Optional[str] = None,
     channel_manager=None,
     request_total_tokens: Optional[int] = None,
+    request_body_bytes: Optional[int] = None,
     debug: bool = False,
     routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
@@ -369,6 +443,18 @@ async def get_right_order_providers(
             for provider in matching_providers
             if not _provider_excludes_endpoint(provider, endpoint)
         ]
+
+    if request_body_bytes and matching_providers:
+        matching_providers = [
+            provider
+            for provider in matching_providers
+            if _provider_accepts_request_body(provider, request_body_bytes)
+        ]
+        if not matching_providers:
+            raise HTTPException(
+                status_code=413,
+                detail=f"The request body is too large for all available providers: {request_model}",
+            )
 
     if request_total_tokens and matching_providers:
         available_providers = []
@@ -563,6 +649,7 @@ async def _call_provider_resolver(
     endpoint: Optional[str] = None,
     channel_manager=None,
     request_total_tokens: int = 0,
+    request_body_bytes: int = 0,
     debug: bool = False,
     routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
@@ -576,6 +663,8 @@ async def _call_provider_resolver(
             resolver_kwargs["channel_manager"] = channel_manager
         if "request_total_tokens" in params or accepts_kwargs:
             resolver_kwargs["request_total_tokens"] = request_total_tokens
+        if "request_body_bytes" in params or accepts_kwargs:
+            resolver_kwargs["request_body_bytes"] = request_body_bytes
         if "debug" in params or accepts_kwargs:
             resolver_kwargs["debug"] = debug
         if "routing_index" in params or accepts_kwargs:
@@ -649,6 +738,7 @@ class RoutingPlan:
     api_key_roles: tuple[str, ...]
     api_key_weights: tuple[dict[str, Any], ...]
     request_total_tokens: int
+    request_body_bytes: int
     scheduling_algorithm: str
     auto_retry: Any
     role: str
@@ -705,6 +795,7 @@ class RoutingPlan:
         *,
         endpoint: Optional[str] = None,
         request_total_tokens: int = 0,
+        request_body_bytes: int = 0,
         debug: bool = False,
         provider_resolver=None,
     ) -> "RoutingPlan":
@@ -771,6 +862,7 @@ class RoutingPlan:
             endpoint=endpoint,
             channel_manager=getattr(runtime_config, "channel_manager", None) or getattr(app.state, "channel_manager", None),
             request_total_tokens=request_total_tokens,
+            request_body_bytes=request_body_bytes,
             debug=debug,
             routing_index=routing_index,
         )
@@ -794,6 +886,7 @@ class RoutingPlan:
             api_key_roles=api_key_roles,
             api_key_weights=api_key_weights,
             request_total_tokens=request_total_tokens,
+            request_body_bytes=request_body_bytes,
             scheduling_algorithm=scheduling_algorithm,
             auto_retry=preferences["AUTO_RETRY"]
             if isinstance(preferences, dict) and "AUTO_RETRY" in preferences
@@ -842,6 +935,7 @@ class RoutingPlan:
             api_key_weights=self.api_key_weights,
             channel_manager=self.channel_manager,
             request_total_tokens=self.request_total_tokens,
+            request_body_bytes=self.request_body_bytes,
             debug=debug,
             routing_index=self.routing_index,
         )

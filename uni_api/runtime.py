@@ -1404,12 +1404,50 @@ async def parse_request_body(request: Request):
     if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
         try:
             body_bytes = await request.body()
+            request.state.uni_api_request_body_bytes = len(body_bytes)
             if not body_bytes:
                 return None
             return await asyncio.to_thread(json.loads, body_bytes)
         except json.JSONDecodeError:
             return None
     return None
+
+
+def _request_content_length_bytes(http_request: Optional[Request]) -> int:
+    if http_request is None:
+        return 0
+    headers = getattr(http_request, "headers", None)
+    raw = headers.get("content-length") if headers is not None else None
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def _request_body_size_bytes(http_request: Optional[Request], body: Any = None) -> int:
+    if http_request is not None:
+        state = getattr(http_request, "state", None)
+        state_bytes = getattr(state, "uni_api_request_body_bytes", None)
+        if isinstance(state_bytes, int) and state_bytes > 0:
+            return state_bytes
+
+    content_length = _request_content_length_bytes(http_request)
+    if content_length > 0:
+        return content_length
+    if body is None:
+        return 0
+
+    try:
+        if isinstance(body, BaseModel):
+            payload = body.model_dump(mode="json")
+        else:
+            payload = jsonable_encoder(body)
+        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:
+        return 0
 
 def _messages_request_last_text(parsed_body: Any) -> Optional[str]:
     if not isinstance(parsed_body, dict):
@@ -2013,6 +2051,7 @@ class ModelRequestHandler:
         _coerce_request_trace(current_info)
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_total_tokens = estimate_request_total_tokens(request_data)
+        request_body_bytes = _request_body_size_bytes(http_request, request_data)
         routing_endpoint = endpoint or "/v1/chat/completions"
         plan = await RoutingPlan.create(
             app,
@@ -2022,6 +2061,7 @@ class ModelRequestHandler:
             self.locks,
             endpoint=routing_endpoint,
             request_total_tokens=request_total_tokens,
+            request_body_bytes=request_body_bytes,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -2078,6 +2118,7 @@ class ModelRequestHandler:
                     endpoint=routing_endpoint,
                     channel_manager=app.state.channel_manager,
                     request_total_tokens=request_total_tokens,
+                    request_body_bytes=request_body_bytes,
                     debug=is_debug,
                     routing_index=getattr(app.state, "routing_index", None),
                 )
@@ -3402,6 +3443,7 @@ class ResponsesRequestExecution:
         _coerce_request_trace(current_info)
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
+        request_body_bytes = _request_body_size_bytes(http_request, request_data)
         plan = await RoutingPlan.create(
             app,
             request_model_name,
@@ -3409,6 +3451,7 @@ class ResponsesRequestExecution:
             handler.last_provider_indices,
             handler.locks,
             endpoint=endpoint,
+            request_body_bytes=request_body_bytes,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -4219,6 +4262,7 @@ class MessagesPassthroughHandler:
         current_info = get_request_info()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
+        request_body_bytes = _request_body_size_bytes(http_request, request_body)
         plan = await RoutingPlan.create(
             app,
             request_model_name,
@@ -4226,6 +4270,7 @@ class MessagesPassthroughHandler:
             self.last_provider_indices,
             self.locks,
             endpoint=endpoint,
+            request_body_bytes=request_body_bytes,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -4920,7 +4965,6 @@ class VideoTaskHandler:
         method: str,
         task_id: Optional[str],
     ):
-        _ = http_request
         config = app.state.config
         if not api_key_has_model_rules(app, api_index):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
@@ -4929,6 +4973,7 @@ class VideoTaskHandler:
         current_info["model"] = current_info.get("model") or request_model_name
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
+        request_body_bytes = _request_body_size_bytes(http_request, request_body)
         plan = await RoutingPlan.create(
             app,
             request_model_name,
@@ -4936,6 +4981,7 @@ class VideoTaskHandler:
             self.last_provider_indices,
             self.locks,
             endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
+            request_body_bytes=request_body_bytes,
             debug=is_debug,
             provider_resolver=self._provider_resolver(request_body),
         )
@@ -5288,6 +5334,7 @@ class LingjingOpenapiHandler:
         current_info = get_request_info()
         current_info["model"] = current_info.get("model") or request_model_name
         request_id = _responses_request_id(current_info)
+        request_body_bytes = _request_body_size_bytes(http_request, payload)
 
         plan = await RoutingPlan.create(
             app,
@@ -5296,6 +5343,7 @@ class LingjingOpenapiHandler:
             self.last_provider_indices,
             self.locks,
             endpoint=endpoint,
+            request_body_bytes=request_body_bytes,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )

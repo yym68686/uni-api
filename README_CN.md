@@ -74,6 +74,8 @@ providers:
       - dall-e-3
     exclude_endpoints: # 选填，该渠道要跳过的请求端点，按请求路径精确匹配。
       - /v1/responses/compact
+    preferences:
+      max_request_body_bytes: 20000000 # 选填，当入站 JSON 请求体大于该字节数时跳过这个渠道。支持数字，也支持 "20MB" 或 "20MiB" 这类字符串。
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages

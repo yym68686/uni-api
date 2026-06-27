@@ -74,6 +74,8 @@ providers:
       - dall-e-3
     exclude_endpoints: # Optional. Exact request paths this provider should skip.
       - /v1/responses/compact
+    preferences:
+      max_request_body_bytes: 20000000 # Optional. Skip this provider when the incoming JSON request body is larger than this many bytes. Numeric values and strings like "20MB" or "20MiB" are supported.
 
   - provider: anthropic
     base_url: https://api.anthropic.com/v1/messages

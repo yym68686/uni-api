@@ -103,6 +103,59 @@ def test_get_right_order_providers_raises_413_when_tpr_exceeds_all_providers(mon
     asyncio.run(run())
 
 
+def test_get_right_order_providers_skips_provider_when_request_body_exceeds_limit():
+    config = _routing_config()
+    config["providers"][0]["preferences"] = {"max_request_body_bytes": "20MB"}
+    config["providers"][1]["preferences"] = {"max_request_body_bytes": "25MiB"}
+
+    async def run():
+        providers = await get_right_order_providers(
+            "gpt-4.1",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-4.1"]},
+            request_body_bytes=20_000_001,
+        )
+        assert [provider["provider"] for provider in providers] == ["provider-b"]
+
+        providers = await get_right_order_providers(
+            "gpt-4.1",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-4.1"]},
+            request_body_bytes=20_000_000,
+        )
+        assert [provider["provider"] for provider in providers] == ["provider-a", "provider-b"]
+
+    asyncio.run(run())
+
+
+def test_get_right_order_providers_raises_413_when_request_body_exceeds_all_limits():
+    config = _routing_config()
+    for provider in config["providers"]:
+        provider["preferences"] = {"max_request_body_bytes": 100}
+
+    async def run():
+        with pytest.raises(HTTPException) as exc_info:
+            await get_right_order_providers(
+                "gpt-4.1",
+                config,
+                0,
+                "fixed_priority",
+                ["sk-test"],
+                {"sk-test": ["gpt-4.1"]},
+                request_body_bytes=101,
+            )
+        assert exc_info.value.status_code == 413
+        assert "request body" in exc_info.value.detail
+
+    asyncio.run(run())
+
+
 def test_routing_plan_returns_429_when_all_provider_keys_are_limited(monkeypatch):
     provider_name = "provider-a"
     monkeypatch.setitem(provider_api_circular_list, provider_name, _ProviderKeys(all_rate_limited=True))
@@ -131,6 +184,48 @@ def test_routing_plan_returns_429_when_all_provider_keys_are_limited(monkeypatch
         plan = await RoutingPlan.create(app, "gpt-4.1", 0, {}, {}, provider_resolver=resolver)
         assert await plan.next_provider() is None
         assert plan.status_code == 429
+
+    asyncio.run(run())
+
+
+def test_routing_plan_passes_request_body_bytes_to_provider_resolver(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(provider_api_circular_list, provider_name, _ProviderKeys())
+    seen = {}
+
+    async def resolver(request_model_name, config, api_index, scheduling_algorithm, api_list, models_list, **kwargs):
+        _ = config, api_index, scheduling_algorithm, api_list, models_list
+        seen["request_body_bytes"] = kwargs.get("request_body_bytes")
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {request_model_name: request_model_name},
+                "base_url": "https://provider-a.example/v1/chat/completions",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    async def run():
+        app = SimpleNamespace(
+            state=SimpleNamespace(
+                config={"api_keys": [{"api": "sk-test", "model": ["gpt-4.1"]}]},
+                api_list=["sk-test"],
+                models_list={"sk-test": ["gpt-4.1"]},
+                channel_manager=None,
+            )
+        )
+        plan = await RoutingPlan.create(
+            app,
+            "gpt-4.1",
+            0,
+            {},
+            {},
+            request_body_bytes=123,
+            provider_resolver=resolver,
+        )
+        assert plan.request_body_bytes == 123
+        assert seen["request_body_bytes"] == 123
 
     asyncio.run(run())
 
