@@ -204,6 +204,101 @@ def test_post_body_parameter_overrides_can_remove_model_specific_fields():
     assert "response_format" not in payload
 
 
+def test_post_body_parameter_overrides_can_remove_matching_list_items():
+    payload = {
+        "model": "gpt-5.5",
+        "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "image_generation", "output_format": "png"},
+            {"type": "function", "name": "apply_patch"},
+        ],
+    }
+    provider = {
+        "model": ["gpt-5.5"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "__remove__": [
+                    {
+                        "path": "tools",
+                        "where": {"type": "image_generation"},
+                        "drop_empty": True,
+                    }
+                ],
+            }
+        },
+    }
+
+    apply_post_body_parameter_overrides(payload, provider, "gpt-5.5")
+
+    assert payload["tools"] == [
+        {"type": "function", "name": "shell"},
+        {"type": "function", "name": "apply_patch"},
+    ]
+
+
+def test_post_body_parameter_overrides_drops_empty_list_after_structured_removal():
+    payload = {
+        "model": "gpt-5.5",
+        "tools": [
+            {"type": "image_generation", "output_format": "png"},
+        ],
+    }
+    provider = {
+        "model": ["gpt-5.5"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "__remove__": [
+                    {
+                        "path": "tools",
+                        "where": {"type": "image_generation"},
+                        "drop_empty": True,
+                    }
+                ],
+            }
+        },
+    }
+
+    apply_post_body_parameter_overrides(payload, provider, "gpt-5.5")
+
+    assert "tools" not in payload
+
+
+def test_post_body_parameter_overrides_can_remove_matching_tool_choice_shapes():
+    provider = {
+        "model": ["gpt-5.5"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "__remove__": [
+                    {
+                        "path": "tool_choice",
+                        "where_any": [
+                            "image_generation",
+                            {"type": "image_generation"},
+                            {"tool.type": "image_generation"},
+                            {"function.name": "image_generation"},
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+
+    payloads = [
+        {"tool_choice": "image_generation"},
+        {"tool_choice": {"type": "image_generation"}},
+        {"tool_choice": {"tool": {"type": "image_generation"}}},
+        {"tool_choice": {"function": {"name": "image_generation"}}},
+    ]
+
+    for payload in payloads:
+        apply_post_body_parameter_overrides(payload, provider, "gpt-5.5")
+        assert "tool_choice" not in payload
+
+    function_payload = {"tool_choice": {"type": "function", "name": "shell"}}
+    apply_post_body_parameter_overrides(function_payload, provider, "gpt-5.5")
+    assert function_payload["tool_choice"] == {"type": "function", "name": "shell"}
+
+
 def test_post_body_parameter_overrides_deep_merge_nested_dicts_without_mutating_provider_config():
     payload = {
         "generationConfig": {
