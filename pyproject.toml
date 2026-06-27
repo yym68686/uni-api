@@ -1,6 +1,6 @@
 [project]
 name = "uni-api"
-version = "1.7.153"
+version = "1.7.154"
 description = "Unified large language model API gateway with OpenAI-compatible routing"
 readme = "README.md"
 license = { file = "LICENSE" }
