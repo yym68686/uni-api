@@ -6,7 +6,11 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import RequestModel
-from core.request import force_codex_client_headers, get_codex_payload
+from core.request import (
+    force_codex_client_headers,
+    get_codex_payload,
+    strip_unsupported_codex_payload_fields,
+)
 
 
 def test_codex_payload_uses_current_cli_version_headers():
@@ -42,6 +46,18 @@ def test_force_codex_client_headers_removes_stale_case_variants():
         "Version": "0.125.0",
         "User-Agent": "codex_cli_rs/0.125.0",
     }
+
+
+def test_codex_payload_strips_unsupported_truncation_field():
+    payload = {
+        "model": "gpt-5.5",
+        "input": [{"role": "user", "content": "hello"}],
+        "truncation": "auto",
+    }
+
+    strip_unsupported_codex_payload_fields(payload)
+
+    assert "truncation" not in payload
 
 
 def test_responses_route_overrides_stale_client_codex_version_header():

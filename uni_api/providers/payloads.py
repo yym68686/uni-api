@@ -1475,6 +1475,7 @@ def strip_unsupported_codex_payload_fields(payload: dict, *, strip_store: bool =
     payload.pop("max_output_tokens", None)
     payload.pop("response_format", None)
     payload.pop("top_p", None)
+    payload.pop("truncation", None)
     _strip_key_recursive(payload, "cache_control")
     # ChatGPT Codex upstream requires store=false. Preserve encrypted reasoning
     # state, but do not replay rs_* ids because non-persisted items 404.
