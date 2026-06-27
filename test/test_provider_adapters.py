@@ -4,6 +4,9 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
+
 from core.models import (
     AudioTranscriptionRequest,
     EmbeddingRequest,
@@ -114,6 +117,152 @@ async def test_codex_adapter_builds_responses_request_from_chat_shape():
     assert upstream_request.payload["model"] == "gpt-5.4"
     assert upstream_request.payload["input"][0]["type"] == "message"
     assert upstream_request.payload["input"][0]["content"][0]["type"] == "input_text"
+
+
+async def test_codex_adapter_infers_empty_tool_call_name_from_unique_tool_schema():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_shell",
+                        "type": "function",
+                        "function": {
+                            "name": "",
+                            "arguments": json.dumps({"command": "pwd", "justification": "check cwd"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_shell", "content": "/tmp"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["command"],
+                        "properties": {
+                            "command": {"type": "string"},
+                            "justification": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_plan",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["plan"],
+                        "properties": {"plan": {"type": "array"}},
+                    },
+                },
+            },
+        ],
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.4"],
+        "tools": True,
+    }
+
+    upstream_request = await codex_adapter.build_request(
+        ProviderRequestContext(
+            request=request,
+            provider=provider,
+            engine="codex",
+            original_model="gpt-5.4",
+            api_key="upstream-key",
+            endpoint="/v1/chat/completions",
+        )
+    )
+
+    function_call = next(item for item in upstream_request.payload["input"] if item["type"] == "function_call")
+    function_output = next(item for item in upstream_request.payload["input"] if item["type"] == "function_call_output")
+    assert function_call["name"] == "shell_command"
+    assert function_call["call_id"] == "call_shell"
+    assert function_output["call_id"] == "call_shell"
+
+
+async def test_codex_adapter_rejects_empty_tool_call_name_when_schema_match_is_ambiguous():
+    request = RequestModel(
+        model="gpt-5.4",
+        messages=[
+            {"role": "user", "content": "run a tool"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_ambiguous",
+                        "type": "function",
+                        "function": {
+                            "name": "",
+                            "arguments": json.dumps({"value": "x"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_ambiguous", "content": "ok"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_a",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": {"value": {"type": "string"}},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_b",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": {"value": {"type": "string"}},
+                    },
+                },
+            },
+        ],
+    )
+    provider = {
+        "provider": "codex-a",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api": "upstream-key",
+        "engine": "codex",
+        "model": ["gpt-5.4"],
+        "tools": True,
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await codex_adapter.build_request(
+            ProviderRequestContext(
+                request=request,
+                provider=provider,
+                engine="codex",
+                original_model="gpt-5.4",
+                api_key="upstream-key",
+                endpoint="/v1/chat/completions",
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "messages[1].tool_calls[0].function.name is empty" in exc_info.value.detail
+    assert "arguments match multiple declared tool schemas" in exc_info.value.detail
 
 
 async def test_codex_adapter_moves_system_messages_into_instructions():

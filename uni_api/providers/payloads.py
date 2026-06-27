@@ -1511,10 +1511,78 @@ def _codex_system_messages_to_instructions(request: RequestModel) -> str:
                 instructions.append("\n".join(text_parts))
     return "\n\n".join(instructions)
 
+_CODEX_EMPTY_TOOL_NAME_INFERENCE_LIMIT = 64
+_CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_BYTES = 64 * 1024
+
+
+def _codex_tool_parameter_schema_index(request: RequestModel) -> list[dict]:
+    tools: list[dict] = []
+    for tool in request.tools or []:
+        if getattr(tool, "type", None) != "function":
+            continue
+
+        fn = getattr(tool, "function", None)
+        name = str(getattr(fn, "name", "") or "").strip() if fn else ""
+        if not name:
+            continue
+
+        parameters = getattr(fn, "parameters", None)
+        if isinstance(parameters, dict):
+            properties = parameters.get("properties")
+            required = parameters.get("required")
+        else:
+            properties = getattr(parameters, "properties", None)
+            required = getattr(parameters, "required", None)
+
+        property_names = set(str(key) for key in properties.keys()) if isinstance(properties, dict) else set()
+        required_names = set(str(key) for key in required) if isinstance(required, list) else set()
+        tools.append({"name": name, "properties": property_names, "required": required_names})
+    return tools
+
+
+def _codex_tool_argument_keys(arguments) -> tuple[set[str] | None, str | None]:
+    if arguments is None:
+        return None, "arguments is missing"
+    raw = str(arguments)
+    if not raw.strip():
+        return None, "arguments is empty"
+    if len(raw.encode("utf-8")) > _CODEX_TOOL_ARGUMENTS_INFERENCE_MAX_BYTES:
+        return None, "arguments is too large to infer safely"
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None, "arguments is not valid JSON"
+    if not isinstance(parsed, dict):
+        return None, "arguments is not a JSON object"
+    return set(str(key) for key in parsed.keys()), None
+
+
+def _infer_codex_tool_call_name_from_arguments(
+    tool_schema_index: list[dict],
+    arguments,
+) -> tuple[str | None, str | None]:
+    argument_keys, reason = _codex_tool_argument_keys(arguments)
+    if argument_keys is None:
+        return None, reason
+
+    matches = [
+        item["name"]
+        for item in tool_schema_index
+        if argument_keys.issubset(item["properties"]) and item["required"].issubset(argument_keys)
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, "arguments do not match any declared tool schema"
+    return None, "arguments match multiple declared tool schemas"
+
+
 def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dict) -> list[dict]:
     input_items: list[dict] = []
+    tool_schema_index: list[dict] | None = None
+    inferred_empty_tool_name_count = 0
 
-    for msg in request.messages or []:
+    for message_index, msg in enumerate(request.messages or []):
         role = (getattr(msg, "role", None) or "").strip()
         if not role:
             continue
@@ -1586,17 +1654,42 @@ def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dic
 
         # Tool calls are separate top-level objects in Codex payloads.
         if role == "assistant":
-            for tool_call in getattr(msg, "tool_calls", None) or []:
+            for tool_call_index, tool_call in enumerate(getattr(msg, "tool_calls", None) or []):
                 if getattr(tool_call, "type", None) != "function":
                     continue
                 func = getattr(tool_call, "function", None)
                 if not func:
                     continue
+                function_name = str(getattr(func, "name", "") or "").strip()
+                if not function_name:
+                    inferred_empty_tool_name_count += 1
+                    if inferred_empty_tool_name_count > _CODEX_EMPTY_TOOL_NAME_INFERENCE_LIMIT:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "Too many assistant tool calls have an empty function.name; "
+                                f"limit={_CODEX_EMPTY_TOOL_NAME_INFERENCE_LIMIT}"
+                            ),
+                        )
+                    if tool_schema_index is None:
+                        tool_schema_index = _codex_tool_parameter_schema_index(request)
+                    function_name, reason = _infer_codex_tool_call_name_from_arguments(
+                        tool_schema_index,
+                        getattr(func, "arguments", None),
+                    )
+                    if not function_name:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"messages[{message_index}].tool_calls[{tool_call_index}].function.name "
+                                f"is empty and cannot be uniquely inferred from tools: {reason}"
+                            ),
+                        )
                 input_items.append(
                     {
                         "type": "function_call",
                         "call_id": getattr(tool_call, "id", None),
-                        "name": getattr(func, "name", None),
+                        "name": function_name,
                         "arguments": getattr(func, "arguments", None),
                     }
                 )
