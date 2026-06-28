@@ -1477,6 +1477,9 @@ def strip_unsupported_codex_payload_fields(payload: dict, *, strip_store: bool =
     payload.pop("top_p", None)
     payload.pop("truncation", None)
     _strip_key_recursive(payload, "cache_control")
+    # Chat-style histories may carry provider-private reasoning deltas that
+    # Responses input objects reject as unknown parameters.
+    _strip_key_recursive(payload, "reasoning_content")
     # ChatGPT Codex upstream requires store=false. Preserve encrypted reasoning
     # state, but do not replay rs_* ids because non-persisted items 404.
     _strip_codex_store_false_reasoning_input_ids(payload)

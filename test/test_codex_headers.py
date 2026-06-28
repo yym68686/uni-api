@@ -60,6 +60,60 @@ def test_codex_payload_strips_unsupported_truncation_field():
     assert "truncation" not in payload
 
 
+def test_codex_payload_strips_reasoning_content_from_input_items():
+    payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+                "reasoning_content": "hidden reasoning",
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "next",
+                        "reasoning_content": "nested hidden reasoning",
+                    }
+                ],
+            },
+        ],
+    }
+
+    strip_unsupported_codex_payload_fields(payload)
+
+    assert "reasoning_content" not in payload["input"][0]
+    assert "reasoning_content" not in payload["input"][1]["content"][0]
+
+
+def test_codex_chat_payload_strips_assistant_reasoning_content_extra():
+    request = RequestModel(
+        model="gpt-5.5",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "hello",
+                "reasoning_content": "internal reasoning",
+            },
+        ],
+        stream=True,
+    )
+    provider = {
+        "provider": "codex",
+        "base_url": "https://chatgpt.com/backend-api/codex/responses",
+        "model": ["gpt-5.5"],
+    }
+
+    _, _, payload = asyncio.run(get_codex_payload(request, "codex", provider, api_key="access-token"))
+
+    assert all("reasoning_content" not in item for item in payload["input"])
+
+
 def test_responses_route_overrides_stale_client_codex_version_header():
     main_source = (Path(__file__).resolve().parents[1] / "uni_api" / "runtime.py").read_text()
 
