@@ -92,6 +92,14 @@ def _gemini_response_modalities(original_model: str, request_modalities: list[st
 def _get_extra_fields(obj) -> dict:
     return getattr(obj, 'model_extra', None) or {}
 
+_CODEX_UNSUPPORTED_MESSAGE_EXTRA_FIELDS = {"reasoning", "reasoning_content"}
+
+def _get_codex_message_extra_fields(obj) -> dict:
+    extra = dict(_get_extra_fields(obj))
+    for key in _CODEX_UNSUPPORTED_MESSAGE_EXTRA_FIELDS:
+        extra.pop(key, None)
+    return extra
+
 def _remove_key_recursive(value, key: str) -> None:
     if isinstance(value, dict):
         value.pop(key, None)
@@ -1470,6 +1478,19 @@ def _strip_codex_store_false_reasoning_input_ids(payload: dict) -> dict:
     return payload
 
 
+def _strip_unsupported_codex_message_item_reasoning_fields(payload: dict) -> dict:
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return payload
+
+    for item in input_items:
+        if isinstance(item, dict) and item.get("type") == "message":
+            for key in _CODEX_UNSUPPORTED_MESSAGE_EXTRA_FIELDS:
+                item.pop(key, None)
+
+    return payload
+
+
 def strip_unsupported_codex_payload_fields(payload: dict, *, strip_store: bool = False) -> dict:
     # Codex rejects these fields; drop them on any Codex-bound request.
     payload.pop("max_output_tokens", None)
@@ -1480,6 +1501,7 @@ def strip_unsupported_codex_payload_fields(payload: dict, *, strip_store: bool =
     # Chat-style histories may carry provider-private reasoning deltas that
     # Responses input objects reject as unknown parameters.
     _strip_key_recursive(payload, "reasoning_content")
+    _strip_unsupported_codex_message_item_reasoning_fields(payload)
     # ChatGPT Codex upstream requires store=false. Preserve encrypted reasoning
     # state, but do not replay rs_* ids because non-persisted items 404.
     _strip_codex_store_false_reasoning_input_ids(payload)
@@ -1653,7 +1675,7 @@ def _codex_chat_messages_to_responses_input(request: RequestModel, provider: dic
             "role": role,
             "content": content_parts,
         }
-        message_item.update(_get_extra_fields(msg))
+        message_item.update(_get_codex_message_extra_fields(msg))
         input_items.append(message_item)
 
         # Tool calls are separate top-level objects in Codex payloads.

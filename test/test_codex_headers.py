@@ -90,6 +90,39 @@ def test_codex_payload_strips_reasoning_content_from_input_items():
     assert "reasoning_content" not in payload["input"][1]["content"][0]
 
 
+def test_codex_payload_strips_message_item_reasoning_without_touching_legal_reasoning():
+    payload = {
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "medium", "summary": "auto"},
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+                "reasoning": "plain text chain of thought",
+                "reasoning_content": "plain text chain of thought",
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_123",
+                "encrypted_content": "encrypted-state",
+                "summary": [],
+            },
+        ],
+    }
+
+    strip_unsupported_codex_payload_fields(payload)
+
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert "reasoning" not in payload["input"][0]
+    assert "reasoning_content" not in payload["input"][0]
+    assert payload["input"][1] == {
+        "type": "reasoning",
+        "encrypted_content": "encrypted-state",
+        "summary": [],
+    }
+
+
 def test_codex_chat_payload_strips_assistant_reasoning_content_extra():
     request = RequestModel(
         model="gpt-5.5",
@@ -111,6 +144,33 @@ def test_codex_chat_payload_strips_assistant_reasoning_content_extra():
 
     _, _, payload = asyncio.run(get_codex_payload(request, "codex", provider, api_key="access-token"))
 
+    assert all("reasoning_content" not in item for item in payload["input"])
+
+
+def test_codex_chat_payload_strips_assistant_reasoning_extra():
+    request = RequestModel(
+        model="gpt-5.5",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "hello",
+                "reasoning": "plain text chain of thought",
+                "reasoning_content": "plain text chain of thought",
+            },
+        ],
+        stream=True,
+    )
+    provider = {
+        "provider": "codex",
+        "base_url": "https://chatgpt.com/backend-api/codex/responses",
+        "model": ["gpt-5.5"],
+    }
+
+    _, _, payload = asyncio.run(get_codex_payload(request, "codex", provider, api_key="access-token"))
+
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert all("reasoning" not in item for item in payload["input"])
     assert all("reasoning_content" not in item for item in payload["input"])
 
 
