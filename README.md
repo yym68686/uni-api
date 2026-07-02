@@ -709,11 +709,17 @@ pex linux packaging:
 
 ```bash
 VERSION=$(cat VERSION)
-pex -D . -r requirements.txt \
+rm -rf pex-src
+mkdir -p pex-src
+cp main.py upstream.py utils.py routing.py db.py fugue_observability.py pyproject.toml pex-src/
+cp -R core uni_api video static pex-src/
+find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
+find pex-src -name '*.pyc' -delete
+find pex-src -name '.git' -prune -exec rm -rf {} +
+pex -D pex-src -r requirements.txt \
     -c uvicorn \
     --inject-args 'main:app --host 0.0.0.0 --port 8000' \
-    --platform linux_x86_64-cp-3.10.12-cp310 \
-    --interpreter-constraint '==3.10.*' \
+    --interpreter-constraint '==3.11.*' \
     --no-strip-pex-env \
     -o uni-api-linux-x86_64-${VERSION}.pex
 ```
@@ -722,9 +728,10 @@ macOS packaging:
 
 ```bash
 VERSION=$(cat VERSION)
-pex -r requirements.txt \
+pex -D pex-src -r requirements.txt \
     -c uvicorn \
     --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+    --interpreter-constraint '==3.11.*' \
     -o uni-api-macos-arm64-${VERSION}.pex
 ```
 

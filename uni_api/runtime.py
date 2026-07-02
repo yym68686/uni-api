@@ -13,6 +13,7 @@ import asyncio
 import random
 from asyncio import Semaphore
 from time import time
+from pathlib import Path
 from urllib.parse import urlparse
 from collections import defaultdict
 from contextlib import aclosing, asynccontextmanager, suppress
@@ -170,6 +171,9 @@ from uni_api.upstream.error_handling import error_handling_wrapper
 from core.utils import safe_get
 
 from sqlalchemy import inspect, text
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from sqlalchemy.sql import sqltypes
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -957,7 +961,7 @@ def _log_debug_request_headers(label: str, headers: Any, **metadata: Any) -> Non
 
 # 从 pyproject.toml 读取版本号
 try:
-    with open('pyproject.toml', 'rb') as f:
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as f:
         data = tomllib.load(f)
         VERSION = data['project']['version']
 except Exception:
@@ -6054,7 +6058,7 @@ async def add_credits_to_api_key(
     return response
 
 # 添加静态文件挂载
-app.mount("/", StaticFiles(directory="./static", html=True), name="static")
+app.mount("/", StaticFiles(directory=str(PROJECT_ROOT / "static"), html=True), name="static")
 
 if __name__ == '__main__':
     import uvicorn

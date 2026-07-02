@@ -27,10 +27,10 @@ jobs:
         with:
           ref: main
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install pex
         run: pip install pex
@@ -54,23 +54,33 @@ jobs:
           VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
+      - name: Prepare PEX sources
+        run: |
+          rm -rf pex-src
+          mkdir -p pex-src
+          cp main.py upstream.py utils.py routing.py db.py fugue_observability.py pyproject.toml pex-src/
+          cp -R core uni_api video static pex-src/
+          find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find pex-src -name '*.pyc' -delete
+          find pex-src -name '.git' -prune -exec rm -rf {} +
+
       - name: Build Linux PEX
         if: matrix.platform == 'linux'
         run: |
-          pex -D . -r requirements.txt \
+          pex -D pex-src -r requirements.txt \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
-          --platform linux_x86_64-cp-310-cp310 \
-          --interpreter-constraint '==3.10.*' \
+          --interpreter-constraint '==3.11.*' \
           --no-strip-pex-env \
           -o uni-api-linux-x86_64-${VERSION}.pex
 
       - name: Build MacOS PEX
         if: matrix.platform == 'macos'
         run: |
-          pex -r requirements.txt \
+          pex -D pex-src -r requirements.txt \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+          --interpreter-constraint '==3.11.*' \
           -o uni-api-macos-arm64-${VERSION}.pex
 
       - name: Create Release
