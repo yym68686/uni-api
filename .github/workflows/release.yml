@@ -83,6 +83,34 @@ jobs:
           --interpreter-constraint '==3.11.*' \
           -o uni-api-macos-arm64-${VERSION}.pex
 
+      - name: Upload PEX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+          path: uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Get Version
+        id: get_version
+        run: |
+          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download PEX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         env:
@@ -93,4 +121,5 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+            dist/uni-api-linux-x86_64-${{ env.VERSION }}.pex
+            dist/uni-api-macos-arm64-${{ env.VERSION }}.pex
