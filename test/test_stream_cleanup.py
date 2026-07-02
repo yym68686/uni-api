@@ -137,6 +137,78 @@ def test_logging_response_records_stats_after_stream_finishes():
     asyncio.run(_logging_response_records_stats_after_stream_finishes())
 
 
+async def _logging_response_records_stats_from_json_without_newline():
+    recorded = []
+
+    async def body():
+        yield '{"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18}}'
+
+    async def update_stats(current_info):
+        recorded.append(dict(current_info))
+
+    async def send(message):
+        return None
+
+    response = main.LoggingStreamingResponse(
+        body(),
+        media_type="application/json",
+        current_info={
+            "start_time": 0,
+            "endpoint": "POST /v1/chat/completions",
+            "request_id": "request",
+            "trace_id": "trace",
+        },
+        update_stats=update_stats,
+    )
+
+    await response({}, None, send)
+
+    assert len(recorded) == 1
+    assert recorded[0]["prompt_tokens"] == 7
+    assert recorded[0]["completion_tokens"] == 11
+    assert recorded[0]["total_tokens"] == 18
+
+
+def test_logging_response_records_stats_from_json_without_newline():
+    asyncio.run(_logging_response_records_stats_from_json_without_newline())
+
+
+async def _logging_response_records_stats_from_nested_input_output_usage_without_newline():
+    recorded = []
+
+    async def body():
+        yield '{"response":{"usage":{"input_tokens":13,"output_tokens":17}}}'
+
+    async def update_stats(current_info):
+        recorded.append(dict(current_info))
+
+    async def send(message):
+        return None
+
+    response = main.LoggingStreamingResponse(
+        body(),
+        media_type="application/json",
+        current_info={
+            "start_time": 0,
+            "endpoint": "POST /v1/responses",
+            "request_id": "request",
+            "trace_id": "trace",
+        },
+        update_stats=update_stats,
+    )
+
+    await response({}, None, send)
+
+    assert len(recorded) == 1
+    assert recorded[0]["prompt_tokens"] == 13
+    assert recorded[0]["completion_tokens"] == 17
+    assert recorded[0]["total_tokens"] == 30
+
+
+def test_logging_response_records_stats_from_nested_input_output_usage_without_newline():
+    asyncio.run(_logging_response_records_stats_from_nested_input_output_usage_without_newline())
+
+
 async def _fetch_response_stream_closes_selected_provider_stream(monkeypatch):
     closed = False
 

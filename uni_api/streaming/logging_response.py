@@ -48,6 +48,78 @@ class LoggingStreamingResponse(Response):
     def _is_trace(self, value: Any) -> bool:
         return self._trace_type is not None and isinstance(value, self._trace_type)
 
+    @staticmethod
+    def _coerce_token_count(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def _record_usage(self, usage_obj: Any) -> bool:
+        if not isinstance(usage_obj, dict):
+            return False
+        if not any(
+            key in usage_obj
+            for key in (
+                "prompt_tokens",
+                "input_tokens",
+                "completion_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+        ):
+            return False
+
+        prompt_tokens = usage_obj.get("prompt_tokens")
+        completion_tokens = usage_obj.get("completion_tokens")
+        if prompt_tokens is None:
+            prompt_tokens = usage_obj.get("input_tokens")
+        if completion_tokens is None:
+            completion_tokens = usage_obj.get("output_tokens")
+
+        prompt_tokens = self._coerce_token_count(prompt_tokens)
+        completion_tokens = self._coerce_token_count(completion_tokens)
+        total_tokens = usage_obj.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+        else:
+            total_tokens = self._coerce_token_count(total_tokens)
+
+        self.current_info["prompt_tokens"] = prompt_tokens
+        self.current_info["completion_tokens"] = completion_tokens
+        self.current_info["total_tokens"] = total_tokens
+        return True
+
+    def _record_usage_from_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        usage_obj = (
+            payload.get("usage")
+            or safe_get(payload, "response", "usage", default=None)
+            or safe_get(payload, "message", "usage", default=None)
+        )
+        return self._record_usage(usage_obj)
+
+    async def _record_usage_from_data(self, data: str) -> bool:
+        data = data.strip()
+        if not data or data.startswith("[DONE]") or data.startswith("OK") or "\"usage\"" not in data:
+            return False
+        if data.startswith("data:"):
+            data = data.removeprefix("data:").lstrip()
+        if not (data.startswith("{") or data.startswith("[")):
+            return False
+        try:
+            payload = await asyncio.to_thread(json.loads, data)
+        except Exception:
+            return False
+        return self._record_usage_from_payload(payload)
+
+    async def _record_usage_from_remainder(self) -> None:
+        data = self._sse_buffer.strip()
+        self._sse_buffer = ""
+        if data:
+            await self._record_usage_from_data(data)
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         _ = scope, receive
         trace = self.current_info.get("trace") if isinstance(self.current_info, dict) else None
@@ -128,83 +200,45 @@ class LoggingStreamingResponse(Response):
                 raise final_send_cancelled
 
     async def _logging_iterator(self):
-        async for chunk in self.body_iterator:
-            self._mark_first_byte_observed(self.current_info)
-            if isinstance(chunk, str):
-                chunk = chunk.encode("utf-8")
-            if str(self.current_info.get("endpoint") or "").endswith("/v1/audio/speech"):
+        try:
+            async for chunk in self.body_iterator:
+                self._mark_first_byte_observed(self.current_info)
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                if str(self.current_info.get("endpoint") or "").endswith("/v1/audio/speech"):
+                    yield chunk
+                    continue
+
+                try:
+                    text = chunk.decode("utf-8", errors="replace")
+                except Exception:
+                    yield chunk
+                    continue
+
+                if self._debug:
+                    try:
+                        logger.info(text.encode("utf-8").decode("unicode_escape"))
+                    except Exception:
+                        logger.info(text)
+
+                self._sse_buffer += text
+                while "\n" in self._sse_buffer:
+                    line, self._sse_buffer = self._sse_buffer.split("\n", 1)
+                    line = line.rstrip("\r")
+                    if not line or is_sse_comment_frame(line) or line.startswith("event:"):
+                        continue
+
+                    data = None
+                    if line.startswith("data:"):
+                        data = line.removeprefix("data:").lstrip()
+                    elif line.startswith("{") or line.startswith("["):
+                        data = line
+
+                    if data:
+                        await self._record_usage_from_data(data)
                 yield chunk
-                continue
-
-            try:
-                text = chunk.decode("utf-8", errors="replace")
-            except Exception:
-                yield chunk
-                continue
-
-            if self._debug:
-                try:
-                    logger.info(text.encode("utf-8").decode("unicode_escape"))
-                except Exception:
-                    logger.info(text)
-
-            self._sse_buffer += text
-            while "\n" in self._sse_buffer:
-                line, self._sse_buffer = self._sse_buffer.split("\n", 1)
-                line = line.rstrip("\r")
-                if not line or is_sse_comment_frame(line) or line.startswith("event:"):
-                    continue
-
-                data = None
-                if line.startswith("data:"):
-                    data = line.removeprefix("data:").lstrip()
-                elif line.startswith("{") or line.startswith("["):
-                    data = line
-
-                if not data or data.startswith("[DONE]") or data.startswith("OK") or "\"usage\"" not in data:
-                    continue
-
-                try:
-                    resp = await asyncio.to_thread(json.loads, data)
-                except Exception:
-                    continue
-
-                usage_obj = None
-                if isinstance(resp, dict):
-                    usage_obj = (
-                        resp.get("usage")
-                        or safe_get(resp, "response", "usage", default=None)
-                        or safe_get(resp, "message", "usage", default=None)
-                    )
-                if not isinstance(usage_obj, dict):
-                    continue
-
-                prompt_tokens = usage_obj.get("prompt_tokens")
-                completion_tokens = usage_obj.get("completion_tokens")
-                if prompt_tokens is None and "input_tokens" in usage_obj:
-                    prompt_tokens = usage_obj.get("input_tokens")
-                if completion_tokens is None and "output_tokens" in usage_obj:
-                    completion_tokens = usage_obj.get("output_tokens")
-
-                try:
-                    prompt_tokens = int(prompt_tokens or 0)
-                except Exception:
-                    prompt_tokens = 0
-                try:
-                    completion_tokens = int(completion_tokens or 0)
-                except Exception:
-                    completion_tokens = 0
-
-                total_tokens = usage_obj.get("total_tokens")
-                try:
-                    total_tokens = int(total_tokens) if total_tokens is not None else prompt_tokens + completion_tokens
-                except Exception:
-                    total_tokens = prompt_tokens + completion_tokens
-
-                self.current_info["prompt_tokens"] = prompt_tokens
-                self.current_info["completion_tokens"] = completion_tokens
-                self.current_info["total_tokens"] = total_tokens
-            yield chunk
+        finally:
+            await self._record_usage_from_remainder()
 
     async def close(self):
         if not self._closed:
