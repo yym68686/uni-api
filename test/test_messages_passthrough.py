@@ -316,6 +316,74 @@ def test_messages_bad_request_forwards_upstream_error_without_retrying_keys(monk
     assert keys.cooling_calls == []
 
 
+def test_messages_model_pricing_400_retries_next_provider(monkeypatch):
+    provider_a = "anthropic-pricing-a"
+    provider_b = "anthropic-pricing-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+    _set_messages_state(
+        monkeypatch,
+        [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"claude-alias": "claude-opus-5"},
+                "base_url": "https://pricing-a.example/v1/messages",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"claude-alias": "claude-opus-5"},
+                "base_url": "https://pricing-b.example/v1/messages",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ],
+    )
+    pricing_error = {
+        "error": {
+            "type": "upstream_error",
+            "code": "model_price_not_configured",
+            "message": (
+                "模型 claude-opus-5 的价格尚未由管理员配置，暂时无法使用；"
+                "Model claude-opus-5 has not been priced by the administrator yet."
+            ),
+        }
+    }
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://pricing-a.example/v1/messages": httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://pricing-a.example/v1/messages"),
+                json=pricing_error,
+            ),
+            "https://pricing-b.example/v1/messages": httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://pricing-b.example/v1/messages"),
+                json={"id": "msg-pricing-fallback", "type": "message"},
+            ),
+        }
+    )
+
+    response = _run_messages_request(
+        {
+            "model": "claude-alias",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "id": "msg-pricing-fallback",
+        "type": "message",
+    }
+    assert [call["url"] for call in main.app.state.client_manager.post_calls] == [
+        "https://pricing-a.example/v1/messages",
+        "https://pricing-b.example/v1/messages",
+    ]
+
+
 def test_messages_debug_logs_final_upstream_request_headers_and_body(monkeypatch):
     provider_name = "anthropic"
     monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["upstream-key"]))

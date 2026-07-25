@@ -870,17 +870,32 @@ def test_nonlocal_failures_do_not_gain_admission_headers(monkeypatch):
     asyncio.run(run())
 
 
-def test_provider_http_503_is_distinct_from_local_admission_503():
+@pytest.mark.parametrize(
+    ("wire_status", "detail", "expected_status"),
+    [
+        (503, "provider unavailable", 503),
+        (
+            400,
+            "Model claude-opus-5 has not been priced by the administrator yet.",
+            502,
+        ),
+    ],
+)
+def test_provider_http_status_origin_survives_status_normalization(
+    wire_status,
+    detail,
+    expected_status,
+):
     async def run():
         class Plan:
             auto_retry = False
 
             def record_failure(self, status_code, _error_message):
-                assert status_code == 503
+                assert status_code == expected_status
 
         entry = {}
         diagnostics = UpstreamTransportDiagnostics(entry)
-        diagnostics.facts["upstream_http_status_code"] = 503
+        diagnostics.facts["upstream_http_status_code"] = wire_status
         attempt = UpstreamAttemptContext(
             plan=Plan(),
             provider={"preferences": {}},
@@ -890,7 +905,7 @@ def test_provider_http_503_is_distinct_from_local_admission_503():
         )
         result = await UpstreamRunner(attempt.plan)._handle_failure(
             attempt,
-            HTTPException(status_code=503, detail="provider unavailable"),
+            HTTPException(status_code=wire_status, detail=detail),
             build_error_response=lambda status, message: httpx.Response(
                 status,
                 json={"error": message},
@@ -898,6 +913,7 @@ def test_provider_http_503_is_distinct_from_local_admission_503():
             prepare_failure=False,
         )
 
+        assert result.response.status_code == expected_status
         assert result.status_origin == "provider_http"
         assert result.response.headers["x-uni-api-status-origin"] == "provider_http"
         assert "x-uni-api-admission-reason" not in result.response.headers

@@ -4599,3 +4599,92 @@ def test_responses_non_stream_semantic_bad_request_does_not_retry(monkeypatch):
     assert [call["url"] for call in main.app.state.client_manager.post_calls] == [
         "https://provider-a.example/v1/responses",
     ]
+
+
+def test_responses_non_stream_model_pricing_400_retries_next_provider(monkeypatch):
+    provider_a = "responses-pricing-a"
+    provider_b = "responses-pricing-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://responses-pricing-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://responses-pricing-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(
+        main,
+        "get_engine",
+        lambda provider, endpoint=None, original_model=None: ("gpt", None),
+    )
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://responses-pricing-a.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request(
+                    "POST",
+                    "https://responses-pricing-a.example/v1/responses",
+                ),
+                json={
+                    "id": "resp-pricing-a",
+                    "status": "failed",
+                    "error": {
+                        "type": "upstream_error",
+                        "code": "model_price_not_configured",
+                        "status": 400,
+                        "message": "Model pricing has not been configured by the administrator yet.",
+                    },
+                },
+            ),
+            "https://responses-pricing-b.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request(
+                    "POST",
+                    "https://responses-pricing-b.example/v1/responses",
+                ),
+                json={"id": "resp-pricing-b", "status": "completed"},
+            ),
+        }
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "id": "resp-pricing-b",
+        "status": "completed",
+    }
+    assert [call["url"] for call in main.app.state.client_manager.post_calls] == [
+        "https://responses-pricing-a.example/v1/responses",
+        "https://responses-pricing-b.example/v1/responses",
+    ]

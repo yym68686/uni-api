@@ -30,6 +30,70 @@ def test_provider_error_classifier_normalizes_http_and_network_errors():
 
 
 @pytest.mark.parametrize(
+    "details",
+    [
+        (
+            "模型 claude-opus-5 的价格尚未由管理员配置，暂时无法使用，请联系站点管理员开启该模型；"
+            "Model claude-opus-5 has not been priced by the administrator yet."
+        ),
+        {
+            "error": {
+                "type": "upstream_error",
+                "code": "model_price_not_configured",
+                "message": "model pricing is not available for this route",
+            }
+        },
+        {
+            "detail": {
+                "code": "model_not_priced",
+                "message": "The model has not been priced by administrator yet",
+            }
+        },
+    ],
+)
+def test_provider_error_classifier_remaps_model_pricing_400_for_failover(details):
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+
+    assert classifier.is_model_pricing_unconfigured_error(400, details) is True
+    assert classifier.remap_status_code(400, str(details)) == 502
+    assert retry_policy.should_retry(
+        True,
+        400,
+        {"base_url": "https://provider.example/v1/messages"},
+        error_message=str(details),
+    ) is True
+
+
+def test_provider_error_classifier_keeps_real_bad_request_non_retryable():
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+    details = {
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages: field required",
+        }
+    }
+
+    assert classifier.is_model_pricing_unconfigured_error(400, details) is False
+    assert classifier.remap_status_code(400, str(details)) == 400
+    assert retry_policy.should_retry(
+        True,
+        400,
+        {"base_url": "https://provider.example/v1/messages"},
+        error_message=str(details),
+    ) is False
+
+
+def test_provider_error_classifier_does_not_remap_pricing_text_on_non400_status():
+    classifier = ProviderErrorClassifier(_safe_get)
+    details = "model has not been priced by the administrator yet"
+
+    assert classifier.is_model_pricing_unconfigured_error(503, details) is False
+    assert classifier.remap_status_code(503, details) == 503
+
+
+@pytest.mark.parametrize(
     ("read_timeout", "expected"),
     [
         (20, "Request timed out after 20 seconds"),

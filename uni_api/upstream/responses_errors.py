@@ -21,6 +21,14 @@ RESPONSES_FAILURE_STATUS_BY_CODE = {
     "invalid_request_error": 400,
     "invalid_type": 400,
     "model_not_found": 404,
+    # Compatible gateways sometimes expose their administrator-side pricing
+    # gate as a Responses semantic 400.  The upstream policy layer remaps the
+    # resulting error to 502 so it can fail over to another provider.
+    "model_not_priced": 400,
+    "model_price_not_configured": 400,
+    "model_pricing_not_configured": 400,
+    "model_price_unconfigured": 400,
+    "model_pricing_missing": 400,
     "not_found_error": 404,
     "permission_denied": 403,
     "rate_limit_exceeded": 429,

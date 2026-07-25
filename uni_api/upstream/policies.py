@@ -24,6 +24,29 @@ NETWORK_ERRORS = (
 )
 
 
+# Some OpenAI-compatible gateways incorrectly use HTTP 400 for a provider-side
+# model/billing configuration failure.  Keep this allow-list deliberately
+# narrow: a generic "model unavailable" message can still be a real caller
+# error, while these codes/phrases identify the gateway's administrator-side
+# pricing gate.
+_MODEL_PRICING_UNCONFIGURED_CODES = frozenset(
+    {
+        "model_not_priced",
+        "model_price_not_configured",
+        "model_pricing_not_configured",
+        "model_price_unconfigured",
+        "model_pricing_missing",
+    }
+)
+_MODEL_PRICING_UNCONFIGURED_MARKERS = (
+    "has not been priced by the administrator",
+    "has not been priced by administrator",
+    "price has not been configured by the administrator",
+    "pricing has not been configured by the administrator",
+    "价格尚未由管理员配置",
+)
+
+
 def _timeout_seconds_text(value: Any) -> Optional[str]:
     if isinstance(value, bool):
         return None
@@ -129,11 +152,49 @@ class ProviderErrorClassifier:
             return 502
         if "Provider API error: bad response status code 400" in error_message:
             return 502
+        if self.is_model_pricing_unconfigured_error(status_code, error_message):
+            # The caller's request is valid; the upstream gateway rejected it
+            # because its own administrator-side model pricing is incomplete.
+            # Treat that provider response as a bad gateway response so the
+            # routing layer can fail over to another channel.
+            return 502
         if "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." in error_message:
             return 403
         if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
             return 429
         return status_code
+
+    def is_model_pricing_unconfigured_error(
+        self,
+        status_code: int,
+        details: Any,
+    ) -> bool:
+        """Identify an upstream 400 caused by missing model pricing config.
+
+        This is intentionally not a general-purpose 400 retry heuristic.  It
+        only recognizes the stable error codes/phrases emitted by the affected
+        compatible gateways, leaving malformed requests and provider parameter
+        validation errors non-retryable.
+        """
+
+        if status_code != 400:
+            return False
+
+        code, _error_type, message, raw = self.details_parts(details)
+        if code in _MODEL_PRICING_UNCONFIGURED_CODES:
+            return True
+
+        haystack = " ".join(
+            part for part in (message, raw) if part
+        ).casefold()
+        if any(marker.casefold() in haystack for marker in _MODEL_PRICING_UNCONFIGURED_MARKERS):
+            return True
+
+        # Chinese gateways occasionally insert spaces or line breaks between
+        # the same words.  Compact only whitespace for this narrow fallback;
+        # do not broaden the match to every "model unavailable" response.
+        compact = re.sub(r"\s+", "", haystack)
+        return "价格尚未由管理员配置" in compact
 
     def is_retryable_rate_limit_error(self, status_code: int, details: Any) -> bool:
         if status_code != 429:
@@ -270,6 +331,11 @@ class RetryPolicy:
     ) -> bool:
         if not auto_retry:
             return False
+        if self.classifier.is_model_pricing_unconfigured_error(
+            status_code,
+            error_message,
+        ):
+            return True
         if self.is_codex_chatgpt_model_unsupported_error(status_code, error_message, provider, endpoint, original_model):
             return True
         if self.is_missing_persisted_responses_item_error(status_code, error_message):

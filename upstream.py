@@ -944,6 +944,7 @@ class UpstreamRunner:
         prepare_failure: bool,
     ) -> UpstreamAttemptResult:
         status_code, error_message = normalize_provider_exception(exc)
+        original_status_code = status_code
         status_code = remap_status_code_from_error(status_code, error_message)
         local_admission_rejection = bool(
             getattr(exc, "local_admission_rejection", False)
@@ -956,7 +957,10 @@ class UpstreamRunner:
         )
         if local_admission_rejection:
             status_origin = "ember_local_admission"
-        elif observed_wire_status == status_code:
+        elif (
+            observed_wire_status == original_status_code
+            or observed_wire_status == status_code
+        ):
             status_origin = "provider_http"
         elif bool(getattr(exc, "upstream_semantic_error", False)):
             status_origin = "provider_semantic"
