@@ -15,7 +15,10 @@ from core.log_config import logger
 from uni_api.admission import AdmissionRejected, get_request_admission_lease
 from uni_api.admission.json_parsing import parse_owned_json_value
 from uni_api.observability.spans import merge_timing_spans
-from uni_api.observability.responses_stream import safe_responses_event_type
+from uni_api.observability.responses_stream import (
+    ResponsesStreamDiagnostics,
+    safe_responses_event_type,
+)
 from uni_api.http_content import is_json_media_type
 from uni_api.serialization import json
 from uni_api.streaming.cleanup import call_cleanup_safely
@@ -356,6 +359,38 @@ class LoggingStreamingResponse(Response):
 
         self.body_iterator = content
         self.current_info = current_info or {}
+        responses_tracker = self.current_info.get(
+            "_responses_stream_diagnostics_tracker"
+        )
+        self._responses_diagnostics_tracker = (
+            responses_tracker
+            if isinstance(responses_tracker, ResponsesStreamDiagnostics)
+            else None
+        )
+        request_kind = str(self.current_info.get("request_kind") or "")
+        endpoint = str(self.current_info.get("endpoint") or "")
+        self._responses_tracker_may_attach = bool(
+            self._responses_diagnostics_tracker is not None
+            or request_kind.rstrip("/")
+            in {"/v1/responses", "/v1/responses/compact"}
+            or endpoint.rstrip("/").endswith(
+                ("/v1/responses", "/v1/responses/compact")
+            )
+        )
+        self._asgi_phase_tracker = (
+            self._responses_diagnostics_tracker
+            if self._responses_diagnostics_tracker is not None
+            and self._responses_diagnostics_tracker.phase_sampled
+            else None
+        )
+        if self._asgi_phase_tracker is not None:
+            self._send_with_deadline = self._send_with_deadline_profiled
+        elif self._responses_diagnostics_tracker is None and (
+            self._responses_tracker_may_attach
+        ):
+            self._send_with_deadline = self._send_with_deadline_resolving
+        else:
+            self._send_with_deadline = self._send_with_deadline_unprofiled
         self._mark_first_byte_observed = mark_first_byte_observed or (lambda current_info: None)
         self._emit_request_observability = emit_request_observability or (lambda current_info: None)
         self._update_stats = update_stats
@@ -451,6 +486,28 @@ class LoggingStreamingResponse(Response):
         # hop-by-hop header here is invalid when the downstream uses HTTP/2.
         if "transfer-encoding" in self.headers:
             del self.headers["transfer-encoding"]
+
+    def _resolve_responses_diagnostics_tracker(
+        self,
+    ) -> ResponsesStreamDiagnostics | None:
+        tracker = self._responses_diagnostics_tracker
+        if tracker is not None or not self._responses_tracker_may_attach:
+            return tracker
+        candidate = self.current_info.get(
+            "_responses_stream_diagnostics_tracker"
+        )
+        if isinstance(candidate, ResponsesStreamDiagnostics):
+            self._responses_diagnostics_tracker = candidate
+            self._asgi_phase_tracker = (
+                candidate if candidate.phase_sampled else None
+            )
+            self._send_with_deadline = (
+                self._send_with_deadline_profiled
+                if self._asgi_phase_tracker is not None
+                else self._send_with_deadline_unprofiled
+            )
+            return candidate
+        return None
 
     def _content_type(self) -> str:
         return self.headers.get("content-type", self.media_type or "")
@@ -602,10 +659,16 @@ class LoggingStreamingResponse(Response):
         if event_type == "error" or semantic_outcome == "error":
             diagnostics["error_event_seen"] = True
         if diagnostics.get("downstream_terminal_seen") or semantic_outcome == "error":
-            diagnostics["downstream_terminal_asgi_write_completed"] = True
-            diagnostics["downstream_terminal_asgi_write_completed_at"] = (
-                datetime.now(timezone.utc).isoformat()
-            )
+            tracker = self._resolve_responses_diagnostics_tracker()
+            if tracker is not None and tracker.facts.get(
+                "upstream_terminal_seen"
+            ):
+                tracker.mark_terminal_asgi_write_completed()
+            else:
+                diagnostics["downstream_terminal_asgi_write_completed"] = True
+                diagnostics["downstream_terminal_asgi_write_completed_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
 
     async def _observe_usage_chunk(self, chunk: bytes) -> None:
         if not self._usage_observation_enabled or self._usage_parser_disabled:
@@ -849,7 +912,11 @@ class LoggingStreamingResponse(Response):
         self._wire_sse_boundary_known = True
         self._wire_sse_at_event_boundary = True
 
-    async def _send_with_deadline(self, send: Send, message: dict[str, Any]) -> None:
+    async def _send_with_deadline_unprofiled(
+        self,
+        send: Send,
+        message: dict[str, Any],
+    ) -> None:
         try:
             if self._downstream_writer is None:
                 await _await_with_hard_deadline(
@@ -865,12 +932,47 @@ class LoggingStreamingResponse(Response):
                 f"{self._downstream_write_timeout_seconds:g} seconds"
             ) from exc
         except Exception as exc:
-            # Socket-shaped exceptions can also originate from the upstream
-            # body iterator.  Only seeing one at the actual ASGI send boundary
-            # proves that the downstream peer disappeared.
             if self._is_disconnect_error(exc):
                 raise DownstreamDisconnected(str(exc)) from exc
             raise DownstreamSendError(type(exc).__name__) from exc
+
+    async def _send_with_deadline_profiled(
+        self,
+        send: Send,
+        message: dict[str, Any],
+    ) -> None:
+        tracker = self._asgi_phase_tracker
+        assert tracker is not None
+        phase = tracker.begin_phase("asgi_write")
+        body = message.get("body")
+        body_size = (
+            len(body)
+            if isinstance(body, (bytes, bytearray, memoryview))
+            else 0
+        )
+        try:
+            await self._send_with_deadline_unprofiled(send, message)
+        finally:
+            tracker.finish_phase(
+                "asgi_write",
+                phase,
+                bytes_count=body_size,
+                events=1,
+            )
+
+    async def _send_with_deadline_resolving(
+        self,
+        send: Send,
+        message: dict[str, Any],
+    ) -> None:
+        tracker = self._resolve_responses_diagnostics_tracker()
+        if tracker is not None and tracker.phase_sampled:
+            await self._send_with_deadline_profiled(send, message)
+            return
+        await self._send_with_deadline_unprofiled(send, message)
+
+    async def _send_with_deadline(self, send: Send, message: dict[str, Any]) -> None:
+        await self._send_with_deadline_unprofiled(send, message)
 
     async def _stream_response_body(self, send: Send) -> None:
         try:
@@ -908,6 +1010,7 @@ class LoggingStreamingResponse(Response):
             text = None
             observed_event_type = None
             observed_semantic_outcome = None
+            observed_terminal_timeline_event = False
             observed_final_event_segment = False
             observed_sse_metadata_complete = False
             observed_usage_snapshot = None
@@ -916,6 +1019,9 @@ class LoggingStreamingResponse(Response):
                 if isinstance(chunk, ObservedStreamChunk):
                     observed_event_type = chunk.event_type
                     observed_semantic_outcome = chunk.semantic_outcome
+                    observed_terminal_timeline_event = (
+                        chunk.terminal_timeline_event
+                    )
                     observed_final_event_segment = chunk.final_event_segment
                     observed_sse_metadata_complete = (
                         chunk.sse_metadata_complete
@@ -997,6 +1103,10 @@ class LoggingStreamingResponse(Response):
                         # write.  Until the await returns successfully the
                         # resulting wire boundary is unknowable.
                         self._wire_sse_boundary_known = False
+                    if observed_terminal_timeline_event:
+                        tracker = self._resolve_responses_diagnostics_tracker()
+                        if tracker is not None:
+                            tracker.mark_terminal_asgi_write_attempted()
                     await self._send_with_deadline(
                         send,
                         {
@@ -1038,6 +1148,7 @@ class LoggingStreamingResponse(Response):
                 chunk = None
                 observed_event_type = None
                 observed_semantic_outcome = None
+                observed_terminal_timeline_event = False
                 observed_final_event_segment = False
                 observed_sse_metadata_complete = False
                 observed_usage_snapshot = None

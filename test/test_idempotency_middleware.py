@@ -170,6 +170,46 @@ def test_incremental_request_identity_matches_legacy_wire_identity():
     ]
 
 
+def test_idempotency_hash_phase_sampling_reports_only_numeric_cost():
+    async def run():
+        observed = []
+
+        async def app(_scope, receive, send):
+            request = await receive()
+            assert request["body"] == b'{"model":"gpt-test"}'
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"ok",
+                    "more_body": False,
+                }
+            )
+
+        middleware = IdempotencyMiddleware(
+            app,
+            coordinator=_coordinator(),
+            phase_sample_decider=lambda: True,
+            phase_observer=lambda phase, **metrics: observed.append(
+                (phase, metrics)
+            ),
+        )
+        await _invoke(middleware)
+        return observed
+
+    observed = asyncio.run(run())
+    assert len(observed) == 1
+    phase, metrics = observed[0]
+    assert phase == "idempotency_hash"
+    assert metrics["bytes_count"] == len(b'{"model":"gpt-test"}')
+    assert metrics["events"] == 1
+    assert metrics["wall_ns"] >= 0
+    assert metrics["cpu_ns"] >= 0
+    assert all(isinstance(value, int) for value in metrics.values())
+
+
 def test_explicit_key_executes_once_and_replays_completed_response():
     async def run():
         calls = 0

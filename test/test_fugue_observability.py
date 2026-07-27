@@ -104,7 +104,7 @@ def test_worker_snapshot_has_queryable_bounded_app_event_fallback():
         service_version="1.7.200",
         identity_attrs={"app_id": "app_123", "runtime_id": "runtime_123"},
         snapshot={
-            "worker_metrics_schema_version": 1,
+            "worker_metrics_schema_version": 2,
             "worker_id": "pod-1:33",
             "worker_pid": 33,
             "worker_started_at": "2026-07-22T10:00:00+00:00",
@@ -117,6 +117,61 @@ def test_worker_snapshot_has_queryable_bounded_app_event_fallback():
             "worker_cpu_seconds_per_sse_mebibyte": 1.25,
             "worker_cpu_profile_enabled": True,
             "worker_cpu_profile_running": False,
+            "worker_phase_sample_rate": 128,
+            "worker_phase_sampling": {
+                "responses_stream": {
+                    "candidates_total": 256,
+                    "selected_total": 2,
+                    "secret": "must-not-be-copied",
+                },
+                "request-controlled-scope": {"selected_total": 999999},
+            },
+            "worker_phase_samples": {
+                "json_parse": {
+                    "samples_total": 2,
+                    "wall_ns_total": 4000,
+                    "cpu_ns_total": 2000,
+                    "bytes_total": 512,
+                    "events_total": 2,
+                    "cpu_us_per_event": 1.0,
+                    "request_body": "must-not-be-copied",
+                },
+                "request-secret-as-phase": {"cpu_ns_total": 999999},
+            },
+            "worker_threadpool_tasks": {
+                "schema_version": 1,
+                "lifecycle_semantics": (
+                    "explicit_task_tag_wall_thread_cpu_v1"
+                ),
+                "categories": {
+                    "json_parse": {
+                        "submitted_total": 2,
+                        "completed_total": 2,
+                        "failed_total": 0,
+                        "queued": 0,
+                        "inflight": 0,
+                        "cpu_ns_total": 2000,
+                        "callback": "must-not-be-copied",
+                    },
+                    "request-secret-as-category": {
+                        "submitted_total": 999999
+                    },
+                },
+                "dedicated_executors": {
+                    "json_parse": {
+                        "queue_depth": 3,
+                        "threads": 2,
+                        "alive_threads": 2,
+                        "callback": "must-not-be-copied",
+                    },
+                    "request-controlled-executor": {"queue_depth": 999999},
+                },
+            },
+            "worker_socket_unread_samples_total": 3,
+            "worker_socket_unread_bytes_total": 8192,
+            "worker_socket_unread_bytes_max": 4096,
+            "worker_socket_unread_bytes_last": 1024,
+            "worker_socket_unread_sample_failures_total": 1,
             "oaix_terminal_flush_to_ember_receive_histogram": {
                 "count": 3,
                 "sum_ms": 8120.5,
@@ -136,10 +191,35 @@ def test_worker_snapshot_has_queryable_bounded_app_event_fallback():
     assert event["attributes"]["worker_id"] == "pod-1:33"
     assert event["summary"]["worker_cpu_cores"] == 0.97
     assert event["summary"]["worker_inflight_requests"] == 74
+    assert event["summary"]["worker_phase_samples"]["json_parse"][
+        "cpu_ns_total"
+    ] == 2000
+    assert event["summary"]["worker_phase_sampling"]["responses_stream"] == {
+        "candidates_total": 256,
+        "selected_total": 2,
+    }
+    assert event["summary"]["worker_threadpool_tasks"]["categories"][
+        "json_parse"
+    ]["completed_total"] == 2
+    assert event["summary"]["worker_threadpool_tasks"][
+        "lifecycle_semantics"
+    ] == "explicit_task_tag_wall_thread_cpu_v1"
+    assert event["summary"]["worker_threadpool_tasks"][
+        "dedicated_executors"
+    ]["json_parse"] == {
+        "queue_depth": 3,
+        "threads": 2,
+        "alive_threads": 2,
+    }
+    assert event["summary"]["worker_socket_unread_bytes_max"] == 4096
     assert event["summary"][
         "oaix_terminal_flush_to_ember_receive_histogram"
     ]["cumulative_buckets"]["10000"] == 3
     assert "must-not-be-copied" not in serialized
+    assert "request-secret-as-phase" not in serialized
+    assert "request-secret-as-category" not in serialized
+    assert "request-controlled-scope" not in serialized
+    assert "request-controlled-executor" not in serialized
     assert "Bearer" not in serialized
 
 
@@ -196,6 +276,9 @@ def test_worker_cpu_profile_event_only_exports_bounded_code_locations():
             "worker_id": "pod-1:33",
             "source_revision": "abc123",
             "status": "completed",
+            "threadpool_classification_semantics": (
+                "explicit_tag_then_dedicated_name_then_bounded_stack_v1"
+            ),
             "trigger_cpu_cores": 0.99,
             "started_at": "2026-07-22T10:00:00+00:00",
             "finished_at": "2026-07-22T10:00:10+00:00",
@@ -221,6 +304,34 @@ def test_worker_cpu_profile_event_only_exports_bounded_code_locations():
                     "request_body": "never-export-request-data",
                 }
             ],
+            "threadpool_categories": [
+                {
+                    "category": "json_parse",
+                    "cpu_ticks": 750,
+                    "cpu_seconds": 7.5,
+                    "samples": 38,
+                    "sources": [
+                        {
+                            "source": "dedicated_thread_name",
+                            "cpu_ticks": 750,
+                            "cpu_seconds": 7.5,
+                            "samples": 38,
+                            "request_body": "never-export-request-data",
+                        },
+                        {
+                            "source": "request-controlled-source",
+                            "cpu_ticks": 999,
+                        },
+                    ],
+                    "request_body": "never-export-request-data",
+                },
+                {
+                    "category": "request-controlled-secret-category",
+                    "cpu_ticks": 150,
+                    "cpu_seconds": 1.5,
+                    "samples": 7,
+                },
+            ],
             "authorization": "Bearer never-export",
         },
     )
@@ -229,6 +340,11 @@ def test_worker_cpu_profile_event_only_exports_bounded_code_locations():
     assert event["event_type"] == "worker_on_cpu_profile"
     assert event["attributes"]["fugue_table"] == "app_events"
     assert "uni_api/runtime.py:_proxy_responses_stream:7300" in serialized
+    assert '"category": "json_parse"' in serialized
+    assert '"source": "dedicated_thread_name"' in serialized
+    assert "explicit_tag_then_dedicated_name_then_bounded_stack_v1" in serialized
+    assert "request-controlled-source" not in serialized
+    assert "request-controlled-secret-category" not in serialized
     assert "never-export-request-data" not in serialized
     assert "Bearer never-export" not in serialized
 
@@ -1110,6 +1226,35 @@ def test_responses_diagnostics_are_exported_with_valid_bounded_json():
             for _ in range(32)
         ],
         "cleanup_actions_truncated": True,
+        "terminal_timeline_schema_version": 1,
+        "terminal_timeline_clock": "unix_nano_plus_process_monotonic_v1",
+        "terminal_received_semantics": "upstream_iterator_yield_completed_v1",
+        "terminal_timeline_complete": True,
+        "terminal_received_unix_nano": 1_700_000_000_000_000_000,
+        "terminal_received_monotonic_nano": 10_000,
+        "terminal_parse_completed_unix_nano": 1_700_000_000_000_001_000,
+        "terminal_parse_completed_monotonic_nano": 11_000,
+        "terminal_received_from_receive_us": 0.0,
+        "terminal_parse_completed_from_receive_us": 1.0,
+        "terminal_received_to_parse_completed_us": 1.0,
+        "phase_sample_rate": 128,
+        "phase_sampled": True,
+        "phase_cpu_semantics": "calling_thread_elapsed_inclusive_v1",
+        "phase_bytes_semantics": "known_wire_bytes_only_v1",
+        "phase_json_parse_samples": 4,
+        "phase_json_parse_wall_ns": 4000,
+        "phase_json_parse_cpu_ns": 2000,
+        "phase_json_parse_bytes": 512,
+        "phase_json_parse_events": 4,
+        "socket_unread_sample_rate": 128,
+        "socket_unread_semantics": (
+            "linux_connection_receive_queue_after_chunk_v1"
+        ),
+        "socket_unread_samples": 2,
+        "socket_unread_bytes_total": 8192,
+        "socket_unread_bytes_max": 4096,
+        "socket_unread_bytes_last": 4096,
+        "socket_unread_sample_failures": 0,
         "exception_chain": [
             {
                 "relation": "cause",
@@ -1157,6 +1302,14 @@ def test_responses_diagnostics_are_exported_with_valid_bounded_json():
         assert attrs["usage_output_known"] == "false"
         assert attrs["downstream_usage_output_known"] == "false"
         assert attrs["cleanup_failure_stage"] == "cleanup"
+        assert attrs["terminal_timeline_complete"] == "true"
+        assert attrs["terminal_received_unix_nano"] == (
+            "1700000000000000000"
+        )
+        assert attrs["terminal_received_to_parse_completed_us"] == "1"
+        assert attrs["phase_sampled"] == "true"
+        assert attrs["phase_json_parse_cpu_ns"] == "2000"
+        assert attrs["socket_unread_bytes_max"] == "4096"
         for field in (
             "terminal_semantics_inconsistency_json",
             "exception_chain_json",

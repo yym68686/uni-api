@@ -20,6 +20,7 @@ from uni_api.admission.json_memory import (
     JSONMemorySnapshot,
 )
 from uni_api.admission.resources import startup_cpu_worker_count
+from uni_api.observability.threadpool_tasks import register_dedicated_threadpool
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.http_content import is_json_media_type
 
@@ -75,6 +76,10 @@ except (TypeError, ValueError):
 _REQUEST_BODY_CPU_EXECUTOR = ThreadPoolExecutor(
     max_workers=REQUEST_BODY_CPU_WORKERS,
     thread_name_prefix="uni-api-body",
+)
+register_dedicated_threadpool(
+    "request_body_decode",
+    _REQUEST_BODY_CPU_EXECUTOR,
 )
 
 BodyBytesReservationCallback = Callable[[int], Awaitable[None]]

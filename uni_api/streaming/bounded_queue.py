@@ -362,6 +362,7 @@ class ReservedStreamChunk:
     reservation: RetainedByteLease
     event_type: str | None = None
     semantic_outcome: str | None = None
+    terminal_timeline_event: bool = False
     sse_metadata_complete: bool = False
     usage_snapshot: StreamUsageSnapshot | None = None
 
@@ -378,6 +379,7 @@ class ObservedStreamChunk(bytes):
 
     event_type: str | None
     semantic_outcome: str | None
+    terminal_timeline_event: bool
     final_event_segment: bool
     sse_metadata_complete: bool
     usage_snapshot: StreamUsageSnapshot | None
@@ -387,6 +389,7 @@ class ObservedStreamChunk(bytes):
         data: bytes | bytearray | memoryview,
         event_type: str | None = None,
         semantic_outcome: str | None = None,
+        terminal_timeline_event: bool = False,
         final_event_segment: bool = True,
         sse_metadata_complete: bool = False,
         usage_snapshot: StreamUsageSnapshot | None = None,
@@ -394,6 +397,7 @@ class ObservedStreamChunk(bytes):
         value = super().__new__(cls, data)
         value.event_type = event_type
         value.semantic_outcome = semantic_outcome
+        value.terminal_timeline_event = bool(terminal_timeline_event)
         value.final_event_segment = bool(final_event_segment)
         value.sse_metadata_complete = bool(sse_metadata_complete)
         value.usage_snapshot = usage_snapshot

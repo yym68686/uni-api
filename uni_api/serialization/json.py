@@ -4,6 +4,8 @@ import asyncio
 import json
 from typing import Any
 
+from uni_api.observability.threadpool_tasks import submit_threadpool_task
+
 JSONDecodeError = json.JSONDecodeError
 
 
@@ -23,11 +25,27 @@ def loads_data(value: str | bytes | bytearray) -> Any:
 
 
 async def dumps_text_async(value: Any, *, ensure_ascii: bool = False, separators: tuple[str, str] | None = None) -> str:
-    return await asyncio.to_thread(dumps_text, value, ensure_ascii=ensure_ascii, separators=separators)
+    ticket = submit_threadpool_task("json_serialization")
+    try:
+        return await asyncio.to_thread(
+            ticket.run,
+            dumps_text,
+            value,
+            ensure_ascii=ensure_ascii,
+            separators=separators,
+        )
+    except asyncio.CancelledError:
+        ticket.cancel_if_queued()
+        raise
 
 
 async def loads_data_async(value: str | bytes | bytearray) -> Any:
-    return await asyncio.to_thread(loads_data, value)
+    ticket = submit_threadpool_task("json_serialization")
+    try:
+        return await asyncio.to_thread(ticket.run, loads_data, value)
+    except asyncio.CancelledError:
+        ticket.cancel_if_queued()
+        raise
 
 
 def sse_data(payload: Any, *, ensure_ascii: bool = False) -> str:

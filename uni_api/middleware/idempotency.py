@@ -5,7 +5,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field
-from time import monotonic
+from time import monotonic, perf_counter_ns, thread_time_ns
 from typing import Any, Callable, Literal
 
 from starlette.responses import JSONResponse
@@ -329,6 +329,8 @@ class IdempotencyMiddleware:
         request_body_total_timeout_seconds: float = 120.0,
         wait_timeout_seconds: float = 30 * 60,
         observer: Callable[[str, dict[str, Any]], Any] | None = None,
+        phase_sample_decider: Callable[[], bool] | None = None,
+        phase_observer: Callable[..., Any] | None = None,
     ) -> None:
         self.app = app
         self.coordinator = coordinator
@@ -343,6 +345,8 @@ class IdempotencyMiddleware:
         )
         self.wait_timeout_seconds = float(wait_timeout_seconds)
         self.observer = observer
+        self.phase_sample_decider = phase_sample_decider
+        self.phase_observer = phase_observer
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not self._applies(scope):
@@ -407,11 +411,32 @@ class IdempotencyMiddleware:
             )
             return
 
-        record_key, request_hash, key_fingerprint = _request_identities(
-            scope,
-            idempotency_key,
-            body,
-        )
+        sample_hash = False
+        if self.phase_sample_decider is not None:
+            try:
+                sample_hash = bool(self.phase_sample_decider())
+            except Exception:
+                sample_hash = False
+        wall_started_ns = perf_counter_ns() if sample_hash else 0
+        cpu_started_ns = thread_time_ns() if sample_hash else 0
+        try:
+            record_key, request_hash, key_fingerprint = _request_identities(
+                scope,
+                idempotency_key,
+                body,
+            )
+        finally:
+            if sample_hash and self.phase_observer is not None:
+                try:
+                    self.phase_observer(
+                        "idempotency_hash",
+                        wall_ns=max(0, perf_counter_ns() - wall_started_ns),
+                        cpu_ns=max(0, thread_time_ns() - cpu_started_ns),
+                        bytes_count=len(body),
+                        events=1,
+                    )
+                except Exception:
+                    pass
         while True:
             claim = await self.coordinator.claim(record_key, request_hash)
             self._observe(

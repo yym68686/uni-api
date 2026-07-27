@@ -2371,6 +2371,7 @@ def test_responses_generic_postcommit_error_is_observed_before_base_http_eof(
         assert diagnostics["error_event_seen"] is True
         assert diagnostics["downstream_terminal_seen"] is False
         assert diagnostics["downstream_terminal_asgi_write_completed"] is True
+        assert "terminal_asgi_write_completed_unix_nano" not in diagnostics
         assert diagnostics["downstream_final_body_outcome"] == "completed"
 
     asyncio.run(scenario())

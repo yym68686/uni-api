@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from uni_api.observability.threadpool_tasks import (
+    active_threadpool_task_categories,
+    submit_threadpool_task,
+    threadpool_task_snapshot,
+)
+
 
 TERMINAL_HOP_BUCKETS_MS = (
     1.0,
@@ -27,6 +33,16 @@ TERMINAL_HOP_BUCKETS_MS = (
     5_000.0,
     10_000.0,
     30_000.0,
+)
+
+PERFORMANCE_PHASES = (
+    "socket_receive",
+    "sse_frame",
+    "json_parse",
+    "observer_hash",
+    "queue_put",
+    "asgi_write",
+    "idempotency_hash",
 )
 
 
@@ -136,6 +152,7 @@ class WorkerRuntimeObserver:
         cpu_profile_duration_seconds: float | None = None,
         cpu_profile_sample_hz: float | None = None,
         cpu_profile_cooldown_seconds: float | None = None,
+        phase_sample_rate: int | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         process_time: Callable[[], float] = time.process_time,
     ) -> None:
@@ -216,6 +233,16 @@ class WorkerRuntimeObserver:
                 maximum=86_400.0,
             )
         )
+        self.phase_sample_rate = (
+            max(1, int(phase_sample_rate))
+            if phase_sample_rate is not None
+            else _env_int(
+                "WORKER_PHASE_SAMPLE_RATE",
+                128,
+                minimum=1,
+                maximum=65_536,
+            )
+        )
 
         self._sse_events_total = 0
         self._sse_bytes_total = 0
@@ -242,6 +269,15 @@ class WorkerRuntimeObserver:
         self._profile_stop = threading.Event()
         self._next_profile_after = 0.0
         self._latest_profile: dict[str, Any] | None = None
+        self._phase_sample_sequences: Counter[str] = Counter()
+        self._phase_metrics: dict[str, Counter[str]] = {
+            phase: Counter() for phase in PERFORMANCE_PHASES
+        }
+        self._socket_unread_samples_total = 0
+        self._socket_unread_bytes_total = 0
+        self._socket_unread_bytes_max = 0
+        self._socket_unread_bytes_last: int | None = None
+        self._socket_unread_sample_failures_total = 0
 
     def set_inflight_supplier(self, supplier: Callable[[], int]) -> None:
         self._inflight_supplier = supplier
@@ -267,6 +303,60 @@ class WorkerRuntimeObserver:
 
     def record_sse_event(self, _size: int = 0) -> None:
         self._sse_events_total += 1
+
+    def should_sample_phase_request(self, scope: str = "default") -> bool:
+        normalized_scope = (
+            scope
+            if scope in {"default", "responses_stream", "idempotency_hash"}
+            else "default"
+        )
+        sequence = self._phase_sample_sequences[normalized_scope]
+        self._phase_sample_sequences[normalized_scope] += 1
+        return sequence % self.phase_sample_rate == 0
+
+    def record_phase_sample(
+        self,
+        phase: str,
+        *,
+        wall_ns: int,
+        cpu_ns: int,
+        bytes_count: int = 0,
+        events: int = 0,
+    ) -> bool:
+        if phase not in self._phase_metrics:
+            return False
+        try:
+            normalized_wall = max(0, int(wall_ns))
+            normalized_cpu = max(0, int(cpu_ns))
+            normalized_bytes = max(0, int(bytes_count))
+            normalized_events = max(0, int(events))
+        except (TypeError, ValueError):
+            return False
+        metrics = self._phase_metrics[phase]
+        metrics["samples_total"] += 1
+        metrics["wall_ns_total"] += normalized_wall
+        metrics["cpu_ns_total"] += normalized_cpu
+        metrics["bytes_total"] += normalized_bytes
+        metrics["events_total"] += normalized_events
+        return True
+
+    def record_socket_unread_bytes(self, value: int | None) -> bool:
+        if value is None:
+            self._socket_unread_sample_failures_total += 1
+            return False
+        try:
+            observed = max(0, int(value))
+        except (TypeError, ValueError):
+            self._socket_unread_sample_failures_total += 1
+            return False
+        self._socket_unread_samples_total += 1
+        self._socket_unread_bytes_total += observed
+        self._socket_unread_bytes_max = max(
+            self._socket_unread_bytes_max,
+            observed,
+        )
+        self._socket_unread_bytes_last = observed
+        return True
 
     def record_terminal_hop(self, observation: dict[str, Any]) -> bool:
         try:
@@ -402,7 +492,9 @@ class WorkerRuntimeObserver:
             stop_event=self._profile_stop,
         )
         try:
+            ticket = submit_threadpool_task("on_cpu_profile")
             result = await asyncio.to_thread(
+                ticket.run,
                 collector.run,
                 trigger_cpu_cores=trigger_cpu_cores,
             )
@@ -413,6 +505,9 @@ class WorkerRuntimeObserver:
                 self._profile_failed_total += 1
             if self._profile_emitter is not None:
                 self._profile_emitter(dict(result))
+        except asyncio.CancelledError:
+            ticket.cancel_if_queued()
+            raise
         except Exception as exc:
             self._profile_failed_total += 1
             self._latest_profile = {
@@ -435,8 +530,41 @@ class WorkerRuntimeObserver:
         except Exception:
             inflight = 0
         histogram = self._terminal_hop_histogram.snapshot()
+        phase_samples: dict[str, dict[str, int | float]] = {}
+        for phase in PERFORMANCE_PHASES:
+            metrics = self._phase_metrics[phase]
+            samples = int(metrics.get("samples_total") or 0)
+            if samples <= 0:
+                continue
+            events = int(metrics.get("events_total") or 0)
+            wall_ns = int(metrics.get("wall_ns_total") or 0)
+            cpu_ns = int(metrics.get("cpu_ns_total") or 0)
+            row: dict[str, int | float] = {
+                "samples_total": samples,
+                "wall_ns_total": wall_ns,
+                "cpu_ns_total": cpu_ns,
+                "bytes_total": int(metrics.get("bytes_total") or 0),
+                "events_total": events,
+            }
+            if events > 0:
+                row["wall_us_per_event"] = wall_ns / (events * 1000.0)
+                row["cpu_us_per_event"] = cpu_ns / (events * 1000.0)
+            phase_samples[phase] = row
+        phase_sampling = {
+            scope: {
+                "candidates_total": candidates,
+                "selected_total": (
+                    (candidates + self.phase_sample_rate - 1)
+                    // self.phase_sample_rate
+                ),
+            }
+            for scope, candidates in sorted(
+                self._phase_sample_sequences.items()
+            )
+            if candidates > 0
+        }
         return {
-            "worker_metrics_schema_version": 1,
+            "worker_metrics_schema_version": 2,
             "worker_id": self.worker_id,
             "worker_pid": self.worker_pid,
             "worker_started_at": self.started_at,
@@ -457,6 +585,19 @@ class WorkerRuntimeObserver:
                 self._cpu_seconds_per_sse_mebibyte
             ),
             "worker_metrics_sample_elapsed_seconds": self._sample_elapsed_seconds,
+            "worker_phase_sample_rate": self.phase_sample_rate,
+            "worker_phase_sampling": phase_sampling,
+            "worker_phase_samples": phase_samples,
+            "worker_threadpool_tasks": threadpool_task_snapshot(),
+            "worker_socket_unread_samples_total": (
+                self._socket_unread_samples_total
+            ),
+            "worker_socket_unread_bytes_total": self._socket_unread_bytes_total,
+            "worker_socket_unread_bytes_max": self._socket_unread_bytes_max,
+            "worker_socket_unread_bytes_last": self._socket_unread_bytes_last,
+            "worker_socket_unread_sample_failures_total": (
+                self._socket_unread_sample_failures_total
+            ),
             "worker_cpu_profile_enabled": self.cpu_profile_enabled,
             "worker_cpu_profile_trigger_cores": self.cpu_profile_trigger_cores,
             "worker_cpu_profile_trigger_samples": self.cpu_profile_trigger_samples,
@@ -511,6 +652,10 @@ class LinuxThreadOnCPUProfiler:
         stack_ticks: Counter[tuple[str, ...]] = Counter()
         leaf_ticks: Counter[str] = Counter()
         stack_samples: Counter[tuple[str, ...]] = Counter()
+        task_category_ticks: Counter[str] = Counter()
+        task_category_samples: Counter[str] = Counter()
+        task_category_source_ticks: Counter[tuple[str, str]] = Counter()
+        task_category_source_samples: Counter[tuple[str, str]] = Counter()
         sample_rounds = 0
         active_thread_samples = 0
         read_errors = 0
@@ -522,6 +667,8 @@ class LinuxThreadOnCPUProfiler:
             try:
                 current = _read_thread_cpu_ticks()
                 frames = _native_thread_frames()
+                thread_names = _native_thread_names()
+                task_categories = active_threadpool_task_categories()
             except Exception:
                 read_errors += 1
                 continue
@@ -538,6 +685,20 @@ class LinuxThreadOnCPUProfiler:
                 stack_ticks[stack] += delta
                 stack_samples[stack] += 1
                 leaf_ticks[stack[-1]] += delta
+                category = task_categories.get(native_id)
+                category_source = "explicit_task_tag" if category else None
+                if not category:
+                    category, category_source = _threadpool_category_from_sample(
+                        thread_names.get(native_id),
+                        stack,
+                    )
+                if category:
+                    task_category_ticks[category] += delta
+                    task_category_samples[category] += 1
+                    assert category_source is not None
+                    source_key = (category, category_source)
+                    task_category_source_ticks[source_key] += delta
+                    task_category_source_samples[source_key] += 1
                 active_thread_samples += 1
             previous = current
 
@@ -561,8 +722,31 @@ class LinuxThreadOnCPUProfiler:
             }
             for function, ticks in leaf_ticks.most_common(20)
         ]
+        threadpool_categories = [
+            {
+                "category": category,
+                "cpu_ticks": ticks,
+                "cpu_seconds": ticks / ticks_per_second,
+                "samples": task_category_samples[category],
+                "sources": [
+                    {
+                        "source": source,
+                        "cpu_ticks": source_ticks,
+                        "cpu_seconds": source_ticks / ticks_per_second,
+                        "samples": task_category_source_samples[
+                            (category, source)
+                        ],
+                    }
+                    for (source_category, source), source_ticks in (
+                        task_category_source_ticks.most_common()
+                    )
+                    if source_category == category
+                ],
+            }
+            for category, ticks in task_category_ticks.most_common(20)
+        ]
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile_id": profile_id,
             "worker_id": self.worker_id,
             "source_revision": self.source_revision,
@@ -578,8 +762,12 @@ class LinuxThreadOnCPUProfiler:
             "profiled_cpu_ticks": total_ticks,
             "profiled_cpu_seconds": total_ticks / ticks_per_second,
             "proc_read_errors": read_errors,
+            "threadpool_classification_semantics": (
+                "explicit_tag_then_dedicated_name_then_bounded_stack_v1"
+            ),
             "top_leaf_functions": top_leaf_functions,
             "top_stacks": top_stacks,
+            "threadpool_categories": threadpool_categories,
         }
 
 
@@ -620,6 +808,37 @@ def _native_thread_frames() -> dict[int, Any]:
         if frame is not None:
             result[int(thread.native_id)] = frame
     return result
+
+
+def _native_thread_names() -> dict[int, str]:
+    return {
+        int(thread.native_id): str(thread.name)
+        for thread in threading.enumerate()
+        if thread.native_id is not None
+    }
+
+
+def _threadpool_category_from_sample(
+    thread_name: str | None,
+    stack: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    name = str(thread_name or "")
+    dedicated_prefixes = (
+        ("uni-api-json", "json_parse"),
+        ("uni-api-upstream-body", "upstream_response_decode"),
+        ("uni-api-body", "request_body_decode"),
+    )
+    for prefix, category in dedicated_prefixes:
+        if name.startswith(prefix):
+            return category, "dedicated_thread_name"
+    if name.startswith(("asyncio_", "ThreadPoolExecutor-")):
+        if any(
+            row.startswith(("json/__init__.py:", "json/encoder.py:"))
+            for row in stack
+        ):
+            return "json_serialization", "default_executor_stack"
+        return "other", "default_executor_stack"
+    return None, None
 
 
 def _frame_stack(frame: Any, *, max_depth: int = 24) -> tuple[str, ...]:

@@ -36,6 +36,59 @@ _REQUEST_BODY_COMPLEXITY_TRIGGER_PHASES = frozenset(
         "scalar_scan",
     }
 )
+_WORKER_PERFORMANCE_PHASES = (
+    "socket_receive",
+    "sse_frame",
+    "json_parse",
+    "observer_hash",
+    "queue_put",
+    "asgi_write",
+    "idempotency_hash",
+)
+_WORKER_PHASE_SAMPLE_SCOPES = (
+    "default",
+    "responses_stream",
+    "idempotency_hash",
+)
+_WORKER_THREADPOOL_TASK_CATEGORIES = (
+    "json_parse",
+    "json_serialization",
+    "network_procfs",
+    "on_cpu_profile",
+    "request_body_decode",
+    "upstream_response_decode",
+    "other",
+)
+_WORKER_THREADPOOL_CATEGORY_SOURCES = frozenset(
+    {
+        "explicit_task_tag",
+        "dedicated_thread_name",
+        "default_executor_stack",
+    }
+)
+_WORKER_THREADPOOL_LIFECYCLE_SEMANTICS = (
+    "explicit_task_tag_wall_thread_cpu_v1"
+)
+_WORKER_THREADPOOL_PROFILE_SEMANTICS = (
+    "explicit_tag_then_dedicated_name_then_bounded_stack_v1"
+)
+_TERMINAL_TIMELINE_POINTS = (
+    "received",
+    "parse_completed",
+    "observer_completed",
+    "semantic_classified",
+    "queue_handoff_completed",
+    "asgi_write_attempted",
+    "asgi_write_completed",
+)
+_TERMINAL_TIMELINE_TRANSITIONS = (
+    ("received", "parse_completed"),
+    ("parse_completed", "observer_completed"),
+    ("observer_completed", "semantic_classified"),
+    ("semantic_classified", "queue_handoff_completed"),
+    ("queue_handoff_completed", "asgi_write_attempted"),
+    ("asgi_write_attempted", "asgi_write_completed"),
+)
 
 _STAGE_ORDER = [
     "request_received",
@@ -904,6 +957,12 @@ def _bounded_worker_runtime_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "worker_cpu_profile_trigger_total",
         "worker_cpu_profile_completed_total",
         "worker_cpu_profile_failed_total",
+        "worker_phase_sample_rate",
+        "worker_socket_unread_samples_total",
+        "worker_socket_unread_bytes_total",
+        "worker_socket_unread_bytes_max",
+        "worker_socket_unread_bytes_last",
+        "worker_socket_unread_sample_failures_total",
         "oaix_terminal_flush_to_ember_receive_invalid_total",
         "oaix_terminal_flush_marker_missing_total",
     )
@@ -917,6 +976,109 @@ def _bounded_worker_runtime_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     summary["worker_cpu_profile_running"] = _safe_bool(
         snapshot.get("worker_cpu_profile_running")
     )
+
+    raw_phase_samples = snapshot.get("worker_phase_samples")
+    if isinstance(raw_phase_samples, dict):
+        phase_samples: dict[str, dict[str, float | int]] = {}
+        for phase in _WORKER_PERFORMANCE_PHASES:
+            raw_metrics = raw_phase_samples.get(phase)
+            if not isinstance(raw_metrics, dict):
+                continue
+            metrics: dict[str, float | int] = {}
+            for key in (
+                "samples_total",
+                "wall_ns_total",
+                "cpu_ns_total",
+                "bytes_total",
+                "events_total",
+                "wall_us_per_event",
+                "cpu_us_per_event",
+            ):
+                value = _finite_metric_value(raw_metrics.get(key))
+                if value is not None and value >= 0:
+                    metrics[key] = value
+            if metrics:
+                phase_samples[phase] = metrics
+        if phase_samples:
+            summary["worker_phase_samples"] = phase_samples
+
+    raw_phase_sampling = snapshot.get("worker_phase_sampling")
+    if isinstance(raw_phase_sampling, dict):
+        phase_sampling: dict[str, dict[str, float | int]] = {}
+        for scope in _WORKER_PHASE_SAMPLE_SCOPES:
+            raw_metrics = raw_phase_sampling.get(scope)
+            if not isinstance(raw_metrics, dict):
+                continue
+            metrics: dict[str, float | int] = {}
+            for key in ("candidates_total", "selected_total"):
+                value = _finite_metric_value(raw_metrics.get(key))
+                if value is not None and value >= 0:
+                    metrics[key] = value
+            if metrics:
+                phase_sampling[scope] = metrics
+        if phase_sampling:
+            summary["worker_phase_sampling"] = phase_sampling
+
+    raw_threadpool = snapshot.get("worker_threadpool_tasks")
+    if isinstance(raw_threadpool, dict):
+        raw_categories = raw_threadpool.get("categories")
+        categories: dict[str, dict[str, float | int]] = {}
+        if isinstance(raw_categories, dict):
+            for category in _WORKER_THREADPOOL_TASK_CATEGORIES:
+                raw_metrics = raw_categories.get(category)
+                if not isinstance(raw_metrics, dict):
+                    continue
+                metrics: dict[str, float | int] = {}
+                for key in (
+                    "submitted_total",
+                    "started_total",
+                    "completed_total",
+                    "failed_total",
+                    "cancelled_total",
+                    "cancelled_task_started_total",
+                    "queued",
+                    "inflight",
+                    "active_threads",
+                    "queue_wait_ns_total",
+                    "wall_ns_total",
+                    "cpu_ns_total",
+                ):
+                    value = _finite_metric_value(raw_metrics.get(key))
+                    if value is not None and value >= 0:
+                        metrics[key] = value
+                if metrics:
+                    categories[category] = metrics
+        raw_dedicated = raw_threadpool.get("dedicated_executors")
+        dedicated: dict[str, dict[str, float | int]] = {}
+        if isinstance(raw_dedicated, dict):
+            for category in _WORKER_THREADPOOL_TASK_CATEGORIES:
+                raw_metrics = raw_dedicated.get(category)
+                if not isinstance(raw_metrics, dict):
+                    continue
+                metrics: dict[str, float | int] = {}
+                for key in ("queue_depth", "threads", "alive_threads"):
+                    value = _finite_metric_value(raw_metrics.get(key))
+                    if value is not None and value >= 0:
+                        metrics[key] = value
+                if metrics:
+                    dedicated[category] = metrics
+        if categories or dedicated:
+            threadpool_summary: dict[str, Any] = {
+                "schema_version": max(
+                    0,
+                    _safe_int(raw_threadpool.get("schema_version"), 0),
+                ),
+                "categories": categories,
+                "dedicated_executors": dedicated,
+            }
+            if (
+                raw_threadpool.get("lifecycle_semantics")
+                == _WORKER_THREADPOOL_LIFECYCLE_SEMANTICS
+            ):
+                threadpool_summary["lifecycle_semantics"] = (
+                    _WORKER_THREADPOOL_LIFECYCLE_SEMANTICS
+                )
+            summary["worker_threadpool_tasks"] = threadpool_summary
 
     histogram = snapshot.get("oaix_terminal_flush_to_ember_receive_histogram")
     if isinstance(histogram, dict):
@@ -1042,6 +1204,13 @@ def _bounded_cpu_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "started_at": _safe_text(profile.get("started_at"), max_len=64),
         "finished_at": _safe_text(profile.get("finished_at"), max_len=64),
     }
+    if (
+        profile.get("threadpool_classification_semantics")
+        == _WORKER_THREADPOOL_PROFILE_SEMANTICS
+    ):
+        summary["threadpool_classification_semantics"] = (
+            _WORKER_THREADPOOL_PROFILE_SEMANTICS
+        )
     for key in (
         "trigger_cpu_cores",
         "configured_duration_seconds",
@@ -1105,6 +1274,73 @@ def _bounded_cpu_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
                 }
             )
     summary["top_stacks"] = stack_rows
+
+    category_rows = []
+    raw_categories = profile.get("threadpool_categories")
+    if isinstance(raw_categories, list):
+        allowed_categories = set(_WORKER_THREADPOOL_TASK_CATEGORIES)
+        for raw in raw_categories[: len(allowed_categories)]:
+            if not isinstance(raw, dict):
+                continue
+            category = _safe_text(raw.get("category"), max_len=48)
+            if category not in allowed_categories:
+                continue
+            category_row: dict[str, Any] = _drop_empty(
+                {
+                    "category": category,
+                    "cpu_ticks": max(
+                        0,
+                        _safe_int(raw.get("cpu_ticks"), 0),
+                    ),
+                    "cpu_seconds": _finite_metric_value(
+                        raw.get("cpu_seconds")
+                    ),
+                    "samples": max(
+                        0,
+                        _safe_int(raw.get("samples"), 0),
+                    ),
+                }
+            )
+            raw_sources = raw.get("sources")
+            sources = []
+            if isinstance(raw_sources, list):
+                for raw_source in raw_sources[:3]:
+                    if not isinstance(raw_source, dict):
+                        continue
+                    source = _safe_text(
+                        raw_source.get("source"),
+                        max_len=48,
+                    )
+                    if source not in _WORKER_THREADPOOL_CATEGORY_SOURCES:
+                        continue
+                    sources.append(
+                        _drop_empty(
+                            {
+                                "source": source,
+                                "cpu_ticks": max(
+                                    0,
+                                    _safe_int(
+                                        raw_source.get("cpu_ticks"),
+                                        0,
+                                    ),
+                                ),
+                                "cpu_seconds": _finite_metric_value(
+                                    raw_source.get("cpu_seconds")
+                                ),
+                                "samples": max(
+                                    0,
+                                    _safe_int(
+                                        raw_source.get("samples"),
+                                        0,
+                                    ),
+                                ),
+                            }
+                        )
+                    )
+            if sources:
+                category_row["sources"] = sources
+            category_rows.append(category_row)
+    summary["threadpool_categories"] = category_rows
     return {
         key: value
         for key, value in summary.items()
@@ -3513,6 +3749,8 @@ def _responses_diagnostic_attrs(
         "oaix_terminal_flush_to_ember_receive_observed",
         "oaix_terminal_flush_marker_missing",
         "oaix_terminal_flush_lag_clamped_for_clock_order",
+        "terminal_timeline_complete",
+        "phase_sampled",
     )
     for key in bool_fields:
         attrs[key] = _bool_text(_safe_bool(diagnostics.get(key)))
@@ -3535,9 +3773,27 @@ def _responses_diagnostic_attrs(
         "oaix_terminal_flush_marker_schema_version",
         "oaix_terminal_flush_attempted_unix_nano",
         "oaix_terminal_flush_completed_unix_nano",
+        "terminal_timeline_schema_version",
+        "phase_sample_rate",
+        "socket_unread_sample_rate",
+        "socket_unread_samples",
+        "socket_unread_bytes_total",
+        "socket_unread_bytes_max",
+        "socket_unread_bytes_last",
+        "socket_unread_sample_failures",
     )
     for key in int_fields:
         attrs[key] = _optional_int_text(diagnostics.get(key))
+    for point in _TERMINAL_TIMELINE_POINTS:
+        for suffix in ("unix_nano", "monotonic_nano"):
+            key = f"terminal_{point}_{suffix}"
+            attrs[key] = _optional_int_text(diagnostics.get(key))
+    for phase in _WORKER_PERFORMANCE_PHASES:
+        if phase == "idempotency_hash":
+            continue
+        for suffix in ("samples", "wall_ns", "cpu_ns", "bytes", "events"):
+            key = f"phase_{phase}_{suffix}"
+            attrs[key] = _optional_int_text(diagnostics.get(key))
 
     text_fields = (
         "last_event_type",
@@ -3583,6 +3839,14 @@ def _responses_diagnostic_attrs(
         "oaix_terminal_flush_marker_missing_at",
         "oaix_terminal_flush_attempted_at",
         "oaix_terminal_flush_completed_at",
+        "terminal_timeline_clock",
+        "terminal_received_semantics",
+        "terminal_timeline_error",
+        "phase_cpu_semantics",
+        "phase_bytes_semantics",
+        "phase_sampler_error",
+        "socket_unread_semantics",
+        "socket_unread_observer_error",
     )
     for key in text_fields:
         attrs[key] = _safe_text(diagnostics.get(key))
@@ -3593,6 +3857,12 @@ def _responses_diagnostic_attrs(
         "oaix_terminal_flush_attempt_to_ember_receive_ms",
         "oaix_terminal_flush_to_ember_receive_ms",
     ):
+        attrs[key] = _optional_float_text(diagnostics.get(key))
+    for point in _TERMINAL_TIMELINE_POINTS:
+        key = f"terminal_{point}_from_receive_us"
+        attrs[key] = _optional_float_text(diagnostics.get(key))
+    for start, end in _TERMINAL_TIMELINE_TRANSITIONS:
+        key = f"terminal_{start}_to_{end}_us"
         attrs[key] = _optional_float_text(diagnostics.get(key))
 
     attrs.update(

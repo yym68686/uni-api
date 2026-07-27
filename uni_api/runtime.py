@@ -11,7 +11,7 @@ import tomllib
 import asyncio
 import random
 from asyncio import Semaphore
-from time import time
+from time import perf_counter_ns, time, time_ns
 from pathlib import Path
 from urllib.parse import urlparse
 from collections import Counter, defaultdict
@@ -157,6 +157,7 @@ from uni_api.observability.responses_stream import (
     observe_pool_sweeper_connection_close,
 )
 from uni_api.observability.worker_runtime import WorkerRuntimeObserver
+from uni_api.observability.threadpool_tasks import submit_threadpool_task
 from uni_api.observability.middleware import (
     StatsMiddleware,
     StatsMiddlewareDependencies,
@@ -790,9 +791,15 @@ class RuntimeGauges:
             await self._sample_network_state()
 
     async def _sample_network_state(self) -> None:
-        open_sockets, tcp_states = await asyncio.to_thread(
-            lambda: (_open_socket_count(), _tcp_state_counts())
-        )
+        ticket = submit_threadpool_task("network_procfs")
+        try:
+            open_sockets, tcp_states = await asyncio.to_thread(
+                ticket.run,
+                lambda: (_open_socket_count(), _tcp_state_counts()),
+            )
+        except asyncio.CancelledError:
+            ticket.cancel_if_queued()
+            raise
         self.open_sockets = open_sockets
         self.tcp_states = tcp_states
 
@@ -2861,6 +2868,10 @@ app.add_middleware(
         _env_float("IDEMPOTENCY_WAIT_TIMEOUT_SECONDS", 30 * 60),
     ),
     observer=_observe_idempotency_claim,
+    phase_sample_decider=lambda: (
+        worker_runtime_observer.should_sample_phase_request("idempotency_hash")
+    ),
+    phase_observer=worker_runtime_observer.record_phase_sample,
 )
 
 
@@ -5342,6 +5353,25 @@ def _raw_responses_sse_event_bytes(raw_event: str) -> bytes:
     return raw_event.encode("utf-8") + b"\n\n"
 
 
+@dataclass(frozen=True, slots=True)
+class _StreamReceiveTiming:
+    received_at: datetime
+    unix_nano: int
+    monotonic_nano: int
+
+
+def _capture_stream_receive_timing() -> _StreamReceiveTiming:
+    unix_nano = time_ns()
+    return _StreamReceiveTiming(
+        received_at=datetime.fromtimestamp(
+            unix_nano / 1_000_000_000,
+            tz=timezone.utc,
+        ),
+        unix_nano=unix_nano,
+        monotonic_nano=perf_counter_ns(),
+    )
+
+
 def _canonical_responses_sse_event_bytes(
     raw_event: str,
     *,
@@ -5386,6 +5416,7 @@ def _observed_responses_stream_chunk(
     *,
     event_type: str,
     semantic_outcome: str,
+    terminal_timeline_event: bool = False,
     usage_snapshot: StreamUsageSnapshot | None = None,
 ) -> ObservedStreamChunk | ReservedStreamChunk:
     if reservation is not None:
@@ -5394,6 +5425,7 @@ def _observed_responses_stream_chunk(
             reservation,
             event_type=event_type,
             semantic_outcome=semantic_outcome,
+            terminal_timeline_event=terminal_timeline_event,
             sse_metadata_complete=True,
             usage_snapshot=usage_snapshot,
         )
@@ -5401,6 +5433,7 @@ def _observed_responses_stream_chunk(
         data,
         event_type=event_type,
         semantic_outcome=semantic_outcome,
+        terminal_timeline_event=terminal_timeline_event,
         sse_metadata_complete=True,
         usage_snapshot=usage_snapshot,
     )
@@ -5434,14 +5467,14 @@ async def _consume_expected_oaix_terminal_flush_marker(
             return
         raw_event = None
         reservation = None
-        received_at = None
+        receive_timing = None
         try:
             (
                 raw_event,
                 reservation,
                 _from_precommit,
                 already_observed,
-                received_at,
+                receive_timing,
                 _upstream_event_bytes,
             ) = await asyncio.wait_for(
                 source.__anext__(),
@@ -5458,7 +5491,21 @@ async def _consume_expected_oaix_terminal_flush_marker(
                 diagnostics.observe_complete_event(
                     raw_event,
                     has_data_field=sse_event_has_data_field(raw_event),
-                    received_at=received_at,
+                    received_at=(
+                        receive_timing.received_at
+                        if receive_timing is not None
+                        else None
+                    ),
+                    received_unix_nano=(
+                        receive_timing.unix_nano
+                        if receive_timing is not None
+                        else None
+                    ),
+                    received_monotonic_nano=(
+                        receive_timing.monotonic_nano
+                        if receive_timing is not None
+                        else None
+                    ),
                 )
             if is_oaix_terminal_flush_marker(raw_event):
                 if not diagnostics.terminal_hop_observed:
@@ -5715,7 +5762,12 @@ async def _prime_responses_upstream_stream(
     raw_event = None
     raw_events = []
     raw_event_wires: list[bytes | None] = []
-    raw_events_received_at: datetime | None = None
+    raw_events_receive_timing: _StreamReceiveTiming | None = None
+    phase_diagnostics = (
+        diagnostics
+        if diagnostics is not None and diagnostics.phase_sampled
+        else None
+    )
 
     def observe_pending_diagnostics() -> None:
         if diagnostics is None:
@@ -5732,16 +5784,31 @@ async def _prime_responses_upstream_stream(
                 return buffered_chunks, False
 
             reached_eof = False
+            receive_phase = (
+                phase_diagnostics.begin_phase("socket_receive")
+                if phase_diagnostics is not None
+                else None
+            )
             try:
                 chunk = await _await_first_byte_deadline(
                     upstream_iter.__anext__(),
                     disconnect_event=disconnect_event,
                 )
-                raw_events_received_at = datetime.now(timezone.utc)
+                raw_events_receive_timing = _capture_stream_receive_timing()
             except StopAsyncIteration:
+                if phase_diagnostics is not None:
+                    phase_diagnostics.finish_phase(
+                        "socket_receive",
+                        receive_phase,
+                    )
                 reached_eof = True
-                raw_events_received_at = datetime.now(timezone.utc)
+                raw_events_receive_timing = _capture_stream_receive_timing()
                 observe_pending_diagnostics()
+                frame_phase = (
+                    phase_diagnostics.begin_phase("sse_frame")
+                    if phase_diagnostics is not None
+                    else None
+                )
                 try:
                     raw_events = sse_parser.finish()
                 except SSEProtocolError as exc:
@@ -5758,7 +5825,37 @@ async def _prime_responses_upstream_stream(
                         status_code=502,
                         detail=f"Invalid upstream SSE stream: {exc}",
                     ) from exc
+                finally:
+                    if phase_diagnostics is not None:
+                        phase_diagnostics.finish_phase(
+                            "sse_frame",
+                            frame_phase,
+                            events=(
+                                len(raw_events)
+                                if isinstance(raw_events, list)
+                                else 0
+                            ),
+                        )
+            except BaseException:
+                if phase_diagnostics is not None:
+                    phase_diagnostics.finish_phase(
+                        "socket_receive",
+                        receive_phase,
+                    )
+                raise
             else:
+                chunk_size = len(chunk)
+                if phase_diagnostics is not None:
+                    phase_diagnostics.finish_phase(
+                        "socket_receive",
+                        receive_phase,
+                        bytes_count=chunk_size,
+                    )
+                frame_phase = (
+                    phase_diagnostics.begin_phase("sse_frame")
+                    if phase_diagnostics is not None
+                    else None
+                )
                 try:
                     raw_events = sse_parser.feed(chunk)
                 except SSEProtocolError as exc:
@@ -5776,6 +5873,17 @@ async def _prime_responses_upstream_stream(
                         detail=f"Invalid upstream SSE stream: {exc}",
                     ) from exc
                 finally:
+                    if phase_diagnostics is not None:
+                        phase_diagnostics.finish_phase(
+                            "sse_frame",
+                            frame_phase,
+                            bytes_count=chunk_size,
+                            events=(
+                                len(raw_events)
+                                if isinstance(raw_events, list)
+                                else 0
+                            ),
+                        )
                     chunk = None
 
             raw_event_wires = [
@@ -5791,22 +5899,69 @@ async def _prime_responses_upstream_stream(
                 ):
                     if observed_event.strip():
                         assert observed_wire is not None
-                        diagnostics.observe_complete_event(
-                            observed_event,
-                            has_data_field=sse_event_has_data_field(
-                                observed_event
-                            ),
-                            wire_bytes=observed_wire,
-                            received_at=raw_events_received_at,
+                        assert raw_events_receive_timing is not None
+                        observer_phase = (
+                            phase_diagnostics.begin_phase("observer_hash")
+                            if phase_diagnostics is not None
+                            else None
                         )
+                        try:
+                            diagnostics.observe_complete_event(
+                                observed_event,
+                                has_data_field=sse_event_has_data_field(
+                                    observed_event
+                                ),
+                                wire_bytes=observed_wire,
+                                received_at=(
+                                    raw_events_receive_timing.received_at
+                                ),
+                                received_unix_nano=(
+                                    raw_events_receive_timing.unix_nano
+                                ),
+                                received_monotonic_nano=(
+                                    raw_events_receive_timing.monotonic_nano
+                                ),
+                            )
+                        finally:
+                            if phase_diagnostics is not None:
+                                phase_diagnostics.finish_phase(
+                                    "observer_hash",
+                                    observer_phase,
+                                    bytes_count=len(observed_wire),
+                                    events=1,
+                                )
 
             for event_index, raw_event in enumerate(raw_events):
                 if not raw_event.strip():
                     continue
 
-                event_owner = await parse_owned_sse_event(raw_event)
+                parse_phase = (
+                    phase_diagnostics.begin_phase("json_parse")
+                    if phase_diagnostics is not None
+                    else None
+                )
+                try:
+                    event_owner = await parse_owned_sse_event(raw_event)
+                finally:
+                    if phase_diagnostics is not None:
+                        phase_diagnostics.finish_phase(
+                            "json_parse",
+                            parse_phase,
+                            bytes_count=len(raw_event_wires[event_index] or b""),
+                            events=1,
+                        )
                 event_type = event_owner.event_name
                 event_payload = event_owner.payload
+                if diagnostics is not None:
+                    assert raw_events_receive_timing is not None
+                    diagnostics.mark_terminal_parse_completed(
+                        event_type,
+                        received_at=raw_events_receive_timing.received_at,
+                        received_unix_nano=raw_events_receive_timing.unix_nano,
+                        received_monotonic_nano=(
+                            raw_events_receive_timing.monotonic_nano
+                        ),
+                    )
                 semantic_failure = None
                 event_bytes = raw_event_wires[event_index]
                 assert event_bytes is not None
@@ -5861,14 +6016,28 @@ async def _prime_responses_upstream_stream(
                     else:
                         semantic_outcome = "nonterminal"
                     if diagnostics is not None:
-                        diagnostics.observe_parsed_event(
-                            raw_event,
-                            event_type,
-                            event_payload,
-                            semantic_outcome=semantic_outcome,
-                            wire_bytes=event_bytes,
-                            received_at=raw_events_received_at,
+                        observer_phase = (
+                            phase_diagnostics.begin_phase("observer_hash")
+                            if phase_diagnostics is not None
+                            else None
                         )
+                        try:
+                            diagnostics.observe_parsed_event(
+                                raw_event,
+                                event_type,
+                                event_payload,
+                                semantic_outcome=semantic_outcome,
+                                wire_bytes=event_bytes,
+                                received_at=(
+                                    raw_events_receive_timing.received_at
+                                ),
+                            )
+                        finally:
+                            if phase_diagnostics is not None:
+                                phase_diagnostics.finish_phase(
+                                    "observer_hash",
+                                    observer_phase,
+                                )
                     if semantic_failure is not None:
                         if (
                             event_type == "error"
@@ -5940,7 +6109,7 @@ async def _prime_responses_upstream_stream(
             raw_events = None
             raw_event_wires.clear()
             raw_event_wires = []
-            raw_events_received_at = None
+            raw_events_receive_timing = None
 
             if reached_eof:
                 if not buffered_chunks:
@@ -5969,7 +6138,7 @@ async def _prime_responses_upstream_stream(
             raw_events.clear()
         raw_events = None
         raw_event_wires.clear()
-        raw_events_received_at = None
+        raw_events_receive_timing = None
         sse_parser.discard()
 
 class ResponsesRequestHandler:
@@ -6118,6 +6287,10 @@ class ResponsesRequestExecution:
     stream_keepalive_sent: bool = False
     stream_precommit_chunks: Optional[ReservedChunkBuffer] = None
     last_response_failed_terminal: Optional[CachedResponsesFailureTerminal] = None
+    stream_phase_diagnostics: ResponsesStreamDiagnostics | None = field(
+        default=None,
+        repr=False,
+    )
 
     @classmethod
     async def create(
@@ -6337,8 +6510,17 @@ class ResponsesRequestExecution:
                                 terminal.data,
                                 event_type="response.failed",
                                 semantic_outcome="failed",
+                                terminal_timeline_event=True,
                             )
                         )
+                        diagnostics = self.current_info.get(
+                            "_responses_stream_diagnostics_tracker"
+                        )
+                        if isinstance(
+                            diagnostics,
+                            ResponsesStreamDiagnostics,
+                        ):
+                            diagnostics.mark_terminal_queue_handoff_completed()
                         self.last_response_failed_terminal = None
                         self.current_info["stream_error_status_code"] = int(
                             terminal.status_code
@@ -6457,21 +6639,25 @@ class ResponsesRequestExecution:
     async def _emit_stream_chunk(self, chunk: Any) -> None:
         if self.stream_output_queue is None:
             return
+        diagnostics = self.stream_phase_diagnostics
         reservation = None
         event_type = None
         semantic_outcome = None
+        terminal_timeline_event = False
         sse_metadata_complete = False
         usage_snapshot = None
         if isinstance(chunk, ReservedStreamChunk):
             reservation = chunk.reservation
             event_type = chunk.event_type
             semantic_outcome = chunk.semantic_outcome
+            terminal_timeline_event = chunk.terminal_timeline_event
             sse_metadata_complete = chunk.sse_metadata_complete
             usage_snapshot = chunk.usage_snapshot
             chunk = chunk.data
         elif isinstance(chunk, ObservedStreamChunk):
             event_type = chunk.event_type
             semantic_outcome = chunk.semantic_outcome
+            terminal_timeline_event = chunk.terminal_timeline_event
             sse_metadata_complete = chunk.sse_metadata_complete
             usage_snapshot = chunk.usage_snapshot
             chunk = chunk.data
@@ -6498,6 +6684,7 @@ class ResponsesRequestExecution:
                         segment,
                         event_type=event_type,
                         semantic_outcome=semantic_outcome,
+                        terminal_timeline_event=terminal_timeline_event,
                         final_event_segment=(
                             offset + len(segment) >= len(chunk_bytes)
                         ),
@@ -6510,6 +6697,11 @@ class ResponsesRequestExecution:
                     else None
                 )
                 try:
+                    queue_phase = (
+                        diagnostics.begin_phase("queue_put")
+                        if diagnostics is not None
+                        else None
+                    )
                     await self.stream_output_queue.put(
                         queue_item,
                         size=len(segment),
@@ -6519,9 +6711,26 @@ class ResponsesRequestExecution:
                     if transferred is not None and not transferred.released:
                         await transferred.release()
                     raise
+                finally:
+                    if diagnostics is not None:
+                        diagnostics.finish_phase(
+                            "queue_put",
+                            queue_phase,
+                            bytes_count=len(segment),
+                            events=(
+                                1
+                                if offset + len(segment) >= len(chunk_bytes)
+                                else 0
+                            ),
+                        )
             if not chunk_bytes:
                 transferred = reservation.split(0) if reservation is not None else None
                 try:
+                    queue_phase = (
+                        diagnostics.begin_phase("queue_put")
+                        if diagnostics is not None
+                        else None
+                    )
                     await self.stream_output_queue.put(
                         b"",
                         retained_byte_lease=transferred,
@@ -6530,6 +6739,13 @@ class ResponsesRequestExecution:
                     if transferred is not None and not transferred.released:
                         await transferred.release()
                     raise
+                finally:
+                    if diagnostics is not None:
+                        diagnostics.finish_phase(
+                            "queue_put",
+                            queue_phase,
+                            events=1,
+                        )
         finally:
             if reservation is not None and not reservation.released:
                 await reservation.release()
@@ -6999,6 +7215,12 @@ class ResponsesRequestExecution:
     async def _execute_stream_attempt(self, client: Any, attempt: Any, headers: dict[str, str], json_payload: str):
         _mark_current_info_stage(self.current_info, "upstream_send_start")
         runtime_gauges.begin_waiting_first_byte(self.current_info)
+        if "_performance_phase_sampled" not in self.current_info:
+            self.current_info["_performance_phase_sampled"] = (
+                worker_runtime_observer.should_sample_phase_request(
+                    "responses_stream"
+                )
+            )
         diagnostics = ResponsesStreamDiagnostics(
             current_info=self.current_info,
             attempt_index=attempt.state.get("observability_attempt_index"),
@@ -7012,6 +7234,17 @@ class ResponsesRequestExecution:
             terminal_marker_missing_observer=(
                 worker_runtime_observer.record_terminal_marker_missing
             ),
+            phase_sampled=bool(
+                self.current_info.get("_performance_phase_sampled")
+            ),
+            phase_sample_rate=worker_runtime_observer.phase_sample_rate,
+            phase_observer=worker_runtime_observer.record_phase_sample,
+            socket_unread_observer=(
+                worker_runtime_observer.record_socket_unread_bytes
+            ),
+        )
+        self.stream_phase_diagnostics = (
+            diagnostics if diagnostics.phase_sampled else None
         )
         attempt.state["responses_stream_diagnostics_tracker"] = diagnostics
         first_byte_timeout = _optional_positive_timeout(attempt.state.get("first_byte_timeout"))
@@ -7259,6 +7492,7 @@ class ResponsesRequestExecution:
         total_timeout_seconds: Any = None,
     ):
         diagnostics.set_phase("postcommit")
+        phase_diagnostics = diagnostics if diagnostics.phase_sampled else None
         completed_seen = False
         incomplete_seen = False
         usage_seen = False
@@ -7339,6 +7573,11 @@ class ResponsesRequestExecution:
                     stage="after-stream-commit",
                 ):
                     raise DownstreamDisconnectedDuringWait()
+                receive_phase = (
+                    phase_diagnostics.begin_phase("socket_receive")
+                    if phase_diagnostics is not None
+                    else None
+                )
                 try:
                     chunk = await _await_first_byte_deadline(
                         upstream_iter.__anext__(),
@@ -7346,9 +7585,27 @@ class ResponsesRequestExecution:
                         total_timeout_seconds=total_timeout_seconds,
                         disconnect_event=self.disconnect_event,
                     )
-                    chunk_received_at = datetime.now(timezone.utc)
+                    chunk_receive_timing = _capture_stream_receive_timing()
                 except StopAsyncIteration:
+                    if phase_diagnostics is not None:
+                        phase_diagnostics.finish_phase(
+                            "socket_receive",
+                            receive_phase,
+                        )
                     break
+                except BaseException:
+                    if phase_diagnostics is not None:
+                        phase_diagnostics.finish_phase(
+                            "socket_receive",
+                            receive_phase,
+                        )
+                    raise
+                if phase_diagnostics is not None:
+                    phase_diagnostics.finish_phase(
+                        "socket_receive",
+                        receive_phase,
+                        bytes_count=len(chunk),
+                    )
                 if self._downstream_disconnected(
                     attempt,
                     stage="after-stream-commit",
@@ -7358,7 +7615,26 @@ class ResponsesRequestExecution:
                     # that raced with that disconnect.
                     chunk = None
                     raise DownstreamDisconnectedDuringWait()
-                raw_events = proxy_sse_parser.feed(bytes(chunk))
+                chunk_size = len(chunk)
+                frame_phase = (
+                    phase_diagnostics.begin_phase("sse_frame")
+                    if phase_diagnostics is not None
+                    else None
+                )
+                try:
+                    raw_events = proxy_sse_parser.feed(bytes(chunk))
+                finally:
+                    if phase_diagnostics is not None:
+                        phase_diagnostics.finish_phase(
+                            "sse_frame",
+                            frame_phase,
+                            bytes_count=chunk_size,
+                            events=(
+                                len(raw_events)
+                                if isinstance(raw_events, list)
+                                else 0
+                            ),
+                        )
                 chunk = None
                 try:
                     for event_index in range(len(raw_events)):
@@ -7369,7 +7645,7 @@ class ResponsesRequestExecution:
                                 None,
                                 False,
                                 False,
-                                chunk_received_at,
+                                chunk_receive_timing,
                                 None,
                             )
                         finally:
@@ -7378,13 +7654,30 @@ class ResponsesRequestExecution:
                 finally:
                     raw_events.clear()
                     raw_events = None
-                    chunk_received_at = None
+                    chunk_receive_timing = None
 
             diagnostics.observe_partial_diagnostics(
                 proxy_sse_parser.pending_diagnostics()
             )
-            eof_received_at = datetime.now(timezone.utc)
-            raw_events = proxy_sse_parser.finish()
+            eof_receive_timing = _capture_stream_receive_timing()
+            frame_phase = (
+                phase_diagnostics.begin_phase("sse_frame")
+                if phase_diagnostics is not None
+                else None
+            )
+            try:
+                raw_events = proxy_sse_parser.finish()
+            finally:
+                if phase_diagnostics is not None:
+                    phase_diagnostics.finish_phase(
+                        "sse_frame",
+                        frame_phase,
+                        events=(
+                            len(raw_events)
+                            if isinstance(raw_events, list)
+                            else 0
+                        ),
+                    )
             try:
                 for event_index in range(len(raw_events)):
                     raw_event = raw_events[event_index]
@@ -7394,7 +7687,7 @@ class ResponsesRequestExecution:
                             None,
                             False,
                             False,
-                            eof_received_at,
+                            eof_receive_timing,
                             None,
                         )
                     finally:
@@ -7403,7 +7696,7 @@ class ResponsesRequestExecution:
             finally:
                 raw_events.clear()
                 raw_events = None
-                eof_received_at = None
+                eof_receive_timing = None
 
         source = source_events()
         try:
@@ -7412,7 +7705,7 @@ class ResponsesRequestExecution:
                 reservation,
                 from_precommit_buffer,
                 already_observed,
-                received_at,
+                receive_timing,
                 upstream_event_bytes,
             ) in source:
                 event_bytes = None
@@ -7420,6 +7713,21 @@ class ResponsesRequestExecution:
                 failure = None
                 event_owner = None
                 usage_snapshot = None
+                received_at = (
+                    receive_timing.received_at
+                    if receive_timing is not None
+                    else None
+                )
+                received_unix_nano = (
+                    receive_timing.unix_nano
+                    if receive_timing is not None
+                    else None
+                )
+                received_monotonic_nano = (
+                    receive_timing.monotonic_nano
+                    if receive_timing is not None
+                    else None
+                )
                 try:
                     if not raw_event.strip():
                         continue
@@ -7430,6 +7738,10 @@ class ResponsesRequestExecution:
                                     raw_event,
                                     has_data_field=False,
                                     received_at=received_at,
+                                    received_unix_nano=received_unix_nano,
+                                    received_monotonic_nano=(
+                                        received_monotonic_nano
+                                    ),
                                 )
                             # This hop-local marker is consumed by diagnostics
                             # and must never change the downstream SSE contract.
@@ -7440,12 +7752,30 @@ class ResponsesRequestExecution:
                             )
                         event_bytes = upstream_event_bytes
                         if not already_observed:
-                            diagnostics.observe_complete_event(
-                                raw_event,
-                                has_data_field=False,
-                                wire_bytes=event_bytes,
-                                received_at=received_at,
+                            observer_phase = (
+                                phase_diagnostics.begin_phase("observer_hash")
+                                if phase_diagnostics is not None
+                                else None
                             )
+                            try:
+                                diagnostics.observe_complete_event(
+                                    raw_event,
+                                    has_data_field=False,
+                                    wire_bytes=event_bytes,
+                                    received_at=received_at,
+                                    received_unix_nano=received_unix_nano,
+                                    received_monotonic_nano=(
+                                        received_monotonic_nano
+                                    ),
+                                )
+                            finally:
+                                if phase_diagnostics is not None:
+                                    phase_diagnostics.finish_phase(
+                                        "observer_hash",
+                                        observer_phase,
+                                        bytes_count=len(event_bytes),
+                                        events=1,
+                                    )
                         if reservation is None:
                             yield event_bytes
                         else:
@@ -7454,6 +7784,11 @@ class ResponsesRequestExecution:
                             yield ReservedStreamChunk(event_bytes, transferred)
                         continue
 
+                    parse_phase = (
+                        phase_diagnostics.begin_phase("json_parse")
+                        if phase_diagnostics is not None
+                        else None
+                    )
                     try:
                         event_owner = await parse_owned_sse_event(
                             raw_event,
@@ -7470,30 +7805,84 @@ class ResponsesRequestExecution:
                                 _raw_responses_sse_event_bytes(raw_event)
                             )
                         if not already_observed:
-                            diagnostics.observe_complete_event(
-                                raw_event,
-                                has_data_field=sse_event_has_data_field(
-                                    raw_event
-                                ),
-                                wire_bytes=upstream_event_bytes,
-                                received_at=received_at,
-                                force_hash=True,
+                            observer_phase = (
+                                phase_diagnostics.begin_phase("observer_hash")
+                                if phase_diagnostics is not None
+                                else None
                             )
+                            try:
+                                diagnostics.observe_complete_event(
+                                    raw_event,
+                                    has_data_field=sse_event_has_data_field(
+                                        raw_event
+                                    ),
+                                    wire_bytes=upstream_event_bytes,
+                                    received_at=received_at,
+                                    received_unix_nano=received_unix_nano,
+                                    received_monotonic_nano=(
+                                        received_monotonic_nano
+                                    ),
+                                    force_hash=True,
+                                )
+                            finally:
+                                if phase_diagnostics is not None:
+                                    phase_diagnostics.finish_phase(
+                                        "observer_hash",
+                                        observer_phase,
+                                        bytes_count=len(upstream_event_bytes),
+                                        events=1,
+                                    )
                         raise
+                    finally:
+                        if phase_diagnostics is not None:
+                            phase_diagnostics.finish_phase(
+                                "json_parse",
+                                parse_phase,
+                                bytes_count=(
+                                    len(upstream_event_bytes)
+                                    if upstream_event_bytes is not None
+                                    else 0
+                                ),
+                                events=1,
+                            )
                     event_type = event_owner.event_name
                     event_payload = event_owner.payload
+                    diagnostics.mark_terminal_parse_completed(
+                        event_type,
+                        received_at=received_at,
+                        received_unix_nano=received_unix_nano,
+                        received_monotonic_nano=received_monotonic_nano,
+                    )
                     if upstream_event_bytes is None:
                         upstream_event_bytes = _raw_responses_sse_event_bytes(
                             raw_event
                         )
                     if not already_observed:
-                        diagnostics.observe_complete_event(
-                            raw_event,
-                            has_data_field=event_owner.has_data_field,
-                            event_type=event_type,
-                            wire_bytes=upstream_event_bytes,
-                            received_at=received_at,
+                        observer_phase = (
+                            phase_diagnostics.begin_phase("observer_hash")
+                            if phase_diagnostics is not None
+                            else None
                         )
+                        try:
+                            diagnostics.observe_complete_event(
+                                raw_event,
+                                has_data_field=event_owner.has_data_field,
+                                event_type=event_type,
+                                wire_bytes=upstream_event_bytes,
+                                received_at=received_at,
+                                received_unix_nano=received_unix_nano,
+                                received_monotonic_nano=(
+                                    received_monotonic_nano
+                                ),
+                            )
+                        finally:
+                            if phase_diagnostics is not None:
+                                phase_diagnostics.finish_phase(
+                                    "observer_hash",
+                                    observer_phase,
+                                    bytes_count=len(upstream_event_bytes),
+                                    events=1,
+                                )
                     semantic_failure = None
                     terminal_success = False
                     try:
@@ -7592,14 +7981,26 @@ class ResponsesRequestExecution:
                             semantic_outcome = "incomplete"
                         else:
                             semantic_outcome = "nonterminal"
-                        diagnostics.observe_parsed_event(
-                            raw_event,
-                            event_type,
-                            event_payload,
-                            semantic_outcome=semantic_outcome,
-                            wire_bytes=upstream_event_bytes,
-                            received_at=received_at,
+                        observer_phase = (
+                            phase_diagnostics.begin_phase("observer_hash")
+                            if phase_diagnostics is not None
+                            else None
                         )
+                        try:
+                            diagnostics.observe_parsed_event(
+                                raw_event,
+                                event_type,
+                                event_payload,
+                                semantic_outcome=semantic_outcome,
+                                wire_bytes=upstream_event_bytes,
+                                received_at=received_at,
+                            )
+                        finally:
+                            if phase_diagnostics is not None:
+                                phase_diagnostics.finish_phase(
+                                    "observer_hash",
+                                    observer_phase,
+                                )
                         # The JSON graph is already materialized here.  Read
                         # the bounded scalar metadata directly instead of
                         # relying on a textual key prefilter: JSON object keys
@@ -7676,6 +8077,7 @@ class ResponsesRequestExecution:
                                 transferred,
                                 event_type=downstream_event_type,
                                 semantic_outcome="failed",
+                                terminal_timeline_event=True,
                                 usage_snapshot=usage_snapshot,
                             )
                             terminal_queue_handoff_completed = True
@@ -7712,6 +8114,7 @@ class ResponsesRequestExecution:
                                 transferred,
                                 event_type=event_type,
                                 semantic_outcome=semantic_outcome,
+                                terminal_timeline_event=True,
                                 usage_snapshot=usage_snapshot,
                             )
                         else:
@@ -7723,6 +8126,7 @@ class ResponsesRequestExecution:
                                 transferred,
                                 event_type=event_type,
                                 semantic_outcome=semantic_outcome,
+                                terminal_timeline_event=False,
                                 usage_snapshot=usage_snapshot,
                             )
 
@@ -7764,6 +8168,9 @@ class ResponsesRequestExecution:
                     from_precommit_buffer = False
                     already_observed = False
                     received_at = None
+                    received_unix_nano = None
+                    received_monotonic_nano = None
+                    receive_timing = None
                     if reservation is not None:
                         await reservation.release()
             raise SSEProtocolError(

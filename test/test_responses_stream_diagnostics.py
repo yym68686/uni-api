@@ -198,13 +198,159 @@ def test_nonterminal_event_records_metadata_without_hashing():
         received_at=received_at,
     )
 
-    assert tracker.facts["schema_version"] == 3
+    assert tracker.facts["schema_version"] == 4
     assert tracker.facts["event_hash_policy"] == "terminal_or_error_only_v1"
     assert tracker.facts["complete_event_count"] == 1
     assert tracker.facts["last_event_type"] == "response.output_text.delta"
     assert tracker.facts["last_event_bytes"] == len(wire)
     assert "last_event_sha256" not in tracker.facts
     assert "last_event_received_at" not in tracker.facts
+
+
+def test_terminal_timeline_uses_exact_monotonic_stage_boundaries():
+    wall_values = iter(
+        [
+            1_700_000_000_000_001_000,
+            1_700_000_000_000_002_000,
+            1_700_000_000_000_003_000,
+            1_700_000_000_000_004_000,
+            1_700_000_000_000_005_000,
+            1_700_000_000_000_006_000,
+        ]
+    )
+    monotonic_values = iter([11_000, 12_000, 13_000, 14_000, 15_000, 16_000])
+    tracker = ResponsesStreamDiagnostics(
+        current_info={"upstream_attempts": [{}]},
+        attempt_index=0,
+        logical_authority="oaix.example",
+        proxy_configured=False,
+        wall_time_ns=lambda: next(wall_values),
+        monotonic_ns=lambda: next(monotonic_values),
+    )
+    received_unix_nano = 1_700_000_000_000_000_000
+    received_monotonic_nano = 10_000
+    raw_event = _completed_event().decode("utf-8").rstrip("\n")
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+            },
+        },
+    }
+
+    tracker.mark_terminal_parse_completed(
+        "response.completed",
+        received_unix_nano=received_unix_nano,
+        received_monotonic_nano=received_monotonic_nano,
+    )
+    tracker.observe_complete_event(
+        raw_event,
+        received_unix_nano=received_unix_nano,
+        received_monotonic_nano=received_monotonic_nano,
+    )
+    tracker.observe_parsed_event(
+        raw_event,
+        "response.completed",
+        payload,
+        semantic_outcome="completed",
+    )
+    tracker.mark_terminal_queue_handoff_completed()
+    tracker.mark_terminal_asgi_write_attempted()
+    tracker.mark_terminal_asgi_write_completed()
+
+    facts = tracker.facts
+    assert facts["terminal_timeline_complete"] is True
+    assert facts["terminal_received_unix_nano"] == received_unix_nano
+    assert facts["terminal_received_monotonic_nano"] == (
+        received_monotonic_nano
+    )
+    assert facts["terminal_parse_completed_monotonic_nano"] == 11_000
+    assert facts["terminal_observer_completed_monotonic_nano"] == 12_000
+    assert facts["terminal_semantic_classified_monotonic_nano"] == 13_000
+    assert facts["terminal_queue_handoff_completed_monotonic_nano"] == 14_000
+    assert facts["terminal_asgi_write_attempted_monotonic_nano"] == 15_000
+    assert facts["terminal_asgi_write_completed_monotonic_nano"] == 16_000
+    assert facts["terminal_received_to_parse_completed_us"] == 1.0
+    assert facts["terminal_parse_completed_to_observer_completed_us"] == 1.0
+    assert facts[
+        "terminal_queue_handoff_completed_to_asgi_write_attempted_us"
+    ] == 1.0
+
+
+def test_phase_sample_records_only_timing_and_numeric_work_counters():
+    observed = []
+    monotonic_values = iter([100, 350])
+    cpu_values = iter([20, 70])
+    tracker = ResponsesStreamDiagnostics(
+        current_info={"upstream_attempts": [{}]},
+        attempt_index=0,
+        logical_authority="oaix.example",
+        proxy_configured=False,
+        phase_sampled=True,
+        phase_sample_rate=128,
+        phase_observer=lambda phase, **metrics: observed.append(
+            (phase, metrics)
+        ),
+        monotonic_ns=lambda: next(monotonic_values),
+        thread_cpu_ns=lambda: next(cpu_values),
+    )
+
+    token = tracker.begin_phase("json_parse")
+    tracker.finish_phase(
+        "json_parse",
+        token,
+        bytes_count=512,
+        events=2,
+    )
+
+    assert tracker.facts["phase_json_parse_samples"] == 1
+    assert tracker.facts["phase_json_parse_wall_ns"] == 250
+    assert tracker.facts["phase_json_parse_cpu_ns"] == 50
+    assert tracker.facts["phase_json_parse_bytes"] == 512
+    assert tracker.facts["phase_json_parse_events"] == 2
+    assert observed == [
+        (
+            "json_parse",
+            {
+                "wall_ns": 250,
+                "cpu_ns": 50,
+                "bytes_count": 512,
+                "events": 2,
+            },
+        )
+    ]
+
+
+def test_kernel_socket_unread_sample_revalidates_fd_inode(monkeypatch):
+    ioctl_calls = []
+    monkeypatch.setattr(responses_stream_observability.sys, "platform", "linux")
+    monkeypatch.setattr(
+        responses_stream_observability.os,
+        "readlink",
+        lambda _path: "socket:[123]",
+    )
+    monkeypatch.setattr(
+        responses_stream_observability.fcntl,
+        "ioctl",
+        lambda fd, operation, value: (
+            ioctl_calls.append((fd, operation, value)) or b"\x00\x10\x00\x00"
+        ),
+    )
+
+    assert responses_stream_observability._kernel_socket_unread_bytes(
+        9,
+        "123",
+    ) == 4096
+    assert len(ioctl_calls) == 1
+    assert responses_stream_observability._kernel_socket_unread_bytes(
+        9,
+        "999",
+    ) is None
+    assert len(ioctl_calls) == 1
 
 
 def test_semantic_failure_hashes_existing_wire_bytes_once_classified():
@@ -859,6 +1005,7 @@ def _completed_event() -> bytes:
 
 def _observe_completed_terminal(tracker: ResponsesStreamDiagnostics) -> None:
     raw_event = _completed_event().decode("utf-8").rstrip("\n")
+    tracker.mark_terminal_parse_completed("response.completed")
     tracker.observe_complete_event(raw_event)
     tracker.observe_parsed_event(
         raw_event,
@@ -887,6 +1034,7 @@ def test_downstream_terminal_is_recorded_only_after_asgi_send_returns():
             _completed_event(),
             event_type="response.completed",
             semantic_outcome="completed",
+            terminal_timeline_event=True,
         )
 
     sent = []
@@ -913,8 +1061,76 @@ def test_downstream_terminal_is_recorded_only_after_asgi_send_returns():
     assert any(b"response.completed" in message.get("body", b"") for message in sent)
     assert tracker.facts["downstream_terminal_seen"] is True
     assert tracker.facts["downstream_terminal_asgi_write_completed"] is True
+    assert tracker.facts["terminal_timeline_complete"] is True
+    monotonic_points = [
+        tracker.facts[f"terminal_{point}_monotonic_nano"]
+        for point in (
+            "received",
+            "parse_completed",
+            "observer_completed",
+            "semantic_classified",
+            "queue_handoff_completed",
+            "asgi_write_attempted",
+            "asgi_write_completed",
+        )
+    ]
+    assert monotonic_points == sorted(monotonic_points)
     assert tracker.facts["downstream_final_body_completed"] is True
     assert current_info["usage_seen"] is True
+
+
+def test_logging_response_lazily_binds_tracker_created_by_body_iterator():
+    current_info = {
+        "request_kind": "/v1/responses",
+        "upstream_attempts": [{}],
+    }
+    trackers = []
+
+    async def body():
+        tracker = ResponsesStreamDiagnostics(
+            current_info=current_info,
+            attempt_index=0,
+            logical_authority="oaix.example",
+            proxy_configured=False,
+            phase_sampled=True,
+        )
+        trackers.append(tracker)
+        _observe_completed_terminal(tracker)
+        yield ObservedStreamChunk(
+            _completed_event(),
+            event_type="response.completed",
+            semantic_outcome="completed",
+            terminal_timeline_event=True,
+        )
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def run():
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info=current_info,
+        )
+        assert response._responses_diagnostics_tracker is None
+        await response(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+    assert len(trackers) == 1
+    tracker = trackers[0]
+    assert tracker.facts["terminal_timeline_complete"] is True
+    assert tracker.facts["downstream_terminal_asgi_write_completed"] is True
+    assert tracker.facts["phase_asgi_write_samples"] >= 1
+    assert any(b"response.completed" in item.get("body", b"") for item in sent)
 
 
 class _MetadataBypassParser:

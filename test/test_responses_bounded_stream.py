@@ -13,6 +13,7 @@ from uni_api.admission import (
     reset_request_admission_lease,
 )
 from uni_api.runtime import ResponsesRequestExecution, _prime_responses_upstream_stream
+from uni_api.observability.responses_stream import ResponsesStreamDiagnostics
 from uni_api.streaming.bounded_queue import StreamQueuePutTimeout
 from uni_api.streaming.logging_response import LoggingStreamingResponse
 from uni_api.streaming.sse import IncrementalSSEParser
@@ -336,6 +337,51 @@ def test_responses_precommit_preserves_split_crlf_parser_state_after_commit():
         assert resumed.finish() == []
 
     asyncio.run(scenario())
+
+
+def test_responses_precommit_sampled_request_reports_pipeline_phases():
+    async def scenario():
+        observed = []
+        diagnostics = ResponsesStreamDiagnostics(
+            current_info={"upstream_attempts": [{}]},
+            attempt_index=0,
+            logical_authority="benchmark.invalid",
+            proxy_configured=False,
+            phase_sampled=True,
+            phase_observer=lambda phase, **metrics: observed.append(
+                (phase, metrics)
+            ),
+        )
+
+        async def upstream_chunks():
+            yield (
+                "event: response.output_text.delta\n"
+                'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+            ).encode()
+
+        buffered, committed = await _prime_responses_upstream_stream(
+            upstream_chunks(),
+            diagnostics=diagnostics,
+        )
+        try:
+            assert committed is True
+        finally:
+            await buffered.clear()
+        return observed
+
+    observed = asyncio.run(scenario())
+    phases = {phase for phase, _metrics in observed}
+    assert {
+        "socket_receive",
+        "sse_frame",
+        "json_parse",
+        "observer_hash",
+    }.issubset(phases)
+    assert all(
+        set(metrics) == {"wall_ns", "cpu_ns", "bytes_count", "events"}
+        and all(isinstance(value, int) for value in metrics.values())
+        for _phase, metrics in observed
+    )
 
 
 def test_responses_queue_and_logging_complete_normal_stream_without_disconnect(monkeypatch):

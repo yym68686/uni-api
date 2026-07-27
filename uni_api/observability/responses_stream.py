@@ -9,14 +9,23 @@ import math
 import os
 import re
 import secrets
+import struct
+import sys
 import weakref
 from datetime import datetime, timezone
+from itertools import count
+from time import perf_counter_ns, thread_time_ns, time_ns
 from typing import Any, Callable
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production is Linux
+    fcntl = None
 
 from uni_api.upstream.transport_errors import classify_httpx_transport_error
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _MAX_CAUSE_DEPTH = 16
 _MAX_TRACE_EVENTS = 32
 _MAX_CLEANUP_ACTIONS = 8
@@ -27,6 +36,28 @@ _ENDPOINT_HMAC_KEY = secrets.token_bytes(32)
 _TrackerRef = weakref.ReferenceType[Any]
 _SOCKET_TRACKERS: dict[str, set[_TrackerRef]] = {}
 _NETWORK_STREAM_TRACKERS: dict[int, set[_TrackerRef]] = {}
+_SOCKET_UNREAD_SAMPLE_RATE = 128
+_SOCKET_UNREAD_SAMPLE_SEQUENCE = count()
+_LINUX_FIONREAD = 0x541B
+_PERFORMANCE_PHASES = frozenset(
+    {
+        "socket_receive",
+        "sse_frame",
+        "json_parse",
+        "observer_hash",
+        "queue_put",
+        "asgi_write",
+    }
+)
+_TERMINAL_TIMELINE_POINTS = (
+    "received",
+    "parse_completed",
+    "observer_completed",
+    "semantic_classified",
+    "queue_handoff_completed",
+    "asgi_write_attempted",
+    "asgi_write_completed",
+)
 
 OAIX_TERMINAL_FLUSH_MARKER_HEADER = "x-oaix-terminal-flush-marker"
 OAIX_TERMINAL_FLUSH_MARKER_CONTRACT = "sse-comment-v1"
@@ -247,6 +278,36 @@ def _socket_inode(sock: Any) -> str | None:
         return None
     match = re.fullmatch(r"socket:\[(\d+)]", target)
     return match.group(1) if match else None
+
+
+def _socket_file_descriptor(sock: Any) -> int | None:
+    fileno = getattr(sock, "fileno", None)
+    if not callable(fileno):
+        return None
+    try:
+        fd = int(fileno())
+    except (OSError, TypeError, ValueError):
+        return None
+    return fd if fd >= 0 else None
+
+
+def _kernel_socket_unread_bytes(fd: int, expected_inode: str) -> int | None:
+    """Return Linux receive-queue bytes only if the fd still owns this socket."""
+
+    if fcntl is None or not sys.platform.startswith("linux"):
+        return None
+    try:
+        target = os.readlink(f"/proc/self/fd/{int(fd)}")
+        if target != f"socket:[{expected_inode}]":
+            return None
+        encoded = fcntl.ioctl(
+            int(fd),
+            _LINUX_FIONREAD,
+            struct.pack("I", 0),
+        )
+        return max(0, int(struct.unpack("I", encoded[:4])[0]))
+    except (OSError, TypeError, ValueError, struct.error):
+        return None
 
 
 def _endpoint_parts(value: Any) -> tuple[str | None, int | None, str | None]:
@@ -504,8 +565,16 @@ class ResponsesStreamDiagnostics:
         sse_event_observer: Callable[[int], Any] | None = None,
         terminal_hop_observer: Callable[[dict[str, Any]], Any] | None = None,
         terminal_marker_missing_observer: Callable[[], Any] | None = None,
+        phase_sampled: bool = False,
+        phase_sample_rate: int = 128,
+        phase_observer: Callable[..., Any] | None = None,
+        socket_unread_observer: Callable[[int | None], Any] | None = None,
+        wall_time_ns: Callable[[], int] = time_ns,
+        monotonic_ns: Callable[[], int] = perf_counter_ns,
+        thread_cpu_ns: Callable[[], int] = thread_time_ns,
     ) -> None:
         self._socket_inode: str | None = None
+        self._socket_fd: int | None = None
         self._network_stream_id: int | None = None
         self._cleanup_claimed = False
         self._cleanup_owner_claimed = False
@@ -516,16 +585,35 @@ class ResponsesStreamDiagnostics:
         self._terminal_marker_missing_observer = (
             terminal_marker_missing_observer
         )
+        self._phase_sampled = bool(phase_sampled)
+        self._phase_sample_rate = max(1, int(phase_sample_rate))
+        self._phase_observer = phase_observer
+        self._socket_unread_observer = socket_unread_observer
+        self._wall_time_ns = wall_time_ns
+        self._monotonic_ns = monotonic_ns
+        self._thread_cpu_ns = thread_cpu_ns
         self._request_id = _safe_text(current_info.get("request_id"), max_bytes=256)
         self._trace_id = _safe_text(current_info.get("trace_id"), max_bytes=256)
         self._declared_terminal_received_at: datetime | None = None
         self._oaix_terminal_flush_marker: dict[str, Any] | None = None
         self._terminal_hop_emitted = False
         self._terminal_marker_missing_recorded = False
+        self._terminal_received_monotonic_ns: int | None = None
         self._facts: dict[str, Any] = {
             "schema_version": _SCHEMA_VERSION,
             "hash_scope": "ember_normalized_sse_event_lf_v1",
             "event_hash_policy": "terminal_or_error_only_v1",
+            "terminal_timeline_schema_version": 1,
+            "terminal_timeline_clock": "unix_nano_plus_process_monotonic_v1",
+            "terminal_received_semantics": "upstream_iterator_yield_completed_v1",
+            "phase_sample_rate": self._phase_sample_rate,
+            "phase_sampled": self._phase_sampled,
+            "phase_cpu_semantics": "calling_thread_elapsed_inclusive_v1",
+            "phase_bytes_semantics": "known_wire_bytes_only_v1",
+            "socket_unread_sample_rate": _SOCKET_UNREAD_SAMPLE_RATE,
+            "socket_unread_semantics": (
+                "linux_connection_receive_queue_after_chunk_v1"
+            ),
             "partial_hash_scope": "normalized_prefix_plus_utf8_tail_v1",
             "transport_peer_semantics": "physical_peer_may_be_proxy",
             "logical_authority": _safe_text(logical_authority, max_bytes=256),
@@ -583,6 +671,166 @@ class ResponsesStreamDiagnostics:
                 "oaix_terminal_flush_to_ember_receive_observed"
             )
         )
+
+    @property
+    def phase_sampled(self) -> bool:
+        return self._phase_sampled
+
+    def begin_phase(self, phase: str) -> tuple[int, int] | None:
+        if not self._phase_sampled or phase not in _PERFORMANCE_PHASES:
+            return None
+        try:
+            return self._monotonic_ns(), self._thread_cpu_ns()
+        except Exception as exc:
+            self._facts["phase_sampler_error"] = type(exc).__name__
+            return None
+
+    def finish_phase(
+        self,
+        phase: str,
+        token: tuple[int, int] | None,
+        *,
+        bytes_count: int = 0,
+        events: int = 0,
+    ) -> None:
+        if token is None or phase not in _PERFORMANCE_PHASES:
+            return
+        try:
+            wall_ns = max(0, self._monotonic_ns() - int(token[0]))
+            cpu_ns = max(0, self._thread_cpu_ns() - int(token[1]))
+            normalized_bytes = max(0, int(bytes_count))
+            normalized_events = max(0, int(events))
+            prefix = f"phase_{phase}"
+            self._facts[f"{prefix}_samples"] = int(
+                self._facts.get(f"{prefix}_samples") or 0
+            ) + 1
+            self._facts[f"{prefix}_wall_ns"] = int(
+                self._facts.get(f"{prefix}_wall_ns") or 0
+            ) + wall_ns
+            self._facts[f"{prefix}_cpu_ns"] = int(
+                self._facts.get(f"{prefix}_cpu_ns") or 0
+            ) + cpu_ns
+            self._facts[f"{prefix}_bytes"] = int(
+                self._facts.get(f"{prefix}_bytes") or 0
+            ) + normalized_bytes
+            self._facts[f"{prefix}_events"] = int(
+                self._facts.get(f"{prefix}_events") or 0
+            ) + normalized_events
+            observer = self._phase_observer
+            if observer is not None:
+                observer(
+                    phase,
+                    wall_ns=wall_ns,
+                    cpu_ns=cpu_ns,
+                    bytes_count=normalized_bytes,
+                    events=normalized_events,
+                )
+        except Exception as exc:
+            self._facts["phase_sampler_error"] = type(exc).__name__
+
+    @staticmethod
+    def _iso_from_unix_nano(value: int) -> str:
+        return datetime.fromtimestamp(
+            int(value) / 1_000_000_000,
+            tz=timezone.utc,
+        ).isoformat()
+
+    def _record_terminal_timeline_point(
+        self,
+        point: str,
+        *,
+        unix_nano: int | None = None,
+        monotonic_nano: int | None = None,
+    ) -> None:
+        if point not in _TERMINAL_TIMELINE_POINTS:
+            return
+        unix_key = f"terminal_{point}_unix_nano"
+        monotonic_key = f"terminal_{point}_monotonic_nano"
+        if unix_key in self._facts and monotonic_key in self._facts:
+            return
+        try:
+            observed_unix = (
+                self._wall_time_ns()
+                if unix_nano is None
+                else max(1, int(unix_nano))
+            )
+            observed_monotonic = (
+                self._monotonic_ns()
+                if monotonic_nano is None
+                else max(1, int(monotonic_nano))
+            )
+        except Exception as exc:
+            self._facts["terminal_timeline_error"] = type(exc).__name__
+            return
+        self._facts.setdefault(unix_key, observed_unix)
+        self._facts.setdefault(monotonic_key, observed_monotonic)
+        if point == "received" and self._terminal_received_monotonic_ns is None:
+            self._terminal_received_monotonic_ns = observed_monotonic
+        received_monotonic = self._terminal_received_monotonic_ns
+        if received_monotonic is not None:
+            self._facts[f"terminal_{point}_from_receive_us"] = (
+                observed_monotonic - received_monotonic
+            ) / 1000.0
+        self._refresh_terminal_timeline_durations()
+
+    def _refresh_terminal_timeline_durations(self) -> None:
+        transitions = (
+            ("received", "parse_completed"),
+            ("parse_completed", "observer_completed"),
+            ("observer_completed", "semantic_classified"),
+            ("semantic_classified", "queue_handoff_completed"),
+            ("queue_handoff_completed", "asgi_write_attempted"),
+            ("asgi_write_attempted", "asgi_write_completed"),
+        )
+        for start, end in transitions:
+            start_value = self._facts.get(
+                f"terminal_{start}_monotonic_nano"
+            )
+            end_value = self._facts.get(f"terminal_{end}_monotonic_nano")
+            if isinstance(start_value, int) and isinstance(end_value, int):
+                self._facts[f"terminal_{start}_to_{end}_us"] = (
+                    end_value - start_value
+                ) / 1000.0
+        if all(
+            f"terminal_{point}_monotonic_nano" in self._facts
+            for point in _TERMINAL_TIMELINE_POINTS
+        ):
+            self._facts["terminal_timeline_complete"] = True
+
+    def mark_terminal_parse_completed(
+        self,
+        event_type: str,
+        *,
+        received_at: datetime | None = None,
+        received_unix_nano: int | None = None,
+        received_monotonic_nano: int | None = None,
+    ) -> None:
+        if event_type not in _TERMINAL_EVENT_TYPES:
+            return
+        if received_unix_nano is None and received_at is not None:
+            received_unix_nano = int(received_at.timestamp() * 1_000_000_000)
+        self._record_terminal_timeline_point(
+            "received",
+            unix_nano=received_unix_nano,
+            monotonic_nano=received_monotonic_nano,
+        )
+        self._record_terminal_timeline_point("parse_completed")
+
+    def mark_terminal_asgi_write_attempted(self) -> None:
+        if not self._facts.get("upstream_terminal_seen"):
+            return
+        self._record_terminal_timeline_point("asgi_write_attempted")
+
+    def mark_terminal_asgi_write_completed(self) -> None:
+        if not self._facts.get("upstream_terminal_seen"):
+            return
+        self._record_terminal_timeline_point("asgi_write_completed")
+        unix_nano = self._facts.get("terminal_asgi_write_completed_unix_nano")
+        if isinstance(unix_nano, int):
+            self._facts["downstream_terminal_asgi_write_completed_at"] = (
+                self._iso_from_unix_nano(unix_nano)
+            )
+        self._facts["downstream_terminal_asgi_write_completed"] = True
 
     def mark_terminal_flush_marker_missing(self, reason: str) -> None:
         if not self.expects_oaix_terminal_flush_marker:
@@ -709,6 +957,7 @@ class ResponsesStreamDiagnostics:
             inode = _socket_inode(sock)
             if inode:
                 self._socket_inode = inode
+                self._socket_fd = _socket_file_descriptor(sock)
                 self._facts["transport_socket_hmac"] = hmac.new(
                     _ENDPOINT_HMAC_KEY,
                     inode.encode("ascii"),
@@ -743,6 +992,40 @@ class ResponsesStreamDiagnostics:
                 observer(max(0, int(size)))
             except Exception as exc:
                 self._facts["sse_chunk_observer_error"] = type(exc).__name__
+        if (
+            self._socket_fd is not None
+            and self._socket_inode is not None
+            and next(_SOCKET_UNREAD_SAMPLE_SEQUENCE)
+            % _SOCKET_UNREAD_SAMPLE_RATE
+            == 0
+        ):
+            unread = _kernel_socket_unread_bytes(
+                self._socket_fd,
+                self._socket_inode,
+            )
+            if unread is None:
+                self._facts["socket_unread_sample_failures"] = int(
+                    self._facts.get("socket_unread_sample_failures") or 0
+                ) + 1
+            else:
+                self._facts["socket_unread_samples"] = int(
+                    self._facts.get("socket_unread_samples") or 0
+                ) + 1
+                self._facts["socket_unread_bytes_last"] = unread
+                self._facts["socket_unread_bytes_max"] = max(
+                    unread,
+                    int(self._facts.get("socket_unread_bytes_max") or 0),
+                )
+                self._facts["socket_unread_bytes_total"] = int(
+                    self._facts.get("socket_unread_bytes_total") or 0
+                ) + unread
+            if self._socket_unread_observer is not None:
+                try:
+                    self._socket_unread_observer(unread)
+                except Exception as exc:
+                    self._facts["socket_unread_observer_error"] = type(
+                        exc
+                    ).__name__
 
     def observe_complete_event(
         self,
@@ -752,6 +1035,8 @@ class ResponsesStreamDiagnostics:
         event_type: str | None = None,
         wire_bytes: bytes | None = None,
         received_at: datetime | None = None,
+        received_unix_nano: int | None = None,
+        received_monotonic_nano: int | None = None,
         force_hash: bool = False,
     ) -> None:
         try:
@@ -777,6 +1062,11 @@ class ResponsesStreamDiagnostics:
             received_at_text = None
             if should_hash:
                 digest_hex = hashlib.sha256(wire_bytes).hexdigest()
+                if received_unix_nano is not None and received_at is None:
+                    received_at = datetime.fromtimestamp(
+                        int(received_unix_nano) / 1_000_000_000,
+                        tz=timezone.utc,
+                    )
                 if received_at is None:
                     received_at = datetime.now(timezone.utc)
                 received_at_text = received_at.isoformat()
@@ -818,8 +1108,18 @@ class ResponsesStreamDiagnostics:
                 self._facts["declared_terminal_sha256"] = digest_hex
                 self._facts["declared_terminal_received_at"] = received_at_text
                 self._declared_terminal_received_at = received_at
+                if received_unix_nano is None:
+                    received_unix_nano = int(
+                        received_at.timestamp() * 1_000_000_000
+                    )
+                self._record_terminal_timeline_point(
+                    "received",
+                    unix_nano=received_unix_nano,
+                    monotonic_nano=received_monotonic_nano,
+                )
                 self._try_emit_terminal_hop_observation()
                 self._refresh_diagnosis()
+                self._record_terminal_timeline_point("observer_completed")
         except Exception as exc:
             self._facts["event_observer_error"] = type(exc).__name__
 
@@ -1090,10 +1390,20 @@ class ResponsesStreamDiagnostics:
                     self._facts.get("phase") or "unknown"
                 )
         self._refresh_diagnosis()
+        if semantic_outcome in {"completed", "incomplete", "failed"}:
+            self._record_terminal_timeline_point("semantic_classified")
 
     def mark_terminal_queue_handoff_completed(self) -> None:
         self._facts["ember_queue_terminal_handoff_completed"] = True
-        self._facts["ember_queue_terminal_handoff_completed_at"] = _utc_now()
+        self._record_terminal_timeline_point("queue_handoff_completed")
+        unix_nano = self._facts.get(
+            "terminal_queue_handoff_completed_unix_nano"
+        )
+        self._facts["ember_queue_terminal_handoff_completed_at"] = (
+            self._iso_from_unix_nano(unix_nano)
+            if isinstance(unix_nano, int)
+            else _utc_now()
+        )
         self._refresh_diagnosis()
 
     def observe_partial_event(self, pending_data: bytes) -> None:
@@ -1416,7 +1726,6 @@ class ResponsesStreamDiagnostics:
     def mark_downstream_sse_events_sent(self, event_types: set[str]) -> None:
         if not event_types:
             return
-        now = _utc_now()
         if "response.completed" in event_types:
             self._facts["downstream_terminal_seen"] = True
             self._facts["downstream_semantic_status"] = "completed"
@@ -1429,8 +1738,13 @@ class ResponsesStreamDiagnostics:
         if "error" in event_types:
             self._facts["error_event_seen"] = True
         if self._facts.get("downstream_terminal_seen") or "error" in event_types:
-            self._facts["downstream_terminal_asgi_write_completed"] = True
-            self._facts["downstream_terminal_asgi_write_completed_at"] = now
+            if self._facts.get("upstream_terminal_seen"):
+                self.mark_terminal_asgi_write_completed()
+            else:
+                self._facts["downstream_terminal_asgi_write_completed"] = True
+                self._facts["downstream_terminal_asgi_write_completed_at"] = (
+                    _utc_now()
+                )
 
     def snapshot_json(self) -> str:
         return json.dumps(
@@ -1574,6 +1888,7 @@ class ResponsesStreamDiagnostics:
 
     def _unregister_socket(self) -> None:
         inode = self._socket_inode
+        self._socket_fd = None
         if inode:
             references = _SOCKET_TRACKERS.get(inode)
             if references is not None:

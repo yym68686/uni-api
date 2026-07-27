@@ -13,6 +13,7 @@ from uni_api.admission.json_memory import (
     estimate_json_memory_bytes,
     estimate_json_text_memory_bytes,
 )
+from uni_api.observability.threadpool_tasks import register_dedicated_threadpool
 from uni_api.serialization import json
 
 
@@ -36,6 +37,7 @@ _JSON_PARSE_CPU_EXECUTOR = ThreadPoolExecutor(
     max_workers=JSON_PARSE_CPU_WORKERS,
     thread_name_prefix="uni-api-json",
 )
+register_dedicated_threadpool("json_parse", _JSON_PARSE_CPU_EXECUTOR)
 
 
 class ReusableJSONParseWorkspace:

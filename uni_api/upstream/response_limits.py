@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from uni_api.admission.resources import startup_cpu_worker_count
+from uni_api.observability.threadpool_tasks import register_dedicated_threadpool
 
 
 DEFAULT_MAX_UPSTREAM_ERROR_BODY_BYTES = 256 * 1024
@@ -36,6 +37,10 @@ except (TypeError, ValueError):
 _UPSTREAM_RESPONSE_CPU_EXECUTOR = ThreadPoolExecutor(
     max_workers=UPSTREAM_RESPONSE_CPU_WORKERS,
     thread_name_prefix="uni-api-upstream-body",
+)
+register_dedicated_threadpool(
+    "upstream_response_decode",
+    _UPSTREAM_RESPONSE_CPU_EXECUTOR,
 )
 
 
