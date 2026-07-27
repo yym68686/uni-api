@@ -1853,6 +1853,9 @@ def build_uni_api_ember_request_telemetry(
                     "event_hash_scope": _safe_text(
                         responses_diagnostics.get("hash_scope")
                     ),
+                    "event_hash_policy": _safe_text(
+                        responses_diagnostics.get("event_hash_policy")
+                    ),
                     **_responses_diagnostic_attrs(
                         responses_diagnostics,
                         current_info=current_info,
@@ -2704,6 +2707,9 @@ def _upstream_attempt_log_events(
                         "event_hash_scope": _safe_text(
                             stream_diagnostics.get("hash_scope")
                         ),
+                        "event_hash_policy": _safe_text(
+                            stream_diagnostics.get("event_hash_policy")
+                        ),
                         "partial_hash_scope": _safe_text(
                             stream_diagnostics.get("partial_hash_scope")
                         ),
@@ -3538,6 +3544,7 @@ def _responses_diagnostic_attrs(
         "last_event_sha256",
         "partial_event_sha256",
         "hash_scope",
+        "event_hash_policy",
         "partial_hash_scope",
         "declared_terminal_sha256",
         "semantic_terminal_sha256",

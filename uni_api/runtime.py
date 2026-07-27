@@ -5347,6 +5347,7 @@ def _canonical_responses_sse_event_bytes(
     *,
     event_type: str,
     has_event_field: bool,
+    wire_bytes: bytes,
 ) -> tuple[bytes, bool]:
     """Emit one data-bearing Responses event in a stable SSE shape.
 
@@ -5357,12 +5358,12 @@ def _canonical_responses_sse_event_bytes(
     """
 
     if raw_event.startswith("\n"):
-        normalized_raw_event = raw_event[1:]
+        normalized_wire = wire_bytes[1:]
         normalized = True
     else:
-        # ``raw_event`` can be a retained str subclass.  removeprefix() would
-        # copy its full payload even when no prefix is present.
-        normalized_raw_event = raw_event
+        # Preserve object identity on the common path so diagnostics, the
+        # terminal hash, and downstream delivery share the one UTF-8 encoding.
+        normalized_wire = wire_bytes
         normalized = False
     if not has_event_field and event_type and event_type != "[DONE]":
         encoded_event_type = event_type.encode("utf-8")
@@ -5372,9 +5373,11 @@ def _canonical_responses_sse_event_bytes(
             or b"\n" in encoded_event_type
         ):
             raise SSEProtocolError("Responses upstream event type is invalid")
-        normalized_raw_event = f"event: {event_type}\n{normalized_raw_event}"
+        normalized_wire = (
+            b"event: " + encoded_event_type + b"\n" + normalized_wire
+        )
         normalized = True
-    return normalized_raw_event.encode("utf-8") + b"\n\n", normalized
+    return normalized_wire, normalized
 
 
 def _observed_responses_stream_chunk(
@@ -5439,6 +5442,7 @@ async def _consume_expected_oaix_terminal_flush_marker(
                 _from_precommit,
                 already_observed,
                 received_at,
+                _upstream_event_bytes,
             ) = await asyncio.wait_for(
                 source.__anext__(),
                 timeout=remaining,
@@ -5454,7 +5458,6 @@ async def _consume_expected_oaix_terminal_flush_marker(
                 diagnostics.observe_complete_event(
                     raw_event,
                     has_data_field=sse_event_has_data_field(raw_event),
-                    wire_bytes=_raw_responses_sse_event_bytes(raw_event),
                     received_at=received_at,
                 )
             if is_oaix_terminal_flush_marker(raw_event):
@@ -5711,6 +5714,8 @@ async def _prime_responses_upstream_stream(
     chunk = None
     raw_event = None
     raw_events = []
+    raw_event_wires: list[bytes | None] = []
+    raw_events_received_at: datetime | None = None
 
     def observe_pending_diagnostics() -> None:
         if diagnostics is None:
@@ -5732,8 +5737,10 @@ async def _prime_responses_upstream_stream(
                     upstream_iter.__anext__(),
                     disconnect_event=disconnect_event,
                 )
+                raw_events_received_at = datetime.now(timezone.utc)
             except StopAsyncIteration:
                 reached_eof = True
+                raw_events_received_at = datetime.now(timezone.utc)
                 observe_pending_diagnostics()
                 try:
                     raw_events = sse_parser.finish()
@@ -5771,14 +5778,26 @@ async def _prime_responses_upstream_stream(
                 finally:
                     chunk = None
 
+            raw_event_wires = [
+                _raw_responses_sse_event_bytes(observed_event)
+                if observed_event.strip()
+                else None
+                for observed_event in raw_events
+            ]
             if diagnostics is not None:
-                for observed_event in raw_events:
+                for observed_event, observed_wire in zip(
+                    raw_events,
+                    raw_event_wires,
+                ):
                     if observed_event.strip():
+                        assert observed_wire is not None
                         diagnostics.observe_complete_event(
                             observed_event,
                             has_data_field=sse_event_has_data_field(
                                 observed_event
                             ),
+                            wire_bytes=observed_wire,
+                            received_at=raw_events_received_at,
                         )
 
             for event_index, raw_event in enumerate(raw_events):
@@ -5789,11 +5808,11 @@ async def _prime_responses_upstream_stream(
                 event_type = event_owner.event_name
                 event_payload = event_owner.payload
                 semantic_failure = None
-                event_bytes = None
+                event_bytes = raw_event_wires[event_index]
+                assert event_bytes is not None
                 handled = None
                 try:
                     if event_owner.is_comment:
-                        event_bytes = _raw_responses_sse_event_bytes(raw_event)
                         await append_buffered(event_bytes)
                         continue
                     if not event_owner.has_data_field:
@@ -5847,6 +5866,8 @@ async def _prime_responses_upstream_stream(
                             event_type,
                             event_payload,
                             semantic_outcome=semantic_outcome,
+                            wire_bytes=event_bytes,
+                            received_at=raw_events_received_at,
                         )
                     if semantic_failure is not None:
                         if (
@@ -5866,6 +5887,7 @@ async def _prime_responses_upstream_stream(
                             raw_event,
                             event_type=event_type,
                             has_event_field=event_owner.has_event_field,
+                            wire_bytes=event_bytes,
                         )
                     )
                     if (
@@ -5888,11 +5910,15 @@ async def _prime_responses_upstream_stream(
                         await append_buffered(event_bytes)
 
                     if _responses_stream_event_commits(event_type, event_payload, commit_policy):
-                        for remaining_raw_event in raw_events[event_index + 1:]:
+                        for remaining_index in range(
+                            event_index + 1,
+                            len(raw_events),
+                        ):
+                            remaining_raw_event = raw_events[remaining_index]
                             if remaining_raw_event.strip():
-                                await append_buffered(
-                                    _raw_responses_sse_event_bytes(remaining_raw_event)
-                                )
+                                remaining_wire = raw_event_wires[remaining_index]
+                                assert remaining_wire is not None
+                                await append_buffered(remaining_wire)
                         if sse_parser.pending_data:
                             await append_buffered(sse_parser.pending_data)
                         return buffered_chunks, True
@@ -5912,6 +5938,9 @@ async def _prime_responses_upstream_stream(
             raw_event = None
             raw_events.clear()
             raw_events = None
+            raw_event_wires.clear()
+            raw_event_wires = []
+            raw_events_received_at = None
 
             if reached_eof:
                 if not buffered_chunks:
@@ -5930,6 +5959,7 @@ async def _prime_responses_upstream_stream(
         raw_event = None
         if raw_events is not None:
             raw_events.clear()
+        raw_event_wires.clear()
         await buffered_chunks.clear()
         raise
     finally:
@@ -5938,6 +5968,8 @@ async def _prime_responses_upstream_stream(
         if raw_events is not None:
             raw_events.clear()
         raw_events = None
+        raw_event_wires.clear()
+        raw_events_received_at = None
         sse_parser.discard()
 
 class ResponsesRequestHandler:
@@ -7254,23 +7286,44 @@ class ResponsesRequestExecution:
                 raw_events = []
                 try:
                     raw_events = proxy_sse_parser.feed(chunk)
+                    # Precommit stores each complete canonical frame as its own
+                    # bytes chunk.  If feeding that chunk yields exactly one
+                    # event and leaves no parser tail, the original chunk is
+                    # already the event wire.  Re-encoding the parsed text only
+                    # to prove equality would violate the encode-once path.
+                    single_event_wire = (
+                        chunk
+                        if len(raw_events) == 1
+                        and not proxy_sse_parser.pending_data
+                        else None
+                    )
                     exact_transfer = (
                         reservation is not None
-                        and len(raw_events) == 1
-                        and not proxy_sse_parser.pending_data
-                        and _raw_responses_sse_event_bytes(raw_events[0]) == chunk
+                        and single_event_wire is not None
                     )
-                    chunk = None
                     for event_index in range(len(raw_events)):
                         raw_event = raw_events[event_index]
                         transferred = None
+                        upstream_event_bytes = (
+                            single_event_wire
+                            if event_index == 0
+                            else None
+                        )
                         if exact_transfer and event_index == 0:
                             transferred = reservation
                             reservation = None
                         try:
-                            yield raw_event, transferred, True, True, None
+                            yield (
+                                raw_event,
+                                transferred,
+                                True,
+                                True,
+                                None,
+                                upstream_event_bytes,
+                            )
                         finally:
                             transferred = None
+                            upstream_event_bytes = None
                             raw_event = None
                             raw_events[event_index] = ""
                 finally:
@@ -7293,6 +7346,7 @@ class ResponsesRequestExecution:
                         total_timeout_seconds=total_timeout_seconds,
                         disconnect_event=self.disconnect_event,
                     )
+                    chunk_received_at = datetime.now(timezone.utc)
                 except StopAsyncIteration:
                     break
                 if self._downstream_disconnected(
@@ -7306,77 +7360,50 @@ class ResponsesRequestExecution:
                     raise DownstreamDisconnectedDuringWait()
                 raw_events = proxy_sse_parser.feed(bytes(chunk))
                 chunk = None
-                batch_observed = len(raw_events) > 1
-                if batch_observed:
-                    for observed_event in raw_events:
-                        if observed_event.strip():
-                            diagnostics.observe_complete_event(
-                                observed_event,
-                                has_data_field=sse_event_has_data_field(
-                                    observed_event
-                                ),
-                            )
                 try:
                     for event_index in range(len(raw_events)):
                         raw_event = raw_events[event_index]
-                        received_at = (
-                            None
-                            if batch_observed
-                            else datetime.now(timezone.utc)
-                        )
                         try:
                             yield (
                                 raw_event,
                                 None,
                                 False,
-                                batch_observed,
-                                received_at,
+                                False,
+                                chunk_received_at,
+                                None,
                             )
                         finally:
-                            received_at = None
                             raw_event = None
                             raw_events[event_index] = ""
                 finally:
                     raw_events.clear()
                     raw_events = None
+                    chunk_received_at = None
 
             diagnostics.observe_partial_diagnostics(
                 proxy_sse_parser.pending_diagnostics()
             )
+            eof_received_at = datetime.now(timezone.utc)
             raw_events = proxy_sse_parser.finish()
-            batch_observed = len(raw_events) > 1
-            if batch_observed:
-                for observed_event in raw_events:
-                    if observed_event.strip():
-                        diagnostics.observe_complete_event(
-                            observed_event,
-                            has_data_field=sse_event_has_data_field(
-                                observed_event
-                            ),
-                        )
             try:
                 for event_index in range(len(raw_events)):
                     raw_event = raw_events[event_index]
-                    received_at = (
-                        None
-                        if batch_observed
-                        else datetime.now(timezone.utc)
-                    )
                     try:
                         yield (
                             raw_event,
                             None,
                             False,
-                            batch_observed,
-                            received_at,
+                            False,
+                            eof_received_at,
+                            None,
                         )
                     finally:
-                        received_at = None
                         raw_event = None
                         raw_events[event_index] = ""
             finally:
                 raw_events.clear()
                 raw_events = None
+                eof_received_at = None
 
         source = source_events()
         try:
@@ -7386,6 +7413,7 @@ class ResponsesRequestExecution:
                 from_precommit_buffer,
                 already_observed,
                 received_at,
+                upstream_event_bytes,
             ) in source:
                 event_bytes = None
                 transferred = None
@@ -7395,8 +7423,22 @@ class ResponsesRequestExecution:
                 try:
                     if not raw_event.strip():
                         continue
-                    event_bytes = _raw_responses_sse_event_bytes(raw_event)
                     if is_sse_comment_frame(raw_event):
+                        if is_oaix_terminal_flush_marker(raw_event):
+                            if not already_observed:
+                                diagnostics.observe_complete_event(
+                                    raw_event,
+                                    has_data_field=False,
+                                    received_at=received_at,
+                                )
+                            # This hop-local marker is consumed by diagnostics
+                            # and must never change the downstream SSE contract.
+                            continue
+                        if upstream_event_bytes is None:
+                            upstream_event_bytes = (
+                                _raw_responses_sse_event_bytes(raw_event)
+                            )
+                        event_bytes = upstream_event_bytes
                         if not already_observed:
                             diagnostics.observe_complete_event(
                                 raw_event,
@@ -7404,10 +7446,6 @@ class ResponsesRequestExecution:
                                 wire_bytes=event_bytes,
                                 received_at=received_at,
                             )
-                        if is_oaix_terminal_flush_marker(raw_event):
-                            # This hop-local marker is consumed by diagnostics
-                            # and must never change the downstream SSE contract.
-                            continue
                         if reservation is None:
                             yield event_bytes
                         else:
@@ -7427,24 +7465,33 @@ class ResponsesRequestExecution:
                             workspace=parse_workspace,
                         )
                     except BaseException:
+                        if upstream_event_bytes is None:
+                            upstream_event_bytes = (
+                                _raw_responses_sse_event_bytes(raw_event)
+                            )
                         if not already_observed:
                             diagnostics.observe_complete_event(
                                 raw_event,
                                 has_data_field=sse_event_has_data_field(
                                     raw_event
                                 ),
-                                wire_bytes=event_bytes,
+                                wire_bytes=upstream_event_bytes,
                                 received_at=received_at,
+                                force_hash=True,
                             )
                         raise
                     event_type = event_owner.event_name
                     event_payload = event_owner.payload
+                    if upstream_event_bytes is None:
+                        upstream_event_bytes = _raw_responses_sse_event_bytes(
+                            raw_event
+                        )
                     if not already_observed:
                         diagnostics.observe_complete_event(
                             raw_event,
                             has_data_field=event_owner.has_data_field,
                             event_type=event_type,
-                            wire_bytes=event_bytes,
+                            wire_bytes=upstream_event_bytes,
                             received_at=received_at,
                         )
                     semantic_failure = None
@@ -7474,6 +7521,7 @@ class ResponsesRequestExecution:
                                 raw_event,
                                 event_type=event_type,
                                 has_event_field=event_owner.has_event_field,
+                                wire_bytes=upstream_event_bytes,
                             )
                         )
                         if (
@@ -7521,9 +7569,12 @@ class ResponsesRequestExecution:
                             event_type,
                             event_payload,
                         )
-                        if _responses_stream_event_has_real_output(
-                            event_type,
-                            event_payload,
+                        if (
+                            not output_seen
+                            and _responses_stream_event_has_real_output(
+                                event_type,
+                                event_payload,
+                            )
                         ):
                             output_seen = True
 
@@ -7546,6 +7597,8 @@ class ResponsesRequestExecution:
                             event_type,
                             event_payload,
                             semantic_outcome=semantic_outcome,
+                            wire_bytes=upstream_event_bytes,
+                            received_at=received_at,
                         )
                         # The JSON graph is already materialized here.  Read
                         # the bounded scalar metadata directly instead of
@@ -7704,6 +7757,7 @@ class ResponsesRequestExecution:
                     failure = None
                     transferred = None
                     event_bytes = None
+                    upstream_event_bytes = None
                     raw_event = None
                     event_owner = None
                     usage_snapshot = None

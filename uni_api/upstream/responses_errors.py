@@ -345,6 +345,15 @@ def responses_failure_error(
     )
     if not valid_event_type:
         normalized_event_type = ""
+    if (
+        normalized_event_type not in _FAILURE_EVENT_TYPES
+        and "response" not in payload
+        and "status" not in payload
+        and "error" not in payload
+    ):
+        # Ordinary delta/progress events cannot satisfy any failure condition
+        # below. Avoid nested status/error inspection on the dominant path.
+        return None
     response_status, valid_response_status = _normalized_protocol_token(
         safe_get(payload, "response", "status", default=None),
     )

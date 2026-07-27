@@ -174,6 +174,102 @@ def test_complete_event_preserves_transport_receive_timestamp():
     )
 
 
+def test_nonterminal_event_records_metadata_without_hashing():
+    tracker, _current_info = _tracker()
+    received_at = datetime(2026, 7, 24, 12, 34, 56, tzinfo=timezone.utc)
+    raw_event = (
+        "event: response.output_text.delta\n"
+        'data: {"type":"response.output_text.delta","delta":"hello"}'
+    )
+    wire = raw_event.encode("utf-8") + b"\n\n"
+
+    tracker.observe_complete_event(
+        raw_event,
+        event_type="response.output_text.delta",
+        wire_bytes=wire,
+        received_at=received_at,
+    )
+    tracker.observe_parsed_event(
+        raw_event,
+        "response.output_text.delta",
+        {"type": "response.output_text.delta", "delta": "hello"},
+        semantic_outcome="nonterminal",
+        wire_bytes=wire,
+        received_at=received_at,
+    )
+
+    assert tracker.facts["schema_version"] == 3
+    assert tracker.facts["event_hash_policy"] == "terminal_or_error_only_v1"
+    assert tracker.facts["complete_event_count"] == 1
+    assert tracker.facts["last_event_type"] == "response.output_text.delta"
+    assert tracker.facts["last_event_bytes"] == len(wire)
+    assert "last_event_sha256" not in tracker.facts
+    assert "last_event_received_at" not in tracker.facts
+
+
+def test_semantic_failure_hashes_existing_wire_bytes_once_classified():
+    tracker, _current_info = _tracker()
+    received_at = datetime(2026, 7, 24, 12, 34, 56, tzinfo=timezone.utc)
+    raw_event = (
+        "event: response.status\n"
+        'data: {"type":"response.status","status":"failed"}'
+    )
+    wire = raw_event.encode("utf-8") + b"\n\n"
+
+    tracker.observe_complete_event(
+        raw_event,
+        event_type="response.status",
+        wire_bytes=wire,
+        received_at=received_at,
+    )
+    tracker.observe_parsed_event(
+        raw_event,
+        "response.status",
+        {"type": "response.status", "status": "failed"},
+        semantic_outcome="failed",
+        wire_bytes=wire,
+        received_at=received_at,
+    )
+
+    expected = hashlib.sha256(wire).hexdigest()
+    assert tracker.facts["last_event_sha256"] == expected
+    assert tracker.facts["semantic_terminal_sha256"] == expected
+    assert tracker.facts["last_event_received_at"] == received_at.isoformat()
+
+
+def test_canonical_standard_event_reuses_the_observed_wire_object():
+    raw_event = (
+        "event: response.output_text.delta\n"
+        'data: {"type":"response.output_text.delta","delta":"hello"}'
+    )
+    wire = raw_event.encode("utf-8") + b"\n\n"
+
+    canonical, normalized = runtime._canonical_responses_sse_event_bytes(
+        raw_event,
+        event_type="response.output_text.delta",
+        has_event_field=True,
+        wire_bytes=wire,
+    )
+
+    assert normalized is False
+    assert canonical is wire
+
+
+def test_canonical_data_only_event_derives_output_without_reencoding_text():
+    raw_event = 'data: {"type":"response.output_text.delta","delta":"hello"}'
+    wire = raw_event.encode("utf-8") + b"\n\n"
+
+    canonical, normalized = runtime._canonical_responses_sse_event_bytes(
+        raw_event,
+        event_type="response.output_text.delta",
+        has_event_field=False,
+        wire_bytes=wire,
+    )
+
+    assert normalized is True
+    assert canonical == b"event: response.output_text.delta\n" + wire
+
+
 def test_oaix_terminal_flush_marker_rejects_hash_mismatch_without_metric():
     observations = []
     tracker = ResponsesStreamDiagnostics(
@@ -584,7 +680,7 @@ def test_transport_tracker_registry_keys_are_removed_when_requests_are_collected
     assert len(responses_stream_observability._NETWORK_STREAM_TRACKERS) == baseline
 
 
-def test_normalized_complete_and_partial_event_hashes_do_not_store_payload():
+def test_nonterminal_and_partial_diagnostics_do_not_store_payload():
     tracker, _current_info = _tracker()
     parser = IncrementalSSEParser()
     complete = parser.feed(
@@ -595,10 +691,8 @@ def test_normalized_complete_and_partial_event_hashes_do_not_store_payload():
     tracker.observe_complete_event(complete[0])
     tracker.observe_partial_diagnostics(parser.pending_diagnostics())
 
-    normalized_wire = complete[0].encode("utf-8") + b"\n\n"
-    assert tracker.facts["last_event_sha256"] == hashlib.sha256(
-        normalized_wire
-    ).hexdigest()
+    assert tracker.facts["last_event_type"] == "response.created"
+    assert "last_event_sha256" not in tracker.facts
     assert tracker.facts["partial_event_bytes"] > 0
     assert tracker.facts["partial_event_sha256"]
     serialized = json.dumps(tracker.facts, sort_keys=True)

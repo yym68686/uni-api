@@ -16,7 +16,7 @@ from typing import Any, Callable
 from uni_api.upstream.transport_errors import classify_httpx_transport_error
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_CAUSE_DEPTH = 16
 _MAX_TRACE_EVENTS = 32
 _MAX_CLEANUP_ACTIONS = 8
@@ -88,6 +88,14 @@ _SAFE_RESPONSES_EVENT_TYPES = frozenset(
         "response.audio.done",
         "response.audio_transcript.delta",
         "response.audio_transcript.done",
+    }
+)
+_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
     }
 )
 _AUTH_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
@@ -517,6 +525,7 @@ class ResponsesStreamDiagnostics:
         self._facts: dict[str, Any] = {
             "schema_version": _SCHEMA_VERSION,
             "hash_scope": "ember_normalized_sse_event_lf_v1",
+            "event_hash_policy": "terminal_or_error_only_v1",
             "partial_hash_scope": "normalized_prefix_plus_utf8_tail_v1",
             "transport_peer_semantics": "physical_peer_may_be_proxy",
             "logical_authority": _safe_text(logical_authority, max_bytes=256),
@@ -743,6 +752,7 @@ class ResponsesStreamDiagnostics:
         event_type: str | None = None,
         wire_bytes: bytes | None = None,
         received_at: datetime | None = None,
+        force_hash: bool = False,
     ) -> None:
         try:
             if is_oaix_terminal_flush_marker(raw_event):
@@ -750,20 +760,27 @@ class ResponsesStreamDiagnostics:
                 return
             if wire_bytes is None:
                 wire_bytes = raw_event.encode("utf-8") + b"\n\n"
-            digest_hex = hashlib.sha256(wire_bytes).hexdigest()
             ordinal = int(self._facts.get("complete_event_count") or 0) + 1
             if event_type is None:
                 event_type = _event_type(raw_event)
-            if received_at is None:
-                received_at = datetime.now(timezone.utc)
-            received_at_text = received_at.isoformat()
             observer = self._sse_event_observer
             if observer is not None:
                 try:
                     observer(len(wire_bytes))
                 except Exception as exc:
                     self._facts["sse_event_observer_error"] = type(exc).__name__
-            if has_data_field:
+            should_hash = bool(
+                force_hash
+                or (has_data_field and event_type in _TERMINAL_EVENT_TYPES)
+            )
+            digest_hex = None
+            received_at_text = None
+            if should_hash:
+                digest_hex = hashlib.sha256(wire_bytes).hexdigest()
+                if received_at is None:
+                    received_at = datetime.now(timezone.utc)
+                received_at_text = received_at.isoformat()
+            if has_data_field and digest_hex is not None:
                 if len(self._observed_event_facts) >= _MAX_EVENT_FACT_CACHE:
                     self._observed_event_facts.pop(
                         next(iter(self._observed_event_facts)),
@@ -780,16 +797,20 @@ class ResponsesStreamDiagnostics:
                     "last_event_ordinal": ordinal,
                     "last_event_type": event_type,
                     "last_event_bytes": len(wire_bytes),
-                    "last_event_sha256": digest_hex,
-                    "last_event_received_at": received_at_text,
                 }
             )
-            if has_data_field and event_type in {
-                "response.completed",
-                "response.incomplete",
-                "response.failed",
-                "error",
-            }:
+            if digest_hex is None:
+                # A stale digest must never describe a newer non-terminal
+                # frame. Only terminal/error frames retain a wire identity.
+                self._facts.pop("last_event_sha256", None)
+                self._facts.pop("last_event_received_at", None)
+            else:
+                self._facts["last_event_sha256"] = digest_hex
+                self._facts["last_event_received_at"] = received_at_text
+            if has_data_field and event_type in _TERMINAL_EVENT_TYPES:
+                assert digest_hex is not None
+                assert received_at is not None
+                assert received_at_text is not None
                 self._facts["terminal_frame_seen"] = True
                 self._facts["declared_terminal_type"] = event_type
                 self._facts["declared_terminal_ordinal"] = ordinal
@@ -947,25 +968,25 @@ class ResponsesStreamDiagnostics:
         payload: Any,
         *,
         semantic_outcome: str,
+        wire_bytes: bytes | None = None,
+        received_at: datetime | None = None,
     ) -> None:
-        declared_terminal = event_type in {
-            "response.completed",
-            "response.incomplete",
-            "response.failed",
-            "error",
-        }
+        declared_terminal = event_type in _TERMINAL_EVENT_TYPES
         cached_event = self._observed_event_facts.pop(id(raw_event), None)
         if not declared_terminal and semantic_outcome == "nonterminal":
             return
         safe_event_type = safe_responses_event_type(event_type)
         if cached_event is None:
-            encoded = raw_event.encode("utf-8")
-            digest = hashlib.sha256()
-            digest.update(encoded)
-            digest.update(b"\n\n")
+            if wire_bytes is None:
+                wire_bytes = raw_event.encode("utf-8") + b"\n\n"
             event_ordinal = int(self._facts.get("complete_event_count") or 0)
-            event_bytes = len(encoded) + 2
-            event_sha256 = digest.hexdigest()
+            event_bytes = len(wire_bytes)
+            event_sha256 = hashlib.sha256(wire_bytes).hexdigest()
+            if received_at is None:
+                received_at = datetime.now(timezone.utc)
+            if self._facts.get("last_event_ordinal") == event_ordinal:
+                self._facts["last_event_sha256"] = event_sha256
+                self._facts["last_event_received_at"] = received_at.isoformat()
         else:
             event_ordinal, event_bytes, event_sha256 = cached_event
         if declared_terminal:
@@ -977,6 +998,13 @@ class ResponsesStreamDiagnostics:
             self._facts.setdefault("declared_terminal_ordinal", event_ordinal)
             self._facts.setdefault("declared_terminal_bytes", event_bytes)
             self._facts.setdefault("declared_terminal_sha256", event_sha256)
+            if "declared_terminal_received_at" not in self._facts:
+                if received_at is None:
+                    received_at = datetime.now(timezone.utc)
+                self._facts["declared_terminal_received_at"] = (
+                    received_at.isoformat()
+                )
+                self._declared_terminal_received_at = received_at
             self._facts["terminal_frame_structured"] = True
             self._facts.setdefault("terminal_frame_structured_at", _utc_now())
             self._facts["terminal_frame_semantic_outcome"] = semantic_outcome

@@ -10,6 +10,7 @@ import statistics
 import sys
 import time
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -79,7 +80,7 @@ async def _one_bound_stream(
     *,
     metadata: bool,
     expected_output_tokens: int,
-) -> tuple[int, list[float]]:
+) -> tuple[int, list[float], list[float]]:
     current_info: dict[str, Any] = {
         "request_id": "benchmark",
         "start_time": time.time(),
@@ -93,16 +94,16 @@ async def _one_bound_stream(
     parser = IncrementalSSEParser()
     parse_workspace = await ReusableJSONParseWorkspace.create()
     yielded_at: deque[int] = deque()
+    available_at: deque[int] = deque()
     frame_latencies_us: list[float] = []
+    pipeline_latencies_us: list[float] = []
     sent_bytes = 0
 
     async def body():
         for chunk in transport_chunks:
+            chunk_available_at = time.perf_counter_ns()
+            received_at = datetime.now(timezone.utc)
             raw_events = parser.feed(chunk)
-            batch_observed = len(raw_events) > 1
-            if batch_observed:
-                for raw_event in raw_events:
-                    diagnostics.observe_complete_event(raw_event)
             try:
                 for event_index in range(len(raw_events)):
                     raw_event = raw_events[event_index]
@@ -115,13 +116,13 @@ async def _one_bound_stream(
                         payload = owner.payload
                         event_type = owner.event_name
                         wire = raw_event.encode("utf-8") + b"\n\n"
-                        if not batch_observed:
-                            diagnostics.observe_complete_event(
-                                raw_event,
-                                has_data_field=owner.has_data_field,
-                                event_type=event_type,
-                                wire_bytes=wire,
-                            )
+                        diagnostics.observe_complete_event(
+                            raw_event,
+                            has_data_field=owner.has_data_field,
+                            event_type=event_type,
+                            wire_bytes=wire,
+                            received_at=received_at,
+                        )
                         validate_sse_event_type_consistency(
                             owner.declared_event_name,
                             payload,
@@ -139,7 +140,10 @@ async def _one_bound_stream(
                             event_type,
                             payload,
                             semantic_outcome=semantic_outcome,
+                            wire_bytes=wire,
+                            received_at=received_at,
                         )
+                        available_at.append(chunk_available_at)
                         yielded_at.append(time.perf_counter_ns())
                         if metadata:
                             snapshot = stream_usage_snapshot_from_payload(
@@ -166,9 +170,13 @@ async def _one_bound_stream(
         nonlocal sent_bytes
         body_bytes = message.get("body", b"")
         if body_bytes:
+            sent_at = time.perf_counter_ns()
             sent_bytes += len(body_bytes)
             frame_latencies_us.append(
-                (time.perf_counter_ns() - yielded_at.popleft()) / 1000.0
+                (sent_at - yielded_at.popleft()) / 1000.0
+            )
+            pipeline_latencies_us.append(
+                (sent_at - available_at.popleft()) / 1000.0
             )
 
     async def receive():
@@ -189,9 +197,11 @@ async def _one_bound_stream(
         await parse_workspace.aclose()
     if yielded_at:
         raise AssertionError("not every yielded frame reached ASGI send")
+    if available_at:
+        raise AssertionError("not every available frame reached ASGI send")
     if current_info.get("completion_tokens") != expected_output_tokens:
         raise AssertionError("downstream usage was not preserved")
-    return sent_bytes, frame_latencies_us
+    return sent_bytes, frame_latencies_us, pipeline_latencies_us
 
 
 async def _one_stream(
@@ -200,7 +210,7 @@ async def _one_stream(
     metadata: bool,
     admission: RequestAdmissionController | None,
     expected_output_tokens: int,
-) -> tuple[int, list[float]]:
+) -> tuple[int, list[float], list[float]]:
     if admission is None:
         return await _one_bound_stream(
             transport_chunks,
@@ -263,13 +273,20 @@ async def _measure(args, *, metadata: bool) -> dict[str, float | int | str]:
     cpu_seconds = time.process_time() - started_cpu
     latencies = sorted(
         latency
-        for _sent_bytes, stream_latencies in results
+        for _sent_bytes, stream_latencies, _pipeline_latencies in results
         for latency in stream_latencies
+    )
+    pipeline_latencies = sorted(
+        latency
+        for _sent_bytes, _stream_latencies, stream_pipeline_latencies in results
+        for latency in stream_pipeline_latencies
     )
     return {
         "variant": "metadata" if metadata else "reparse",
         "events": total_events,
-        "bytes": sum(sent_bytes for sent_bytes, _latencies in results),
+        "bytes": sum(
+            sent_bytes for sent_bytes, _latencies, _pipeline_latencies in results
+        ),
         "wall_seconds": wall_seconds,
         "cpu_seconds": cpu_seconds,
         "events_per_wall_second": total_events / wall_seconds,
@@ -277,6 +294,12 @@ async def _measure(args, *, metadata: bool) -> dict[str, float | int | str]:
         "frame_latency_us_p50": latencies[(len(latencies) - 1) // 2],
         "frame_latency_us_p95": latencies[
             int((len(latencies) - 1) * 0.95)
+        ],
+        "pipeline_latency_us_p50": pipeline_latencies[
+            (len(pipeline_latencies) - 1) // 2
+        ],
+        "pipeline_latency_us_p95": pipeline_latencies[
+            int((len(pipeline_latencies) - 1) * 0.95)
         ],
     }
 
@@ -305,6 +328,12 @@ async def _benchmark(args) -> None:
             ),
             "median_frame_latency_us_p95": statistics.median(
                 float(item["frame_latency_us_p95"]) for item in samples
+            ),
+            "median_pipeline_latency_us_p50": statistics.median(
+                float(item["pipeline_latency_us_p50"]) for item in samples
+            ),
+            "median_pipeline_latency_us_p95": statistics.median(
+                float(item["pipeline_latency_us_p95"]) for item in samples
             ),
             "samples": samples,
         }

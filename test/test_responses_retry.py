@@ -1846,8 +1846,8 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
                     {"type": "response.output_text.delta", "delta": "ok"},
                 ),
                 # OAIX may flush the terminal and [DONE] in one HTTP body
-                # chunk. The terminal hash must remain independently queryable
-                # even though [DONE] becomes the last fully framed event.
+                # chunk. The semantic terminal ends processing; the unconsumed
+                # [DONE] frame must not replace its diagnostics or hash.
                 completed_event + _responses_sse(None, "[DONE]"),
             ],
             headers={"X-OAIX-Connection-ID": "oaixc-terminal-success"},
@@ -1882,8 +1882,8 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
     assert diagnostics["upstream_terminal_validated"] is True
     assert diagnostics["usage_seen"] is True
     assert diagnostics["diagnosis"] == "responses_completed_with_usage"
-    assert diagnostics["last_event_type"] == "[DONE]"
-    assert diagnostics["complete_event_count"] == 4
+    assert diagnostics["last_event_type"] == "response.completed"
+    assert diagnostics["complete_event_count"] == 3
     assert diagnostics["semantic_terminal_type"] == "response.completed"
     assert diagnostics["semantic_terminal_outcome"] == "completed"
     assert diagnostics["semantic_terminal_sequence_number"] == 7
@@ -1896,6 +1896,97 @@ def test_responses_stream_records_channel_success_only_after_protocol_terminal(
     assert callable(
         main.app.state.client_manager.stream_calls[0]["extensions"]["trace"]
     )
+
+
+def test_stream_encodes_each_event_once_and_reuses_batch_receive_time(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="codex")
+    observed = []
+    encoded = []
+    original_observe = runtime.ResponsesStreamDiagnostics.observe_complete_event
+    original_encode = runtime._raw_responses_sse_event_bytes
+
+    def observe_complete_event(self, raw_event, *args, **kwargs):
+        if "batch-after-commit" in raw_event or kwargs.get("event_type") == (
+            "response.completed"
+        ):
+            observed.append(
+                (
+                    kwargs.get("event_type"),
+                    kwargs.get("wire_bytes"),
+                    kwargs.get("received_at"),
+                )
+            )
+        return original_observe(self, raw_event, *args, **kwargs)
+
+    def encode_wire(raw_event):
+        if "event: response." in raw_event:
+            encoded.append(raw_event)
+        return original_encode(raw_event)
+
+    monkeypatch.setattr(
+        runtime.ResponsesStreamDiagnostics,
+        "observe_complete_event",
+        observe_complete_event,
+    )
+    monkeypatch.setattr(runtime, "_raw_responses_sse_event_bytes", encode_wire)
+
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                _responses_sse(
+                    "response.created",
+                    {"type": "response.created", "sequence_number": 0},
+                ),
+                _responses_sse(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "sequence_number": 1,
+                        "delta": "commit",
+                    },
+                ),
+                _responses_sse(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "sequence_number": 2,
+                        "delta": "batch-after-commit",
+                    },
+                )
+                + _responses_sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "sequence_number": 3,
+                        "response": {
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 2,
+                                "total_tokens": 3,
+                            },
+                        },
+                    },
+                ),
+            ]
+        )
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+    )
+
+    assert response.status_code == 200
+    assert "batch-after-commit" in body
+    assert len(observed) == 2
+    assert all(wire_bytes is not None for _, wire_bytes, _ in observed)
+    assert observed[0][2] is observed[1][2]
+    assert observed[0][2] is not None
+    assert len(encoded) == 4
+    assert sum("response.created" in event for event in encoded) == 1
+    assert sum('"delta": "commit"' in event for event in encoded) == 1
+    assert sum("batch-after-commit" in event for event in encoded) == 1
+    assert sum("response.completed" in event for event in encoded) == 1
 
 
 def test_responses_stream_consumes_exact_oaix_terminal_flush_marker(monkeypatch):

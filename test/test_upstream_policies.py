@@ -363,6 +363,21 @@ def test_provider_error_classifier_preserves_responses_semantic_400():
     ) is False
 
 
+def test_responses_failure_error_fast_returns_for_ordinary_delta():
+    class DeltaPayload(dict):
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("ordinary delta must not inspect payload values")
+
+    payload = DeltaPayload(delta="hello", sequence_number=1)
+
+    assert responses_failure_error(
+        payload,
+        event_type="response.output_text.delta",
+        wire_status_code=200,
+        validated_provider_sse=True,
+    ) is None
+
+
 def test_responses_semantic_error_bounds_attacker_sized_message():
     error = responses_failure_error(
         {
