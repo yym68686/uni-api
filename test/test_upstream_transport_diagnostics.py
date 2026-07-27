@@ -65,6 +65,44 @@ def test_httpcore_trace_preserves_raw_exception_and_failure_stage():
     asyncio.run(run())
 
 
+def test_transport_diagnostics_classifies_pool_timeout_as_local_overload():
+    entry = {}
+    diagnostics = UpstreamTransportDiagnostics(entry)
+
+    diagnostics.observe_exception(
+        httpx.PoolTimeout("pool exhausted"),
+        client=SimpleNamespace(),
+    )
+    diagnostics.finalize("failed")
+
+    assert entry["transport_error_kind"] == "pool_timeout"
+    assert entry["transport_error_owner"] == "ember_local_overload"
+    assert entry["transport_error_phase"] == "pool_acquire"
+    assert entry["transport_error_status_code"] == 503
+    assert entry["provider_penalty_eligible"] is False
+    assert entry["local_overload"] is True
+
+
+def test_transport_diagnostics_classifies_read_timeout_before_headers():
+    async def run():
+        entry = {}
+        diagnostics = UpstreamTransportDiagnostics(entry)
+        await diagnostics.httpcore_trace(
+            "http11.receive_response_headers.started",
+            {},
+        )
+
+        diagnostics.observe_exception(
+            httpx.ReadTimeout("read timed out"),
+            client=SimpleNamespace(),
+        )
+
+        assert entry["transport_error_kind"] == "read_timeout"
+        assert entry["transport_error_phase"] == "before_response_headers"
+
+    asyncio.run(run())
+
+
 def test_connection_snapshot_records_h2_state_goaway_and_alpn():
     class SSLObject:
         def selected_alpn_protocol(self):

@@ -13,6 +13,8 @@ import weakref
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from uni_api.upstream.transport_errors import classify_httpx_transport_error
+
 
 _SCHEMA_VERSION = 2
 _MAX_CAUSE_DEPTH = 16
@@ -1123,6 +1125,15 @@ class ResponsesStreamDiagnostics:
         )
         self._facts["transport_error_code"] = transport_error_code
         self._facts["transport_error_code_source"] = transport_error_code_source
+        transport_failure = classify_httpx_transport_error(
+            exc,
+            failure_stage=self._facts.get("phase"),
+            first_byte_observed=bool(
+                int(self._facts.get("upstream_chunk_count") or 0)
+            ),
+        )
+        if transport_failure is not None:
+            self._facts.update(transport_failure.observability_facts())
         if chain:
             deepest_errno = next(
                 (row for row in reversed(chain) if row.get("errno") is not None),
@@ -1459,7 +1470,22 @@ class ResponsesStreamDiagnostics:
             semantic_status = "unknown"
         elif facts.get("exception_type"):
             error_type = str(facts.get("exception_type") or "")
-            if error_type in {"ReadError", "RemoteProtocolError"}:
+            transport_error_kind = str(
+                facts.get("transport_error_kind") or ""
+            )
+            transport_error_phase = str(
+                facts.get("transport_error_phase") or ""
+            )
+            if facts.get("local_overload"):
+                diagnosis = "responses_local_overload"
+            elif transport_error_kind == "connect_timeout":
+                diagnosis = "responses_connect_timeout"
+            elif (
+                transport_error_kind == "read_timeout"
+                and transport_error_phase == "before_first_byte"
+            ):
+                diagnosis = "responses_read_timeout_before_first_byte"
+            elif error_type in {"ReadError", "RemoteProtocolError"}:
                 diagnosis = "responses_read_error"
             elif error_type == "ReadTimeout":
                 diagnosis = "responses_read_timeout"

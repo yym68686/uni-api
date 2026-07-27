@@ -54,6 +54,30 @@ def test_first_byte_deadline_timeout_reports_configured_seconds():
     )
 
 
+def test_runtime_records_pool_timeout_as_local_without_marking_admission():
+    current_info = {}
+
+    classification = runtime._record_transport_failure(
+        current_info,
+        httpx.PoolTimeout("pool exhausted"),
+    )
+    assert classification is not None
+    assert current_info["transport_error_kind"] == "pool_timeout"
+    assert current_info["transport_error_owner"] == "ember_local_overload"
+    assert current_info["transport_error_phase"] == "pool_acquire"
+    assert current_info["provider_penalty_eligible"] is False
+    assert current_info["local_overload"] is True
+    assert current_info["status_origin"] == "ember_local_overload"
+    assert "admission_rejected" not in current_info
+
+    connect_failure = runtime._record_transport_failure(
+        {},
+        httpx.ConnectTimeout("connect timed out"),
+    )
+    assert connect_failure is not None
+    assert connect_failure.provider_penalty_eligible is True
+
+
 class DummyCircularList:
     def __init__(self, items):
         self.items = list(items)
@@ -3882,6 +3906,11 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
             )
         }
     )
+    current_info = {
+        "request_id": "req-test",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
 
     response, body = _run_responses_request_with_stream_body(
         ResponsesRequest(
@@ -3890,6 +3919,7 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
             stream=True,
         ),
         endpoint="/v1/responses/compact",
+        current_info=current_info,
     )
 
     assert response.status_code == 200
@@ -3901,6 +3931,10 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
     assert any("actual_model=gpt-5.4" in log for log in warning_logs)
     assert any("request_id=req-test" in log for log in warning_logs)
     assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in warning_logs)
+    assert current_info["transport_error_kind"] == "remote_protocol_error"
+    assert current_info["transport_error_owner"] == "upstream_transport"
+    assert current_info["transport_error_phase"] == "postcommit"
+    assert current_info["transport_error_count"] == 1
 
 
 def test_responses_non_stream_retries_next_provider_on_semantic_failure(monkeypatch):

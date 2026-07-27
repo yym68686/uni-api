@@ -988,6 +988,195 @@ def test_local_upstream_admission_does_not_cool_or_mark_channel_failure(monkeypa
     asyncio.run(run())
 
 
+def test_httpx_pool_timeout_is_local_overload_and_never_penalizes_provider(
+    monkeypatch,
+):
+    async def run():
+        after_failure_states = []
+        current_info = {}
+
+        class Plan:
+            auto_retry = False
+
+            def record_failure(self, status_code, error_message):
+                assert status_code == 503
+                assert error_message == (
+                    "Local upstream connection pool timed out after "
+                    "0.25 seconds"
+                )
+
+        async def fail_if_penalized(*_args, **_kwargs):
+            raise AssertionError(
+                "PoolTimeout must not cool a key or exclude a channel"
+            )
+
+        monkeypatch.setattr(
+            "upstream.maybe_cool_provider_api_key",
+            fail_if_penalized,
+        )
+        monkeypatch.setattr(
+            "upstream.maybe_exclude_failed_channel",
+            fail_if_penalized,
+        )
+        request = httpx.Request(
+            "POST",
+            "https://provider.example/v1/responses",
+            extensions={"timeout": {"pool": 0.25}},
+        )
+        attempt = UpstreamAttemptContext(
+            plan=Plan(),
+            provider={
+                "preferences": {"api_key_cooldown_period": 300},
+            },
+            provider_name="provider-a",
+            original_model="model-a",
+            provider_api_key_raw="provider-key",
+            state={"track_channel_stats": True},
+        )
+        result = await UpstreamRunner(
+            attempt.plan,
+            observability_context=current_info,
+        )._handle_failure(
+            attempt,
+            httpx.PoolTimeout("pool exhausted", request=request),
+            after_failure=lambda item, *_args: after_failure_states.append(
+                dict(item.state)
+            ),
+            build_error_response=lambda status, message: httpx.Response(
+                status,
+                json={"error": message},
+            ),
+            allow_channel_exclusion=True,
+            should_cool_down=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("PoolTimeout must not run cooldown policy")
+            ),
+            prepare_failure=False,
+        )
+
+        assert result.response.status_code == 503
+        assert result.status_origin == "ember_local_overload"
+        assert (
+            result.response.headers["x-uni-api-status-origin"]
+            == "ember_local_overload"
+        )
+        state = after_failure_states[0]
+        assert state["track_channel_stats"] is False
+        assert state["transport_error_kind"] == "pool_timeout"
+        assert state["transport_error_owner"] == "ember_local_overload"
+        assert state["transport_error_phase"] == "pool_acquire"
+        assert state["provider_penalty_eligible"] is False
+        assert state["local_overload"] is True
+        assert current_info["transport_error_count"] == 1
+        assert current_info["local_overload_count"] == 1
+
+    asyncio.run(run())
+
+
+def test_read_timeout_before_first_byte_is_visible_on_routing_attempt():
+    async def run():
+        class Plan:
+            auto_retry = False
+
+            def record_failure(self, status_code, _error_message):
+                assert status_code == 504
+
+        routing_entry = {}
+        diagnostics = UpstreamTransportDiagnostics(routing_entry)
+        responses_diagnostics = SimpleNamespace(
+            facts={
+                "phase": "precommit",
+                "upstream_chunk_count": 0,
+            }
+        )
+        attempt = UpstreamAttemptContext(
+            plan=Plan(),
+            provider={"preferences": {}},
+            provider_name="provider-a",
+            original_model="model-a",
+            state={
+                "_routing_attempt_entry": routing_entry,
+                "_transport_diagnostics": diagnostics,
+                "responses_stream_diagnostics_tracker": (
+                    responses_diagnostics
+                ),
+            },
+        )
+
+        result = await UpstreamRunner(attempt.plan)._handle_failure(
+            attempt,
+            httpx.ReadTimeout("timed out"),
+            build_error_response=lambda status, message: httpx.Response(
+                status,
+                json={"error": message},
+            ),
+            prepare_failure=False,
+        )
+
+        assert result.response.status_code == 504
+        assert routing_entry["transport_error_kind"] == "read_timeout"
+        assert (
+            routing_entry["transport_error_phase"]
+            == "before_first_byte"
+        )
+        assert routing_entry["transport_error_owner"] == "upstream_transport"
+        assert routing_entry["provider_penalty_eligible"] is True
+
+    asyncio.run(run())
+
+
+def test_generic_read_timeout_uses_request_first_byte_state():
+    async def run():
+        class Plan:
+            auto_retry = False
+
+            def record_failure(self, status_code, _error_message):
+                assert status_code == 504
+
+        routing_entry = {}
+        diagnostics = UpstreamTransportDiagnostics(routing_entry)
+        diagnostics.capture_response(
+            httpx.Response(
+                200,
+                request=httpx.Request(
+                    "POST",
+                    "https://provider.example/v1/chat/completions",
+                ),
+            ),
+            client=SimpleNamespace(),
+        )
+        attempt = UpstreamAttemptContext(
+            plan=Plan(),
+            provider={"preferences": {}},
+            provider_name="provider-a",
+            original_model="model-a",
+            state={
+                "_routing_attempt_entry": routing_entry,
+                "_transport_diagnostics": diagnostics,
+            },
+        )
+
+        result = await UpstreamRunner(
+            attempt.plan,
+            observability_context={"_first_byte_observed": False},
+        )._handle_failure(
+            attempt,
+            httpx.ReadTimeout("timed out"),
+            build_error_response=lambda status, message: httpx.Response(
+                status,
+                json={"error": message},
+            ),
+            prepare_failure=False,
+        )
+
+        assert result.response.status_code == 504
+        assert (
+            routing_entry["transport_error_phase"]
+            == "before_first_byte"
+        )
+
+    asyncio.run(run())
+
+
 def test_request_scoped_semantic_error_does_not_cool_or_mark_channel_failure(
     monkeypatch,
 ):

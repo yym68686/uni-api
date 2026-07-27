@@ -8,20 +8,18 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
-import httpx
 from fastapi import HTTPException
 
 from uni_api.observability.exceptions import exception_diagnostics
 from uni_api.upstream.responses_errors import ResponsesSemanticError
-
-
-NETWORK_ERRORS = (
-    httpx.ReadError,
-    httpx.RemoteProtocolError,
-    httpx.LocalProtocolError,
-    httpx.ReadTimeout,
-    httpx.ConnectError,
+from uni_api.upstream.transport_errors import (
+    HTTPX_TRANSPORT_ERRORS,
+    TransportErrorClassification,
+    classify_httpx_transport_error,
 )
+
+
+NETWORK_ERRORS = HTTPX_TRANSPORT_ERRORS
 
 
 # Some OpenAI-compatible gateways incorrectly use HTTP 400 for a provider-side
@@ -57,6 +55,43 @@ def _timeout_seconds_text(value: Any) -> Optional[str]:
     if not math.isfinite(seconds) or seconds < 0:
         return None
     return f"{seconds:g}"
+
+
+def _transport_error_message(
+    exc: BaseException,
+    classification: TransportErrorClassification,
+    safe_get: Callable[..., Any],
+) -> str:
+    if classification.kind in {
+        "local_protocol_error",
+        "remote_protocol_error",
+    }:
+        reason = exception_diagnostics(exc)["protocol_error_reason"]
+        prefix = (
+            "Local"
+            if classification.kind == "local_protocol_error"
+            else "Remote"
+        )
+        return f"{prefix} protocol error: {reason}"
+
+    timeout_key = classification.timeout_extension_key
+    if timeout_key is None:
+        return classification.message
+    try:
+        request = getattr(exc, "request", None)
+    except RuntimeError:
+        request = None
+    timeout_extensions = getattr(request, "extensions", {}) or {}
+    timeout_value = safe_get(
+        timeout_extensions,
+        "timeout",
+        timeout_key,
+        default=None,
+    )
+    timeout_text = _timeout_seconds_text(timeout_value)
+    if timeout_text is None:
+        return classification.message
+    return f"{classification.message} after {timeout_text} seconds"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,23 +145,16 @@ class ProviderErrorClassifier:
             and 400 <= local_status <= 599
         ):
             return local_status, local_reason
-        if isinstance(exc, httpx.ReadTimeout):
-            timeout_extensions = getattr(getattr(exc, "request", None), "extensions", {}) or {}
-            timeout_value = self.safe_get(timeout_extensions, "timeout", "read", default=None)
-            timeout_text = _timeout_seconds_text(timeout_value)
-            if timeout_text is not None:
-                return 504, f"Request timed out after {timeout_text} seconds"
-            return 504, "Request timed out"
-        if isinstance(exc, httpx.ConnectError):
-            return 503, "Unable to connect to service"
-        if isinstance(exc, httpx.ReadError):
-            return 502, "Network read error"
-        if isinstance(exc, httpx.RemoteProtocolError):
-            reason = exception_diagnostics(exc)["protocol_error_reason"]
-            return 502, f"Remote protocol error: {reason}"
-        if isinstance(exc, httpx.LocalProtocolError):
-            reason = exception_diagnostics(exc)["protocol_error_reason"]
-            return 502, f"Local protocol error: {reason}"
+        transport_failure = classify_httpx_transport_error(exc)
+        if transport_failure is not None:
+            return (
+                transport_failure.status_code,
+                _transport_error_message(
+                    exc,
+                    transport_failure,
+                    self.safe_get,
+                ),
+            )
         if isinstance(exc, HTTPException):
             return exc.status_code, str(exc.detail)
         return 500, str(exc) or f"Unknown error: {exc.__class__.__name__}"

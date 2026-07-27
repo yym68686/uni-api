@@ -278,6 +278,10 @@ from uni_api.upstream.responses_normalization import (
     ResponsesCustomToolCallIdNormalizer,
     responses_custom_tool_call_id_normalization_enabled,
 )
+from uni_api.upstream.transport_errors import (
+    TransportErrorClassification,
+    classify_httpx_transport_error,
+)
 from core.utils import safe_get
 
 from sqlalchemy import inspect, text
@@ -3300,6 +3304,13 @@ async def _track_legacy_stream_outcome(
                 current_info,
                 exc,
             )
+            transport_failure = _record_transport_failure(
+                current_info,
+                exc,
+                failure_stage="postcommit",
+                first_byte_observed=True,
+                increment_count=True,
+            )
             semantic_failure = isinstance(exc, ResponsesSemanticError)
             if local_admission:
                 current_info["stream_outcome"] = "local_backpressure_abort"
@@ -3341,7 +3352,14 @@ async def _track_legacy_stream_outcome(
                 ),
                 error_message=exc,
             )
-            if not local_admission and not _is_request_scoped_semantic_error(exc):
+            if (
+                not local_admission
+                and (
+                    transport_failure is None
+                    or transport_failure.provider_penalty_eligible
+                )
+                and not _is_request_scoped_semantic_error(exc)
+            ):
                 _schedule_channel_stats_bounded(
                     current_info["request_id"],
                     channel_id,
@@ -3413,6 +3431,76 @@ def _record_local_admission_rejection(
         current_info["success"] = False
         current_info["status_origin"] = "ember_local_admission"
     return True
+
+
+def _record_transport_failure(
+    current_info: Any,
+    exc: BaseException,
+    *,
+    failure_stage: Any = None,
+    first_byte_observed: bool | None = None,
+    increment_count: bool = False,
+) -> TransportErrorClassification | None:
+    transport_failure = classify_httpx_transport_error(
+        exc,
+        failure_stage=failure_stage,
+        first_byte_observed=first_byte_observed,
+    )
+    if transport_failure is None:
+        return None
+    if isinstance(current_info, dict):
+        current_info.update(transport_failure.observability_facts())
+        current_info["status_origin"] = transport_failure.owner
+        if increment_count:
+            current_info["transport_error_count"] = max(
+                0,
+                int(current_info.get("transport_error_count") or 0),
+            ) + 1
+            if transport_failure.local_overload:
+                current_info["local_overload_count"] = max(
+                    0,
+                    int(current_info.get("local_overload_count") or 0),
+                ) + 1
+    return transport_failure
+
+
+def _record_stream_transport_failure(
+    current_info: Any,
+    attempt: Any,
+    exc: BaseException,
+) -> TransportErrorClassification | None:
+    state = getattr(attempt, "state", None)
+    state = state if isinstance(state, dict) else {}
+    diagnostics = state.get("responses_stream_diagnostics_tracker")
+    diagnostics_facts = getattr(diagnostics, "facts", None)
+    if isinstance(diagnostics_facts, dict):
+        failure_stage = diagnostics_facts.get("phase") or "postcommit"
+        first_byte_observed = bool(
+            int(diagnostics_facts.get("upstream_chunk_count") or 0)
+        )
+    else:
+        failure_stage = "postcommit"
+        first_byte_observed = True
+
+    transport_failure = _record_transport_failure(
+        current_info,
+        exc,
+        failure_stage=failure_stage,
+        first_byte_observed=first_byte_observed,
+        increment_count=True,
+    )
+    if transport_failure is None:
+        return None
+
+    facts = transport_failure.observability_facts()
+    state.update(facts)
+    state["status_origin"] = transport_failure.owner
+    routing_entry = state.get("_routing_attempt_entry")
+    if isinstance(routing_entry, dict):
+        routing_entry.update(facts)
+    if not transport_failure.provider_penalty_eligible:
+        state["track_channel_stats"] = False
+    return transport_failure
 
 
 def _is_request_scoped_semantic_error(exc: BaseException) -> bool:
@@ -3664,8 +3752,19 @@ async def process_request(
             current_info,
             e,
         )
+        transport_failure = _record_transport_failure(
+            current_info,
+            e,
+            first_byte_observed=bool(
+                current_info.get("_first_byte_observed")
+            ),
+        )
         if not (
             local_admission_rejection
+            or (
+                transport_failure is not None
+                and not transport_failure.provider_penalty_eligible
+            )
             or _is_request_scoped_semantic_error(e)
             or isinstance(e, asyncio.CancelledError)
             or (
@@ -6782,6 +6881,12 @@ class ResponsesRequestExecution:
         routing_entry = attempt.state.get("_routing_attempt_entry")
         if isinstance(routing_entry, dict):
             for key in (
+                "transport_error_kind",
+                "transport_error_owner",
+                "transport_error_phase",
+                "transport_error_status_code",
+                "provider_penalty_eligible",
+                "local_overload",
                 "failure_stage",
                 "protocol_error_reason",
                 "exception_type",
@@ -7772,6 +7877,11 @@ class ResponsesRequestExecution:
         if attempt.state.get("stream_attempt_finalized"):
             return
         attempt.state["stream_attempt_finalized"] = True
+        _record_stream_transport_failure(
+            self.current_info,
+            attempt,
+            exc,
+        )
         self._record_upstream_attempt_result(
             attempt,
             status_code=status_code,
@@ -8538,6 +8648,7 @@ class MessagesPassthroughHandler:
             return
         attempt.state["messages_stream_finalized"] = True
         current_info = ctx["current_info"]
+        _record_stream_transport_failure(current_info, attempt, exc)
         current_info["success"] = False
         current_info["stream_outcome"] = "upstream_stream_abort"
         current_info["stream_error_status_code"] = 502

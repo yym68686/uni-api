@@ -8,6 +8,10 @@ from time import monotonic
 from typing import Any, Awaitable, Callable
 
 from uni_api.observability.exceptions import exception_diagnostics
+from uni_api.upstream.transport_errors import (
+    TransportErrorClassification,
+    classify_httpx_transport_error,
+)
 
 
 _MAX_TRACE_EVENTS = 32
@@ -390,9 +394,22 @@ class UpstreamTransportDiagnostics:
             diagnostics = exception_diagnostics(exc)
             prefix = "outer_" if self._raw_exception_captured else ""
             self._capture_exception(diagnostics, prefix=prefix, stage=self._stage)
+            transport_failure = classify_httpx_transport_error(
+                exc,
+                failure_stage=self._stage,
+            )
+            if transport_failure is not None:
+                self.record_transport_failure(transport_failure)
             self._capture_connection(client)
         except Exception:
             return
+
+    def record_transport_failure(
+        self,
+        classification: TransportErrorClassification,
+    ) -> None:
+        self.facts.update(classification.observability_facts())
+        self._sync_entry()
 
     def _capture_exception(
         self,

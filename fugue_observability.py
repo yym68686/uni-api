@@ -1349,6 +1349,14 @@ def build_uni_api_ember_request_telemetry(
         current_info.get("planned_attempt_count"),
         0,
     )
+    transport_error_count = _safe_int(
+        current_info.get("transport_error_count"),
+        0,
+    )
+    local_overload_count = _safe_int(
+        current_info.get("local_overload_count"),
+        0,
+    )
     cooldown_count = _safe_int(current_info.get("cooldown_count"), 0)
     is_stream = _safe_bool(current_info.get("stream"))
     api_key_hash = _secret_hash(current_info.get("api_key"))
@@ -1388,6 +1396,8 @@ def build_uni_api_ember_request_telemetry(
                 "retry_decision_count": _int_text(retry_decision_count),
                 "retry_transition_count": _int_text(retry_transition_count),
                 "planned_attempt_count": _int_text(planned_attempt_count),
+                "transport_error_count": _int_text(transport_error_count),
+                "local_overload_count": _int_text(local_overload_count),
             }
         )
     )
@@ -1513,6 +1523,12 @@ def build_uni_api_ember_request_telemetry(
                             current_info.get("routing_attempts_omitted_count"),
                             0,
                         )
+                    ),
+                    "transport_error_count": _int_text(
+                        transport_error_count
+                    ),
+                    "local_overload_count": _int_text(
+                        local_overload_count
                     ),
                     "client_pool_wait_ms": _int_text(_span_ms(spans, "upstream_pool_wait_ms")),
                     "request_admission_wait_ms": _int_text(
@@ -1989,6 +2005,8 @@ def build_uni_api_ember_request_telemetry(
             "uniapi_ember_upstream_errors_total": _actual_upstream_error_count(
                 current_info
             ),
+            "uniapi_ember_transport_errors_total": transport_error_count,
+            "uniapi_ember_local_overload_total": local_overload_count,
             "uniapi_ember_exposed_5xx_total": 1 if status_code >= 500 else 0,
             "uniapi_ember_request_admission_rejected_total": 1
             if _safe_bool(current_info.get("admission_rejected"))
@@ -2245,6 +2263,35 @@ def _routing_attempt_log_events(
                             raw_attempt.get("error_type"),
                             max_len=128,
                         ),
+                        "transport_error_kind": _safe_text(
+                            raw_attempt.get("transport_error_kind"),
+                            max_len=80,
+                        ),
+                        "transport_error_owner": _safe_text(
+                            raw_attempt.get("transport_error_owner"),
+                            max_len=80,
+                        ),
+                        "transport_error_phase": _safe_text(
+                            raw_attempt.get("transport_error_phase"),
+                            max_len=80,
+                        ),
+                        "transport_error_status_code": _optional_int_text(
+                            raw_attempt.get("transport_error_status_code")
+                        ),
+                        "provider_penalty_eligible": _bool_text(
+                            _safe_bool(
+                                raw_attempt.get(
+                                    "provider_penalty_eligible"
+                                )
+                            )
+                        )
+                        if "provider_penalty_eligible" in raw_attempt
+                        else None,
+                        "local_overload": _bool_text(
+                            _safe_bool(raw_attempt.get("local_overload"))
+                        )
+                        if "local_overload" in raw_attempt
+                        else None,
                         "error_message_sha256": _safe_text(
                             raw_attempt.get("error_message_sha256"),
                             max_len=64,
@@ -2473,6 +2520,59 @@ def _upstream_attempt_log_events(
                         "attempt_status_class": _status_class(attempt_status),
                         "attempt_success": _bool_text(_safe_bool(raw_attempt.get("success"))),
                         "attempt_error_type": attempt_error_type,
+                        "transport_error_kind": _safe_text(
+                            stream_diagnostics.get("transport_error_kind")
+                            or raw_attempt.get("transport_error_kind"),
+                            max_len=80,
+                        ),
+                        "transport_error_owner": _safe_text(
+                            stream_diagnostics.get("transport_error_owner")
+                            or raw_attempt.get("transport_error_owner"),
+                            max_len=80,
+                        ),
+                        "transport_error_phase": _safe_text(
+                            stream_diagnostics.get("transport_error_phase")
+                            or raw_attempt.get("transport_error_phase"),
+                            max_len=80,
+                        ),
+                        "transport_error_status_code": _optional_int_text(
+                            stream_diagnostics.get(
+                                "transport_error_status_code"
+                            )
+                            or raw_attempt.get(
+                                "transport_error_status_code"
+                            )
+                        ),
+                        "provider_penalty_eligible": _bool_text(
+                            _safe_bool(
+                                stream_diagnostics.get(
+                                    "provider_penalty_eligible"
+                                )
+                                if "provider_penalty_eligible"
+                                in stream_diagnostics
+                                else raw_attempt.get(
+                                    "provider_penalty_eligible"
+                                )
+                            )
+                        )
+                        if (
+                            "provider_penalty_eligible"
+                            in stream_diagnostics
+                            or "provider_penalty_eligible" in raw_attempt
+                        )
+                        else None,
+                        "local_overload": _bool_text(
+                            _safe_bool(
+                                stream_diagnostics.get("local_overload")
+                                if "local_overload" in stream_diagnostics
+                                else raw_attempt.get("local_overload")
+                            )
+                        )
+                        if (
+                            "local_overload" in stream_diagnostics
+                            or "local_overload" in raw_attempt
+                        )
+                        else None,
                         "status_origin": _safe_text(
                             raw_attempt.get("status_origin"),
                             max_len=64,
@@ -3270,6 +3370,18 @@ def _responses_diagnostic_attrs(
         "transport_error_code_source": _safe_text(
             diagnostics.get("transport_error_code_source")
         ),
+        "transport_error_kind": _safe_text(
+            diagnostics.get("transport_error_kind"), max_len=80
+        ),
+        "transport_error_owner": _safe_text(
+            diagnostics.get("transport_error_owner"), max_len=80
+        ),
+        "transport_error_phase": _safe_text(
+            diagnostics.get("transport_error_phase"), max_len=80
+        ),
+        "transport_error_status_code": _optional_int_text(
+            diagnostics.get("transport_error_status_code")
+        ),
         "transport_end_trigger": _safe_text(
             diagnostics.get("transport_end_trigger")
         ),
@@ -3341,6 +3453,8 @@ def _responses_diagnostic_attrs(
     }
 
     bool_fields = (
+        "provider_penalty_eligible",
+        "local_overload",
         "transport_metadata_available",
         "response_start_asgi_write_attempted",
         "response_start_asgi_write_completed",

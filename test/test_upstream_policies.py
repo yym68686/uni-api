@@ -4,6 +4,7 @@ from fastapi import HTTPException
 
 from uni_api.upstream.policies import CooldownPolicy, ProviderErrorClassifier, RetryPolicy
 from uni_api.upstream.responses_errors import responses_failure_error
+from uni_api.upstream.transport_errors import classify_httpx_transport_error
 
 
 def _safe_get(data, *keys, default=None):
@@ -27,6 +28,186 @@ def test_provider_error_classifier_normalizes_http_and_network_errors():
     assert classifier.normalize_exception(HTTPException(status_code=418, detail="teapot")) == (418, "teapot")
     assert classifier.normalize_exception(httpx.ConnectError("no route")) == (503, "Unable to connect to service")
     assert classifier.remap_status_code(500, "string_above_max_length") == 413
+
+
+@pytest.mark.parametrize(
+    ("error_type", "kind", "owner", "phase", "status_code", "penalty"),
+    [
+        (
+            httpx.ConnectTimeout,
+            "connect_timeout",
+            "upstream_transport",
+            "connect",
+            504,
+            True,
+        ),
+        (
+            httpx.ConnectError,
+            "connect_error",
+            "upstream_transport",
+            "connect",
+            503,
+            True,
+        ),
+        (
+            httpx.PoolTimeout,
+            "pool_timeout",
+            "ember_local_overload",
+            "pool_acquire",
+            503,
+            False,
+        ),
+        (
+            httpx.ReadTimeout,
+            "read_timeout",
+            "upstream_transport",
+            "unknown",
+            504,
+            True,
+        ),
+        (
+            httpx.WriteTimeout,
+            "write_timeout",
+            "upstream_transport",
+            "send_body",
+            504,
+            True,
+        ),
+        (
+            httpx.ReadError,
+            "read_error",
+            "upstream_transport",
+            "read_body",
+            502,
+            True,
+        ),
+        (
+            httpx.WriteError,
+            "write_error",
+            "upstream_transport",
+            "send_body",
+            502,
+            True,
+        ),
+        (
+            httpx.CloseError,
+            "close_error",
+            "upstream_transport",
+            "close",
+            502,
+            True,
+        ),
+        (
+            httpx.ProxyError,
+            "proxy_error",
+            "upstream_transport",
+            "proxy_connect",
+            502,
+            True,
+        ),
+        (
+            httpx.UnsupportedProtocol,
+            "unsupported_protocol",
+            "ember_local_configuration",
+            "configuration",
+            500,
+            True,
+        ),
+        (
+            httpx.LocalProtocolError,
+            "local_protocol_error",
+            "upstream_transport",
+            "protocol",
+            502,
+            True,
+        ),
+        (
+            httpx.RemoteProtocolError,
+            "remote_protocol_error",
+            "upstream_transport",
+            "protocol",
+            502,
+            True,
+        ),
+    ],
+)
+def test_httpx_transport_error_classification_is_complete(
+    error_type,
+    kind,
+    owner,
+    phase,
+    status_code,
+    penalty,
+):
+    classification = classify_httpx_transport_error(error_type("failure"))
+
+    assert classification is not None
+    assert classification.kind == kind
+    assert classification.owner == owner
+    assert classification.phase == phase
+    assert classification.status_code == status_code
+    assert classification.provider_penalty_eligible is penalty
+
+
+def test_read_timeout_classification_distinguishes_first_byte_phase():
+    before = classify_httpx_transport_error(
+        httpx.ReadTimeout("timed out"),
+        failure_stage="precommit",
+        first_byte_observed=False,
+    )
+    after = classify_httpx_transport_error(
+        httpx.ReadTimeout("timed out"),
+        failure_stage="postcommit",
+        first_byte_observed=True,
+    )
+
+    assert before is not None
+    assert before.kind == "read_timeout"
+    assert before.phase == "before_first_byte"
+    assert after is not None
+    assert after.kind == "read_timeout"
+    assert after.phase == "after_first_byte"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "timeout_key", "timeout_value", "expected"),
+    [
+        (
+            httpx.ConnectTimeout,
+            "connect",
+            15,
+            (504, "Connection timed out after 15 seconds"),
+        ),
+        (
+            httpx.PoolTimeout,
+            "pool",
+            0.25,
+            (503, "Local upstream connection pool timed out after 0.25 seconds"),
+        ),
+        (
+            httpx.WriteTimeout,
+            "write",
+            30,
+            (504, "Request write timed out after 30 seconds"),
+        ),
+    ],
+)
+def test_provider_error_classifier_reports_transport_timeout_phase_setting(
+    error_type,
+    timeout_key,
+    timeout_value,
+    expected,
+):
+    classifier = ProviderErrorClassifier(_safe_get)
+    request = httpx.Request(
+        "POST",
+        "https://provider.example/v1/responses",
+        extensions={"timeout": {timeout_key: timeout_value}},
+    )
+
+    assert classifier.normalize_exception(
+        error_type("timed out", request=request)
+    ) == expected
 
 
 @pytest.mark.parametrize(

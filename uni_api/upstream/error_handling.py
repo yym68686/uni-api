@@ -207,11 +207,7 @@ async def error_handling_wrapper(
                     logger.debug("provider: %-11s Stream cancelled by client", channel_id)
                     raise
                 except (
-                    httpx.ReadError,
-                    httpx.RemoteProtocolError,
-                    httpx.ReadTimeout,
-                    httpx.WriteError,
-                    httpx.ProtocolError,
+                    httpx.TransportError,
                     h2.exceptions.ProtocolError,
                 ) as exc:
                     logger.error("provider: %-11s Network error in new_generator: %s", channel_id, exc)

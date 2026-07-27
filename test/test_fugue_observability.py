@@ -465,6 +465,80 @@ def test_normal_request_does_not_emit_body_complexity_diagnostics():
     assert "request_body_rejected" not in serialized
 
 
+def test_transport_failure_classification_reaches_logs_summary_and_metrics():
+    failure_facts = {
+        "transport_error_kind": "pool_timeout",
+        "transport_error_owner": "ember_local_overload",
+        "transport_error_phase": "pool_acquire",
+        "transport_error_status_code": 503,
+        "provider_penalty_eligible": False,
+        "local_overload": True,
+    }
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "request_id": "pool_timeout_123",
+            "endpoint": "POST /v1/responses",
+            "status_code": 503,
+            "process_time": 0.25,
+            "attempt_count": 1,
+            "transport_error_count": 1,
+            "local_overload_count": 1,
+            "timing_spans": {"request_received": 0, "stream_end": 250},
+            "routing_attempts": [
+                {
+                    "index": 1,
+                    "provider": "provider-a",
+                    "actual_model": "model-a",
+                    "semantic_status_code": 503,
+                    "error_type": "PoolTimeout",
+                    **failure_facts,
+                }
+            ],
+            "upstream_attempts": [
+                {
+                    "index": 1,
+                    "provider": "provider-a",
+                    "actual_model": "model-a",
+                    "status_code": 503,
+                    "error_type": "PoolTimeout",
+                    **failure_facts,
+                }
+            ],
+        },
+        runtime_metrics={},
+    )
+
+    request_summary = next(
+        event
+        for event in telemetry["logs"]
+        if event["event"] == "request_summary"
+    )
+    assert request_summary["summary"]["transport_error_count"] == "1"
+    assert request_summary["summary"]["local_overload_count"] == "1"
+
+    for event_type in ("routing_attempt", "upstream_attempt"):
+        event = next(
+            item
+            for item in telemetry["logs"]
+            if item["event"] == event_type
+        )
+        attrs = event["attributes"]
+        assert attrs["transport_error_kind"] == "pool_timeout"
+        assert attrs["transport_error_owner"] == "ember_local_overload"
+        assert attrs["transport_error_phase"] == "pool_acquire"
+        assert attrs["transport_error_status_code"] == "503"
+        assert attrs["provider_penalty_eligible"] == "false"
+        assert attrs["local_overload"] == "true"
+
+    metrics = {event["metric"]: event for event in telemetry["metrics"]}
+    assert metrics["uniapi_ember_transport_errors_total"]["value"] == 1
+    assert metrics["uniapi_ember_local_overload_total"]["value"] == 1
+
+
 def test_early_admission_rejection_only_emits_observed_stage_spans():
     telemetry = build_uni_api_ember_request_telemetry(
         service_name="uni-api-ember",

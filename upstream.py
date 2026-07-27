@@ -21,15 +21,18 @@ from uni_api.observability.upstream_transport import (
     reset_upstream_transport_diagnostics,
 )
 from uni_api.routing.core import RoutingPlan, select_provider_api_key_raw
-from uni_api.upstream.policies import CooldownPolicy, ProviderErrorClassifier, RetryPolicy
-
-UPSTREAM_NETWORK_ERRORS = (
-    httpx.ReadError,
-    httpx.RemoteProtocolError,
-    httpx.LocalProtocolError,
-    httpx.ReadTimeout,
-    httpx.ConnectError,
+from uni_api.upstream.policies import (
+    NETWORK_ERRORS,
+    CooldownPolicy,
+    ProviderErrorClassifier,
+    RetryPolicy,
 )
+from uni_api.upstream.transport_errors import (
+    TransportErrorClassification,
+    classify_httpx_transport_error,
+)
+
+UPSTREAM_NETWORK_ERRORS = NETWORK_ERRORS
 
 _PROVIDER_ERROR_CLASSIFIER = ProviderErrorClassifier(safe_get=safe_get)
 _RETRY_POLICY = RetryPolicy(_PROVIDER_ERROR_CLASSIFIER, get_engine=get_engine)
@@ -579,7 +582,7 @@ class UpstreamRunner:
         local_admission_rejection: bool,
         status_origin: str,
     ) -> None:
-        attempt.state["_routing_failure"] = {
+        failure = {
             "wire_status_code": (
                 getattr(exc, "wire_status_code", None)
                 or attempt.state.get("routing_wire_status_code")
@@ -611,12 +614,82 @@ class UpstreamRunner:
                 attempt.state.get("provider_model_circuit_blocks_retry")
             ),
         }
+        for key in (
+            "transport_error_kind",
+            "transport_error_owner",
+            "transport_error_phase",
+            "transport_error_status_code",
+            "provider_penalty_eligible",
+            "local_overload",
+        ):
+            if key in attempt.state:
+                failure[key] = attempt.state[key]
+        attempt.state["_routing_failure"] = failure
         if retry_decision and self.observability_context is not None:
             info = self.observability_context
             info["retry_decision_count"] = max(
                 0,
                 int(info.get("retry_decision_count") or 0),
             ) + 1
+        if (
+            attempt.state.get("transport_error_kind")
+            and self.observability_context is not None
+        ):
+            info = self.observability_context
+            info["transport_error_count"] = max(
+                0,
+                int(info.get("transport_error_count") or 0),
+            ) + 1
+            if attempt.state.get("local_overload"):
+                info["local_overload_count"] = max(
+                    0,
+                    int(info.get("local_overload_count") or 0),
+                ) + 1
+
+    def _classify_transport_failure(
+        self,
+        attempt: UpstreamAttemptContext,
+        exc: BaseException,
+    ) -> TransportErrorClassification | None:
+        diagnostics = attempt.state.get("_transport_diagnostics")
+        failure_stage = None
+        if isinstance(diagnostics, UpstreamTransportDiagnostics):
+            failure_stage = diagnostics.facts.get("failure_stage")
+
+        first_byte_observed: bool | None = None
+        responses_diagnostics = attempt.state.get(
+            "responses_stream_diagnostics_tracker"
+        )
+        responses_facts = getattr(responses_diagnostics, "facts", None)
+        if isinstance(responses_facts, dict):
+            failure_stage = (
+                responses_facts.get("phase")
+                or failure_stage
+            )
+            if "upstream_chunk_count" in responses_facts:
+                first_byte_observed = bool(
+                    int(responses_facts.get("upstream_chunk_count") or 0)
+                )
+        if (
+            first_byte_observed is None
+            and self.observability_context is not None
+        ):
+            first_byte_observed = bool(
+                self.observability_context.get("_first_byte_observed")
+            )
+
+        classification = classify_httpx_transport_error(
+            exc,
+            failure_stage=failure_stage,
+            first_byte_observed=first_byte_observed,
+        )
+        if classification is None:
+            return None
+
+        attempt.state.update(classification.observability_facts())
+        if isinstance(diagnostics, UpstreamTransportDiagnostics):
+            diagnostics.record_transport_failure(classification)
+        return classification
 
     @staticmethod
     def _finish_routing_attempt(
@@ -943,6 +1016,7 @@ class UpstreamRunner:
         on_cooldown=None,
         prepare_failure: bool,
     ) -> UpstreamAttemptResult:
+        transport_failure = self._classify_transport_failure(attempt, exc)
         status_code, error_message = normalize_provider_exception(exc)
         original_status_code = status_code
         status_code = remap_status_code_from_error(status_code, error_message)
@@ -964,8 +1038,8 @@ class UpstreamRunner:
             status_origin = "provider_http"
         elif bool(getattr(exc, "upstream_semantic_error", False)):
             status_origin = "provider_semantic"
-        elif isinstance(exc, UPSTREAM_NETWORK_ERRORS):
-            status_origin = "upstream_transport"
+        elif transport_failure is not None:
+            status_origin = transport_failure.owner
         else:
             status_origin = "ember_upstream_processing"
         attempt.state["status_origin"] = status_origin
@@ -999,6 +1073,11 @@ class UpstreamRunner:
         if local_admission_rejection:
             attempt.state["local_admission_rejected"] = True
             attempt.state["track_channel_stats"] = False
+        if (
+            transport_failure is not None
+            and not transport_failure.provider_penalty_eligible
+        ):
+            attempt.state["track_channel_stats"] = False
 
         request_scoped_failure = status_code in (400, 413) or (
             status_code == 404
@@ -1017,6 +1096,10 @@ class UpstreamRunner:
             allow_channel_exclusion
             and not prepare_failure
             and not local_admission_rejection
+            and (
+                transport_failure is None
+                or transport_failure.provider_penalty_eligible
+            )
             and not request_scoped_failure
         ):
             circuit_result = await maybe_exclude_failed_channel(
@@ -1044,9 +1127,20 @@ class UpstreamRunner:
         )
         should_cool_key = bool(
             not local_admission_rejection
+            and (
+                transport_failure is None
+                or transport_failure.provider_penalty_eligible
+            )
             and (force_cool_key or not request_scoped_failure)
         )
-        if should_cool_down is not None and not local_admission_rejection:
+        if (
+            should_cool_down is not None
+            and not local_admission_rejection
+            and (
+                transport_failure is None
+                or transport_failure.provider_penalty_eligible
+            )
+        ):
             should_cool_key = force_cool_key or bool(
                 not request_scoped_failure
                 and await _maybe_await(
