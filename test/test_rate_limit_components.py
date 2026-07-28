@@ -73,6 +73,28 @@ def test_provider_key_pool_cooldown_expires():
     asyncio.run(run())
 
 
+def test_provider_key_pool_warning_masks_api_key():
+    api_key = "AIza-secret-provider-key-123456"
+    warnings = []
+    pool = ProviderKeyPool(
+        [api_key],
+        rate_limit={"default": "1/min"},
+        on_warning=warnings.append,
+    )
+
+    async def run():
+        await pool.set_cooling(api_key, cooling_time=60)
+        pool.state.cooling_until.clear()
+        assert await pool.is_rate_limited(api_key, "gpt-5.6-sol") is False
+        assert await pool.is_rate_limited(api_key, "gpt-5.6-sol") is True
+
+    asyncio.run(run())
+
+    assert len(warnings) == 2
+    assert all(api_key not in warning for warning in warnings)
+    assert all("AIza...3456" in warning for warning in warnings)
+
+
 def test_provider_key_pool_rollback_restores_last_record():
     clock = {"now": 1000.0}
     pool = ProviderKeyPool(["key-1"], rate_limit={"default": "1/min"}, now_func=lambda: clock["now"])

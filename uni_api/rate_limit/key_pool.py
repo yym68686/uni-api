@@ -12,6 +12,15 @@ from uni_api.rate_limit.policy import DEFAULT_RATE_LIMIT, RateLimitPolicy
 from uni_api.rate_limit.state import RateLimitState
 
 
+def _masked_api_key(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    if len(raw) <= 10:
+        return "***"
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
 class ProviderKeyPool:
     def __init__(
         self,
@@ -77,13 +86,18 @@ class ProviderKeyPool:
     async def set_cooling(self, item: str, cooling_time: int = 60):
         async with self.lock:
             self.state.set_cooling(item, cooling_time)
-        self._log_warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
+        self._log_warning(
+            f"API key {_masked_api_key(item)} 已进入冷却状态，冷却时间 {cooling_time} 秒"
+        )
 
     async def is_rate_limited(self, item: str, model: str | None = None, is_check: bool = False) -> bool:
         async with self.lock:
             limited = self.state.is_rate_limited(item, model, self.policy, commit=not is_check)
         if limited and not is_check:
-            self._log_warning(f"API key {item}: model: {model or 'default'} has been rate limited")
+            self._log_warning(
+                f"API key {_masked_api_key(item)}: model: {model or 'default'} "
+                "has been rate limited"
+            )
         return limited
 
     def rollback_rate_limit_record(self, item: str, model: str | None = None) -> None:
