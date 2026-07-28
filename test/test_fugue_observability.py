@@ -1432,6 +1432,30 @@ def test_responses_request_summary_is_never_sampled_away():
     assert client._queue.qsize() == 0
 
 
+def test_responses_delta_fast_path_counters_reach_request_summary():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "status_code": 200,
+            "stream": True,
+            "responses_delta_fast_path_candidates": 491,
+            "responses_delta_fast_path_events": 487,
+            "responses_delta_fast_path_fallbacks": 4,
+            "responses_delta_fast_path_bytes": 249_164,
+        },
+        runtime_metrics={},
+    )
+
+    summary = telemetry["logs"][0]["summary"]
+    assert summary["responses_delta_fast_path_candidates"] == "491"
+    assert summary["responses_delta_fast_path_events"] == "487"
+    assert summary["responses_delta_fast_path_fallbacks"] == "4"
+    assert summary["responses_delta_fast_path_bytes"] == "249164"
+
+
 def test_image_stream_terminal_contract_is_exported_without_payload_data():
     telemetry = build_uni_api_ember_request_telemetry(
         service_name="uni-api-ember",

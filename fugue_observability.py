@@ -1907,6 +1907,18 @@ def build_uni_api_ember_request_telemetry(
                     "stream_queue_peak_bytes": _int_text(
                         _safe_int(current_info.get("stream_queue_peak_bytes"), 0)
                     ),
+                    "responses_delta_fast_path_candidates": _optional_int_text(
+                        current_info.get("responses_delta_fast_path_candidates")
+                    ),
+                    "responses_delta_fast_path_events": _optional_int_text(
+                        current_info.get("responses_delta_fast_path_events")
+                    ),
+                    "responses_delta_fast_path_fallbacks": _optional_int_text(
+                        current_info.get("responses_delta_fast_path_fallbacks")
+                    ),
+                    "responses_delta_fast_path_bytes": _optional_int_text(
+                        current_info.get("responses_delta_fast_path_bytes")
+                    ),
                     "wire_status_code": _optional_int_text(
                         current_info.get("wire_status_code")
                     ),
