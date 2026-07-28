@@ -219,6 +219,7 @@ from uni_api.streaming.chat_completion_collector import (
 )
 from uni_api.streaming.bounded_queue import (
     ByteBoundedQueue,
+    ObservedStreamFrame,
     ObservedStreamChunk,
     ReservedChunkBuffer,
     ReservedStreamChunk,
@@ -233,12 +234,19 @@ from uni_api.streaming.sse import (
     DEFAULT_MAX_EVENT_BYTES,
     IncrementalSSEParser,
     SSEProtocolError,
+    StreamParserRetainedLease,
     is_sse_comment_frame,
     parse_owned_sse_event,
     parse_sse_event,
     sse_event_has_data_field,
     stream_parser_retained_budget_snapshot,
     validate_sse_event_type_consistency,
+)
+from uni_api.streaming.responses_fast_path import (
+    CanonicalResponsesDeltaFrame,
+    MIN_CANONICAL_RESPONSES_DELTA_FRAME_BYTES,
+    can_forward_responses_delta_without_materializing,
+    match_canonical_responses_delta_frame,
 )
 from uni_api.streaming.usage import (
     StreamUsageSnapshot,
@@ -5125,6 +5133,10 @@ def _log_responses_downstream_disconnect(
     )
 
 RESPONSES_STREAM_NETWORK_ERRORS = UPSTREAM_NETWORK_ERRORS
+RESPONSES_DELTA_FAST_PATH_ENABLED = _env_bool(
+    "RESPONSES_DELTA_FAST_PATH_ENABLED",
+    True,
+)
 
 RESPONSES_STREAM_QUEUE_MAX_ITEMS = max(
     1,
@@ -5418,7 +5430,7 @@ def _observed_responses_stream_chunk(
     semantic_outcome: str,
     terminal_timeline_event: bool = False,
     usage_snapshot: StreamUsageSnapshot | None = None,
-) -> ObservedStreamChunk | ReservedStreamChunk:
+) -> ObservedStreamFrame | ReservedStreamChunk:
     if reservation is not None:
         return ReservedStreamChunk(
             data,
@@ -5429,8 +5441,8 @@ def _observed_responses_stream_chunk(
             sse_metadata_complete=True,
             usage_snapshot=usage_snapshot,
         )
-    return ObservedStreamChunk(
-        data,
+    return ObservedStreamFrame(
+        data=data,
         event_type=event_type,
         semantic_outcome=semantic_outcome,
         terminal_timeline_event=terminal_timeline_event,
@@ -6661,6 +6673,13 @@ class ResponsesRequestExecution:
             sse_metadata_complete = chunk.sse_metadata_complete
             usage_snapshot = chunk.usage_snapshot
             chunk = chunk.data
+        elif isinstance(chunk, ObservedStreamFrame):
+            event_type = chunk.event_type
+            semantic_outcome = chunk.semantic_outcome
+            terminal_timeline_event = chunk.terminal_timeline_event
+            sse_metadata_complete = chunk.sse_metadata_complete
+            usage_snapshot = chunk.usage_snapshot
+            chunk = chunk.data
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8")
         if not isinstance(chunk, (bytes, bytearray)):
@@ -7498,6 +7517,10 @@ class ResponsesRequestExecution:
         usage_seen = False
         output_seen = False
         terminal_queue_handoff_completed = False
+        fast_path_candidates = 0
+        fast_path_events = 0
+        fast_path_fallbacks = 0
+        fast_path_bytes = 0
         # Precommit may add one bounded event header to an otherwise maximum-
         # sized upstream frame.  The owned parser below only uses this relaxed
         # limit for chunks already accepted by the stricter upstream parser.
@@ -7616,13 +7639,30 @@ class ResponsesRequestExecution:
                     chunk = None
                     raise DownstreamDisconnectedDuringWait()
                 chunk_size = len(chunk)
+                chunk_bytes = bytes(chunk)
                 frame_phase = (
                     phase_diagnostics.begin_phase("sse_frame")
                     if phase_diagnostics is not None
                     else None
                 )
+                raw_events = None
+                fast_frame = None
                 try:
-                    raw_events = proxy_sse_parser.feed(bytes(chunk))
+                    if (
+                        RESPONSES_DELTA_FAST_PATH_ENABLED
+                        and output_seen
+                        and custom_tool_call_id_normalizer is None
+                        and chunk_size
+                        >= MIN_CANONICAL_RESPONSES_DELTA_FRAME_BYTES
+                        and chunk_bytes.startswith(b"event: response.")
+                        and chunk_bytes.endswith(b"\n\n")
+                        and proxy_sse_parser.can_bypass_complete_frame
+                    ):
+                        fast_frame = match_canonical_responses_delta_frame(
+                            chunk_bytes
+                        )
+                    if fast_frame is None:
+                        raw_events = proxy_sse_parser.feed(chunk_bytes)
                 finally:
                     if phase_diagnostics is not None:
                         phase_diagnostics.finish_phase(
@@ -7630,12 +7670,35 @@ class ResponsesRequestExecution:
                             frame_phase,
                             bytes_count=chunk_size,
                             events=(
-                                len(raw_events)
+                                1
+                                if fast_frame is not None
+                                else len(raw_events)
                                 if isinstance(raw_events, list)
                                 else 0
                             ),
                         )
                 chunk = None
+                if fast_frame is not None:
+                    fast_frame_lease = StreamParserRetainedLease()
+                    fast_frame_lease.grow(len(chunk_bytes) - 2)
+                    try:
+                        yield (
+                            fast_frame,
+                            None,
+                            False,
+                            False,
+                            chunk_receive_timing,
+                            chunk_bytes,
+                        )
+                    finally:
+                        fast_frame_lease.release()
+                        fast_frame_lease = None
+                        fast_frame = None
+                        chunk_bytes = None
+                        chunk_receive_timing = None
+                    continue
+                assert isinstance(raw_events, list)
+                chunk_bytes = None
                 try:
                     for event_index in range(len(raw_events)):
                         raw_event = raw_events[event_index]
@@ -7713,6 +7776,12 @@ class ResponsesRequestExecution:
                 failure = None
                 event_owner = None
                 usage_snapshot = None
+                fast_frame = (
+                    raw_event
+                    if isinstance(raw_event, CanonicalResponsesDeltaFrame)
+                    else None
+                )
+                fast_transparent = False
                 received_at = (
                     receive_timing.received_at
                     if receive_timing is not None
@@ -7729,9 +7798,9 @@ class ResponsesRequestExecution:
                     else None
                 )
                 try:
-                    if not raw_event.strip():
+                    if fast_frame is None and not raw_event.strip():
                         continue
-                    if is_sse_comment_frame(raw_event):
+                    if fast_frame is None and is_sse_comment_frame(raw_event):
                         if is_oaix_terminal_flush_marker(raw_event):
                             if not already_observed:
                                 diagnostics.observe_complete_event(
@@ -7790,19 +7859,33 @@ class ResponsesRequestExecution:
                         else None
                     )
                     try:
-                        event_owner = await parse_owned_sse_event(
-                            raw_event,
-                            max_event_bytes=(
-                                RESPONSES_CANONICAL_EVENT_MAX_BYTES
-                                if from_precommit_buffer
-                                else DEFAULT_MAX_EVENT_BYTES
-                            ),
-                            workspace=parse_workspace,
-                        )
+                        if fast_frame is not None:
+                            fast_path_candidates += 1
+                            fast_transparent = await (
+                                can_forward_responses_delta_without_materializing(
+                                    fast_frame,
+                                    workspace=parse_workspace,
+                                )
+                            )
+                            if not fast_transparent:
+                                fast_path_fallbacks += 1
+                                raw_event = fast_frame.decode_raw_event()
+                        if not fast_transparent:
+                            event_owner = await parse_owned_sse_event(
+                                raw_event,
+                                max_event_bytes=(
+                                    RESPONSES_CANONICAL_EVENT_MAX_BYTES
+                                    if from_precommit_buffer
+                                    else DEFAULT_MAX_EVENT_BYTES
+                                ),
+                                workspace=parse_workspace,
+                            )
                     except BaseException:
                         if upstream_event_bytes is None:
                             upstream_event_bytes = (
-                                _raw_responses_sse_event_bytes(raw_event)
+                                fast_frame.wire_bytes
+                                if fast_frame is not None
+                                else _raw_responses_sse_event_bytes(raw_event)
                             )
                         if not already_observed:
                             observer_phase = (
@@ -7812,9 +7895,20 @@ class ResponsesRequestExecution:
                             )
                             try:
                                 diagnostics.observe_complete_event(
-                                    raw_event,
-                                    has_data_field=sse_event_has_data_field(
+                                    (
                                         raw_event
+                                        if isinstance(raw_event, str)
+                                        else ""
+                                    ),
+                                    has_data_field=(
+                                        True
+                                        if fast_frame is not None
+                                        else sse_event_has_data_field(raw_event)
+                                    ),
+                                    event_type=(
+                                        fast_frame.event_type
+                                        if fast_frame is not None
+                                        else None
                                     ),
                                     wire_bytes=upstream_event_bytes,
                                     received_at=received_at,
@@ -7845,6 +7939,44 @@ class ResponsesRequestExecution:
                                 ),
                                 events=1,
                             )
+                    if fast_transparent:
+                        assert fast_frame is not None
+                        assert upstream_event_bytes is not None
+                        event_bytes = upstream_event_bytes
+                        observer_phase = (
+                            phase_diagnostics.begin_phase("observer_hash")
+                            if phase_diagnostics is not None
+                            else None
+                        )
+                        try:
+                            diagnostics.observe_complete_event(
+                                "",
+                                has_data_field=True,
+                                event_type=fast_frame.event_type,
+                                wire_bytes=upstream_event_bytes,
+                                received_at=received_at,
+                                received_unix_nano=received_unix_nano,
+                                received_monotonic_nano=(
+                                    received_monotonic_nano
+                                ),
+                            )
+                        finally:
+                            if phase_diagnostics is not None:
+                                phase_diagnostics.finish_phase(
+                                    "observer_hash",
+                                    observer_phase,
+                                    bytes_count=len(upstream_event_bytes),
+                                    events=1,
+                                )
+                        fast_path_events += 1
+                        fast_path_bytes += len(event_bytes)
+                        yield _observed_responses_stream_chunk(
+                            event_bytes,
+                            None,
+                            event_type=fast_frame.event_type,
+                            semantic_outcome="nonterminal",
+                        )
+                        continue
                     event_type = event_owner.event_name
                     event_payload = event_owner.payload
                     diagnostics.mark_terminal_parse_completed(
@@ -8212,6 +8344,19 @@ class ResponsesRequestExecution:
                 yield _observed_responses_stream_error_event(502, exc)
                 yield b"data: [DONE]\n\n"
         finally:
+            if fast_path_candidates:
+                self.current_info["responses_delta_fast_path_candidates"] = (
+                    fast_path_candidates
+                )
+                self.current_info["responses_delta_fast_path_events"] = (
+                    fast_path_events
+                )
+                self.current_info["responses_delta_fast_path_fallbacks"] = (
+                    fast_path_fallbacks
+                )
+                self.current_info["responses_delta_fast_path_bytes"] = (
+                    fast_path_bytes
+                )
             try:
                 try:
                     await source.aclose()

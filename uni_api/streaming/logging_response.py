@@ -1054,9 +1054,14 @@ class LoggingStreamingResponse(Response):
                 else:
                     offsets = (0,)
                 for offset in offsets:
-                    segment = chunk[
-                        offset : offset + self._downstream_chunk_bytes
-                    ]
+                    if offset == 0 and len(chunk) <= self._downstream_chunk_bytes:
+                        # Keep the metadata-carrying bytes object itself on the
+                        # overwhelmingly common one-frame/one-write path.
+                        segment = chunk
+                    else:
+                        segment = chunk[
+                            offset : offset + self._downstream_chunk_bytes
+                        ]
                     metadata_event_complete = bool(
                         observed_final_event_segment
                         and offset + len(segment) >= len(chunk)

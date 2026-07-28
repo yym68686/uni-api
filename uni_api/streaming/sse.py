@@ -558,6 +558,20 @@ class IncrementalSSEParser:
         return self._pending_size_bytes()
 
     @property
+    def can_bypass_complete_frame(self) -> bool:
+        """Whether an external complete frame can leave parser state unchanged."""
+
+        undecoded_bytes, _ = self._decoder.getstate()
+        return bool(
+            not self._finished
+            and not self._failed
+            and not self._at_stream_start
+            and not self._event
+            and not undecoded_bytes
+            and not self._trailing_cr
+        )
+
+    @property
     def pending_data(self) -> bytes:
         """Return the normalized partial event plus undecoded UTF-8 bytes.
 

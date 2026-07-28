@@ -1989,6 +1989,94 @@ def test_stream_encodes_each_event_once_and_reuses_batch_receive_time(monkeypatc
     assert sum("response.completed" in event for event in encoded) == 1
 
 
+def test_postcommit_delta_fast_path_preserves_wire_and_falls_back_on_status(
+    monkeypatch,
+):
+    _configure_responses_test(monkeypatch, engine="codex")
+    created = _responses_sse(
+        "response.created",
+        {"type": "response.created", "sequence_number": 0},
+    )
+    first_delta = _responses_sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "delta": "commit",
+        },
+    )
+    transparent_delta = _responses_sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 2,
+            "delta": "零拷贝",
+        },
+    )
+    fallback_delta = _responses_sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 3,
+            "status": "in_progress",
+            "delta": "fallback",
+        },
+    )
+    completed = _responses_sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 3,
+                    "total_tokens": 4,
+                },
+            },
+        },
+    )
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[
+                created,
+                first_delta,
+                transparent_delta,
+                fallback_delta,
+                completed,
+            ]
+        )
+    )
+    current_info = {
+        "request_id": "responses-fast-path",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    # The Codex adapter may prepend its protocol keepalive. The provider event
+    # sequence itself must remain a byte-for-byte suffix.
+    assert body.encode("utf-8").endswith(
+        created
+        + first_delta
+        + transparent_delta
+        + fallback_delta
+        + completed
+    )
+    assert current_info["responses_delta_fast_path_candidates"] == 2
+    assert current_info["responses_delta_fast_path_events"] == 1
+    assert current_info["responses_delta_fast_path_fallbacks"] == 1
+    assert current_info["responses_delta_fast_path_bytes"] == len(
+        transparent_delta
+    )
+
+
 def test_responses_stream_consumes_exact_oaix_terminal_flush_marker(monkeypatch):
     _configure_responses_test(monkeypatch, engine="codex")
     hop_observations = []

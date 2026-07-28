@@ -367,6 +367,18 @@ class ReservedStreamChunk:
     usage_snapshot: StreamUsageSnapshot | None = None
 
 
+@dataclass(slots=True)
+class ObservedStreamFrame:
+    """Protocol metadata around existing bytes without copying their payload."""
+
+    data: bytes
+    event_type: str | None = None
+    semantic_outcome: str | None = None
+    terminal_timeline_event: bool = False
+    sse_metadata_complete: bool = False
+    usage_snapshot: StreamUsageSnapshot | None = None
+
+
 class ObservedStreamChunk(bytes):
     """Bytes plus bounded protocol metadata carried through ASGI unchanged.
 

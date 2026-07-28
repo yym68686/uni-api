@@ -14,7 +14,11 @@ from uni_api.admission import (
 )
 from uni_api.runtime import ResponsesRequestExecution, _prime_responses_upstream_stream
 from uni_api.observability.responses_stream import ResponsesStreamDiagnostics
-from uni_api.streaming.bounded_queue import StreamQueuePutTimeout
+from uni_api.streaming.bounded_queue import (
+    ObservedStreamChunk,
+    ObservedStreamFrame,
+    StreamQueuePutTimeout,
+)
 from uni_api.streaming.logging_response import LoggingStreamingResponse
 from uni_api.streaming.sse import IncrementalSSEParser
 
@@ -60,6 +64,60 @@ async def _wait_until(predicate, *, timeout=1.0):
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0)
+
+
+def test_observed_responses_frame_borrows_wire_until_queue_handoff():
+    wire = b'event: response.output_text.delta\ndata: {"delta":"x"}\n\n'
+
+    frame = runtime._observed_responses_stream_chunk(
+        wire,
+        None,
+        event_type="response.output_text.delta",
+        semantic_outcome="nonterminal",
+    )
+
+    assert isinstance(frame, ObservedStreamFrame)
+    assert frame.data is wire
+    assert frame.sse_metadata_complete is True
+
+
+def test_logging_response_reuses_small_metadata_chunk_for_asgi_write():
+    async def scenario():
+        chunk = ObservedStreamChunk(
+            b'event: response.output_text.delta\ndata: {"delta":"x"}\n\n',
+            event_type="response.output_text.delta",
+            semantic_outcome="nonterminal",
+            sse_metadata_complete=True,
+        )
+
+        async def body():
+            yield chunk
+
+        sent_bodies = []
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            body_bytes = message.get("body", b"")
+            if body_bytes:
+                sent_bodies.append(body_bytes)
+
+        response = LoggingStreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            current_info={"request_id": "zero-copy-asgi"},
+        )
+        await response(
+            {"type": "http", "method": "POST", "path": "/v1/responses"},
+            receive,
+            send,
+        )
+        return chunk, sent_bodies
+
+    chunk, sent_bodies = asyncio.run(scenario())
+    assert sent_bodies == [chunk]
+    assert sent_bodies[0] is chunk
 
 
 def test_responses_stream_queue_backpressures_producer_without_dropping(monkeypatch):

@@ -1,4 +1,4 @@
-"""A/B benchmark parsed Responses SSE metadata versus downstream reparsing."""
+"""A/B benchmark legacy, metadata, and selective Responses SSE paths."""
 
 from __future__ import annotations
 
@@ -27,6 +27,11 @@ from uni_api.admission.json_parsing import ReusableJSONParseWorkspace
 from uni_api.observability.responses_stream import ResponsesStreamDiagnostics
 from uni_api.streaming.bounded_queue import ObservedStreamChunk
 from uni_api.streaming.logging_response import LoggingStreamingResponse
+from uni_api.streaming.responses_fast_path import (
+    MIN_CANONICAL_RESPONSES_DELTA_FRAME_BYTES,
+    can_forward_responses_delta_without_materializing,
+    match_canonical_responses_delta_frame,
+)
 from uni_api.streaming.sse import (
     IncrementalSSEParser,
     parse_owned_sse_event,
@@ -78,9 +83,9 @@ def _transport_events(count: int, delta_bytes: int) -> tuple[bytes, ...]:
 async def _one_bound_stream(
     transport_chunks: tuple[bytes, ...],
     *,
-    metadata: bool,
+    variant: str,
     expected_output_tokens: int,
-) -> tuple[int, list[float], list[float]]:
+) -> tuple[int, list[float], list[float], int]:
     current_info: dict[str, Any] = {
         "request_id": "benchmark",
         "start_time": time.time(),
@@ -98,11 +103,50 @@ async def _one_bound_stream(
     frame_latencies_us: list[float] = []
     pipeline_latencies_us: list[float] = []
     sent_bytes = 0
+    output_seen = False
+    fast_path_events = 0
 
     async def body():
+        nonlocal output_seen, fast_path_events
         for chunk in transport_chunks:
             chunk_available_at = time.perf_counter_ns()
             received_at = datetime.now(timezone.utc)
+            fast_frame = (
+                match_canonical_responses_delta_frame(chunk)
+                if (
+                    variant == "fast"
+                    and output_seen
+                    and len(chunk)
+                    >= MIN_CANONICAL_RESPONSES_DELTA_FRAME_BYTES
+                    and chunk.startswith(b"event: response.")
+                    and chunk.endswith(b"\n\n")
+                    and parser.can_bypass_complete_frame
+                )
+                else None
+            )
+            if fast_frame is not None and await (
+                can_forward_responses_delta_without_materializing(
+                    fast_frame,
+                    workspace=parse_workspace,
+                )
+            ):
+                diagnostics.observe_complete_event(
+                    "",
+                    has_data_field=True,
+                    event_type=fast_frame.event_type,
+                    wire_bytes=chunk,
+                    received_at=received_at,
+                )
+                available_at.append(chunk_available_at)
+                yielded_at.append(time.perf_counter_ns())
+                fast_path_events += 1
+                yield ObservedStreamChunk(
+                    chunk,
+                    event_type=fast_frame.event_type,
+                    semantic_outcome="nonterminal",
+                    sse_metadata_complete=True,
+                )
+                continue
             raw_events = parser.feed(chunk)
             try:
                 for event_index in range(len(raw_events)):
@@ -143,9 +187,16 @@ async def _one_bound_stream(
                             wire_bytes=wire,
                             received_at=received_at,
                         )
+                        if (
+                            not output_seen
+                            and event_type.endswith(".delta")
+                            and isinstance(payload, dict)
+                            and payload.get("delta")
+                        ):
+                            output_seen = True
                         available_at.append(chunk_available_at)
                         yielded_at.append(time.perf_counter_ns())
-                        if metadata:
+                        if variant != "reparse":
                             snapshot = stream_usage_snapshot_from_payload(
                                 payload
                             )
@@ -201,20 +252,25 @@ async def _one_bound_stream(
         raise AssertionError("not every available frame reached ASGI send")
     if current_info.get("completion_tokens") != expected_output_tokens:
         raise AssertionError("downstream usage was not preserved")
-    return sent_bytes, frame_latencies_us, pipeline_latencies_us
+    return (
+        sent_bytes,
+        frame_latencies_us,
+        pipeline_latencies_us,
+        fast_path_events,
+    )
 
 
 async def _one_stream(
     transport_chunks: tuple[bytes, ...],
     *,
-    metadata: bool,
+    variant: str,
     admission: RequestAdmissionController | None,
     expected_output_tokens: int,
-) -> tuple[int, list[float], list[float]]:
+) -> tuple[int, list[float], list[float], int]:
     if admission is None:
         return await _one_bound_stream(
             transport_chunks,
-            metadata=metadata,
+            variant=variant,
             expected_output_tokens=expected_output_tokens,
         )
     lease = await admission.acquire()
@@ -222,7 +278,7 @@ async def _one_stream(
     try:
         return await _one_bound_stream(
             transport_chunks,
-            metadata=metadata,
+            variant=variant,
             expected_output_tokens=expected_output_tokens,
         )
     finally:
@@ -230,7 +286,7 @@ async def _one_stream(
         await lease.release()
 
 
-async def _measure(args, *, metadata: bool) -> dict[str, float | int | str]:
+async def _measure(args, *, variant: str) -> dict[str, float | int | str]:
     event_frames = _transport_events(
         args.events_per_stream,
         args.delta_bytes,
@@ -262,7 +318,7 @@ async def _measure(args, *, metadata: bool) -> dict[str, float | int | str]:
         *(
             _one_stream(
                 transport_chunks,
-                metadata=metadata,
+                variant=variant,
                 admission=admission,
                 expected_output_tokens=args.events_per_stream,
             )
@@ -273,19 +329,44 @@ async def _measure(args, *, metadata: bool) -> dict[str, float | int | str]:
     cpu_seconds = time.process_time() - started_cpu
     latencies = sorted(
         latency
-        for _sent_bytes, stream_latencies, _pipeline_latencies in results
+        for (
+            _sent_bytes,
+            stream_latencies,
+            _pipeline_latencies,
+            _fast_events,
+        ) in results
         for latency in stream_latencies
     )
     pipeline_latencies = sorted(
         latency
-        for _sent_bytes, _stream_latencies, stream_pipeline_latencies in results
+        for (
+            _sent_bytes,
+            _stream_latencies,
+            stream_pipeline_latencies,
+            _fast_events,
+        ) in results
         for latency in stream_pipeline_latencies
     )
     return {
-        "variant": "metadata" if metadata else "reparse",
+        "variant": variant,
         "events": total_events,
         "bytes": sum(
-            sent_bytes for sent_bytes, _latencies, _pipeline_latencies in results
+            sent_bytes
+            for (
+                sent_bytes,
+                _latencies,
+                _pipeline_latencies,
+                _fast_events,
+            ) in results
+        ),
+        "fast_path_events": sum(
+            fast_events
+            for (
+                _sent_bytes,
+                _latencies,
+                _pipeline_latencies,
+                fast_events,
+            ) in results
         ),
         "wall_seconds": wall_seconds,
         "cpu_seconds": cpu_seconds,
@@ -310,8 +391,7 @@ async def _benchmark(args) -> None:
     }
     for _ in range(args.rounds):
         for variant in args.variants:
-            metadata = variant == "metadata"
-            result = await _measure(args, metadata=metadata)
+            result = await _measure(args, variant=variant)
             measurements[str(result["variant"])].append(result)
 
     summaries = {}
@@ -357,6 +437,27 @@ async def _benchmark(args) -> None:
                 / baseline_throughput
             ),
         }
+    if "metadata" in summaries and "fast" in summaries:
+        baseline_cpu = summaries["metadata"]["best_cpu_us_per_event"]
+        optimized_cpu = summaries["fast"]["best_cpu_us_per_event"]
+        baseline_throughput = summaries["metadata"][
+            "best_events_per_wall_second"
+        ]
+        optimized_throughput = summaries["fast"][
+            "best_events_per_wall_second"
+        ]
+        comparison.update(
+            {
+                "fast_cpu_reduction_percent_vs_metadata": (
+                    100.0 * (baseline_cpu - optimized_cpu) / baseline_cpu
+                ),
+                "fast_throughput_gain_percent_vs_metadata": (
+                    100.0
+                    * (optimized_throughput - baseline_throughput)
+                    / baseline_throughput
+                ),
+            }
+        )
     print(
         json.dumps(
             {
@@ -386,8 +487,8 @@ def main() -> None:
     parser.add_argument(
         "--variants",
         nargs="+",
-        choices=("reparse", "metadata"),
-        default=("reparse", "metadata"),
+        choices=("reparse", "metadata", "fast"),
+        default=("reparse", "metadata", "fast"),
     )
     parser.add_argument(
         "--loop",
