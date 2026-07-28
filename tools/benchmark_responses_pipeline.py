@@ -38,6 +38,9 @@ from uni_api.streaming.sse import (
     validate_sse_event_type_consistency,
 )
 from uni_api.streaming.usage import stream_usage_snapshot_from_payload
+from uni_api.upstream.responses_normalization import (
+    ResponsesCustomToolCallIdNormalizer,
+)
 
 
 def _event(event_type: str, payload: dict[str, Any]) -> bytes:
@@ -55,6 +58,7 @@ def _transport_events(count: int, delta_bytes: int) -> tuple[bytes, ...]:
             {
                 "type": "response.output_text.delta",
                 "sequence_number": index,
+                "item_id": "item_benchmark_message",
                 "delta": f"token-{index}-{padding}",
             },
         )
@@ -105,6 +109,16 @@ async def _one_bound_stream(
     sent_bytes = 0
     output_seen = False
     fast_path_events = 0
+    custom_tool_call_id_normalizer = (
+        ResponsesCustomToolCallIdNormalizer()
+        if variant == "fast_normalizer"
+        else None
+    )
+    item_id_requires_full_normalization = (
+        custom_tool_call_id_normalizer.requires_item_id_full_normalization
+        if custom_tool_call_id_normalizer is not None
+        else None
+    )
 
     async def body():
         nonlocal output_seen, fast_path_events
@@ -114,7 +128,7 @@ async def _one_bound_stream(
             fast_frame = (
                 match_canonical_responses_delta_frame(chunk)
                 if (
-                    variant == "fast"
+                    variant in {"fast", "fast_normalizer"}
                     and output_seen
                     and len(chunk)
                     >= MIN_CANONICAL_RESPONSES_DELTA_FRAME_BYTES
@@ -128,6 +142,9 @@ async def _one_bound_stream(
                 can_forward_responses_delta_without_materializing(
                     fast_frame,
                     workspace=parse_workspace,
+                    item_id_requires_full_normalization=(
+                        item_id_requires_full_normalization
+                    ),
                 )
             ):
                 diagnostics.observe_complete_event(
@@ -389,8 +406,13 @@ async def _benchmark(args) -> None:
     measurements: dict[str, list[dict[str, float | int | str]]] = {
         variant: [] for variant in args.variants
     }
-    for _ in range(args.rounds):
-        for variant in args.variants:
+    for round_index in range(args.rounds):
+        round_variants = (
+            args.variants
+            if round_index % 2 == 0
+            else tuple(reversed(args.variants))
+        )
+        for variant in round_variants:
             result = await _measure(args, variant=variant)
             measurements[str(result["variant"])].append(result)
 
@@ -401,6 +423,12 @@ async def _benchmark(args) -> None:
                 float(item["events_per_wall_second"]) for item in samples
             ),
             "best_cpu_us_per_event": min(
+                float(item["cpu_us_per_event"]) for item in samples
+            ),
+            "median_events_per_wall_second": statistics.median(
+                float(item["events_per_wall_second"]) for item in samples
+            ),
+            "median_cpu_us_per_event": statistics.median(
                 float(item["cpu_us_per_event"]) for item in samples
             ),
             "median_frame_latency_us_p50": statistics.median(
@@ -458,6 +486,54 @@ async def _benchmark(args) -> None:
                 ),
             }
         )
+    if "metadata" in summaries and "fast_normalizer" in summaries:
+        baseline_cpu = summaries["metadata"]["best_cpu_us_per_event"]
+        optimized_cpu = summaries["fast_normalizer"][
+            "best_cpu_us_per_event"
+        ]
+        baseline_throughput = summaries["metadata"][
+            "best_events_per_wall_second"
+        ]
+        optimized_throughput = summaries["fast_normalizer"][
+            "best_events_per_wall_second"
+        ]
+        median_baseline_cpu = summaries["metadata"][
+            "median_cpu_us_per_event"
+        ]
+        median_optimized_cpu = summaries["fast_normalizer"][
+            "median_cpu_us_per_event"
+        ]
+        median_baseline_throughput = summaries["metadata"][
+            "median_events_per_wall_second"
+        ]
+        median_optimized_throughput = summaries["fast_normalizer"][
+            "median_events_per_wall_second"
+        ]
+        comparison.update(
+            {
+                "fast_normalizer_cpu_reduction_percent_vs_metadata": (
+                    100.0 * (baseline_cpu - optimized_cpu) / baseline_cpu
+                ),
+                "fast_normalizer_throughput_gain_percent_vs_metadata": (
+                    100.0
+                    * (optimized_throughput - baseline_throughput)
+                    / baseline_throughput
+                ),
+                "fast_normalizer_median_cpu_reduction_percent_vs_metadata": (
+                    100.0
+                    * (median_baseline_cpu - median_optimized_cpu)
+                    / median_baseline_cpu
+                ),
+                "fast_normalizer_median_throughput_gain_percent_vs_metadata": (
+                    100.0
+                    * (
+                        median_optimized_throughput
+                        - median_baseline_throughput
+                    )
+                    / median_baseline_throughput
+                ),
+            }
+        )
     print(
         json.dumps(
             {
@@ -487,8 +563,8 @@ def main() -> None:
     parser.add_argument(
         "--variants",
         nargs="+",
-        choices=("reparse", "metadata", "fast"),
-        default=("reparse", "metadata", "fast"),
+        choices=("reparse", "metadata", "fast", "fast_normalizer"),
+        default=("reparse", "metadata", "fast", "fast_normalizer"),
     )
     parser.add_argument(
         "--loop",

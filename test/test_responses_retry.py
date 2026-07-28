@@ -941,6 +941,15 @@ def test_responses_normalizes_stream_custom_tool_call_ids_consistently(monkeypat
                 },
             ),
             _responses_sse(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "item_id": "item_stream123",
+                    "delta": "mapped reference",
+                },
+            ),
+            _responses_sse(
                 "response.custom_tool_call_input.done",
                 {
                     "type": "response.custom_tool_call_input.done",
@@ -989,10 +998,13 @@ def test_responses_normalizes_stream_custom_tool_call_ids_consistently(monkeypat
 
     assert response.status_code == 200
     assert "item_stream123" not in body
-    assert body.count("ctc_stream123") == 5
+    assert body.count("ctc_stream123") == 6
     assert current_info["custom_tool_call_id_normalized"] is True
     assert current_info["custom_tool_call_id_normalization_count"] == 3
-    assert current_info["custom_tool_call_id_reference_rewrite_count"] == 2
+    assert current_info["custom_tool_call_id_reference_rewrite_count"] == 3
+    assert current_info["responses_delta_fast_path_candidates"] == 1
+    assert current_info["responses_delta_fast_path_events"] == 0
+    assert current_info["responses_delta_fast_path_fallbacks"] == 1
 
 
 @pytest.mark.parametrize(
@@ -2072,6 +2084,81 @@ def test_postcommit_delta_fast_path_preserves_wire_and_falls_back_on_status(
     assert current_info["responses_delta_fast_path_candidates"] == 2
     assert current_info["responses_delta_fast_path_events"] == 1
     assert current_info["responses_delta_fast_path_fallbacks"] == 1
+    assert current_info["responses_delta_fast_path_bytes"] == len(
+        transparent_delta
+    )
+
+
+def test_postcommit_delta_fast_path_coexists_with_custom_tool_id_normalizer(
+    monkeypatch,
+):
+    _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={
+            "normalize_responses_custom_tool_call_ids": True,
+        },
+    )
+    created = _responses_sse(
+        "response.created",
+        {"type": "response.created", "sequence_number": 0},
+    )
+    first_delta = _responses_sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "item_message",
+            "delta": "commit",
+        },
+    )
+    transparent_delta = _responses_sse(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 2,
+            "item_id": "item_message",
+            "delta": "normalizer-compatible",
+        },
+    )
+    completed = _responses_sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3,
+                },
+            },
+        },
+    )
+    main.app.state.client_manager = DummyClientManager(
+        DummyStreamingUpstreamResponse(
+            chunks=[created, first_delta, transparent_delta, completed]
+        )
+    )
+    current_info = {
+        "request_id": "responses-fast-path-normalizer",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+    }
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert body.encode("utf-8").endswith(
+        created + first_delta + transparent_delta + completed
+    )
+    assert current_info["responses_delta_fast_path_candidates"] == 1
+    assert current_info["responses_delta_fast_path_events"] == 1
+    assert current_info["responses_delta_fast_path_fallbacks"] == 0
     assert current_info["responses_delta_fast_path_bytes"] == len(
         transparent_delta
     )

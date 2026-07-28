@@ -7533,6 +7533,11 @@ class ResponsesRequestExecution:
             if self._custom_tool_call_id_normalization_enabled(attempt)
             else None
         )
+        item_id_requires_full_normalization = (
+            custom_tool_call_id_normalizer.requires_item_id_full_normalization
+            if custom_tool_call_id_normalizer is not None
+            else None
+        )
         parse_workspace = await ReusableJSONParseWorkspace.create()
 
         async def source_events():
@@ -7651,7 +7656,6 @@ class ResponsesRequestExecution:
                     if (
                         RESPONSES_DELTA_FAST_PATH_ENABLED
                         and output_seen
-                        and custom_tool_call_id_normalizer is None
                         and chunk_size
                         >= MIN_CANONICAL_RESPONSES_DELTA_FRAME_BYTES
                         and chunk_bytes.startswith(b"event: response.")
@@ -7865,6 +7869,9 @@ class ResponsesRequestExecution:
                                 can_forward_responses_delta_without_materializing(
                                     fast_frame,
                                     workspace=parse_workspace,
+                                    item_id_requires_full_normalization=(
+                                        item_id_requires_full_normalization
+                                    ),
                                 )
                             )
                             if not fast_transparent:

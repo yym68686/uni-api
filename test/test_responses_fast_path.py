@@ -8,6 +8,9 @@ from uni_api.streaming.responses_fast_path import (
     match_canonical_responses_delta_frame,
 )
 from uni_api.streaming.sse import IncrementalSSEParser, SSEProtocolError
+from uni_api.upstream.responses_normalization import (
+    ResponsesCustomToolCallIdNormalizer,
+)
 
 
 def _delta_wire(payload: bytes) -> bytes:
@@ -19,7 +22,11 @@ def _delta_wire(payload: bytes) -> bytes:
     )
 
 
-def _is_transparent(wire: bytes) -> bool:
+def _is_transparent(
+    wire: bytes,
+    *,
+    item_id_requires_full_normalization=None,
+) -> bool:
     async def scenario() -> bool:
         frame = match_canonical_responses_delta_frame(wire)
         assert frame is not None
@@ -28,6 +35,9 @@ def _is_transparent(wire: bytes) -> bool:
             return await can_forward_responses_delta_without_materializing(
                 frame,
                 workspace=workspace,
+                item_id_requires_full_normalization=(
+                    item_id_requires_full_normalization
+                ),
             )
         finally:
             await workspace.aclose()
@@ -90,6 +100,58 @@ def test_selective_decoder_accepts_utf8_and_ignores_nested_diagnostic_keys():
     )
 
     assert _is_transparent(wire) is True
+
+
+def test_custom_tool_normalizer_allows_unmapped_reference_and_rejects_mapped_one():
+    normalizer = ResponsesCustomToolCallIdNormalizer()
+    requires_full_normalization = (
+        normalizer.requires_item_id_full_normalization
+    )
+    unmapped = _delta_wire(
+        b'{"type":"response.output_text.delta",'
+        b'"item_id":"item_unmapped","delta":"x"}'
+    )
+
+    assert _is_transparent(
+        unmapped,
+        item_id_requires_full_normalization=requires_full_normalization,
+    ) is True
+
+    result = normalizer.normalize(
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "custom_tool_call", "id": "item_mapped"},
+        }
+    )
+    assert result.changed is True
+    mapped = _delta_wire(
+        b'{"type":"response.output_text.delta",'
+        b'"item_id":"item_mapped","delta":"x"}'
+    )
+
+    assert _is_transparent(
+        mapped,
+        item_id_requires_full_normalization=requires_full_normalization,
+    ) is False
+
+
+@pytest.mark.parametrize("field", ["item", "input", "output"])
+def test_custom_tool_normalizer_forces_full_path_for_embedded_items(field):
+    normalizer = ResponsesCustomToolCallIdNormalizer()
+    wire = _delta_wire(
+        (
+            '{"type":"response.output_text.delta","delta":"x","'
+            + field
+            + '":null}'
+        ).encode()
+    )
+
+    assert _is_transparent(
+        wire,
+        item_id_requires_full_normalization=(
+            normalizer.requires_item_id_full_normalization
+        ),
+    ) is False
 
 
 @pytest.mark.parametrize(

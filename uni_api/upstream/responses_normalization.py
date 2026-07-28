@@ -139,6 +139,18 @@ class ResponsesCustomToolCallIdNormalizer:
             paths=tuple(normalized_paths),
         )
 
+    def requires_item_id_full_normalization(
+        self,
+        event_type: str,
+        item_id: str,
+    ) -> bool:
+        """Return whether this reference must stay on the stateful full path."""
+
+        return (
+            event_type in _CUSTOM_TOOL_CALL_INPUT_EVENT_TYPES
+            or item_id in self._id_map
+        )
+
     def _would_collide(
         self,
         item_id: str,

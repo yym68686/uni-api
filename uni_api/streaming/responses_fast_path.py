@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import msgspec
@@ -74,6 +75,10 @@ class CanonicalResponsesDeltaFrame:
 
 class _SelectiveResponsesMetadata(msgspec.Struct):
     type: str | msgspec.UnsetType = msgspec.UNSET
+    item_id: str | None | msgspec.UnsetType = msgspec.UNSET
+    item: msgspec.Raw | msgspec.UnsetType = msgspec.UNSET
+    input: msgspec.Raw | msgspec.UnsetType = msgspec.UNSET
+    output: msgspec.Raw | msgspec.UnsetType = msgspec.UNSET
     response: msgspec.Raw | msgspec.UnsetType = msgspec.UNSET
     status: msgspec.Raw | msgspec.UnsetType = msgspec.UNSET
     error: msgspec.Raw | msgspec.UnsetType = msgspec.UNSET
@@ -120,6 +125,8 @@ async def can_forward_responses_delta_without_materializing(
     frame: CanonicalResponsesDeltaFrame,
     *,
     workspace: ReusableJSONParseWorkspace,
+    item_id_requires_full_normalization: Callable[[str, str], bool]
+    | None = None,
 ) -> bool:
     """Validate a delta while materializing only protocol discriminator fields.
 
@@ -157,6 +164,28 @@ async def can_forward_responses_delta_without_materializing(
 
         if metadata.type is not msgspec.UNSET:
             if metadata.type != frame.event_type:
+                return False
+        if item_id_requires_full_normalization is not None:
+            # A configured custom-tool normalizer can mutate embedded items or
+            # a previously mapped item_id. Keep those frames on the full path;
+            # ordinary deltas with an unmapped reference remain byte-transparent.
+            if any(
+                field is not msgspec.UNSET
+                for field in (
+                    metadata.item,
+                    metadata.input,
+                    metadata.output,
+                    metadata.response,
+                )
+            ):
+                return False
+            if (
+                isinstance(metadata.item_id, str)
+                and item_id_requires_full_normalization(
+                    frame.event_type,
+                    metadata.item_id,
+                )
+            ):
                 return False
         return all(
             field is msgspec.UNSET
