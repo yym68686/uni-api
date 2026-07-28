@@ -107,3 +107,89 @@ def test_deterministic_failure_circuit_ignores_legacy_cooldown_exclusions():
         assert circuit.is_open("provider-a", "model-x") is True
 
     asyncio.run(run())
+
+
+def test_provider_zero_cooldown_skips_legacy_exclusion_and_refresh():
+    async def run():
+        class Manager:
+            cooldown_period = 30
+
+            def __init__(self):
+                self.exclusions = []
+
+            async def exclude_model(self, provider, model):
+                self.exclusions.append((provider, model))
+
+        manager = Manager()
+
+        class Plan:
+            num_matching_providers = 2
+            app = SimpleNamespace(
+                state=SimpleNamespace(channel_manager=manager)
+            )
+
+            def __init__(self):
+                self.refresh_count = 0
+
+            async def refresh_matching_providers(self, *, debug=False):
+                _ = debug
+                self.refresh_count += 1
+
+        plan = Plan()
+        result = await maybe_exclude_failed_channel(
+            plan,
+            "provider-a",
+            "model-x",
+            502,
+            "upstream failed",
+            provider={"preferences": {"cooldown_period": 0}},
+        )
+
+        assert result is None
+        assert manager.exclusions == []
+        assert plan.refresh_count == 0
+
+    asyncio.run(run())
+
+
+def test_provider_without_cooldown_override_uses_global_cooldown():
+    async def run():
+        class Manager:
+            cooldown_period = 30
+
+            def __init__(self):
+                self.exclusions = []
+
+            async def exclude_model(self, provider, model):
+                self.exclusions.append((provider, model))
+
+        manager = Manager()
+
+        class Plan:
+            num_matching_providers = 2
+            app = SimpleNamespace(
+                state=SimpleNamespace(channel_manager=manager)
+            )
+
+            def __init__(self):
+                self.refresh_count = 0
+
+            async def refresh_matching_providers(self, *, debug=False):
+                _ = debug
+                self.refresh_count += 1
+
+        plan = Plan()
+        result = await maybe_exclude_failed_channel(
+            plan,
+            "provider-a",
+            "model-x",
+            502,
+            "upstream failed",
+            provider={"preferences": {}},
+        )
+
+        assert result is None
+        assert manager.exclusions == [("provider-a", "model-x")]
+        assert plan.refresh_count == 1
+
+    asyncio.run(run())

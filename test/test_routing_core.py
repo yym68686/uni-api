@@ -82,6 +82,143 @@ def test_get_right_order_providers_raises_404_for_missing_provider():
     asyncio.run(run())
 
 
+def test_routing_plan_refresh_preserves_original_order_budget_and_cursor(
+    monkeypatch,
+):
+    request_model_name = "gpt-5.4"
+    provider_names = (
+        "provider-a",
+        "provider-b",
+        "provider-c",
+        "provider-d",
+        "provider-e",
+        "provider-f",
+        "provider-g",
+    )
+    providers = {}
+    for provider_name in provider_names:
+        monkeypatch.setitem(
+            provider_api_circular_list,
+            provider_name,
+            _ProviderKeys(),
+        )
+        providers[provider_name] = {
+            "provider": provider_name,
+            "_model_dict_cache": {
+                request_model_name: request_model_name,
+            },
+            "base_url": (
+                f"https://{provider_name}.example/v1/responses"
+            ),
+            "api": [f"{provider_name}-key"],
+            "preferences": {},
+        }
+
+    resolver_results = [
+        [
+            providers["provider-a"],
+            providers["provider-b"],
+            providers["provider-c"],
+            providers["provider-d"],
+            providers["provider-e"],
+        ],
+        [
+            providers["provider-e"],
+            providers["provider-d"],
+            providers["provider-c"],
+            providers["provider-b"],
+        ],
+        [
+            providers["provider-g"],
+            providers["provider-f"],
+            providers["provider-e"],
+            providers["provider-d"],
+            providers["provider-c"],
+            providers["provider-a"],
+            providers["provider-b"],
+        ],
+    ]
+
+    async def resolver(*_args, **_kwargs):
+        return resolver_results.pop(0)
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config={
+                "api_keys": [
+                    {
+                        "api": "sk-test",
+                        "model": [request_model_name],
+                    }
+                ]
+            },
+            api_list=["sk-test"],
+            models_list={"sk-test": [request_model_name]},
+            channel_manager=None,
+        )
+    )
+
+    async def run():
+        plan = await RoutingPlan.create(
+            app,
+            request_model_name,
+            0,
+            {},
+            {},
+            endpoint="/v1/responses",
+            provider_resolver=resolver,
+        )
+
+        attempts = [(await plan.next_provider()).provider_name]
+        await plan.refresh_matching_providers()
+        assert plan.retry_count == 10
+        assert plan.index == 1
+        assert [
+            provider["provider"] for provider in plan.matching_providers
+        ] == [
+            "provider-a",
+            "provider-b",
+            "provider-c",
+            "provider-d",
+            "provider-e",
+        ]
+
+        attempts.append((await plan.next_provider()).provider_name)
+        await plan.refresh_matching_providers()
+        assert plan.retry_count == 10
+        assert plan.index == 2
+        assert plan.num_matching_providers == 5
+
+        while True:
+            attempt = await plan.next_provider()
+            if attempt is None:
+                break
+            attempts.append(attempt.provider_name)
+
+        assert attempts == [
+            "provider-a",
+            "provider-b",
+            "provider-c",
+            "provider-d",
+            "provider-e",
+            "provider-a",
+            "provider-b",
+            "provider-c",
+            "provider-d",
+            "provider-e",
+            "provider-a",
+            "provider-b",
+            "provider-c",
+            "provider-d",
+            "provider-e",
+        ]
+        assert "provider-f" not in attempts
+        assert "provider-g" not in attempts
+        assert plan.index == 15
+
+    asyncio.run(run())
+
+
 def test_get_right_order_providers_raises_413_when_tpr_exceeds_all_providers(monkeypatch):
     config = _routing_config()
     monkeypatch.setitem(provider_api_circular_list, "provider-a", _ProviderKeys(tpr_exceeded=True))

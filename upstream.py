@@ -219,6 +219,7 @@ async def maybe_exclude_failed_channel(
     status_code: int,
     error_message: str,
     *,
+    provider: Optional[dict] = None,
     exclude_error_substrings: Optional[list[str]] = None,
     debug: bool = False,
 ) -> str | None:
@@ -256,8 +257,22 @@ async def maybe_exclude_failed_channel(
 
     if excluded_from_legacy_cooldown:
         return None
+    provider_preferences = (
+        provider.get("preferences", {})
+        if isinstance(provider, dict)
+        and isinstance(provider.get("preferences", {}), dict)
+        else {}
+    )
+    effective_cooldown_period = provider_preferences.get(
+        "cooldown_period",
+        getattr(channel_manager, "cooldown_period", 0),
+    )
+    try:
+        effective_cooldown_enabled = float(effective_cooldown_period) > 0
+    except (TypeError, ValueError):
+        effective_cooldown_enabled = False
     if (
-        getattr(channel_manager, "cooldown_period", 0) <= 0
+        not effective_cooldown_enabled
         or plan.num_matching_providers <= 1
     ):
         return None
@@ -1108,6 +1123,7 @@ class UpstreamRunner:
                 attempt.original_model,
                 status_code,
                 error_message,
+                provider=attempt.provider,
                 exclude_error_substrings=exclude_error_substrings,
                 debug=self.debug,
             )

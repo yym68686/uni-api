@@ -725,8 +725,12 @@ class ProviderAttempt:
 
 @dataclass(slots=True)
 class RoutingPlanState:
+    # This tuple is the request-local routing ring chosen when the plan is
+    # created.  Its order and size must remain stable for the lifetime of the
+    # request; otherwise a channel refresh can repeat or skip planned slots.
     matching_providers: tuple[dict, ...]
     retry_count: int
+    available_provider_names: frozenset[str]
     index: int = 0
     status_code: int = 500
     error_message: Optional[str] = None
@@ -910,18 +914,30 @@ class RoutingPlan:
             _state=RoutingPlanState(
                 matching_providers=tuple(matching_providers),
                 retry_count=compute_retry_count(matching_providers),
+                available_provider_names=frozenset(
+                    str(provider.get("provider") or "")
+                    for provider in matching_providers
+                ),
             ),
         )
 
     async def next_provider(self) -> Optional[ProviderAttempt]:
         # ``retry_count`` is the number of attempts in addition to the first
-        # pass over the matching providers.  Keep the total hard boundary at
-        # N + R; using ``<=`` here silently admitted one extra attempt.
+        # pass over the request-local provider ring.  Both values are fixed
+        # when the plan is created, so consuming this ring is monotonic even
+        # when channel eligibility changes while the request is in flight.
         while self.index < self.num_matching_providers + self.retry_count:
             current_index = (self.start_index + self.index) % self.num_matching_providers
             self._state.index += 1
             provider = self._state.matching_providers[current_index]
             provider_name = provider["provider"]
+
+            # A refresh may make one of the originally planned providers
+            # temporarily unavailable.  Consume that provider's planned slot
+            # without replacing, reordering, or restarting the ring.
+            if provider_name not in self._state.available_provider_names:
+                continue
+
             original_model = provider["_model_dict_cache"][self.request_model_name]
 
             if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
@@ -948,6 +964,7 @@ class RoutingPlan:
             return False
         self._state.matching_providers = matching_providers
         self._state.retry_count = 0
+        self._state.available_provider_names = frozenset({provider_name})
         self._state.index = 0
         return True
 
@@ -969,8 +986,17 @@ class RoutingPlan:
             debug=debug,
             routing_index=self.routing_index,
         )
-        last_num_matching_providers = self.num_matching_providers
-        self._state.matching_providers = tuple(matching_providers)
-        self._state.retry_count = compute_retry_count(matching_providers)
-        if self.num_matching_providers != last_num_matching_providers:
-            self._state.index = 0
+        # Refresh only request-local eligibility.  The provider ring, retry
+        # budget, and cursor were planned from one coherent snapshot and must
+        # not be rewritten by global channel state changing concurrently.
+        refreshed_provider_names = frozenset(
+            str(provider.get("provider") or "")
+            for provider in matching_providers
+        )
+        planned_provider_names = frozenset(
+            str(provider.get("provider") or "")
+            for provider in self._state.matching_providers
+        )
+        self._state.available_provider_names = (
+            planned_provider_names & refreshed_provider_names
+        )
