@@ -571,11 +571,15 @@ def test_zstd_json_complexity_rejection_stashes_diagnostics_before_stats(
 
 def test_zstd_known_json_route_without_content_type_charges_decoded_structure():
     reserved: list[int] = []
+    released: list[int] = []
     payload = b'{"a":1}'
     compressed = _zstd_compress(payload)
 
     async def reserve_body_bytes(size: int) -> None:
         reserved.append(size)
+
+    async def release_body_bytes(size: int) -> None:
+        released.append(size)
 
     middleware = RequestBodyDecompressionMiddleware(_echo_asgi)
     messages = asyncio.run(
@@ -583,7 +587,10 @@ def test_zstd_known_json_route_without_content_type_charges_decoded_structure():
             middleware,
             [{"type": "http.request", "body": compressed, "more_body": False}],
             headers=[(b"content-encoding", b"zstd")],
-            state={"uni_api_reserve_body_bytes": reserve_body_bytes},
+            state={
+                "uni_api_reserve_body_bytes": reserve_body_bytes,
+                "uni_api_release_body_bytes": release_body_bytes,
+            },
             path="/v1/responses",
         )
     )
@@ -593,6 +600,10 @@ def test_zstd_known_json_route_without_content_type_charges_decoded_structure():
         len(compressed),
         zstd.get_frame_parameters(compressed).window_size,
         3107,
+    ]
+    assert released == [
+        zstd.get_frame_parameters(compressed).window_size,
+        len(compressed),
     ]
 
 
@@ -1753,9 +1764,10 @@ def test_main_app_zstd_complexity_rejection_emits_synthetic_diagnostics(
     assert diagnostics["raw_bytes"] == len(body)
     assert diagnostics["peak_depth"] == 129
     assert diagnostics["configured_limit"] == 128
-    assert diagnostics["reserved_weighted_bytes_at_rejection"] == (
-        len(compressed_body)
-        + zstd.get_frame_parameters(compressed_body).window_size
+    # The decoder context is already closed when rejection diagnostics are
+    # captured, so only the still-live compressed bytes remain charged.
+    assert diagnostics["reserved_weighted_bytes_at_rejection"] == len(
+        compressed_body
     )
     assert body.decode("utf-8") not in repr(diagnostics)
     assert current_info["timing_spans"]["request_body_rejected"] >= 1

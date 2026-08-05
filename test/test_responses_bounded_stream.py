@@ -81,6 +81,42 @@ def test_observed_responses_frame_borrows_wire_until_queue_handoff():
     assert frame.sse_metadata_complete is True
 
 
+def test_responses_retry_payload_releases_after_early_response_start():
+    async def scenario():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024,
+            body_budget_bytes=1024,
+        )
+        lease = await controller.acquire(initial_body_bytes=100)
+
+        async def body():
+            if False:
+                yield b""
+
+        execution = _ControlledResponsesExecution(body())
+        execution.http_request = SimpleNamespace(
+            scope={
+                "state": {
+                    "uni_api_admission_lease": lease,
+                    "uni_api_body_response_started": True,
+                }
+            }
+        )
+        await execution._release_request_retry_payload()
+
+        assert execution.request_data is None
+        assert lease.reserved_body_bytes == 0
+        assert execution.http_request.scope["state"][
+            "uni_api_release_body_at_response_start"
+        ] is True
+        await lease.release()
+
+    asyncio.run(scenario())
+
+
 def test_logging_response_reuses_small_metadata_chunk_for_asgi_write():
     async def scenario():
         chunk = ObservedStreamChunk(

@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
 import json
+import os
+import stat
 
 from uni_api.admission import RequestAdmissionController
+from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 from uni_api.middleware.admission import RequestAdmissionMiddleware
 from uni_api.middleware.idempotency import (
@@ -263,7 +266,7 @@ def test_explicit_key_executes_once_and_replays_completed_response():
         snapshot = coordinator.snapshot()
         assert snapshot["owners"] == 1
         assert snapshot["replays"] == 1
-        assert snapshot["mode"] == "memory-single-process"
+        assert snapshot["mode"] == "spool-single-process"
         assert snapshot["persistence"] is False
 
     asyncio.run(run())
@@ -308,6 +311,215 @@ def test_concurrent_duplicate_waits_for_single_owner_then_replays():
         assert _response(owner)[2][b"x-uni-api-idempotency-status"] == b"executed"
         assert _response(duplicate)[2][b"x-uni-api-idempotency-status"] == b"replayed"
         assert coordinator.snapshot()["waits"] == 1
+
+    asyncio.run(run())
+
+
+def test_request_spool_is_released_as_soon_as_downstream_consumes_body():
+    async def run():
+        consumed = asyncio.Event()
+        finish = asyncio.Event()
+
+        coordinator = _coordinator(spool_memory_threshold_bytes=8)
+
+        async def app(_scope, receive, send):
+            chunks = []
+            while True:
+                message = await receive()
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            assert b"".join(chunks) == b"x" * 4096
+            consumed.set()
+            await finish.wait()
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {"type": "http.response.body", "body": b"ok", "more_body": False}
+            )
+
+        middleware = IdempotencyMiddleware(app, coordinator=coordinator)
+        task = asyncio.create_task(_invoke(middleware, body=b"x" * 4096))
+        await consumed.wait()
+        snapshot = coordinator.snapshot()
+        assert snapshot["spool_bytes_by_kind"].get("request_body", 0) == 0
+        assert snapshot["spool_memory_bytes"] == 0
+        finish.set()
+        await task
+
+    asyncio.run(run())
+
+
+def test_in_memory_spool_prefix_is_charged_to_adaptive_governor():
+    async def run():
+        entered = asyncio.Event()
+        consume = asyncio.Event()
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(0, 1024 * 1024, source="test"),
+            guard_bytes=0,
+            guard_ratio=0,
+            sample_cache_seconds=60,
+        )
+        coordinator = _coordinator(
+            spool_memory_threshold_bytes=1024,
+            memory_governor=governor,
+        )
+
+        async def app(_scope, receive, send):
+            entered.set()
+            await consume.wait()
+            await receive()
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {"type": "http.response.body", "body": b"ok", "more_body": False}
+            )
+
+        middleware = IdempotencyMiddleware(app, coordinator=coordinator)
+        task = asyncio.create_task(_invoke(middleware, body=b"x" * 128))
+        await entered.wait()
+        assert governor.snapshot().reservations == {
+            "idempotency_request_body": 128
+        }
+        consume.set()
+        await task
+        assert governor.snapshot().reserved_bytes == 0
+
+    asyncio.run(run())
+
+
+def test_completed_response_cache_is_disk_backed_and_heap_bounded():
+    async def run():
+        async def app(_scope, _receive, send):
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"r" * 4096,
+                    "more_body": False,
+                }
+            )
+
+        coordinator = _coordinator(spool_memory_threshold_bytes=64)
+        middleware = IdempotencyMiddleware(app, coordinator=coordinator)
+        first = await _invoke(middleware)
+        replay = await _invoke(middleware)
+
+        assert _response(first)[1] == b"r" * 4096
+        assert _response(replay)[1] == b"r" * 4096
+        snapshot = coordinator.snapshot()
+        assert snapshot["stored_response_bytes"] == 4096
+        assert snapshot["spool_memory_bytes"] == 0
+        assert snapshot["spool_bytes_by_kind"] == {
+            "completed_response": 4096
+        }
+        entry = next(iter(coordinator._entries.values()))
+        assert entry.response is not None
+        spool_path = entry.response.body._path
+        assert spool_path is not None
+        assert stat.S_IMODE(os.stat(spool_path).st_mode) == 0o600
+        assert stat.S_IMODE(
+            os.stat(coordinator._spool_directory.name).st_mode
+        ) == 0o700
+
+    asyncio.run(run())
+
+
+def test_spool_quota_failure_preserves_execution_tombstone():
+    async def run():
+        calls = 0
+
+        async def app(_scope, receive, send):
+            nonlocal calls
+            calls += 1
+            await receive()
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"response-too-large-for-global-spool",
+                    "more_body": False,
+                }
+            )
+
+        coordinator = _coordinator(
+            max_stored_bytes=24,
+            max_response_bytes=1024,
+            spool_memory_threshold_bytes=8,
+        )
+        middleware = IdempotencyMiddleware(app, coordinator=coordinator)
+        executed = await _invoke(middleware, body=b"{}")
+        retry = await _invoke(middleware, body=b"{}")
+
+        assert _response(executed)[0] == 200
+        assert _response(retry)[0] == 409
+        assert calls == 1
+        snapshot = coordinator.snapshot()
+        assert snapshot["spool_capacity_rejections"] == 1
+        assert snapshot["nonreplayable_completed"] == 1
+        assert snapshot["spool_total_bytes"] == 0
+
+    asyncio.run(run())
+
+
+def test_active_replay_pins_disk_entry_against_quota_eviction():
+    async def run():
+        async def app(_scope, receive, send):
+            await receive()
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"12345678",
+                    "more_body": False,
+                }
+            )
+
+        coordinator = _coordinator(
+            max_stored_bytes=8,
+            max_response_bytes=8,
+        )
+        middleware = IdempotencyMiddleware(app, coordinator=coordinator)
+        await _invoke(middleware, body=b"", scope=_scope(key="first"))
+
+        replay_started = asyncio.Event()
+        finish_replay = asyncio.Event()
+        replay_messages = []
+
+        async def blocked_send(message):
+            replay_messages.append(dict(message))
+            if message["type"] == "http.response.start":
+                replay_started.set()
+                await finish_replay.wait()
+
+        replay_task = asyncio.create_task(
+            middleware(
+                _scope(key="first"),
+                _receive_body(b""),
+                blocked_send,
+            )
+        )
+        await replay_started.wait()
+        second = await _invoke(
+            middleware,
+            body=b"",
+            scope=_scope(key="second"),
+        )
+        assert _response(second)[0] == 200
+        assert coordinator.snapshot()["nonreplayable_completed"] == 1
+
+        finish_replay.set()
+        await replay_task
+        assert _response(replay_messages)[1] == b"12345678"
+        assert coordinator.snapshot()["replays"] == 1
 
     asyncio.run(run())
 
@@ -376,7 +588,7 @@ def test_key_scope_includes_authenticated_caller():
     asyncio.run(run())
 
 
-def test_transient_5xx_and_oversized_responses_are_not_replayed():
+def test_transient_5xx_retries_but_oversized_success_gets_tombstone():
     async def run():
         calls = 0
         response_status = 503
@@ -409,10 +621,21 @@ def test_transient_5xx_and_oversized_responses_are_not_replayed():
 
         response_status = 200
         response_body = b"12345"
-        await _invoke(middleware, scope=_scope(key="oversized"))
-        await _invoke(middleware, scope=_scope(key="oversized"))
-        assert calls == 4
-        assert coordinator.snapshot()["responses_not_cached"] == 4
+        executed = await _invoke(middleware, scope=_scope(key="oversized"))
+        retry = await _invoke(middleware, scope=_scope(key="oversized"))
+        assert calls == 3
+        assert _response(executed)[0:2] == (200, b"12345")
+        status, body, headers = _response(retry)
+        assert status == 409
+        assert json.loads(body)["error"]["code"] == "executed_nonreplayable"
+        assert (
+            headers[b"x-uni-api-idempotency-status"]
+            == b"executed-nonreplayable"
+        )
+        snapshot = coordinator.snapshot()
+        assert snapshot["responses_not_cached"] == 3
+        assert snapshot["nonreplayable_completions"] == 1
+        assert snapshot["nonreplayable_rejections"] == 1
 
     asyncio.run(run())
 

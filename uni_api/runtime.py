@@ -195,6 +195,8 @@ from uni_api.middleware.request_decompression import (
     REQUEST_BODY_CPU_WORKERS,
     REQUEST_BODY_COMPLEXITY_INFO_KEY,
     RequestBodyDecompressionMiddleware,
+    mark_request_body_releasable_at_response_start,
+    request_body_response_started,
     request_body_complexity_diagnostics_from_scope,
 )
 from uni_api.persistence.repositories import StatsRepository
@@ -1473,6 +1475,27 @@ REQUEST_LARGE_BODY_LIMIT = _bounded_env_int(
     1,
     _startup_large_body_limit_max,
 )
+REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS = max(
+    0.001,
+    _env_float("REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS", 1.0),
+)
+REQUEST_BODY_MEMORY_WAITER_LIMIT = max(
+    1,
+    _env_int(
+        "REQUEST_BODY_MEMORY_WAITER_LIMIT",
+        REQUEST_ADMISSION_ACTIVE_LIMIT,
+    ),
+)
+REQUEST_SMALL_BODY_LANE_THRESHOLD_BYTES = _bounded_env_int(
+    "REQUEST_SMALL_BODY_LANE_THRESHOLD_BYTES",
+    min(4 * 1024 * 1024, REQUEST_BODY_RESERVATION_MAX_BYTES),
+    REQUEST_BODY_RESERVATION_MAX_BYTES,
+)
+REQUEST_SMALL_BODY_LANE_RESERVE_BYTES = _bounded_env_int(
+    "REQUEST_SMALL_BODY_LANE_RESERVE_BYTES",
+    min(64 * 1024 * 1024, max(1, REQUEST_BODY_BUDGET_BYTES // 8)),
+    REQUEST_BODY_BUDGET_BYTES,
+)
 UPSTREAM_POOL_SIZE = max(
     1,
     _env_int("UPSTREAM_POOL_SIZE", REQUEST_ADMISSION_ACTIVE_LIMIT),
@@ -1501,11 +1524,19 @@ request_admission_controller = RequestAdmissionController(
         REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES
     ),
     large_body_limit=REQUEST_LARGE_BODY_LIMIT,
+    body_memory_wait_timeout_seconds=(
+        REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS
+    ),
+    body_memory_waiter_limit=REQUEST_BODY_MEMORY_WAITER_LIMIT,
+    small_body_lane_threshold_bytes=REQUEST_SMALL_BODY_LANE_THRESHOLD_BYTES,
+    small_body_lane_reserve_bytes=REQUEST_SMALL_BODY_LANE_RESERVE_BYTES,
     memory_governor=process_memory_governor,
     decision_observer=emit_large_body_admission_decision,
     response_buffer_observer=emit_response_buffer_event,
 )
-idempotency_coordinator = build_default_idempotency_coordinator()
+idempotency_coordinator = build_default_idempotency_coordinator(
+    memory_governor=process_memory_governor
+)
 runtime_gauges.attach_request_admission(request_admission_controller.snapshot)
 runtime_gauges.attach_stream_parser_budget(stream_parser_retained_budget_snapshot)
 
@@ -2535,6 +2566,30 @@ def _request_body_size_bytes(http_request: Optional[Request], body: Any = None) 
         return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
     except Exception:
         return 0
+
+
+async def _drop_parsed_request_caches(http_request: Request) -> None:
+    """Drop FastAPI's raw/JSON cache after endpoint model validation."""
+
+    raw_body = getattr(http_request, "_body", None)
+    raw_bytes = (
+        len(raw_body)
+        if isinstance(raw_body, (bytes, bytearray, memoryview))
+        else 0
+    )
+    if raw_bytes:
+        http_request.state.uni_api_request_body_bytes = raw_bytes
+    if hasattr(http_request, "_body"):
+        http_request._body = b""
+    if hasattr(http_request, "_json"):
+        delattr(http_request, "_json")
+    raw_body = None
+    lease = get_request_admission_lease()
+    if lease is not None and raw_bytes:
+        await lease.release_body_bytes(
+            min(raw_bytes, max(0, int(lease.reserved_body_bytes)))
+        )
+
 
 def _messages_request_last_text(parsed_body: Any) -> Optional[str]:
     if not isinstance(parsed_body, dict):
@@ -6364,10 +6419,36 @@ class ResponsesRequestExecution:
         if self.request_data.stream:
             response = await self._run_stream()
         else:
-            response = await self._run_attempts()
+            try:
+                response = await self._run_attempts()
+            finally:
+                await self._release_request_retry_payload()
         if isinstance(response, Response):
             setattr(response, "current_info", self.current_info)
         return response
+
+    async def _release_request_retry_payload(self) -> None:
+        if self.request_data is None:
+            return
+        # All retry-capable code has finished reading this model before this
+        # handoff. Drop the object reference before returning its accounting.
+        self.request_data = None
+        request_scope = getattr(self.http_request, "scope", None)
+        if not isinstance(request_scope, dict):
+            return
+        mark_request_body_releasable_at_response_start(request_scope)
+        if not request_body_response_started(request_scope):
+            return
+        state = request_scope.get("state")
+        lease = (
+            state.get(ADMISSION_LEASE_STATE_KEY)
+            if isinstance(state, dict)
+            else None
+        )
+        if lease is None:
+            lease = get_request_admission_lease()
+        if lease is not None and lease.reserved_body_bytes:
+            await lease.release_body_bytes(lease.reserved_body_bytes)
 
     async def _run_attempts(self):
         return await self.runner.run(
@@ -6576,6 +6657,7 @@ class ResponsesRequestExecution:
             ) as queue_exc:
                 await self._abort_stream_for_backpressure(queue_exc)
         finally:
+            await self._release_request_retry_payload()
             if self.stream_precommit_chunks is not None:
                 await self.stream_precommit_chunks.clear()
             await self.stream_output_queue.close()
@@ -7481,6 +7563,7 @@ class ResponsesRequestExecution:
 
         attempt.state["stream_upstream_status_code"] = upstream_resp.status_code
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        await self._release_request_retry_payload()
         return StarletteStreamingResponse(
             self._proxy_responses_stream(
                 attempt,
@@ -10496,6 +10579,7 @@ async def chat_completions_route(
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key),
 ):
+    await _drop_parsed_request_caches(http_request)
     return await chat_completions_response(
         model_handler=model_handler,
         http_request=http_request,
@@ -10511,6 +10595,7 @@ async def responses_route(
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key),
 ):
+    await _drop_parsed_request_caches(http_request)
     return await responses_api_response(
         responses_handler=responses_handler,
         http_request=http_request,
@@ -10541,6 +10626,7 @@ async def responses_compact_route(
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key),
 ):
+    await _drop_parsed_request_caches(http_request)
     return await responses_api_response(
         responses_handler=responses_handler,
         http_request=http_request,
@@ -10557,6 +10643,7 @@ async def messages_route(
     request: dict[str, Any] = Body(...),
     api_index: int = Depends(verify_api_key),
 ):
+    await _drop_parsed_request_caches(http_request)
     return await messages_response(
         messages_handler=messages_handler,
         http_request=http_request,

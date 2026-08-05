@@ -7,7 +7,7 @@ from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from time import monotonic, time
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from uni_api.admission.memory import (
@@ -62,6 +62,162 @@ class UpstreamResponseBudgetExhausted(AdmissionRejected):
 class _Waiter:
     future: asyncio.Future[float]
     state: str = "queued"
+
+
+@dataclass(slots=True)
+class _BodyMemoryWaiter:
+    future: asyncio.Future[None]
+    tenant_key: str
+    small_lane: bool
+    state: str = "queued"
+
+
+class _FairBodyMemoryWaitQueue:
+    """Bounded two-lane, tenant-round-robin admission for memory waiters."""
+
+    def __init__(self, limit: int) -> None:
+        if limit < 0:
+            raise ValueError("body memory waiter limit cannot be negative")
+        self.limit = int(limit)
+        self._queues: dict[bool, dict[str, deque[_BodyMemoryWaiter]]] = {
+            True: {},
+            False: {},
+        }
+        self._tenant_round_robin: dict[bool, deque[str]] = {
+            True: deque(),
+            False: deque(),
+        }
+        self._active_turn: dict[bool, bool] = {True: False, False: False}
+        self._promotion_enabled: dict[bool, bool] = {True: True, False: True}
+        self._count = 0
+        self._peak = 0
+        self._grants = 0
+        self._timeouts = 0
+        self._queue_full = 0
+
+    def has_waiters(self, small_lane: bool) -> bool:
+        lane = bool(small_lane)
+        return self._active_turn[lane] or self._count_for_lane(lane) > 0
+
+    async def wait_turn(
+        self,
+        *,
+        tenant_key: str,
+        small_lane: bool,
+        timeout_seconds: float,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise TimeoutError
+        if self._count >= self.limit:
+            self._queue_full += 1
+            raise TimeoutError
+        loop = asyncio.get_running_loop()
+        normalized_tenant = str(tenant_key or "anonymous")[:96]
+        waiter = _BodyMemoryWaiter(
+            future=loop.create_future(),
+            tenant_key=normalized_tenant,
+            small_lane=bool(small_lane),
+        )
+        tenant_queues = self._queues[waiter.small_lane]
+        tenant_queue = tenant_queues.get(normalized_tenant)
+        if tenant_queue is None:
+            tenant_queue = deque()
+            tenant_queues[normalized_tenant] = tenant_queue
+            self._tenant_round_robin[waiter.small_lane].append(
+                normalized_tenant
+            )
+        tenant_queue.append(waiter)
+        self._count += 1
+        self._peak = max(self._peak, self._count)
+        self._promote(waiter.small_lane)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter.future),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            self._timeouts += 1
+            self._remove(waiter)
+            raise
+        except asyncio.CancelledError:
+            self._remove(waiter)
+            raise
+
+    def finish_turn(self, small_lane: bool) -> None:
+        if not self._active_turn[bool(small_lane)]:
+            raise RuntimeError("body memory wait turn underflow")
+        self._active_turn[bool(small_lane)] = False
+        self._promote(bool(small_lane))
+
+    def block_until_release(self, small_lane: bool) -> None:
+        self._promotion_enabled[bool(small_lane)] = False
+
+    def notify_memory_released(self) -> None:
+        for lane in (True, False):
+            self._promotion_enabled[lane] = True
+            self._promote(lane)
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "body_memory_waiters": self._count,
+            "body_memory_small_waiters": self._count_for_lane(True),
+            "body_memory_large_waiters": self._count_for_lane(False),
+            "body_memory_small_turn_active": int(self._active_turn[True]),
+            "body_memory_large_turn_active": int(self._active_turn[False]),
+            "body_memory_waiter_peak": self._peak,
+            "body_memory_wait_grants": self._grants,
+            "body_memory_wait_timeouts": self._timeouts,
+            "body_memory_wait_queue_full": self._queue_full,
+        }
+
+    def _count_for_lane(self, small_lane: bool) -> int:
+        return sum(
+            len(queue) for queue in self._queues[bool(small_lane)].values()
+        )
+
+    def _promote(self, small_lane: bool) -> None:
+        lane = bool(small_lane)
+        if self._active_turn[lane] or not self._promotion_enabled[lane]:
+            return
+        round_robin = self._tenant_round_robin[lane]
+        tenant_queues = self._queues[lane]
+        while round_robin:
+            tenant = round_robin.popleft()
+            queue = tenant_queues.get(tenant)
+            if not queue:
+                tenant_queues.pop(tenant, None)
+                continue
+            waiter = queue.popleft()
+            self._count -= 1
+            if queue:
+                round_robin.append(tenant)
+            else:
+                tenant_queues.pop(tenant, None)
+            if waiter.state != "queued" or waiter.future.done():
+                continue
+            waiter.state = "granted"
+            self._active_turn[lane] = True
+            self._grants += 1
+            waiter.future.set_result(None)
+            return
+
+    def _remove(self, waiter: _BodyMemoryWaiter) -> None:
+        if waiter.state == "granted":
+            waiter.state = "abandoned"
+            self.finish_turn(waiter.small_lane)
+            return
+        if waiter.state != "queued":
+            return
+        waiter.state = "abandoned"
+        queue = self._queues[waiter.small_lane].get(waiter.tenant_key)
+        if queue is not None:
+            try:
+                queue.remove(waiter)
+                self._count -= 1
+            except ValueError:
+                pass
+            if not queue:
+                self._queues[waiter.small_lane].pop(waiter.tenant_key, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,7 +529,12 @@ class BoundedAdmissionGate:
 class PendingBodyReservation:
     """Bytes consumed while a request is still waiting for an active slot."""
 
-    def __init__(self, controller: RequestAdmissionController) -> None:
+    def __init__(
+        self,
+        controller: RequestAdmissionController,
+        *,
+        fairness_key: str = "anonymous",
+    ) -> None:
         self._controller = controller
         self._reserved_bytes = 0
         self._transferred = False
@@ -383,6 +544,7 @@ class PendingBodyReservation:
         self._lease_id = controller._new_lease_id()
         self._body_observation = RequestBodyObservation()
         self._release_reason = "pending_released"
+        self._fairness_key = str(fairness_key or "anonymous")[:96]
 
     @property
     def reserved_bytes(self) -> int:
@@ -461,6 +623,7 @@ class RequestAdmissionLease:
         self._body_observation = RequestBodyObservation()
         self._release_reason = "request_completed"
         self._release_task: asyncio.Task[None] | None = None
+        self._fairness_key = "anonymous"
         self._response_attempt: dict[str, Any] | None = None
         self._response_attempts_started = 0
         self._response_committed_allocations: dict[str, dict[str, Any]] = {}
@@ -494,6 +657,11 @@ class RequestAdmissionLease:
         if self._release_requested or self._released:
             return
         self._body_observation = observation
+
+    def set_fairness_key(self, value: str) -> None:
+        if self._release_requested or self._released:
+            return
+        self._fairness_key = str(value or "anonymous")[:96]
 
     def begin_response_attempt(
         self,
@@ -658,6 +826,16 @@ class RequestAdmissionLease:
             additional_bytes,
             observation=observation,
         )
+        return self._reserved_body_bytes
+
+    async def release_body_bytes(self, released_bytes: int) -> int:
+        """Release an owned request-memory phase after dropping its objects."""
+
+        if released_bytes < 0:
+            raise ValueError("released_bytes cannot be negative")
+        if self._release_requested:
+            return self._reserved_body_bytes
+        await self._controller._release_body_bytes(self, released_bytes)
         return self._reserved_body_bytes
 
     async def reserve_response_bytes(self, additional_bytes: int) -> int:
@@ -880,6 +1058,10 @@ class RequestAdmissionController:
         max_retained_bytes_per_request: int | None = None,
         large_body_threshold_weighted_bytes: int = 0,
         large_body_limit: int = 0,
+        body_memory_wait_timeout_seconds: float = 0.0,
+        body_memory_waiter_limit: int = 0,
+        small_body_lane_threshold_bytes: int = 256 * 1024,
+        small_body_lane_reserve_bytes: int = 0,
         memory_governor: AdaptiveMemoryGovernor | None = None,
         clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], float] = time,
@@ -898,6 +1080,12 @@ class RequestAdmissionController:
             raise ValueError("max_response_bytes cannot be negative")
         if large_body_threshold_weighted_bytes < 0 or large_body_limit < 0:
             raise ValueError("large body admission settings cannot be negative")
+        if body_memory_wait_timeout_seconds < 0 or body_memory_waiter_limit < 0:
+            raise ValueError("body memory wait settings cannot be negative")
+        if small_body_lane_threshold_bytes < 0 or small_body_lane_reserve_bytes < 0:
+            raise ValueError("small body lane settings cannot be negative")
+        if small_body_lane_reserve_bytes > body_budget_bytes:
+            raise ValueError("small body lane reserve cannot exceed body budget")
         if bool(large_body_threshold_weighted_bytes) != bool(large_body_limit):
             raise ValueError(
                 "large body threshold and limit must both be enabled or disabled"
@@ -921,6 +1109,19 @@ class RequestAdmissionController:
             large_body_threshold_weighted_bytes
         )
         self.large_body_limit = int(large_body_limit)
+        self.body_memory_wait_timeout_seconds = float(
+            body_memory_wait_timeout_seconds
+        )
+        self.body_memory_waiter_limit = int(body_memory_waiter_limit)
+        self.small_body_lane_threshold_bytes = int(
+            small_body_lane_threshold_bytes
+        )
+        self.small_body_lane_reserve_bytes = int(
+            small_body_lane_reserve_bytes
+        )
+        self._body_memory_wait_queue = _FairBodyMemoryWaitQueue(
+            self.body_memory_waiter_limit
+        )
         self._large_body_holders: dict[str, _LargeBodyHolder] = {}
         if self.max_retained_bytes_per_request < 0:
             raise ValueError("max_retained_bytes_per_request cannot be negative")
@@ -961,6 +1162,8 @@ class RequestAdmissionController:
         self._reserved_body_bytes = 0
         self._pending_body_reserved_bytes = 0
         self._reserved_response_bytes = 0
+        self._staged_body_release_count = 0
+        self._staged_body_released_bytes = 0
         self._deferred_memory_leases: set[RequestAdmissionLease] = set()
         self._body_rejected: Counter[str] = Counter()
         self._response_rejected: Counter[str] = Counter()
@@ -1060,8 +1263,12 @@ class RequestAdmissionController:
             reserved_body_bytes=0,
         )
 
-    def pending_body_reservation(self) -> PendingBodyReservation:
-        return PendingBodyReservation(self)
+    def pending_body_reservation(
+        self,
+        *,
+        fairness_key: str = "anonymous",
+    ) -> PendingBodyReservation:
+        return PendingBodyReservation(self, fairness_key=fairness_key)
 
     async def _reserve_pending_body_additional(
         self,
@@ -1070,54 +1277,12 @@ class RequestAdmissionController:
         *,
         observation: RequestBodyObservation | None = None,
     ) -> None:
-        decision_events: list[LargeBodyAdmissionDecision] = []
-        try:
-            async with self._body_lock:
-                request_before = reservation._reserved_bytes
-                global_body_before = self._reserved_body_bytes
-                global_response_before = self._reserved_response_bytes
-                if observation is not None:
-                    reservation._body_observation = observation
-                next_request_bytes = request_before + additional_bytes
-                if next_request_bytes > self.max_body_bytes:
-                    self._body_rejected["body_too_large"] += 1
-                    raise RequestBodyTooLarge()
-                if (
-                    self._reserved_body_bytes
-                    + self._reserved_response_bytes
-                    + additional_bytes
-                    > self.body_budget_bytes
-                ):
-                    self._body_rejected["body_budget_exhausted"] += 1
-                    raise RequestBodyBudgetExhausted()
-                self._ensure_large_body_slot_available_locked(
-                    reservation,
-                    next_request_bytes,
-                    request_before=request_before,
-                    global_body_before=global_body_before,
-                    global_response_before=global_response_before,
-                    decision_events=decision_events,
-                )
-                if not self._reserve_parent_memory("request_body", additional_bytes):
-                    self._body_rejected["body_budget_exhausted"] += 1
-                    raise RequestBodyBudgetExhausted()
-                reservation._reserved_bytes = next_request_bytes
-                self._reserved_body_bytes += additional_bytes
-                self._pending_body_reserved_bytes += additional_bytes
-                self._claim_large_body_slot_locked(
-                    reservation,
-                    next_request_bytes,
-                    request_before=request_before,
-                    global_body_before=global_body_before,
-                    global_response_before=global_response_before,
-                    decision_events=decision_events,
-                )
-                self._update_large_body_holder_locked(
-                    reservation,
-                    next_request_bytes,
-                )
-        finally:
-            self._publish_decision_events(decision_events)
+        await self._reserve_body_owner(
+            reservation,
+            additional_bytes,
+            observation=observation,
+            pending=True,
+        )
 
     async def _transfer_pending_body(
         self,
@@ -1212,6 +1377,49 @@ class RequestAdmissionController:
         finally:
             self._publish_decision_events(decision_events)
 
+    async def _release_body_bytes(
+        self,
+        lease: RequestAdmissionLease,
+        released_bytes: int,
+    ) -> None:
+        released = int(released_bytes)
+        if released == 0:
+            return
+        decision_events: list[LargeBodyAdmissionDecision] = []
+        try:
+            async with self._body_lock:
+                if lease._release_requested or lease._released:
+                    return
+                if released > lease._reserved_body_bytes:
+                    raise RuntimeError("request body staged release underflow")
+                request_before = lease._reserved_body_bytes
+                global_body_before = self._reserved_body_bytes
+                global_response_before = self._reserved_response_bytes
+                if released > self._reserved_body_bytes:
+                    raise RuntimeError("global request body staged release underflow")
+                lease._reserved_body_bytes -= released
+                self._reserved_body_bytes -= released
+                self._staged_body_release_count += 1
+                self._staged_body_released_bytes += released
+                self._release_parent_memory("request_body", released)
+                if lease._reserved_body_bytes == 0:
+                    self._release_large_body_slot_locked(
+                        lease,
+                        request_before=request_before,
+                        global_body_before=global_body_before,
+                        global_response_before=global_response_before,
+                        release_reason="request_body_objects_released",
+                        release_finalizer="staged_body_release",
+                        decision_events=decision_events,
+                    )
+                else:
+                    self._update_large_body_holder_locked(
+                        lease,
+                        lease._reserved_body_bytes,
+                    )
+        finally:
+            self._publish_decision_events(decision_events)
+
     async def _reserve_additional(
         self,
         lease: RequestAdmissionLease,
@@ -1219,56 +1427,298 @@ class RequestAdmissionController:
         *,
         observation: RequestBodyObservation | None = None,
     ) -> None:
+        await self._reserve_body_owner(
+            lease,
+            additional_bytes,
+            observation=observation,
+            pending=False,
+        )
+
+    async def _reserve_body_owner(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        additional_bytes: int,
+        *,
+        observation: RequestBodyObservation | None,
+        pending: bool,
+    ) -> None:
+        """Reserve without awaiting the parent governor under ``_body_lock``."""
+
+        additional = int(additional_bytes)
+        if additional < 0:
+            raise ValueError("additional_bytes cannot be negative")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.body_memory_wait_timeout_seconds
+        wait_lane = True
+        while True:
+            decision_events: list[LargeBodyAdmissionDecision] = []
+            unavailable_reason: str | None = None
+            parent_reserved = False
+            try:
+                async with self._body_lock:
+                    request_before = self._owner_reserved_body_bytes(owner, pending)
+                    if observation is not None:
+                        owner._body_observation = observation
+                    self._validate_body_owner_active(owner, pending)
+                    next_request_bytes = request_before + additional
+                    self._validate_body_hard_limits_locked(
+                        owner,
+                        next_request_bytes,
+                        pending=pending,
+                    )
+                    wait_lane = self._is_small_body_lane(next_request_bytes)
+                    unavailable_reason = self._body_unavailable_reason_locked(
+                        owner,
+                        next_request_bytes,
+                        additional,
+                    )
+                    if (
+                        unavailable_reason is None
+                        and request_before == 0
+                        and self._body_memory_wait_queue.has_waiters(wait_lane)
+                    ):
+                        unavailable_reason = "body_budget_exhausted"
+                    if unavailable_reason is None:
+                        parent_reserved = self._reserve_parent_memory(
+                            "request_body",
+                            additional,
+                        )
+                        if not parent_reserved:
+                            unavailable_reason = "body_budget_exhausted"
+                    if unavailable_reason is None:
+                        self._commit_body_owner_locked(
+                            owner,
+                            next_request_bytes,
+                            additional,
+                            pending=pending,
+                            request_before=request_before,
+                            decision_events=decision_events,
+                        )
+                        return
+            finally:
+                self._publish_decision_events(decision_events)
+
+            remaining = deadline - loop.time()
+            if remaining <= 0 or self.body_memory_waiter_limit <= 0:
+                await self._raise_body_wait_rejection(
+                    owner,
+                    additional,
+                    pending=pending,
+                    reason=unavailable_reason or "body_budget_exhausted",
+                )
+            if unavailable_reason != "body_budget_exhausted" or (
+                self._reserved_body_bytes
+                + self._reserved_response_bytes
+                + additional
+                > self._body_budget_for_lane(wait_lane)
+            ):
+                self._body_memory_wait_queue.block_until_release(wait_lane)
+            try:
+                await self._body_memory_wait_queue.wait_turn(
+                    tenant_key=owner._fairness_key,
+                    small_lane=wait_lane,
+                    timeout_seconds=remaining,
+                )
+            except TimeoutError:
+                await self._raise_body_wait_rejection(
+                    owner,
+                    additional,
+                    pending=pending,
+                    reason=unavailable_reason or "body_budget_exhausted",
+                )
+            outcome = await self._commit_body_owner_after_wait_turn(
+                owner,
+                additional,
+                pending=pending,
+                wait_lane=wait_lane,
+                deadline=deadline,
+            )
+            if outcome == "committed":
+                return
+            if outcome == "timeout":
+                await self._raise_body_wait_rejection(
+                    owner,
+                    additional,
+                    pending=pending,
+                    reason="body_budget_exhausted",
+                )
+
+    async def _commit_body_owner_after_wait_turn(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        additional_bytes: int,
+        *,
+        pending: bool,
+        wait_lane: bool,
+        deadline: float,
+    ) -> Literal["committed", "retry", "timeout"]:
+        parent_reserved = False
+        decision_events: list[LargeBodyAdmissionDecision] = []
+        try:
+            if self._memory_governor is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0 or not await self._memory_governor.reserve(
+                    "request_body",
+                    additional_bytes,
+                    timeout_seconds=remaining,
+                ):
+                    return "timeout"
+                parent_reserved = True
+            async with self._body_lock:
+                request_before = self._owner_reserved_body_bytes(owner, pending)
+                self._validate_body_owner_active(owner, pending)
+                next_request_bytes = request_before + additional_bytes
+                self._validate_body_hard_limits_locked(
+                    owner,
+                    next_request_bytes,
+                    pending=pending,
+                )
+                unavailable_reason = self._body_unavailable_reason_locked(
+                    owner,
+                    next_request_bytes,
+                    additional_bytes,
+                )
+                if unavailable_reason is not None:
+                    return "retry"
+                self._commit_body_owner_locked(
+                    owner,
+                    next_request_bytes,
+                    additional_bytes,
+                    pending=pending,
+                    request_before=request_before,
+                    decision_events=decision_events,
+                )
+                parent_reserved = False
+                return "committed"
+        finally:
+            self._publish_decision_events(decision_events)
+            if parent_reserved:
+                self._release_parent_memory("request_body", additional_bytes)
+            self._body_memory_wait_queue.finish_turn(wait_lane)
+
+    def _owner_reserved_body_bytes(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        pending: bool,
+    ) -> int:
+        return owner._reserved_bytes if pending else owner._reserved_body_bytes
+
+    @staticmethod
+    def _validate_body_owner_active(
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        pending: bool,
+    ) -> None:
+        if pending:
+            if owner._transferred or owner._released:
+                raise RuntimeError("pending body reservation is no longer active")
+            return
+        if owner._release_requested or owner._released:
+            raise RuntimeError("cannot reserve bytes on a released request lease")
+
+    def _validate_body_hard_limits_locked(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        next_request_bytes: int,
+        *,
+        pending: bool,
+    ) -> None:
+        if next_request_bytes > self.max_body_bytes:
+            self._body_rejected["body_too_large"] += 1
+            raise RequestBodyTooLarge()
+        if (
+            not pending
+            and next_request_bytes + owner._reserved_response_bytes
+            > self.max_retained_bytes_per_request
+        ):
+            self._body_rejected["body_budget_exhausted"] += 1
+            raise RequestBodyBudgetExhausted()
+
+    def _is_small_body_lane(self, next_request_bytes: int) -> bool:
+        return bool(
+            self.small_body_lane_threshold_bytes
+            and next_request_bytes <= self.small_body_lane_threshold_bytes
+        )
+
+    def _body_budget_for_lane(self, small_lane: bool) -> int:
+        if small_lane:
+            return self.body_budget_bytes
+        return max(0, self.body_budget_bytes - self.small_body_lane_reserve_bytes)
+
+    def _body_unavailable_reason_locked(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        next_request_bytes: int,
+        additional_bytes: int,
+    ) -> str | None:
+        if (
+            self._reserved_body_bytes
+            + self._reserved_response_bytes
+            + additional_bytes
+            > self._body_budget_for_lane(
+                self._is_small_body_lane(next_request_bytes)
+            )
+        ):
+            return "body_budget_exhausted"
+        if (
+            self.large_body_limit
+            and not owner._large_body_slot
+            and next_request_bytes > self.large_body_threshold_weighted_bytes
+            and len(self._large_body_holders) >= self.large_body_limit
+        ):
+            return "large_body_capacity_exhausted"
+        return None
+
+    def _commit_body_owner_locked(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        next_request_bytes: int,
+        additional_bytes: int,
+        *,
+        pending: bool,
+        request_before: int,
+        decision_events: list[LargeBodyAdmissionDecision],
+    ) -> None:
+        global_body_before = self._reserved_body_bytes
+        global_response_before = self._reserved_response_bytes
+        if pending:
+            owner._reserved_bytes = next_request_bytes
+            self._pending_body_reserved_bytes += additional_bytes
+        else:
+            owner._reserved_body_bytes = next_request_bytes
+        self._reserved_body_bytes += additional_bytes
+        self._claim_large_body_slot_locked(
+            owner,
+            next_request_bytes,
+            request_before=request_before,
+            global_body_before=global_body_before,
+            global_response_before=global_response_before,
+            decision_events=decision_events,
+        )
+        self._update_large_body_holder_locked(owner, next_request_bytes)
+
+    async def _raise_body_wait_rejection(
+        self,
+        owner: RequestAdmissionLease | PendingBodyReservation,
+        additional_bytes: int,
+        *,
+        pending: bool,
+        reason: str,
+    ) -> None:
         decision_events: list[LargeBodyAdmissionDecision] = []
         try:
             async with self._body_lock:
-                if lease._release_requested or lease._released:
-                    raise RuntimeError("cannot reserve bytes on a released request lease")
-                request_before = lease._reserved_body_bytes
-                global_body_before = self._reserved_body_bytes
-                global_response_before = self._reserved_response_bytes
-                if observation is not None:
-                    lease._body_observation = observation
-                next_request_bytes = request_before + additional_bytes
-                if next_request_bytes > self.max_body_bytes:
-                    self._body_rejected["body_too_large"] += 1
-                    raise RequestBodyTooLarge()
-                if (
-                    self._reserved_body_bytes
-                    + self._reserved_response_bytes
-                    + additional_bytes
-                    > self.body_budget_bytes
-                ):
-                    self._body_rejected["body_budget_exhausted"] += 1
-                    raise RequestBodyBudgetExhausted()
-                if (
-                    next_request_bytes + lease._reserved_response_bytes
-                    > self.max_retained_bytes_per_request
-                ):
-                    self._body_rejected["body_budget_exhausted"] += 1
-                    raise RequestBodyBudgetExhausted()
-                self._ensure_large_body_slot_available_locked(
-                    lease,
-                    next_request_bytes,
-                    request_before=request_before,
-                    global_body_before=global_body_before,
-                    global_response_before=global_response_before,
-                    decision_events=decision_events,
-                )
-                if not self._reserve_parent_memory("request_body", additional_bytes):
-                    self._body_rejected["body_budget_exhausted"] += 1
-                    raise RequestBodyBudgetExhausted()
-                lease._reserved_body_bytes = next_request_bytes
-                self._reserved_body_bytes += additional_bytes
-                self._claim_large_body_slot_locked(
-                    lease,
-                    next_request_bytes,
-                    request_before=request_before,
-                    global_body_before=global_body_before,
-                    global_response_before=global_response_before,
-                    decision_events=decision_events,
-                )
-                self._update_large_body_holder_locked(lease, next_request_bytes)
+                request_before = self._owner_reserved_body_bytes(owner, pending)
+                if reason == "large_body_capacity_exhausted":
+                    self._ensure_large_body_slot_available_locked(
+                        owner,
+                        request_before + additional_bytes,
+                        request_before=request_before,
+                        global_body_before=self._reserved_body_bytes,
+                        global_response_before=self._reserved_response_bytes,
+                        decision_events=decision_events,
+                    )
+                self._body_rejected["body_budget_exhausted"] += 1
+                raise RequestBodyBudgetExhausted()
         finally:
             self._publish_decision_events(decision_events)
 
@@ -2666,6 +3116,8 @@ class RequestAdmissionController:
     def _release_parent_memory(self, category: str, size: int) -> None:
         if self._memory_governor is not None and size:
             self._memory_governor.release(category, size)
+        if size:
+            self._body_memory_wait_queue.notify_memory_released()
 
     def snapshot(self) -> dict[str, Any]:
         gate_snapshot = self._active_gate.snapshot()
@@ -2708,7 +3160,10 @@ class RequestAdmissionController:
         response_rejections_1m = len(self._response_rejection_timestamps)
         return {
             **gate_snapshot,
+            **self._body_memory_wait_queue.snapshot(),
             "reserved_body_bytes": self._reserved_body_bytes,
+            "staged_body_release_count": self._staged_body_release_count,
+            "staged_body_released_bytes": self._staged_body_released_bytes,
             "pending_body_reserved_bytes": self._pending_body_reserved_bytes,
             "reserved_response_bytes": self._reserved_response_bytes,
             "reserved_retained_bytes": (
@@ -2724,6 +3179,14 @@ class RequestAdmissionController:
             "max_body_bytes": self.max_body_bytes,
             "max_response_bytes": self.max_response_bytes,
             "max_retained_bytes_per_request": self.max_retained_bytes_per_request,
+            "body_memory_wait_timeout_seconds": (
+                self.body_memory_wait_timeout_seconds
+            ),
+            "body_memory_waiter_limit": self.body_memory_waiter_limit,
+            "small_body_lane_threshold_bytes": (
+                self.small_body_lane_threshold_bytes
+            ),
+            "small_body_lane_reserve_bytes": self.small_body_lane_reserve_bytes,
             "large_body_threshold_weighted_bytes": (
                 self.large_body_threshold_weighted_bytes
             ),

@@ -400,6 +400,184 @@ def test_request_controller_enforces_global_body_budget_and_recovers_on_release(
     asyncio.run(run())
 
 
+def test_body_budget_exhaustion_waits_for_release_when_enabled():
+    async def run():
+        controller = RequestAdmissionController(
+            capacity=2,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=10,
+            body_budget_bytes=10,
+            body_memory_wait_timeout_seconds=0.5,
+            body_memory_waiter_limit=2,
+        )
+        first = await controller.acquire(initial_body_bytes=6)
+        second = await controller.acquire(initial_body_bytes=4)
+        reservation = asyncio.create_task(second.reserve_body_bytes(1))
+        async with asyncio.timeout(1):
+            while controller.snapshot()["body_memory_waiters"] != 1:
+                await asyncio.sleep(0)
+
+        await first.release()
+        assert await reservation == 5
+        snapshot = controller.snapshot()
+        assert snapshot["body_memory_wait_timeouts"] == 0
+        assert snapshot["rejected"] == {}
+        await second.release()
+
+    asyncio.run(run())
+
+
+def test_existing_body_owner_can_finish_while_new_request_waits():
+    async def run():
+        controller = RequestAdmissionController(
+            capacity=2,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=10,
+            body_budget_bytes=10,
+            body_memory_wait_timeout_seconds=0.5,
+            body_memory_waiter_limit=2,
+        )
+        existing = await controller.acquire(initial_body_bytes=8)
+        newcomer = await controller.acquire()
+        waiting = asyncio.create_task(newcomer.reserve_body_bytes(8))
+        async with asyncio.timeout(1):
+            while controller.snapshot()["body_memory_waiters"] != 1:
+                await asyncio.sleep(0)
+
+        # Incremental decoding for the existing body must not queue behind a
+        # new request that cannot proceed until this owner finishes/releases.
+        assert await existing.reserve_body_bytes(2) == 10
+        await existing.release()
+        assert await waiting == 8
+        await newcomer.release()
+
+    asyncio.run(run())
+
+
+def test_parent_memory_wait_does_not_hold_controller_body_lock():
+    async def run():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+            guard_bytes=0,
+            guard_ratio=0,
+            sample_cache_seconds=60,
+        )
+        controller = RequestAdmissionController(
+            capacity=2,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=900,
+            body_budget_bytes=1000,
+            body_memory_wait_timeout_seconds=0.5,
+            body_memory_waiter_limit=2,
+            memory_governor=governor,
+        )
+        owner = await controller.acquire(initial_body_bytes=900)
+        waiter = await controller.acquire()
+        blocked = asyncio.create_task(waiter.reserve_body_bytes(1))
+        async with asyncio.timeout(1):
+            while governor.snapshot().waiting_reservations != 1:
+                await asyncio.sleep(0)
+
+        # This release needs _body_lock. If reserve() awaited the parent while
+        # holding that lock, the pair would deadlock until timeout.
+        await owner.release()
+        assert await blocked == 1
+        await waiter.release()
+
+    asyncio.run(run())
+
+
+def test_cancelled_parent_memory_wait_releases_fair_turn():
+    async def run():
+        governor = AdaptiveMemoryGovernor(
+            source=lambda: ProcessMemorySample(100, 1000, source="fake"),
+            guard_bytes=0,
+            guard_ratio=0,
+            sample_cache_seconds=60,
+        )
+        controller = RequestAdmissionController(
+            capacity=3,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=900,
+            body_budget_bytes=1000,
+            body_memory_wait_timeout_seconds=1,
+            body_memory_waiter_limit=2,
+            memory_governor=governor,
+        )
+        owner = await controller.acquire(initial_body_bytes=900)
+        cancelled_lease = await controller.acquire()
+        cancelled = asyncio.create_task(cancelled_lease.reserve_body_bytes(1))
+        async with asyncio.timeout(1):
+            while governor.snapshot().waiting_reservations != 1:
+                await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert controller.snapshot()["body_memory_small_turn_active"] == 0
+
+        await owner.release()
+        next_lease = await controller.acquire(initial_body_bytes=1)
+        await asyncio.gather(cancelled_lease.release(), next_lease.release())
+
+    asyncio.run(run())
+
+
+def test_small_lane_and_tenant_round_robin_prevent_large_request_monopoly():
+    async def run():
+        controller = RequestAdmissionController(
+            capacity=6,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=100,
+            body_budget_bytes=100,
+            body_memory_wait_timeout_seconds=0.5,
+            body_memory_waiter_limit=4,
+            small_body_lane_threshold_bytes=10,
+            small_body_lane_reserve_bytes=20,
+        )
+        large = await controller.acquire(initial_body_bytes=80)
+        small_one = await controller.acquire(initial_body_bytes=10)
+        small_two = await controller.acquire(initial_body_bytes=10)
+        assert controller.snapshot()["reserved_body_bytes"] == 100
+
+        order = []
+        first_a = await controller.acquire()
+        second_a = await controller.acquire()
+        first_b = await controller.acquire()
+        first_a.set_fairness_key("tenant-a")
+        second_a.set_fairness_key("tenant-a")
+        first_b.set_fairness_key("tenant-b")
+
+        async def reserve(lease, name):
+            await lease.reserve_body_bytes(5)
+            order.append(name)
+
+        tasks = [
+            asyncio.create_task(reserve(first_a, "a1")),
+            asyncio.create_task(reserve(second_a, "a2")),
+            asyncio.create_task(reserve(first_b, "b1")),
+        ]
+        async with asyncio.timeout(1):
+            while controller.snapshot()["body_memory_waiters"] != 3:
+                await asyncio.sleep(0)
+        await asyncio.gather(small_one.release(), small_two.release())
+        await asyncio.gather(*tasks)
+        assert order == ["a1", "b1", "a2"]
+
+        await asyncio.gather(
+            large.release(),
+            first_a.release(),
+            second_a.release(),
+            first_b.release(),
+        )
+
+    asyncio.run(run())
+
+
 def test_request_and_response_share_adaptive_parent_without_leaking():
     async def run():
         governor = AdaptiveMemoryGovernor(

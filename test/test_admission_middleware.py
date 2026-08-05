@@ -22,6 +22,7 @@ from uni_api.middleware.admission import (
 from uni_api.middleware.request_decompression import (
     BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
     RequestBodyDecompressionMiddleware,
+    mark_request_body_releasable_at_response_start,
 )
 
 
@@ -104,6 +105,63 @@ def test_admission_lease_covers_the_complete_streaming_asgi_lifecycle():
         await task
         assert controller.snapshot()["active"] == 0
         assert sent[-1]["more_body"] is False
+
+    asyncio.run(run())
+
+
+def test_declared_body_is_reserved_before_read_and_released_at_response_start():
+    async def run():
+        controller = _controller(max_body_bytes=100, body_budget_bytes=100)
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-length", b"4"),
+            (b"content-type", b"application/octet-stream"),
+        ]
+        received = False
+        sent = []
+
+        async def receive():
+            nonlocal received
+            assert controller.snapshot()["reserved_body_bytes"] == 4
+            assert not received
+            received = True
+            return {
+                "type": "http.request",
+                "body": b"data",
+                "more_body": False,
+            }
+
+        async def app(inner_scope, inner_receive, send):
+            message = await inner_receive()
+            assert message["body"] == b"data"
+            # Non-JSON identity bodies use the configured four-copy weight.
+            assert controller.snapshot()["reserved_body_bytes"] == 16
+            mark_request_body_releasable_at_response_start(inner_scope)
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {"type": "http.response.body", "body": b"ok", "more_body": False}
+            )
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                assert controller.snapshot()["reserved_body_bytes"] == 0
+            sent.append(message)
+
+        middleware = RequestAdmissionMiddleware(
+            RequestBodyDecompressionMiddleware(
+                app,
+                max_identity_body_bytes=100,
+            ),
+            controller=controller,
+        )
+        await middleware(scope, receive, send)
+        assert sent[-1]["more_body"] is False
+        snapshot = controller.snapshot()
+        assert snapshot["reserved_body_bytes"] == 0
+        assert snapshot["staged_body_release_count"] == 1
+        assert snapshot["staged_body_released_bytes"] == 16
 
     asyncio.run(run())
 

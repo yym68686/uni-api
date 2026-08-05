@@ -4,7 +4,7 @@ import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
-from typing import Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 import zstandard as zstd
 from starlette.responses import JSONResponse
@@ -83,9 +83,15 @@ register_dedicated_threadpool(
 )
 
 BodyBytesReservationCallback = Callable[[int], Awaitable[None]]
+BodyBytesReleaseCallback = Callable[[int], Awaitable[Any]]
 BODY_BYTES_RESERVATION_SCOPE_KEY = "uni_api_reserve_body_bytes"
+BODY_BYTES_RELEASE_SCOPE_KEY = "uni_api_release_body_bytes"
 BODY_REJECTION_RECORDER_SCOPE_KEY = "uni_api_record_body_rejection"
 BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY = "uni_api_observe_body_early_response"
+BODY_RELEASE_AT_RESPONSE_START_SCOPE_KEY = (
+    "uni_api_release_body_at_response_start"
+)
+BODY_RESPONSE_STARTED_SCOPE_KEY = "uni_api_body_response_started"
 BODY_COMPLEXITY_DIAGNOSTICS_SCOPE_KEY = "uni_api_request_body_complexity"
 BODY_OBSERVATION_SCOPE_KEY = "uni_api_request_body_observation"
 REQUEST_BODY_COMPLEXITY_INFO_KEY = "request_body_complexity"
@@ -197,6 +203,34 @@ def request_body_observation_from_scope(scope: Scope) -> dict[str, int]:
         for key, value in raw.items()
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0
     }
+
+
+def mark_request_body_releasable_at_response_start(scope: Scope) -> None:
+    state = scope.setdefault("state", {})
+    if isinstance(state, dict):
+        state[BODY_RELEASE_AT_RESPONSE_START_SCOPE_KEY] = True
+
+
+def _request_body_releasable_at_response_start(scope: Scope) -> bool:
+    state = scope.get("state")
+    return bool(
+        isinstance(state, dict)
+        and state.get(BODY_RELEASE_AT_RESPONSE_START_SCOPE_KEY)
+    )
+
+
+def request_body_response_started(scope: Scope) -> bool:
+    state = scope.get("state")
+    return bool(
+        isinstance(state, dict)
+        and state.get(BODY_RESPONSE_STARTED_SCOPE_KEY)
+    )
+
+
+def _mark_request_body_response_started(scope: Scope) -> None:
+    state = scope.setdefault("state", {})
+    if isinstance(state, dict):
+        state[BODY_RESPONSE_STARTED_SCOPE_KEY] = True
 
 
 class RequestBodyTooComplex(JSONMemoryComplexityError):
@@ -473,6 +507,7 @@ class RequestBodyDecompressionMiddleware:
             )
             return
         reserve_body_bytes = _body_bytes_reservation_callback(scope)
+        release_body_bytes = _body_bytes_release_callback(scope)
         body_memory_budget = _request_body_memory_budget(
             scope,
             headers,
@@ -514,11 +549,17 @@ class RequestBodyDecompressionMiddleware:
                 compressed,
                 self.max_zstd_decompressed_body_bytes,
                 reserve_body_bytes,
+                release_body_bytes,
                 memory_budget=body_memory_budget,
             )
-            # Do not retain the compressed body for the lifetime of the
-            # downstream request. FastAPI will cache the decoded bytes.
+            compressed_bytes = len(compressed)
+            compressed.clear()
             del compressed
+            if release_body_bytes is not None and compressed_bytes:
+                await _release_body_bytes(
+                    release_body_bytes,
+                    compressed_bytes,
+                )
         except _RequestBodyHardLimitExceeded:
             _record_body_rejection(scope, "body_too_large")
             await _json_error(
@@ -595,15 +636,33 @@ class RequestBodyDecompressionMiddleware:
         )
 
         async def decompressed_receive() -> Message:
+            nonlocal body
             nonlocal body_sent
             if not body_sent:
                 body_sent = True
-                return {"type": "http.request", "body": body, "more_body": False}
+                outgoing_body = body
+                body = b""
+                return {
+                    "type": "http.request",
+                    "body": outgoing_body,
+                    "more_body": False,
+                }
             await disconnect_event.wait()
             return {"type": "http.disconnect"}
 
+        async def tracking_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                _mark_request_body_response_started(scope)
+                if _request_body_releasable_at_response_start(scope):
+                    await _release_remaining_body_bytes(scope)
+            await send(message)
+
         try:
-            await self.app(decompressed_scope, decompressed_receive, send)
+            await self.app(
+                decompressed_scope,
+                decompressed_receive,
+                tracking_send,
+            )
         finally:
             await _cancel_disconnect_monitor(disconnect_monitor)
 
@@ -703,6 +762,12 @@ class RequestBodyDecompressionMiddleware:
             nonlocal response_started
             if message["type"] == "http.response.start":
                 response_started = True
+                _mark_request_body_response_started(scope)
+                if (
+                    body_complete
+                    and _request_body_releasable_at_response_start(scope)
+                ):
+                    await _release_remaining_body_bytes(scope)
             await send(message)
 
         try:
@@ -887,6 +952,7 @@ async def _decompress_zstd(
     body: bytes | bytearray,
     max_body_bytes: int,
     reserve_body_bytes: BodyBytesReservationCallback | None = None,
+    release_body_bytes: BodyBytesReleaseCallback | None = None,
     *,
     memory_budget: _RequestBodyMemoryBudget,
 ) -> bytes:
@@ -915,43 +981,45 @@ async def _decompress_zstd(
     # A tiny unknown-size frame can advertise a huge decode window.  Bound the
     # decoder workspace itself, not only emitted output bytes, so zstd cannot
     # allocate hundreds of MiB before our decoded-body limit is consulted.
-    decoder = zstd.ZstdDecompressor(
-        max_window_size=allowed_window_size
-    )
+    decoder = zstd.ZstdDecompressor(max_window_size=allowed_window_size)
     decoded = bytearray()
     # ``read()`` is allowed to return fewer bytes than requested at a frame
     # boundary. Keep reading across every concatenated frame instead of
     # treating a short first read as evidence that the next byte exceeds the
     # limit. Each read is capped by the remaining budget plus one byte, so a
     # compression bomb cannot allocate its declared output before rejection.
-    with decoder.stream_reader(body, read_across_frames=True) as reader:
-        while True:
-            remaining = max_body_bytes - len(decoded)
-            chunk = await _run_body_cpu(
-                reader.read,
-                min(64 * 1024, remaining + 1),
-            )
-            if not chunk:
-                break
-            if len(chunk) > remaining:
-                # Record the attempted decoded output even though this byte
-                # cannot be retained. The early-response callback will sync the
-                # observation to the admission lease before release.
-                _observe_request_decoded_bytes(
-                    memory_budget._scope,
-                    len(chunk),
+    try:
+        with decoder.stream_reader(body, read_across_frames=True) as reader:
+            while True:
+                remaining = max_body_bytes - len(decoded)
+                chunk = await _run_body_cpu(
+                    reader.read,
+                    min(64 * 1024, remaining + 1),
                 )
-                if reserve_body_bytes is not None:
-                    await _reserve_body_bytes(reserve_body_bytes, 0)
-                raise _RequestBodyHardLimitExceeded()
-            # Reserve each bounded output chunk before retaining it.  JSON is
-            # charged by raw bytes plus structural tokens; non-JSON bodies use
-            # a conservative multi-copy weight.  A concurrent decoded-body
-            # surge therefore cannot allocate first and discover exhaustion
-            # afterwards.
-            await memory_budget.reserve_chunk(chunk, reserve_body_bytes)
-            decoded.extend(chunk)
-    return await _run_body_cpu(bytes, decoded)
+                if not chunk:
+                    break
+                if len(chunk) > remaining:
+                    # Record the attempted decoded output even though this
+                    # byte cannot be retained. The early-response callback
+                    # syncs the observation before release.
+                    _observe_request_decoded_bytes(
+                        memory_budget._scope,
+                        len(chunk),
+                    )
+                    if reserve_body_bytes is not None:
+                        await _reserve_body_bytes(reserve_body_bytes, 0)
+                    raise _RequestBodyHardLimitExceeded()
+                # Reserve each bounded output chunk before retaining it. JSON
+                # uses raw bytes plus structural tokens; non-JSON uses a
+                # conservative multi-copy weight.
+                await memory_budget.reserve_chunk(chunk, reserve_body_bytes)
+                decoded.extend(chunk)
+        result = await _run_body_cpu(bytes, decoded)
+        decoded.clear()
+        return result
+    finally:
+        if release_body_bytes is not None and max_window_size:
+            await _release_body_bytes(release_body_bytes, max_window_size)
 
 
 async def _run_body_cpu(callback: Callable[..., object], *args: object):
@@ -1094,6 +1162,35 @@ def _body_bytes_reservation_callback(
         return None
     callback = state.get(BODY_BYTES_RESERVATION_SCOPE_KEY)
     return callback if callable(callback) else None
+
+
+def _body_bytes_release_callback(
+    scope: Scope,
+) -> BodyBytesReleaseCallback | None:
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return None
+    callback = state.get(BODY_BYTES_RELEASE_SCOPE_KEY)
+    return callback if callable(callback) else None
+
+
+async def _release_body_bytes(
+    callback: BodyBytesReleaseCallback,
+    released_bytes: int,
+) -> None:
+    result = callback(max(0, int(released_bytes)))
+    if hasattr(result, "__await__"):
+        await result
+
+
+async def _release_remaining_body_bytes(scope: Scope) -> None:
+    callback = _body_bytes_release_callback(scope)
+    lease = get_request_admission_lease()
+    if callback is None or lease is None:
+        return
+    remaining = max(0, int(lease.reserved_body_bytes))
+    if remaining:
+        await _release_body_bytes(callback, remaining)
 
 
 def _disconnect_event(scope: Scope) -> asyncio.Event:

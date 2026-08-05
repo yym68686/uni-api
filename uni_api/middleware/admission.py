@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections import deque
 from collections.abc import Callable
@@ -19,8 +20,10 @@ from uni_api.admission import (
     bind_request_admission_lease,
     reset_request_admission_lease,
 )
+from uni_api.admission.json_memory import DEFAULT_JSON_RAW_MEMORY_MULTIPLIER
 from core.log_config import logger
 from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
+from uni_api.http_content import is_json_media_type
 from uni_api.middleware.request_decompression import (
     BODY_BYTES_RESERVATION_SCOPE_KEY,
     BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
@@ -32,6 +35,7 @@ from uni_api.middleware.request_decompression import (
 
 
 RESERVE_BODY_BYTES_STATE_KEY = BODY_BYTES_RESERVATION_SCOPE_KEY
+RELEASE_BODY_BYTES_STATE_KEY = "uni_api_release_body_bytes"
 ADMISSION_LEASE_STATE_KEY = "uni_api_admission_lease"
 ADMISSION_WAIT_MS_STATE_KEY = "uni_api_admission_wait_ms"
 ADMISSION_REQUEST_ID_STATE_KEY = "uni_api_admission_request_id"
@@ -58,6 +62,63 @@ def _safe_w3c_trace_id(value: Any) -> str | None:
     if _W3C_TRACE_ID_RE.fullmatch(text) is None or text == "0" * 32:
         return None
     return text
+
+
+def _valid_declared_content_length(scope: Scope) -> int | None:
+    values = [
+        value
+        for name, value in (scope.get("headers") or [])
+        if name.lower() == b"content-length"
+    ]
+    if len(values) != 1:
+        return None
+    try:
+        decoded = values[0].decode("ascii")
+        if not decoded or not decoded.isdigit():
+            return None
+        return int(decoded)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _admission_fairness_key(scope: Scope) -> str:
+    headers = {
+        name.lower(): value
+        for name, value in (scope.get("headers") or [])
+    }
+    identity = b"\x00".join(
+        headers.get(name, b"")
+        for name in (
+            b"openai-organization",
+            b"x-organization-id",
+            b"authorization",
+            b"x-api-key",
+        )
+    )
+    if not identity.strip(b"\x00"):
+        client = scope.get("client")
+        client_identity = (
+            client[0] if isinstance(client, tuple) and client else "anonymous"
+        )
+        identity = str(client_identity).encode("utf-8", errors="replace")
+    return hashlib.sha256(identity).hexdigest()[:24]
+
+
+def _declared_memory_target(scope: Scope, content_length: int) -> int:
+    headers = {
+        name.lower(): value.decode("latin-1", errors="replace").strip().lower()
+        for name, value in (scope.get("headers") or [])
+    }
+    encoding = headers.get(b"content-encoding", "")
+    content_type = headers.get(b"content-type", "")
+    identity_encoded = encoding in {"", "identity"}
+    json_body = is_json_media_type(content_type)
+    multiplier = (
+        DEFAULT_JSON_RAW_MEMORY_MULTIPLIER
+        if identity_encoded and json_body
+        else 1
+    )
+    return max(0, int(content_length)) * max(1, int(multiplier))
 
 
 def _incoming_observation_identifiers(scope: Scope) -> tuple[str, str]:
@@ -228,6 +289,7 @@ class RequestAdmissionMiddleware:
         replayed_messages: deque[tuple[Message, int]] = deque()
         handed_off_receive_task: asyncio.Task[Message] | None = None
         available_replayed_credit = 0
+        pre_reserved_wire_credit = 0
         admission_started_at = monotonic()
         release_reason = "request_completed"
 
@@ -270,7 +332,33 @@ class RequestAdmissionMiddleware:
             state: dict[str, Any] = scope.setdefault("state", {})
             state[ADMISSION_LEASE_STATE_KEY] = lease
             state[ADMISSION_WAIT_MS_STATE_KEY] = lease.wait_ms
+            lease.set_fairness_key(_admission_fairness_key(scope))
             lease.observe_body(_request_body_observation(scope))
+            declared_content_length = _valid_declared_content_length(scope)
+            if declared_content_length is not None:
+                already_reserved = lease.reserved_body_bytes
+                declared_memory_target = _declared_memory_target(
+                    scope,
+                    declared_content_length,
+                )
+                additional_declared = max(
+                    0,
+                    declared_memory_target - already_reserved,
+                )
+                if additional_declared:
+                    await lease.reserve_body_bytes(
+                        additional_declared,
+                        observation=_request_body_observation(scope),
+                    )
+                pre_reserved_wire_credit = max(
+                    0,
+                    declared_content_length - already_reserved,
+                )
+                available_replayed_credit += max(
+                    0,
+                    declared_memory_target - declared_content_length,
+                )
+
             async def reserve_body_bytes(additional_bytes: int) -> int:
                 nonlocal available_replayed_credit
                 if int(additional_bytes) < 0:
@@ -291,6 +379,11 @@ class RequestAdmissionMiddleware:
                 )
 
             state[RESERVE_BODY_BYTES_STATE_KEY] = reserve_body_bytes
+
+            async def release_body_bytes(released_bytes: int) -> int:
+                return await lease.release_body_bytes(int(released_bytes))
+
+            state[RELEASE_BODY_BYTES_STATE_KEY] = release_body_bytes
             state[BODY_REJECTION_RECORDER_SCOPE_KEY] = (
                 self.controller.record_rejection
             )
@@ -311,9 +404,11 @@ class RequestAdmissionMiddleware:
             state[BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY] = (
                 observe_body_early_response
             )
+
             async def replay_receive() -> Message:
                 nonlocal available_replayed_credit
                 nonlocal handed_off_receive_task
+                nonlocal pre_reserved_wire_credit
                 if replayed_messages:
                     message, credited_bytes = replayed_messages.popleft()
                     available_replayed_credit += credited_bytes
@@ -328,11 +423,22 @@ class RequestAdmissionMiddleware:
                     body = message.get("body", b"") or b""
                     if body:
                         observe_request_wire_bytes(scope, len(body))
-                        await lease.reserve_body_bytes(
-                            len(body),
-                            observation=_request_body_observation(scope),
-                        )
+                        credited = min(len(body), pre_reserved_wire_credit)
+                        pre_reserved_wire_credit -= credited
+                        additional_wire = len(body) - credited
+                        if additional_wire:
+                            await lease.reserve_body_bytes(
+                                additional_wire,
+                                observation=_request_body_observation(scope),
+                            )
                         available_replayed_credit += len(body)
+                    if (
+                        not message.get("more_body", False)
+                        and pre_reserved_wire_credit
+                    ):
+                        unused_credit = pre_reserved_wire_credit
+                        pre_reserved_wire_credit = 0
+                        await lease.release_body_bytes(unused_credit)
                 return message
 
             await self.app(scope, replay_receive, tracking_send)
@@ -409,6 +515,7 @@ class RequestAdmissionMiddleware:
                     if isinstance(request_state, dict):
                         request_state.pop(ADMISSION_LEASE_STATE_KEY, None)
                         request_state.pop(RESERVE_BODY_BYTES_STATE_KEY, None)
+                        request_state.pop(RELEASE_BODY_BYTES_STATE_KEY, None)
                         request_state.pop(BODY_REJECTION_RECORDER_SCOPE_KEY, None)
                         request_state.pop(
                             BODY_EARLY_RESPONSE_OBSERVER_SCOPE_KEY,
@@ -470,7 +577,9 @@ class RequestAdmissionMiddleware:
             else None
         )
         buffered: deque[tuple[Message, int]] = deque()
-        pending = self.controller.pending_body_reservation()
+        pending = self.controller.pending_body_reservation(
+            fairness_key=_admission_fairness_key(scope)
+        )
         lease = None
         queued_body_complete = False
 
