@@ -589,6 +589,9 @@ def test_transport_failure_classification_reaches_logs_summary_and_metrics():
         "transport_error_status_code": 503,
         "provider_penalty_eligible": False,
         "local_overload": True,
+        "transport_dns_duration_ms": 12,
+        "transport_tcp_duration_ms": 80,
+        "transport_first_body_ms": 102,
     }
     telemetry = build_uni_api_ember_request_telemetry(
         service_name="uni-api-ember",
@@ -635,6 +638,9 @@ def test_transport_failure_classification_reaches_logs_summary_and_metrics():
     )
     assert request_summary["summary"]["transport_error_count"] == "1"
     assert request_summary["summary"]["local_overload_count"] == "1"
+    assert request_summary["summary"]["transport_dns_duration_ms"] == "12"
+    assert request_summary["summary"]["transport_tcp_duration_ms"] == "80"
+    assert request_summary["summary"]["transport_first_body_ms"] == "102"
 
     for event_type in ("routing_attempt", "upstream_attempt"):
         event = next(
@@ -649,6 +655,9 @@ def test_transport_failure_classification_reaches_logs_summary_and_metrics():
         assert attrs["transport_error_status_code"] == "503"
         assert attrs["provider_penalty_eligible"] == "false"
         assert attrs["local_overload"] == "true"
+        assert attrs["transport_dns_duration_ms"] == "12"
+        assert attrs["transport_tcp_duration_ms"] == "80"
+        assert attrs["transport_first_body_ms"] == "102"
 
     metrics = {event["metric"]: event for event in telemetry["metrics"]}
     assert metrics["uniapi_ember_transport_errors_total"]["value"] == 1

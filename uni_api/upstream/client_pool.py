@@ -39,6 +39,7 @@ from uni_api.observability.responses_stream import (
 from uni_api.observability.upstream_transport import (
     current_upstream_transport_diagnostics,
     inject_transport_trace,
+    install_transport_phase_observability,
 )
 from uni_api.streaming.cleanup import (
     await_isolated_transport_cleanup_safely,
@@ -824,6 +825,7 @@ class ClientPool:
                 if http2 is not None:
                     client_config["http2"] = bool(http2)
                 raw_client = httpx.AsyncClient(**client_config)
+                install_transport_phase_observability(raw_client)
                 self.clients[client_key] = raw_client
                 self._admission_gates[client_key] = BoundedAdmissionGate(
                     self.pool_size,

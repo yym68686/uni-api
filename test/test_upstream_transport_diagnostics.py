@@ -65,6 +65,64 @@ def test_httpcore_trace_preserves_raw_exception_and_failure_stage():
     asyncio.run(run())
 
 
+def test_httpcore_trace_records_tls_and_http_phase_timings():
+    async def run():
+        entry = {}
+        diagnostics = UpstreamTransportDiagnostics(entry)
+        for name in (
+            "connection.start_tls.started",
+            "connection.start_tls.complete",
+            "http11.send_request_headers.started",
+            "http11.send_request_headers.complete",
+            "http11.send_request_body.started",
+            "http11.send_request_body.complete",
+            "http11.receive_response_headers.started",
+            "http11.receive_response_headers.complete",
+        ):
+            await diagnostics.httpcore_trace(name, {})
+
+        for phase in (
+            "tls",
+            "request_headers",
+            "request_body",
+            "response_headers",
+        ):
+            assert entry[f"transport_{phase}_started_ms"] >= 0
+            assert entry[f"transport_{phase}_completed_ms"] >= 0
+            assert entry[f"transport_{phase}_duration_ms"] >= 0
+            assert entry[f"transport_{phase}_status"] == "complete"
+
+    asyncio.run(run())
+
+
+def test_response_body_observer_records_only_the_first_nonempty_chunk():
+    class BodyStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b""
+            yield b"abc"
+            yield b"defgh"
+
+        async def aclose(self):
+            return None
+
+    async def run():
+        entry = {}
+        diagnostics = UpstreamTransportDiagnostics(entry)
+        response = httpx.Response(
+            200,
+            request=httpx.Request("GET", "http://test.local"),
+            stream=BodyStream(),
+        )
+        diagnostics.capture_response(response, client=SimpleNamespace())
+        assert b"".join([chunk async for chunk in response.aiter_bytes()]) == b"abcdefgh"
+        diagnostics.capture_response(response, client=SimpleNamespace())
+
+        assert entry["transport_first_body_ms"] >= 0
+        assert entry["transport_first_body_bytes"] == 3
+
+    asyncio.run(run())
+
+
 def test_transport_diagnostics_classifies_pool_timeout_as_local_overload():
     entry = {}
     diagnostics = UpstreamTransportDiagnostics(entry)
@@ -275,5 +333,13 @@ def test_managed_client_records_real_http11_connection_metadata():
         assert entry["connection_request_count"] == 1
         assert entry["connection_snapshot_match"] == "exact"
         assert "send_request_headers.started" in entry["httpcore_events_json"]
+        assert entry["transport_dns_status"] == "ip_literal"
+        assert entry["transport_dns_duration_ms"] >= 0
+        assert entry["transport_tcp_duration_ms"] >= 0
+        assert entry["transport_request_headers_duration_ms"] >= 0
+        assert entry["transport_request_body_duration_ms"] >= 0
+        assert entry["transport_response_headers_duration_ms"] >= 0
+        assert entry["transport_first_body_bytes"] == 2
+        assert entry["transport_first_body_ms"] >= 0
 
     asyncio.run(run())

@@ -104,6 +104,44 @@ _STAGE_ORDER = [
     "stream_end",
 ]
 
+_TRANSPORT_PHASE_FIELDS = (
+    "transport_dns_started_ms",
+    "transport_dns_completed_ms",
+    "transport_dns_duration_ms",
+    "transport_dns_status",
+    "transport_dns_error_type",
+    "transport_dns_address_count",
+    "transport_tcp_started_ms",
+    "transport_tcp_completed_ms",
+    "transport_tcp_duration_ms",
+    "transport_tcp_status",
+    "transport_tcp_error_type",
+    "transport_tcp_attempt_count",
+    "transport_tcp_failed_attempt_count",
+    "transport_tls_started_ms",
+    "transport_tls_completed_ms",
+    "transport_tls_duration_ms",
+    "transport_tls_status",
+    "transport_tls_error_type",
+    "transport_request_headers_started_ms",
+    "transport_request_headers_completed_ms",
+    "transport_request_headers_duration_ms",
+    "transport_request_headers_status",
+    "transport_request_headers_error_type",
+    "transport_request_body_started_ms",
+    "transport_request_body_completed_ms",
+    "transport_request_body_duration_ms",
+    "transport_request_body_status",
+    "transport_request_body_error_type",
+    "transport_response_headers_started_ms",
+    "transport_response_headers_completed_ms",
+    "transport_response_headers_duration_ms",
+    "transport_response_headers_status",
+    "transport_response_headers_error_type",
+    "transport_first_body_ms",
+    "transport_first_body_bytes",
+)
+
 
 @dataclass(frozen=True)
 class FugueObservabilityConfig:
@@ -1600,6 +1638,16 @@ def build_uni_api_ember_request_telemetry(
     image_stream_diagnostics = current_info.get("image_stream_diagnostics")
     if not isinstance(image_stream_diagnostics, dict):
         image_stream_diagnostics = {}
+    transport_attempt: dict[str, Any] = {}
+    routing_attempts = current_info.get("routing_attempts")
+    if isinstance(routing_attempts, list):
+        for candidate in reversed(routing_attempts):
+            if not isinstance(candidate, dict):
+                continue
+            if any(key in candidate for key in _TRANSPORT_PHASE_FIELDS):
+                transport_attempt = candidate
+                break
+    transport_phase_attrs = _transport_phase_attrs(transport_attempt)
     request_body_complexity_attrs = _request_body_complexity_attrs(
         current_info
     )
@@ -1732,6 +1780,7 @@ def build_uni_api_ember_request_telemetry(
                         max_len=96,
                     ),
                     **request_body_complexity_attrs,
+                    **transport_phase_attrs,
                 }
             ),
             "summary": _drop_empty(
@@ -1766,6 +1815,7 @@ def build_uni_api_ember_request_telemetry(
                     "local_overload_count": _int_text(
                         local_overload_count
                     ),
+                    **transport_phase_attrs,
                     "client_pool_wait_ms": _int_text(_span_ms(spans, "upstream_pool_wait_ms")),
                     "request_admission_wait_ms": _int_text(
                         _span_ms(spans, "request_admission_wait_ms")
@@ -2477,6 +2527,7 @@ def _routing_attempt_log_events(
                 "attributes": _drop_empty(
                     {
                         **base,
+                        **_transport_phase_attrs(raw_attempt),
                         "provider": provider,
                         "channel": provider,
                         "model": _safe_text(raw_attempt.get("model"))
@@ -2760,6 +2811,10 @@ def _upstream_attempt_log_events(
                 "attributes": _drop_empty(
                     {
                         **base,
+                        **_transport_phase_attrs(
+                            stream_diagnostics,
+                            fallback=raw_attempt,
+                        ),
                         "provider": attempt_provider,
                         "channel": attempt_provider,
                         "model": _safe_text(raw_attempt.get("model")) or base.get("model"),
@@ -4126,6 +4181,26 @@ def _optional_int_text(value: Any) -> str | None:
     if value is None:
         return None
     return _int_text(value)
+
+
+def _transport_phase_attrs(
+    primary: dict[str, Any],
+    *,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, str | None]:
+    attrs: dict[str, str | None] = {}
+    fallback = fallback if isinstance(fallback, dict) else {}
+    for key in _TRANSPORT_PHASE_FIELDS:
+        value = primary.get(key)
+        if value is None:
+            value = fallback.get(key)
+        if value is None:
+            continue
+        if key.endswith(("_ms", "_bytes", "_count")):
+            attrs[key] = _optional_int_text(value)
+        else:
+            attrs[key] = _safe_text(value, max_len=64)
+    return attrs
 
 
 def _iso_timestamp(value: datetime) -> str:
