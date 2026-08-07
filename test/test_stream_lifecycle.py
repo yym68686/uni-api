@@ -2248,7 +2248,7 @@ def test_stats_stream_context_lives_through_body_then_restores_outer_context():
 def test_responses_generic_postcommit_error_is_observed_before_base_http_eof(
     monkeypatch,
 ):
-    """A local iterator bug must not become a clean, terminal-free HTTP 200."""
+    """A post-commit iterator bug must end as an incomplete stream."""
 
     from fastapi import BackgroundTasks
 
@@ -2346,9 +2346,9 @@ def test_responses_generic_postcommit_error_is_observed_before_base_http_eof(
             if message["type"] == "http.response.body"
         )
         assert b"response.output_text.delta" in body
-        assert b"event: error" in body
-        assert b"unexpected postcommit iterator failure" in body
-        assert b"data: [DONE]" in body
+        assert b"event: error" not in body
+        assert b"unexpected postcommit iterator failure" not in body
+        assert b"data: [DONE]" not in body
 
         assert gauges.active == 0
         assert gauges.begin_calls == 1
@@ -2362,15 +2362,17 @@ def test_responses_generic_postcommit_error_is_observed_before_base_http_eof(
         assert current_info["stream_outcome"] == "upstream_stream_abort"
         assert current_info["error_type"] == "RuntimeError"
         assert current_info["success"] is False
+        assert current_info["stream_error_after_response_start"] is True
+        assert current_info["postcommit_stream_terminal_suppressed"] is True
 
         diagnostics = current_info["responses_stream_diagnostics"]
         assert diagnostics["diagnosis"] == "responses_stream_error"
-        assert diagnostics["semantic_status"] == "error"
+        assert diagnostics["semantic_status"] == "transport_error"
         assert diagnostics["failure_stage"] == "postcommit"
         assert diagnostics["exception_type"] == "RuntimeError"
-        assert diagnostics["error_event_seen"] is True
+        assert diagnostics["error_event_seen"] is False
         assert diagnostics["downstream_terminal_seen"] is False
-        assert diagnostics["downstream_terminal_asgi_write_completed"] is True
+        assert diagnostics["downstream_terminal_asgi_write_completed"] is False
         assert "terminal_asgi_write_completed_unix_nano" not in diagnostics
         assert diagnostics["downstream_final_body_outcome"] == "completed"
 

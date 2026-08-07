@@ -8447,8 +8447,16 @@ class ResponsesRequestExecution:
             # Starlette BaseHTTPMiddleware transports inner response body
             # messages over an anyio stream and may re-raise an inner iterator
             # exception only after the outer response has observed a clean EOF.
-            # Convert every ordinary post-commit generator failure here, before
-            # that boundary, so it cannot become a false completed HTTP 200.
+            # Handle every ordinary post-commit generator failure here, before
+            # that boundary, so it is recorded as a failed upstream attempt.
+            #
+            # Do not turn a transport/protocol truncation into a synthetic
+            # Responses semantic terminal.  Codex clients distinguish an
+            # incomplete stream (no response terminal and no [DONE]) from an
+            # explicit provider error and may safely retry only the former.
+            # Returning normally after the already-forwarded prefix preserves
+            # that distinction while still containing the iterator exception
+            # inside this ASGI body owner.
             if proxy_sse_parser.failure_pending_diagnostics is not None:
                 diagnostics.observe_partial_diagnostics(
                     proxy_sse_parser.failure_pending_diagnostics
@@ -8462,12 +8470,14 @@ class ResponsesRequestExecution:
             self._finalize_stream_attempt_failure(attempt, exc)
             await self._handle_proxy_stream_abort(attempt, exc, stream_committed)
             if stream_committed:
+                diagnostics.mark_postcommit_stream_terminal_suppressed()
                 self.current_info["stream_error_status_code"] = 502
                 self.current_info["error_type"] = type(exc).__name__
                 self.current_info["stream_outcome"] = "upstream_stream_abort"
                 self.current_info["success"] = False
-                yield _observed_responses_stream_error_event(502, exc)
-                yield b"data: [DONE]\n\n"
+                self.current_info["stream_error_after_response_start"] = True
+                self.current_info["postcommit_stream_terminal_suppressed"] = True
+                return
         finally:
             if fast_path_candidates:
                 self.current_info["responses_delta_fast_path_candidates"] = (

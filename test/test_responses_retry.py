@@ -3332,10 +3332,13 @@ def test_responses_postcommit_abort_records_only_channel_failure(
     )
 
     assert "partial" in body
-    assert "event: error" in body
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
     assert channel_results == [False]
     assert current_info["success"] is False
     assert current_info["stream_outcome"] == "upstream_stream_abort"
+    assert current_info["stream_error_after_response_start"] is True
+    assert current_info["postcommit_stream_terminal_suppressed"] is True
     assert current_info["upstream_attempts"][-1]["success"] is False
     diagnostics = current_info["responses_stream_diagnostics"]
     assert diagnostics["diagnosis"] != "responses_stream_in_progress"
@@ -3386,7 +3389,8 @@ def test_responses_postcommit_partial_terminal_read_error_is_fully_diagnostic(
 
     assert response.status_code == 200
     assert "partial" in body
-    assert "event: error" in body
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
     diagnostics = current_info["responses_stream_diagnostics"]
     assert diagnostics["oaix_connection_id"] == "oaixc-partial-reset"
     assert diagnostics["upstream_terminal_seen"] is False
@@ -4115,7 +4119,8 @@ def test_responses_stream_does_not_retry_after_output_started(monkeypatch):
     assert '"provider": "a"' in body
     assert "hello-a" in body
     assert "hello-b" not in body
-    assert body.endswith("data: [DONE]\n\n")
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
     assert [call["url"] for call in main.app.state.client_manager.stream_calls] == [
         "https://provider-a.example/v1/responses",
     ]
@@ -4190,7 +4195,8 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
 
     assert response.status_code == 200
     assert "hello-a" in body
-    assert body.endswith("data: [DONE]\n\n")
+    assert "event: error" not in body
+    assert "data: [DONE]" not in body
     assert any("/v1/responses/compact upstream stream aborted stage=post-commit" in log for log in warning_logs)
     assert any("error_type=RemoteProtocolError" in log for log in warning_logs)
     assert any("request_model=friendly-model" in log for log in warning_logs)

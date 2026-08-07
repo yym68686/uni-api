@@ -53,6 +53,29 @@ _HOP_BY_HOP_HEADERS = frozenset(
 )
 
 
+def _retryable_incomplete_stream(scope: Scope) -> bool:
+    """Return whether the executed response ended after a committed stream abort.
+
+    A transport-truncated Responses stream deliberately ends without a semantic
+    terminal so compatible clients can retry it.  Treating the resulting ASGI
+    body EOF as a completed idempotent response would replay the same partial
+    stream forever and defeat that recovery contract.
+    """
+
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return False
+    current_info = state.get("uni_api_request_info")
+    if not isinstance(current_info, dict):
+        return False
+    return (
+        current_info.get("success") is False
+        and current_info.get("stream_outcome") == "upstream_stream_abort"
+        and current_info.get("stream_error_after_response_start") is True
+        and current_info.get("postcommit_stream_terminal_suppressed") is True
+    )
+
+
 def _positive_int_env(name: str, default: int) -> int:
     try:
         value = int(os.getenv(name, str(default)) or str(default))
@@ -1009,6 +1032,15 @@ class IdempotencyMiddleware:
                 and original_disconnect_event.is_set()
             ):
                 self.coordinator.note_detached_disconnect()
+
+        if _retryable_incomplete_stream(detached_scope):
+            await self.coordinator.close_spool(response_spool)
+            await self.coordinator.release_failure(
+                record_key,
+                owner_token,
+                not_cached=True,
+            )
+            return
 
         replayable_status = (
             response_complete

@@ -640,6 +640,50 @@ def test_transient_5xx_retries_but_oversized_success_gets_tombstone():
     asyncio.run(run())
 
 
+def test_incomplete_postcommit_stream_is_not_cached_for_idempotency_retry():
+    async def run():
+        calls = 0
+
+        async def app(scope, receive, send):
+            nonlocal calls
+            _ = receive
+            calls += 1
+            current_info = scope["state"].setdefault(
+                "uni_api_request_info",
+                {},
+            )
+            current_info.update(
+                {
+                    "success": False,
+                    "stream_outcome": "upstream_stream_abort",
+                    "stream_error_after_response_start": True,
+                    "postcommit_stream_terminal_suppressed": True,
+                }
+            )
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"event: response.output_text.delta\n\n",
+                    "more_body": False,
+                }
+            )
+
+        coordinator = _coordinator()
+        middleware = IdempotencyMiddleware(app, coordinator=coordinator)
+        first = await _invoke(middleware, scope=_scope(key="incomplete"))
+        second = await _invoke(middleware, scope=_scope(key="incomplete"))
+
+        assert calls == 2
+        assert _response(first)[1] == b"event: response.output_text.delta\n\n"
+        assert _response(second)[1] == b"event: response.output_text.delta\n\n"
+        assert coordinator.snapshot()["responses_not_cached"] == 2
+
+    asyncio.run(run())
+
+
 def test_owner_continues_after_transport_disconnect_and_retry_replays_stream():
     async def run():
         calls = 0

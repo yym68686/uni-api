@@ -1570,6 +1570,12 @@ class ResponsesStreamDiagnostics:
         self._facts.setdefault("local_end_at", _utc_now())
         self._refresh_diagnosis()
 
+    def mark_postcommit_stream_terminal_suppressed(self) -> None:
+        """Record an incomplete post-commit stream without a semantic terminal."""
+
+        self._facts["postcommit_stream_terminal_suppressed"] = True
+        self._refresh_diagnosis()
+
     def mark_cleanup_intent(self, *, owner: str, trigger: str) -> None:
         """Record a local cancellation intent before it reaches HTTPcore.
 
@@ -1837,7 +1843,11 @@ class ResponsesStreamDiagnostics:
                 diagnosis = "responses_stream_error"
             if int(facts.get("partial_event_bytes") or 0) > 0:
                 diagnosis = "responses_partial_event_abort"
-            semantic_status = "error"
+            semantic_status = (
+                "transport_error"
+                if facts.get("postcommit_stream_terminal_suppressed")
+                else "error"
+            )
         elif facts.get("terminal_semantics_consistent") is False:
             # Consistency remains an independent fact.  A later confirmed
             # transport/protocol exception is the primary stream failure and
