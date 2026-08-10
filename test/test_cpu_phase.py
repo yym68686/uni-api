@@ -109,3 +109,21 @@ def test_cancelled_cpu_phase_waiter_does_not_consume_a_token(monkeypatch):
             executor.shutdown(wait=True)
 
     asyncio.run(scenario())
+
+
+def test_cpu_phase_limiter_rebinds_after_an_event_loop_drains():
+    limiter = CPUPhaseLimiter(1)
+
+    async def contend_once():
+        await limiter.acquire("json")
+        waiter = asyncio.create_task(limiter.acquire("request_body"))
+        await asyncio.sleep(0)
+        assert limiter.snapshot()["waiters"] == 1
+        limiter.release("json", cancelled=False, failed=False)
+        await waiter
+        limiter.release("request_body", cancelled=False, failed=False)
+
+    asyncio.run(contend_once())
+    asyncio.run(contend_once())
+
+    assert limiter.snapshot()["completed_total"] == 4

@@ -39,7 +39,8 @@ class CPUPhaseLimiter:
         if capacity <= 0:
             raise ValueError("CPU phase capacity must be positive")
         self.capacity = int(capacity)
-        self._semaphore = asyncio.Semaphore(self.capacity)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._semaphore: asyncio.Semaphore | None = None
         self._active = 0
         self._waiters = 0
         self._acquired_total = 0
@@ -49,12 +50,28 @@ class CPUPhaseLimiter:
         self._active_by_phase: Counter[str] = Counter()
         self._waiters_by_phase: Counter[str] = Counter()
 
+    def _semaphore_for_running_loop(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._loop is loop and self._semaphore is not None:
+            return self._semaphore
+        if self._active or self._waiters:
+            raise RuntimeError(
+                "CPU phase limiter cannot span active event loops"
+            )
+        # asyncio primitives bind lazily when they first contend. Recreate the
+        # primitive after a prior loop has drained so reloads and isolated
+        # asyncio.run() lifecycles cannot retain a closed loop.
+        self._loop = loop
+        self._semaphore = asyncio.Semaphore(self.capacity)
+        return self._semaphore
+
     async def acquire(self, phase: str) -> None:
         normalized = str(phase or "other")
+        semaphore = self._semaphore_for_running_loop()
         self._waiters += 1
         self._waiters_by_phase[normalized] += 1
         try:
-            await self._semaphore.acquire()
+            await semaphore.acquire()
         finally:
             self._waiters -= 1
             self._waiters_by_phase[normalized] -= 1
@@ -83,7 +100,10 @@ class CPUPhaseLimiter:
             self._cancelled_total += 1
         if failed:
             self._failed_total += 1
-        self._semaphore.release()
+        semaphore = self._semaphore
+        if semaphore is None:
+            raise RuntimeError("CPU phase semaphore is unavailable")
+        semaphore.release()
 
     def snapshot(self) -> dict[str, Any]:
         return {
