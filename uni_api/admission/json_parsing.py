@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
 
+from uni_api.admission.cpu import run_cpu_phase
 from uni_api.admission.core import get_request_admission_lease
 from uni_api.admission.resources import startup_cpu_worker_count
 from uni_api.admission.json_memory import (
@@ -97,39 +98,13 @@ async def _finish_owner_cleanup_despite_cancellation(task: asyncio.Task[Any]) ->
 
 async def run_json_cpu(callback, *args, **kwargs):
     """Run bounded JSON CPU work without releasing ownership on cancellation."""
-
-    loop = asyncio.get_running_loop()
-
-    def invoke():
-        return callback(*args, **kwargs)
-
-    future = loop.run_in_executor(_JSON_PARSE_CPU_EXECUTOR, invoke)
-    pending_cancel: asyncio.CancelledError | None = None
-    owner_task = asyncio.current_task()
-    while not future.done():
-        try:
-            await asyncio.shield(future)
-        except asyncio.CancelledError as exc:
-            pending_cancel = pending_cancel or exc
-        except BaseException:
-            if pending_cancel is None and owner_task is not None and owner_task.cancelling():
-                pending_cancel = asyncio.CancelledError()
-            if pending_cancel is None:
-                raise
-            break
-    if pending_cancel is None and owner_task is not None and owner_task.cancelling():
-        pending_cancel = asyncio.CancelledError()
-    if pending_cancel is not None:
-        # Once task cancellation has been observed it remains the externally
-        # correct outcome.  We still wait for the worker to stop allocating,
-        # but a later parse/encode exception must not be misclassified as an
-        # upstream protocol failure or trigger provider cooldown.
-        try:
-            future.result()
-        except BaseException:
-            pass
-        raise pending_cancel
-    return future.result()
+    return await run_cpu_phase(
+        _JSON_PARSE_CPU_EXECUTOR,
+        callback,
+        *args,
+        phase="json",
+        **kwargs,
+    )
 
 
 class OwnedJSONValue:

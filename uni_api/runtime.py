@@ -168,6 +168,7 @@ from uni_api.admission import (
     RequestAdmissionController,
     get_request_admission_lease,
 )
+from uni_api.admission.cpu import cpu_phase_snapshot
 from uni_api.admission.json_parsing import (
     JSON_PARSE_CPU_WORKERS,
     ReusableJSONParseWorkspace,
@@ -884,6 +885,7 @@ class RuntimeGauges:
         worker_runtime: dict[str, Any] = {}
         if self._worker_runtime_snapshot is not None:
             worker_runtime = self._worker_runtime_snapshot()
+        cpu_phase = cpu_phase_snapshot()
         stream_queue_blocked_puts = self._retired_stream_queue_blocked_puts + sum(
             snapshot.blocked_puts for snapshot in queue_snapshots
         )
@@ -903,6 +905,13 @@ class RuntimeGauges:
             "request_active": request_active,
             "request_waiters": request_waiters,
             "request_capacity": admission.get("capacity"),
+            "request_admission_sizing_source": (
+                REQUEST_ADMISSION_ACTIVE_SIZING_SOURCE
+            ),
+            "cpu_phase": cpu_phase,
+            "cpu_phase_capacity": cpu_phase.get("capacity"),
+            "cpu_phase_active": cpu_phase.get("active"),
+            "cpu_phase_waiters": cpu_phase.get("waiters"),
             "request_startup_cpu_millicores": REQUEST_ADMISSION_CPU_MILLICORES,
             "request_startup_cpu_weight": REQUEST_ADMISSION_CPU_WEIGHT,
             "request_startup_cpu_affinity_count": (
@@ -1306,6 +1315,9 @@ STARTUP_CONCURRENCY_ENVELOPE = startup_concurrency_from_environment(
 REQUEST_ADMISSION_ACTIVE_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.active_limit
 REQUEST_ADMISSION_WAITER_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.waiter_limit
 REQUEST_ADMISSION_TOTAL_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.total_limit
+REQUEST_ADMISSION_ACTIVE_SIZING_SOURCE = (
+    STARTUP_CONCURRENCY_ENVELOPE.active_sizing_source
+)
 REQUEST_ADMISSION_CPU_MILLICORES = STARTUP_CONCURRENCY_ENVELOPE.cpu_millicores
 REQUEST_ADMISSION_CPU_WEIGHT = STARTUP_CONCURRENCY_ENVELOPE.cpu_weight
 REQUEST_ADMISSION_CPU_AFFINITY_COUNT = (
@@ -1498,7 +1510,7 @@ REQUEST_SMALL_BODY_LANE_RESERVE_BYTES = _bounded_env_int(
 )
 UPSTREAM_POOL_SIZE = max(
     1,
-    _env_int("UPSTREAM_POOL_SIZE", REQUEST_ADMISSION_ACTIVE_LIMIT),
+    _env_int("UPSTREAM_POOL_SIZE", REQUEST_ADMISSION_CPU_ACTIVE_LIMIT),
 )
 UPSTREAM_POOL_WAITER_LIMIT = max(
     0,

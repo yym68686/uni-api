@@ -12,6 +12,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from core.log_config import logger
 from uni_api.admission import get_request_admission_lease
+from uni_api.admission.cpu import run_cpu_phase
 from uni_api.admission.json_memory import (
     DEFAULT_JSON_MAX_ESTIMATED_BYTES,
     IncrementalJSONMemoryEstimator,
@@ -1023,33 +1024,12 @@ async def _decompress_zstd(
 
 
 async def _run_body_cpu(callback: Callable[..., object], *args: object):
-    future = asyncio.get_running_loop().run_in_executor(
+    return await run_cpu_phase(
         _REQUEST_BODY_CPU_EXECUTOR,
         callback,
         *args,
+        phase="request_body",
     )
-    pending_cancel: asyncio.CancelledError | None = None
-    owner_task = asyncio.current_task()
-    while not future.done():
-        try:
-            await asyncio.shield(future)
-        except asyncio.CancelledError as exc:
-            pending_cancel = pending_cancel or exc
-        except BaseException:
-            if pending_cancel is None and owner_task is not None and owner_task.cancelling():
-                pending_cancel = asyncio.CancelledError()
-            if pending_cancel is None:
-                raise
-            break
-    if pending_cancel is None and owner_task is not None and owner_task.cancelling():
-        pending_cancel = asyncio.CancelledError()
-    if pending_cancel is not None:
-        try:
-            future.result()
-        except BaseException:
-            pass
-        raise pending_cancel
-    return future.result()
 
 
 def _ensure_complete_zstd_frames(

@@ -16,6 +16,11 @@ from uni_api.admission.core import (
     get_request_admission_lease,
     reset_request_admission_lease,
 )
+from uni_api.admission.cpu import (
+    CPUPhaseLimiter,
+    cpu_phase_snapshot,
+    run_cpu_phase,
+)
 from uni_api.admission.observability import (
     Admission503ResponseWriteOutcome,
     LargeBodyAdmissionDecision,
@@ -29,6 +34,7 @@ __all__ = [
     "Admission503ResponseWriteOutcome",
     "AdmissionRejected",
     "BoundedAdmissionGate",
+    "CPUPhaseLimiter",
     "LargeBodyCapacityExhausted",
     "LargeBodyAdmissionDecision",
     "LargeBodyHolderSnapshot",
@@ -43,5 +49,7 @@ __all__ = [
     "UpstreamResponseBudgetExhausted",
     "bind_request_admission_lease",
     "get_request_admission_lease",
+    "cpu_phase_snapshot",
     "reset_request_admission_lease",
+    "run_cpu_phase",
 ]

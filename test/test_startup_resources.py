@@ -207,6 +207,30 @@ def test_current_fugue_shape_preserves_1000_request_burst_envelope():
     assert envelope.uvicorn_backlog == 1036
 
 
+def test_resource_separated_mode_sizes_whole_requests_without_cpu_cap():
+    envelope = _envelope(cpu_bound_active=False)
+
+    assert envelope.active_sizing_source == "resource"
+    assert envelope.cpu_active_limit == 64
+    assert envelope.resource_active_limit == 749
+    assert envelope.active_limit == 749
+    assert envelope.waiter_limit == 1
+    assert envelope.total_limit == 750
+
+
+def test_resource_separated_mode_does_not_inherit_cpu_search_ceiling():
+    envelope = _envelope(
+        cpu_weight=1,
+        memory_available_bytes=96 * 1024**3,
+        cpu_bound_active=False,
+    )
+
+    assert envelope.cpu_active_limit == 1
+    assert envelope.ephemeral_active_limit == 11292
+    assert envelope.resource_active_limit == 11292
+    assert envelope.active_limit == 11292
+
+
 def test_128_cpu_128_gib_shape_is_not_capped_at_100():
     envelope = _envelope(
         cpu_millicores=128000,
@@ -332,7 +356,29 @@ def test_environment_cpu_weight_scales_beyond_100(monkeypatch):
     envelope = startup_concurrency_from_environment(
         memory_available_bytes=3 * 1024**3
     )
-    assert envelope.active_limit == 128
+    assert envelope.active_sizing_source == "resource"
+    assert envelope.cpu_active_limit == 128
+    assert envelope.active_limit > envelope.cpu_active_limit
+
+
+def test_environment_can_restore_legacy_cpu_bound_request_admission(monkeypatch):
+    monkeypatch.setenv("REQUEST_ADMISSION_CPU_BOUND_ACTIVE", "true")
+    monkeypatch.setattr(resources_module, "cgroup_cpu_quota_millicores", lambda: None)
+    monkeypatch.setattr(resources_module, "cgroup_cpu_weight", lambda: 55)
+    monkeypatch.setattr(resources_module, "process_cpu_affinity_count", lambda: 8)
+    monkeypatch.setattr(resources_module, "process_nofile_soft_limit", lambda: 1_000_000)
+    monkeypatch.setattr(resources_module, "process_open_fd_count", lambda: 10)
+    monkeypatch.setattr(resources_module, "ephemeral_port_count", lambda: 28000)
+    monkeypatch.setattr(resources_module, "tcp_socket_port_occupancy", lambda: 0)
+    monkeypatch.setattr(resources_module, "kernel_somaxconn", lambda: 4096)
+
+    envelope = startup_concurrency_from_environment(
+        memory_available_bytes=3 * 1024**3
+    )
+
+    assert envelope.active_sizing_source == "cpu"
+    assert envelope.active_limit == 64
+    assert envelope.waiter_limit == 936
 
 
 def test_configured_cpu_entitlement_supports_uncalibrated_standalone_hosts(

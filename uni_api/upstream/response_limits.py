@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from uni_api.admission.cpu import run_cpu_phase
 from uni_api.admission.resources import startup_cpu_worker_count
 from uni_api.observability.threadpool_tasks import register_dedicated_threadpool
 
@@ -46,35 +47,12 @@ register_dedicated_threadpool(
 
 async def _run_response_cpu(callback, *args):
     """Run bounded decoder work without releasing ownership on cancellation."""
-
-    loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(
+    return await run_cpu_phase(
         _UPSTREAM_RESPONSE_CPU_EXECUTOR,
         callback,
         *args,
+        phase="upstream_response",
     )
-    pending_cancel: asyncio.CancelledError | None = None
-    owner_task = asyncio.current_task()
-    while not future.done():
-        try:
-            await asyncio.shield(future)
-        except asyncio.CancelledError as exc:
-            pending_cancel = pending_cancel or exc
-        except BaseException:
-            if pending_cancel is None and owner_task is not None and owner_task.cancelling():
-                pending_cancel = asyncio.CancelledError()
-            if pending_cancel is None:
-                raise
-            break
-    if pending_cancel is None and owner_task is not None and owner_task.cancelling():
-        pending_cancel = asyncio.CancelledError()
-    if pending_cancel is not None:
-        try:
-            future.result()
-        except BaseException:
-            pass
-        raise pending_cancel
-    return future.result()
 
 
 class UpstreamResponseDecodingError(RuntimeError):

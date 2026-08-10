@@ -10,6 +10,11 @@ from uni_api.streaming.bounded_queue import ByteBoundedQueue
 
 def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(monkeypatch):
     gauges = RuntimeGauges()
+    monkeypatch.setattr(
+        runtime,
+        "cpu_phase_snapshot",
+        lambda: {"capacity": 2, "active": 1, "waiters": 3},
+    )
     gauges.inflight_requests = 99
     gauges.attach_request_admission(
         lambda: {
@@ -71,6 +76,9 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
     assert snapshot["inflight_requests"] == 7
     assert snapshot["request_active"] == 7
     assert snapshot["request_waiters"] == 11
+    assert snapshot["cpu_phase_capacity"] == 2
+    assert snapshot["cpu_phase_active"] == 1
+    assert snapshot["cpu_phase_waiters"] == 3
     assert snapshot["middleware_inflight_requests"] == 99
     assert snapshot["request_body_reserved_weighted_bytes"] == 1234
     assert snapshot["runtime_global_request_body_reserved_weighted_bytes"] == 1234

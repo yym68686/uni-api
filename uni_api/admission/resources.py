@@ -88,6 +88,18 @@ def _positive_float_environment(name: str, default: float) -> float:
     return value
 
 
+def _bool_environment(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _ratio_environment(name: str, default: float) -> float:
     value = _positive_float_environment(name, default)
     if value >= 1:
@@ -459,6 +471,7 @@ class StartupConcurrencyEnvelope:
     total_limit: int
     uvicorn_limit_concurrency: int
     uvicorn_backlog: int
+    active_sizing_source: str
     cpu_millicores: int | None
     cpu_weight: int | None
     cpu_affinity_count: int | None
@@ -550,6 +563,7 @@ def calculate_startup_concurrency(
     reference_cpu_millicores: int = _DEFAULT_REFERENCE_CPU_MILLICORES,
     reference_cpu_weight: int = _DEFAULT_REFERENCE_CPU_WEIGHT,
     explicit_max_active: int | None = None,
+    cpu_bound_active: bool = True,
     minimum_total: int = _DEFAULT_MIN_TOTAL,
     burst_multiplier: float = _DEFAULT_BURST_MULTIPLIER,
     connection_memory_bytes: int = _DEFAULT_CONNECTION_MEMORY_BYTES,
@@ -603,7 +617,6 @@ def calculate_startup_concurrency(
         reference_cpu_weight=reference_cpu_weight,
         explicit_max=explicit_max_active,
     )
-    target_active = requested_active if requested_active is not None else cpu_limit
     cpu_sizing_source = cpu_sizing_source or (
         "quota"
         if cpu_millicores is not None and cpu_millicores > 0
@@ -613,15 +626,6 @@ def calculate_startup_concurrency(
         if cpu_affinity_count is not None and cpu_affinity_count > 0
         else "fallback"
     )
-    if target_active <= 0:
-        raise ValueError("requested active limit must be positive")
-    if explicit_max_active is not None and target_active > explicit_max_active:
-        raise ValueError("requested active limit exceeds explicit maximum")
-    if requested_total is not None:
-        if requested_active is not None and requested_active > requested_total:
-            raise ValueError("REQUEST_ADMISSION_TOTAL_LIMIT is below active limit")
-        target_active = min(target_active, requested_total)
-
     port_active_limit: int | None = None
     if ephemeral_ports is not None:
         if ephemeral_ports <= 0:
@@ -640,8 +644,6 @@ def calculate_startup_concurrency(
                 / outbound_fds_per_active
             ),
         )
-        target_active = min(target_active, port_active_limit)
-
     memory_control_budget: int | None = None
     if memory_available_bytes is not None:
         if memory_available_bytes <= 0:
@@ -697,12 +699,67 @@ def calculate_startup_concurrency(
                 high = middle - 1
         return low
 
-    resource_active = largest_fitting(target_active, lambda value: fits(value, 0))
-    if resource_active <= 0:
+    # Find the whole-request ceiling from concrete connection resources. The
+    # loose arithmetic bounds only bound the binary search; ``fits`` applies
+    # the exact transport headroom, FD, and control-memory accounting.
+    resource_upper_bounds: list[int] = []
+    if port_active_limit is not None:
+        resource_upper_bounds.append(port_active_limit)
+    if memory_control_budget is not None:
+        resource_upper_bounds.append(
+            memory_control_budget
+            // (connection_memory_bytes + active_extra_memory_bytes)
+        )
+    if nofile_soft_limit is not None:
+        available_fds = max(
+            0,
+            nofile_soft_limit - baseline_open_fds - fd_reserve,
+        )
+        resource_upper_bounds.append(
+            available_fds // (outbound_fds_per_active + 1)
+        )
+    if resource_upper_bounds:
+        resource_search_limit = min(resource_upper_bounds)
+    else:
+        # Unconstrained developer hosts still need a finite envelope. This
+        # fallback is never used when any memory, FD, or port bound is known.
+        resource_search_limit = max(
+            minimum_total,
+            math.ceil(cpu_limit * burst_multiplier),
+        )
+    resource_active_limit = largest_fitting(
+        resource_search_limit,
+        lambda value: fits(value, 0),
+    )
+    if resource_active_limit <= 0:
         raise ValueError("Pod startup resources cannot safely host one active request")
-    if requested_active is not None and resource_active != requested_active:
+
+    if requested_active is not None:
+        target_active = requested_active
+    elif cpu_bound_active:
+        target_active = cpu_limit
+    else:
+        # Whole requests own memory and transport state. CPU entitlement is
+        # enforced separately, only while bounded CPU callbacks execute.
+        target_active = resource_active_limit
+    if (
+        requested_active is not None
+        and explicit_max_active is not None
+        and requested_active > explicit_max_active
+    ):
+        raise ValueError("requested active limit exceeds explicit maximum")
+    if explicit_max_active is not None:
+        target_active = min(target_active, explicit_max_active)
+    if target_active <= 0:
+        raise ValueError("requested active limit must be positive")
+    if requested_total is not None:
+        if requested_active is not None and requested_active > requested_total:
+            raise ValueError("REQUEST_ADMISSION_TOTAL_LIMIT is below active limit")
+        target_active = min(target_active, requested_total)
+
+    active = min(target_active, resource_active_limit)
+    if requested_active is not None and active != requested_active:
         raise ValueError("REQUEST_ADMISSION_ACTIVE_LIMIT exceeds startup resources")
-    active = resource_active
 
     if requested_total is not None:
         total_waiter_ceiling = requested_total - active
@@ -740,12 +797,19 @@ def calculate_startup_concurrency(
         total_limit=total,
         uvicorn_limit_concurrency=uvicorn_limit,
         uvicorn_backlog=max(1, backlog),
+        active_sizing_source=(
+            "explicit"
+            if requested_active is not None
+            else "cpu"
+            if cpu_bound_active
+            else "resource"
+        ),
         cpu_millicores=cpu_millicores,
         cpu_weight=cpu_weight,
         cpu_affinity_count=cpu_affinity_count,
         cpu_sizing_source=cpu_sizing_source,
         cpu_active_limit=cpu_limit,
-        resource_active_limit=resource_active,
+        resource_active_limit=resource_active_limit,
         memory_available_bytes=memory_available_bytes,
         memory_control_budget_bytes=memory_control_budget,
         nofile_soft_limit=nofile_soft_limit,
@@ -774,6 +838,10 @@ def startup_concurrency_from_environment(
     )
     explicit_max = _optional_positive_int_environment(
         "REQUEST_ADMISSION_MAX_ACTIVE_LIMIT"
+    )
+    cpu_bound_active = _bool_environment(
+        "REQUEST_ADMISSION_CPU_BOUND_ACTIVE",
+        False,
     )
     base_active = _positive_int_environment(
         "REQUEST_ADMISSION_BASE_ACTIVE_LIMIT",
@@ -874,6 +942,7 @@ def startup_concurrency_from_environment(
         reference_cpu_millicores=reference_cpu,
         reference_cpu_weight=reference_weight,
         explicit_max_active=explicit_max,
+        cpu_bound_active=cpu_bound_active,
         minimum_total=minimum_total,
         burst_multiplier=burst_multiplier,
         connection_memory_bytes=connection_memory,

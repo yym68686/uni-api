@@ -42,3 +42,4 @@ rust/**
 !rust/uni-api-native/Cargo.lock
 !rust/uni-api-native/src/
 !rust/uni-api-native/src/**
+rust/uni-api-native/target/

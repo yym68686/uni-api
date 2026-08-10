@@ -418,10 +418,11 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 
 生产入口会在每个新进程启动时计算一次不可变的并发包络。计算会读取 cgroup
 v2/v1 CPU 与内存、CPU affinity、`RLIMIT_NOFILE`、临时端口范围与当前 TCP
-占用以及 `somaxconn`。默认路径不再存在 100 请求上限。CPU 候选值从 Fugue
-实测基线（465m CPU、cgroup v2 weight 55 对应 64 active）按比例计算，再受保留
-内存、文件描述符和上游端口预算共同约束。默认突发目标为至少 1000 个已接收请求，
-或 active 的两倍，最终仍受同一资源包络限制。
+占用以及 `somaxconn`。完整 ASGI 请求的所有权包络默认只由保留内存、文件描述符
+和上游端口预算定容，不再因为请求等待上游或持续传输流式字节而长期占用 CPU
+派生槽位。CPU entitlement 改为控制三组专用 executor 共享的阶段 token，仅在
+request decode、JSON 和 upstream response decode 回调实际执行期间持有。历史
+CPU 候选值仍进入观测，并作为默认上游连接池容量。
 
 TCP accepted connection 硬上限与绝对请求头超时在进入 ASGI admission 前执行。
 active、有限 waiter、request body、buffered response、SSE parser 和 stream
@@ -451,7 +452,8 @@ age 字段明确表达这一边界，而不是把缓存值冒充成内核原子�
 仅表示发送调用完成，不代表远端调用方已经消费响应。
 
 主要覆盖项包括：`REQUEST_ADMISSION_CPU_MILLICORES`（适合 CPU weight
-没有平台含义的独立服务器）、`REQUEST_ADMISSION_ACTIVE_LIMIT`、
+没有平台含义的独立服务器）、`REQUEST_ADMISSION_CPU_BOUND_ACTIVE`（恢复旧的
+完整请求 CPU 定容）、`CPU_PHASE_TOKENS`、`REQUEST_ADMISSION_ACTIVE_LIMIT`、
 `REQUEST_ADMISSION_WAITER_LIMIT`、`REQUEST_ADMISSION_TOTAL_LIMIT`、
 `REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`、`MEMORY_SOFT_LIMIT_BYTES`、
 `REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`、

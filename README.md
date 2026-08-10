@@ -417,11 +417,12 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 The production launcher computes one immutable concurrency envelope whenever a
 new process starts. It reads cgroup v2/v1 CPU and memory, CPU affinity,
 `RLIMIT_NOFILE`, the ephemeral port range/TCP occupancy, and `somaxconn`.
-There is no default 100-request ceiling. The CPU candidate scales from the
-measured Fugue baseline of 64 active requests at 465m CPU (cgroup v2 weight 55)
-and is then reduced by retained-memory, file-descriptor, and upstream-port
-bounds. The default burst target is at least 1000 total admitted requests or
-twice the active limit, subject to the same resource bounds.
+Whole-request ASGI ownership is resource-sized from retained-memory,
+file-descriptor, and upstream-port bounds; it is no longer capped by CPU while
+the request waits on an upstream or streams bytes. CPU entitlement instead
+sizes one shared token gate held only by request decode, JSON, and upstream
+response decode callbacks running in the dedicated executors. The historical
+CPU candidate remains visible and is the default upstream-pool capacity.
 
 The accepted TCP connection limit and absolute request-header timeout are
 enforced before ASGI admission. Active work, bounded waiters, request bodies,
@@ -459,6 +460,7 @@ response.
 
 Primary overrides are `REQUEST_ADMISSION_CPU_MILLICORES` (useful when a
 standalone host's default CPU weight is not meaningful),
+`REQUEST_ADMISSION_CPU_BOUND_ACTIVE` (legacy whole-request CPU sizing),
 `REQUEST_ADMISSION_ACTIVE_LIMIT`, `REQUEST_ADMISSION_WAITER_LIMIT`,
 `REQUEST_ADMISSION_TOTAL_LIMIT`, `REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`,
 `REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`,
@@ -466,7 +468,7 @@ standalone host's default CPU weight is not meaningful),
 `PRODUCT_REQUEST_MAX_BODY_BYTES`, `REQUEST_MAX_BODY_BYTES`,
 `REQUEST_JSON_COMPLEXITY_MAX_BYTES`, `REQUEST_BODY_RESERVATION_MAX_BYTES`,
 `REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES`, `REQUEST_LARGE_BODY_LIMIT`,
-`UPSTREAM_POOL_SIZE`, `UVICORN_CONNECTION_LIMIT`, and
+`CPU_PHASE_TOKENS`, `UPSTREAM_POOL_SIZE`, `UVICORN_CONNECTION_LIMIT`, and
 `UVICORN_HEADER_TIMEOUT_SECONDS`. Explicit limits that exceed the detected
 startup safety envelope fail startup instead of silently overcommitting. The
 formula is a resource-safety envelope, not a throughput guarantee; validate

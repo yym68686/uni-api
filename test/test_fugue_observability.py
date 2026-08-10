@@ -949,6 +949,10 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         },
         runtime_metrics={
             "inflight_requests": 12,
+            "request_capacity": 812,
+            "cpu_phase_capacity": 1,
+            "cpu_phase_active": 1,
+            "cpu_phase_waiters": 3,
             "request_body_reserved_weighted_bytes": 8192,
             "upstream_response_reserved_weighted_bytes": 16384,
             "request_retained_reserved_weighted_bytes": 24576,
@@ -1078,6 +1082,8 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     metrics = {event["metric"]: event for event in telemetry["metrics"]}
     assert metrics["uniapi_ember_upstream_errors_total"]["value"] == 1
     assert metrics["uniapi_ember_attempt_total"]["value"] == 2
+    assert metrics["uniapi_ember_cpu_phase_active"]["value"] == 1
+    assert metrics["uniapi_ember_cpu_phase_waiters"]["value"] == 3
     assert metrics["uniapi_ember_retry_decision_total"]["value"] == 1
     assert metrics["uniapi_ember_retry_transition_total"]["value"] == 1
     assert metrics["uniapi_ember_retry_total"]["value"] == 1

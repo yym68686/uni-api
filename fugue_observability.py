@@ -1823,6 +1823,18 @@ def build_uni_api_ember_request_telemetry(
                     "event_loop_lag_ms": _int_text(_runtime_int(runtime_metrics, "event_loop_lag_ms")),
                     "inflight_requests": _int_text(_runtime_int(runtime_metrics, "inflight_requests")),
                     "request_waiters": _int_text(_runtime_int(runtime_metrics, "request_waiters")),
+                    "request_capacity": _int_text(
+                        _runtime_int(runtime_metrics, "request_capacity")
+                    ),
+                    "cpu_phase_capacity": _int_text(
+                        _runtime_int(runtime_metrics, "cpu_phase_capacity")
+                    ),
+                    "cpu_phase_active": _int_text(
+                        _runtime_int(runtime_metrics, "cpu_phase_active")
+                    ),
+                    "cpu_phase_waiters": _int_text(
+                        _runtime_int(runtime_metrics, "cpu_phase_waiters")
+                    ),
                     "runtime_global_large_body_active": _int_text(
                         _runtime_int(
                             runtime_metrics,
@@ -2231,6 +2243,12 @@ def build_uni_api_ember_request_telemetry(
             "uniapi_ember_request_ttfb_ms": ttft_ms,
             "uniapi_ember_inflight_requests": _runtime_int(runtime_metrics, "inflight_requests"),
             "uniapi_ember_request_waiters": _runtime_int(runtime_metrics, "request_waiters"),
+            "uniapi_ember_cpu_phase_active": _runtime_int(
+                runtime_metrics, "cpu_phase_active"
+            ),
+            "uniapi_ember_cpu_phase_waiters": _runtime_int(
+                runtime_metrics, "cpu_phase_waiters"
+            ),
             "uniapi_ember_request_large_body_active": _runtime_int(
                 runtime_metrics, "request_large_body_active"
             ),
@@ -3271,6 +3289,8 @@ def _request_metric_events(
     global_metrics = {
         "uniapi_ember_inflight_requests",
         "uniapi_ember_request_waiters",
+        "uniapi_ember_cpu_phase_active",
+        "uniapi_ember_cpu_phase_waiters",
         "uniapi_ember_request_large_body_active",
         "uniapi_ember_runtime_global_large_body_active",
         "uniapi_ember_request_body_reserved_weighted_bytes",
