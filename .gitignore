@@ -6,6 +6,9 @@ __pycache__
 node_modules
 .wrangler
 .pytest_cache
+rust/**/target/
+uni_api/_uni_api_native*.so
+uni_api/_uni_api_native*.dylib
 *.jpg
 *.json
 !vercel.json

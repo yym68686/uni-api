@@ -1,0 +1,20 @@
+[package]
+name = "uni-api-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+
+[lib]
+name = "_uni_api_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+memchr = "2.7.4"
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

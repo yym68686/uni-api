@@ -29,8 +29,24 @@ jobs:
         with:
           version: "0.8.0"
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.84.0"
+
       - name: Install dependencies
         run: uv sync --frozen
+
+      - name: Check native JSON guard
+        run: |
+          cargo fmt --check --manifest-path rust/uni-api-native/Cargo.toml
+          cargo clippy --manifest-path rust/uni-api-native/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path rust/uni-api-native/Cargo.toml --locked
+
+      - name: Build native JSON guard
+        run: |
+          cargo build --release --manifest-path rust/uni-api-native/Cargo.toml --locked
+          cp rust/uni-api-native/target/release/lib_uni_api_native.so uni_api/_uni_api_native.so
 
       - name: Lint syntax
         run: uv run python -m compileall -q main.py utils.py upstream.py core uni_api

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+
+try:
+    from uni_api import _uni_api_native
+except ImportError:
+    _uni_api_native = None
 
 
 DEFAULT_JSON_RAW_MEMORY_MULTIPLIER = 5
@@ -13,6 +19,22 @@ DEFAULT_JSON_MAX_ESTIMATED_BYTES = 256 * 1024 * 1024
 _TEXT_SCAN_CHUNK_CHARACTERS = 256 * 1024
 _JSON_STRING_SPECIAL = re.compile(br'["\\]')
 _JSON_OUTSIDE_SPECIAL = re.compile(br'["{}\[\]\x20\x09\x0a\x0d,:]')
+_NATIVE_INTEGER_MAX = (1 << 64) - 1
+_REQUESTED_JSON_MEMORY_BACKEND = os.getenv(
+    "UNI_API_JSON_GUARD_BACKEND",
+    "auto",
+).strip().lower()
+if _REQUESTED_JSON_MEMORY_BACKEND not in {"auto", "python", "rust"}:
+    raise ValueError(
+        "UNI_API_JSON_GUARD_BACKEND must be auto, python, or rust"
+    )
+if _REQUESTED_JSON_MEMORY_BACKEND == "rust" and _uni_api_native is None:
+    raise RuntimeError(
+        "UNI_API_JSON_GUARD_BACKEND=rust requires uni_api._uni_api_native"
+    )
+_USE_NATIVE_JSON_MEMORY = _uni_api_native is not None and (
+    _REQUESTED_JSON_MEMORY_BACKEND != "python"
+)
 
 
 class JSONMemoryComplexityReason(StrEnum):
@@ -79,6 +101,14 @@ class JSONMemorySnapshot:
     structural_item_memory_bytes: int
 
 
+def json_memory_backend() -> str:
+    return "rust" if _USE_NATIVE_JSON_MEMORY else "python"
+
+
+def json_memory_native_available() -> bool:
+    return _uni_api_native is not None
+
+
 class IncrementalJSONMemoryEstimator:
     """Estimate JSON materialization memory with O(1) retained state.
 
@@ -121,6 +151,16 @@ class IncrementalJSONMemoryEstimator:
         self._escaped = False
         self._scalar_active = False
         self._scalar_bytes = 0
+        self._native_enabled = _USE_NATIVE_JSON_MEMORY and all(
+            value <= _NATIVE_INTEGER_MAX
+            for value in (
+                self.raw_memory_multiplier,
+                self.token_memory_bytes,
+                self.max_depth,
+                self.max_scalar_bytes,
+                self.max_estimated_bytes,
+            )
+        )
 
     @property
     def estimated_bytes(self) -> int:
@@ -142,6 +182,85 @@ class IncrementalJSONMemoryEstimator:
         )
 
     def feed(self, chunk: bytes | bytearray | memoryview) -> int:
+        if self._native_enabled:
+            return self._feed_native(chunk)
+        return self._feed_python(chunk)
+
+    def _feed_native(self, chunk: bytes | bytearray | memoryview) -> int:
+        view = memoryview(chunk).cast("B")
+        native_chunk = chunk if isinstance(chunk, bytes) else view.tobytes()
+        try:
+            result = _uni_api_native.scan_json_memory_chunk(
+                native_chunk,
+                self.raw_memory_multiplier,
+                self.token_memory_bytes,
+                self.max_depth,
+                self.max_scalar_bytes,
+                self.max_estimated_bytes,
+                self.raw_bytes,
+                self.tokens,
+                self.depth,
+                self.peak_depth,
+                self._in_string,
+                self._escaped,
+                self._scalar_active,
+                self._scalar_bytes,
+            )
+        except OverflowError:
+            self._native_enabled = False
+            return self._feed_python(chunk)
+
+        (
+            error_code,
+            trigger_phase_code,
+            self.raw_bytes,
+            self.tokens,
+            self.depth,
+            self.peak_depth,
+            self._in_string,
+            self._escaped,
+            self._scalar_active,
+            self._scalar_bytes,
+            estimated_bytes,
+        ) = result
+        if error_code == 0:
+            return int(estimated_bytes)
+
+        trigger_phases = {
+            1: JSONMemoryComplexityTriggerPhase.CHUNK_RAW_CHARGE,
+            2: JSONMemoryComplexityTriggerPhase.STRUCTURAL_ITEM_SCAN,
+            3: JSONMemoryComplexityTriggerPhase.DEPTH_SCAN,
+            4: JSONMemoryComplexityTriggerPhase.SCALAR_SCAN,
+        }
+        trigger_phase = trigger_phases.get(int(trigger_phase_code))
+        if trigger_phase is None:
+            raise RuntimeError(
+                f"native JSON guard returned phase {trigger_phase_code}"
+            )
+        if error_code == 1:
+            self._raise_complexity(
+                reason=JSONMemoryComplexityReason.MAX_DEPTH,
+                trigger_phase=trigger_phase,
+                message=f"JSON nesting exceeds {self.max_depth} levels",
+            )
+        if error_code == 2:
+            self._raise_complexity(
+                reason=JSONMemoryComplexityReason.MAX_SCALAR_BYTES,
+                trigger_phase=trigger_phase,
+                message=f"JSON scalar exceeds {self.max_scalar_bytes} bytes",
+            )
+        if error_code == 3:
+            self._raise_complexity(
+                reason=JSONMemoryComplexityReason.MAX_ESTIMATED_BYTES,
+                trigger_phase=trigger_phase,
+                message=(
+                    "JSON materialization estimate exceeds "
+                    f"{self.max_estimated_bytes} bytes"
+                ),
+            )
+        raise RuntimeError(f"native JSON guard returned error {error_code}")
+
+    def _feed_python(self, chunk: bytes | bytearray | memoryview) -> int:
         view = memoryview(chunk).cast("B")
         scan_buffer = chunk if isinstance(chunk, (bytes, bytearray)) else view
         self.raw_bytes += len(view)

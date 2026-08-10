@@ -18,6 +18,7 @@ on:
       - static/**
       - Dockerfile
       - .dockerignore
+      - rust/**
       - pyproject.toml
       - uv.lock
       - docker-compose.yml
