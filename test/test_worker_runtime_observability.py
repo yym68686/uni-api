@@ -153,6 +153,10 @@ def test_threadpool_profile_category_uses_dedicated_names_and_bounded_stack():
         ("zlib.py:decompress:1",),
     ) == ("upstream_response_decode", "dedicated_thread_name")
     assert worker_runtime._threadpool_category_from_sample(
+        "uni-api-idempotency-spool_0",
+        ("idempotency_spool.py:_write_all:300",),
+    ) == ("idempotency_spool", "dedicated_thread_name")
+    assert worker_runtime._threadpool_category_from_sample(
         "uni-api-body_1",
         ("zstandard/backend_c.py:decompress:1",),
     ) == ("request_body_decode", "dedicated_thread_name")

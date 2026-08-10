@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 
 from uni_api.admission import RequestAdmissionController
 from uni_api.admission.memory import AdaptiveMemoryGovernor, ProcessMemorySample
@@ -347,6 +348,87 @@ def test_request_spool_is_released_as_soon_as_downstream_consumes_body():
         assert snapshot["spool_memory_bytes"] == 0
         finish.set()
         await task
+
+    asyncio.run(run())
+
+
+def test_disk_spool_write_does_not_block_the_event_loop():
+    async def run():
+        coordinator = _coordinator(max_stored_bytes=2 * 1024 * 1024)
+        spool = coordinator.create_spool("inflight_response")
+        original_write = spool._write_all
+        entered = threading.Event()
+        release = threading.Event()
+        fallback = threading.Timer(0.5, release.set)
+
+        def blocked_write(payload):
+            entered.set()
+            assert release.wait(timeout=1.0)
+            original_write(payload)
+
+        spool._write_all = blocked_write
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.01, release.set)
+        fallback.start()
+        started = loop.time()
+        try:
+            assert await coordinator.append_spool(
+                spool,
+                b"x" * (256 * 1024),
+            )
+            assert entered.is_set()
+            assert loop.time() - started < 0.2
+        finally:
+            fallback.cancel()
+            fallback.join(timeout=1.0)
+            await coordinator.close_spool(spool)
+
+    asyncio.run(run())
+
+
+def test_stream_chunks_are_coalesced_into_bounded_disk_writes():
+    async def run():
+        coordinator = _coordinator(max_stored_bytes=2 * 1024 * 1024)
+        spool = coordinator.create_spool("inflight_response")
+        original_write = spool._write_all
+        write_sizes = []
+
+        def observed_write(payload):
+            write_sizes.append(len(payload))
+            original_write(payload)
+
+        spool._write_all = observed_write
+        try:
+            for _ in range(256):
+                assert await coordinator.append_spool(spool, b"x" * 4096)
+            await spool.seal_async(force_disk=True)
+            assert write_sizes == [256 * 1024] * 4
+            assert b"".join(spool.iter_chunks()) == b"x" * (1024 * 1024)
+        finally:
+            await coordinator.close_spool(spool)
+
+    asyncio.run(run())
+
+
+def test_append_skips_expiry_scan_without_spool_capacity_pressure():
+    async def run():
+        coordinator = _coordinator(max_stored_bytes=2 * 1024 * 1024)
+        spool = coordinator.create_spool("inflight_response")
+        original_prune = coordinator._prune_expired_locked
+        prune_calls = 0
+
+        def observed_prune(now):
+            nonlocal prune_calls
+            prune_calls += 1
+            original_prune(now)
+
+        coordinator._prune_expired_locked = observed_prune
+        try:
+            for _ in range(128):
+                assert await coordinator.append_spool(spool, b"x" * 4096)
+            assert prune_calls == 0
+        finally:
+            await coordinator.close_spool(spool)
 
     asyncio.run(run())
 

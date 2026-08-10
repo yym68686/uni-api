@@ -16,6 +16,7 @@ THREADPOOL_TASK_CATEGORIES = frozenset(
         "on_cpu_profile",
         "request_body_decode",
         "upstream_response_decode",
+        "idempotency_spool",
     }
 )
 

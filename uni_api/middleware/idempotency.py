@@ -229,13 +229,17 @@ class InMemoryIdempotencyCoordinator:
         if accounting is None or accounting[0] is not spool:
             raise RuntimeError("idempotency spool is not owned by this coordinator")
         async with self._lock:
-            self._prune_expired_locked(monotonic())
+            # Expiry cleanup is needed for claims and only when quota pressure
+            # exists. Scanning every cached entry for every stream chunk made
+            # this O(chunks * entries) on the incident hot path.
+            if self._spool_bytes + len(chunk) > self.max_stored_bytes:
+                self._prune_expired_locked(monotonic())
             if not self._make_spool_room_locked(len(chunk)):
                 self._counters["spool_capacity_rejections"] += 1
                 return False
             self._account_spool_growth_locked(accounting, len(chunk))
         try:
-            spool.append(chunk)
+            await spool.append_async(chunk)
         except IdempotencySpoolError:
             async with self._lock:
                 self._discard_spool_locked(spool)
@@ -258,7 +262,14 @@ class InMemoryIdempotencyCoordinator:
         if spool is None:
             return
         async with self._lock:
-            self._discard_spool_locked(spool)
+            accounting = self._spools.pop(id(spool), None)
+            if accounting is not None and accounting[0] is spool:
+                self._account_spool_shrink_locked(accounting, int(accounting[2]))
+                self._spool_memory_bytes = max(
+                    0,
+                    self._spool_memory_bytes - int(accounting[3]),
+                )
+        await spool.close_async()
 
     async def claim(self, record_key: str, request_hash: str) -> IdempotencyClaim:
         now = monotonic()
@@ -326,6 +337,13 @@ class InMemoryIdempotencyCoordinator:
             if accounting is None or accounting[0] is not response.body:
                 self._release_locked(record_key, entry, not_cached=True)
                 return False
+            memory_before = int(accounting[3])
+            memory_after = response.body.memory_bytes
+            accounting[3] = memory_after
+            self._spool_memory_bytes = max(
+                0,
+                self._spool_memory_bytes + memory_after - memory_before,
+            )
             entry.response = response
             entry.completed_at = now
             entry.expires_at = now + self.ttl_seconds
@@ -848,7 +866,7 @@ class IdempotencyMiddleware:
                         )
                         hash_cpu_ns += max(0, thread_time_ns() - cpu_started_ns)
                 more_body = bool(message.get("more_body", False))
-            spool.seal(force_disk=False)
+            await spool.seal_async(force_disk=False)
             return spool, total, hash_wall_ns, hash_cpu_ns
         except BaseException:
             await self.coordinator.close_spool(spool)
@@ -1064,7 +1082,9 @@ class IdempotencyMiddleware:
             )
             return
         try:
-            response_spool.seal(force_disk=response_spool.size > 0)
+            await response_spool.seal_async(
+                force_disk=response_spool.size > 0,
+            )
         except IdempotencySpoolError:
             await self.coordinator.close_spool(response_spool)
             await self.coordinator.complete_nonreplayable(

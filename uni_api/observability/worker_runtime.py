@@ -826,6 +826,7 @@ def _threadpool_category_from_sample(
     dedicated_prefixes = (
         ("uni-api-json", "json_parse"),
         ("uni-api-upstream-body", "upstream_response_decode"),
+        ("uni-api-idempotency-spool", "idempotency_spool"),
         ("uni-api-body", "request_body_decode"),
     )
     for prefix, category in dedicated_prefixes:

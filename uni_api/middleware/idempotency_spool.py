@@ -1,11 +1,59 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
 from uni_api.admission.memory import AdaptiveMemoryGovernor
+from uni_api.observability.threadpool_tasks import (
+    register_dedicated_threadpool,
+    submit_threadpool_task,
+)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or str(default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+_SPOOL_IO_WORKERS = _positive_int_env("IDEMPOTENCY_SPOOL_IO_WORKERS", 4)
+_SPOOL_IO_MAX_PENDING = max(
+    _SPOOL_IO_WORKERS,
+    _positive_int_env("IDEMPOTENCY_SPOOL_IO_MAX_PENDING", 128),
+)
+_SPOOL_BATCH_BYTES = _positive_int_env(
+    "IDEMPOTENCY_SPOOL_BATCH_BYTES",
+    256 * 1024,
+)
+_SPOOL_IO_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_SPOOL_IO_WORKERS,
+    thread_name_prefix="uni-api-idempotency-spool",
+)
+register_dedicated_threadpool("idempotency_spool", _SPOOL_IO_EXECUTOR)
+_SPOOL_IO_LIMITERS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    asyncio.Semaphore,
+] = weakref.WeakKeyDictionary()
+_SPOOL_IO_LIMITERS_LOCK = threading.Lock()
+
+
+def _spool_io_limiter(
+    loop: asyncio.AbstractEventLoop,
+) -> asyncio.Semaphore:
+    with _SPOOL_IO_LIMITERS_LOCK:
+        limiter = _SPOOL_IO_LIMITERS.get(loop)
+        if limiter is None:
+            limiter = asyncio.Semaphore(_SPOOL_IO_MAX_PENDING)
+            _SPOOL_IO_LIMITERS[loop] = limiter
+        return limiter
 
 
 class IdempotencySpoolError(RuntimeError):
@@ -37,11 +85,15 @@ class IdempotencySpool:
         self._memory_category = str(memory_category or "idempotency_spool")
         self._memory = bytearray()
         self._memory_reserved_bytes = 0
+        self._pending_disk = bytearray()
+        self._pending_disk_reserved_bytes = 0
         self._writer = None
         self._path: str | None = None
         self._size = 0
         self._sealed = False
         self._closed = False
+        self._async_io_lock = asyncio.Lock()
+        self._async_close_task: asyncio.Task[None] | None = None
 
     @property
     def size(self) -> int:
@@ -49,7 +101,7 @@ class IdempotencySpool:
 
     @property
     def memory_bytes(self) -> int:
-        return self._memory_reserved_bytes
+        return self._memory_reserved_bytes + self._pending_disk_reserved_bytes
 
     @property
     def on_disk(self) -> bool:
@@ -80,6 +132,72 @@ class IdempotencySpool:
         else:
             self._memory.extend(chunk)
         self._size += len(chunk)
+
+    async def append_async(self, payload: bytes | bytearray | memoryview) -> None:
+        """Append with bounded coalescing and no blocking I/O on the loop."""
+
+        chunk = bytes(payload)
+        if not chunk:
+            return
+        async with self._async_io_lock:
+            if self._sealed or self._closed:
+                raise IdempotencySpoolError(
+                    "cannot append to a closed replay spool"
+                )
+            if self._writer is None and not self._pending_disk:
+                projected = len(self._memory) + len(chunk)
+                if (
+                    projected <= self._memory_threshold_bytes
+                    and self._reserve_memory(len(chunk))
+                ):
+                    self._memory.extend(chunk)
+                    self._size += len(chunk)
+                    return
+
+            if len(chunk) >= _SPOOL_BATCH_BYTES:
+                await self._flush_pending_disk()
+                await self._run_io(self._append_storage, chunk)
+                self._size += len(chunk)
+                return
+
+            if len(self._pending_disk) + len(chunk) > _SPOOL_BATCH_BYTES:
+                await self._flush_pending_disk()
+            if not self._reserve_pending_disk_memory(len(chunk)):
+                await self._flush_pending_disk()
+                await self._run_io(self._append_storage, chunk)
+                self._size += len(chunk)
+                return
+
+            self._pending_disk.extend(chunk)
+            self._size += len(chunk)
+            if len(self._pending_disk) >= _SPOOL_BATCH_BYTES:
+                await self._flush_pending_disk()
+
+    async def seal_async(self, *, force_disk: bool) -> None:
+        if self._closed:
+            raise IdempotencySpoolError("cannot seal a closed replay spool")
+        if self._sealed:
+            return
+        async with self._async_io_lock:
+            await self._flush_pending_disk()
+            await self._run_io(self.seal, force_disk=force_disk)
+
+    async def close_async(self) -> None:
+        if self._closed:
+            return
+        if self._async_close_task is None:
+            self._async_close_task = asyncio.create_task(self._close_async_once())
+        task = self._async_close_task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._await_future_despite_cancellation(task)
+            raise
+
+    async def _close_async_once(self) -> None:
+        async with self._async_io_lock:
+            self._discard_pending_disk()
+            await self._run_io(self.close)
 
     def seal(self, *, force_disk: bool) -> None:
         if self._closed:
@@ -125,6 +243,7 @@ class IdempotencySpool:
                 writer.close()
             except OSError:
                 pass
+        self._discard_pending_disk()
         self._release_memory()
         self._memory.clear()
         path = self._path
@@ -136,6 +255,76 @@ class IdempotencySpool:
                 pass
             except OSError:
                 pass
+
+    async def _run_io(self, callback, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        limiter = _spool_io_limiter(loop)
+        async with limiter:
+            ticket = submit_threadpool_task("idempotency_spool")
+
+            def invoke():
+                return ticket.run(callback, *args, **kwargs)
+
+            future = loop.run_in_executor(
+                _SPOOL_IO_EXECUTOR,
+                invoke,
+            )
+            return await self._await_future_despite_cancellation(future)
+
+    async def _flush_pending_disk(self) -> None:
+        if not self._pending_disk:
+            return
+        payload = self._pending_disk
+        reserved = self._pending_disk_reserved_bytes
+        self._pending_disk = bytearray()
+        self._pending_disk_reserved_bytes = 0
+        try:
+            await self._run_io(self._append_storage, payload)
+        finally:
+            if reserved and self._memory_governor is not None:
+                self._memory_governor.release(self._memory_category, reserved)
+
+    def _append_storage(self, payload: bytes | bytearray | memoryview) -> None:
+        if self._writer is None:
+            self._spill_to_disk()
+        self._write_all(payload)
+
+    def _reserve_pending_disk_memory(self, size: int) -> bool:
+        if size <= 0:
+            return True
+        if (
+            self._memory_governor is not None
+            and not self._memory_governor.reserve_nowait(
+                self._memory_category,
+                size,
+            )
+        ):
+            return False
+        self._pending_disk_reserved_bytes += size
+        return True
+
+    def _discard_pending_disk(self) -> None:
+        reserved = self._pending_disk_reserved_bytes
+        self._pending_disk_reserved_bytes = 0
+        self._pending_disk.clear()
+        if reserved and self._memory_governor is not None:
+            self._memory_governor.release(self._memory_category, reserved)
+
+    @staticmethod
+    async def _await_future_despite_cancellation(future):
+        pending_cancel: asyncio.CancelledError | None = None
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError as exc:
+                pending_cancel = pending_cancel or exc
+        if pending_cancel is not None:
+            try:
+                future.result()
+            except BaseException:
+                pass
+            raise pending_cancel
+        return future.result()
 
     def _reserve_memory(self, size: int) -> bool:
         if size <= 0:

@@ -164,6 +164,9 @@ def test_real_tcp_disconnect_finishes_owner_and_replays_on_new_connection():
             assert calls == 1
             snapshot = coordinator.snapshot()
             assert snapshot["downstream_disconnects_detached"] == 1
+            async with asyncio.timeout(1):
+                while controller.snapshot()["active"] != 0:
+                    await asyncio.sleep(0)
             assert controller.snapshot()["active"] == 0
         finally:
             if writer is not None:
