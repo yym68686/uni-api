@@ -407,6 +407,33 @@ def test_invalid_explicit_active_limit_fails_fast(monkeypatch):
         startup_concurrency_from_environment(memory_available_bytes=None)
 
 
+def test_weighted_startup_ignores_legacy_request_count_overrides(monkeypatch):
+    monkeypatch.setenv("REQUEST_ADMISSION_ACTIVE_LIMIT", "invalid")
+    monkeypatch.setenv("REQUEST_ADMISSION_WAITER_LIMIT", "invalid")
+    monkeypatch.setenv("REQUEST_ADMISSION_TOTAL_LIMIT", "invalid")
+    monkeypatch.setenv("REQUEST_ADMISSION_MAX_ACTIVE_LIMIT", "invalid")
+    monkeypatch.setenv("REQUEST_ADMISSION_CPU_BOUND_ACTIVE", "invalid")
+    monkeypatch.setattr(
+        resources_module,
+        "cgroup_cpu_quota_millicores",
+        lambda: 1000,
+    )
+    monkeypatch.setattr(resources_module, "cgroup_cpu_weight", lambda: None)
+    monkeypatch.setattr(resources_module, "process_cpu_affinity_count", lambda: 1)
+    monkeypatch.setattr(resources_module, "process_nofile_soft_limit", lambda: 10000)
+    monkeypatch.setattr(resources_module, "process_open_fd_count", lambda: 10)
+    monkeypatch.setattr(resources_module, "ephemeral_port_count", lambda: 28000)
+    monkeypatch.setattr(resources_module, "tcp_socket_port_occupancy", lambda: 0)
+    monkeypatch.setattr(resources_module, "kernel_somaxconn", lambda: 4096)
+
+    envelope = startup_concurrency_from_environment(
+        memory_available_bytes=3 * 1024**3,
+        honor_request_count_overrides=False,
+    )
+
+    assert envelope.active_sizing_source == "resource"
+
+
 def test_ephemeral_port_count_excludes_reserved_ranges(tmp_path: Path):
     port_range = tmp_path / "range"
     reserved = tmp_path / "reserved"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from math import ceil
@@ -26,11 +26,10 @@ from uni_api.admission import (
     BoundedAdmissionGate,
     get_request_admission_lease,
 )
-from uni_api.admission.resources import (
-    cgroup_cpu_quota_millicores,
-    cgroup_cpu_weight,
-    process_cpu_affinity_count,
-    startup_active_limit,
+from uni_api.admission.network import (
+    AdaptiveNetworkGovernor,
+    NetworkGovernorClosed,
+    NetworkResourceLease,
 )
 from uni_api.observability.responses_stream import (
     observe_client_pool_shutdown_connection,
@@ -160,17 +159,20 @@ async def _finish_cleanup_despite_cancellation(task: asyncio.Task[Any]) -> None:
 
 
 class _UpstreamLease:
-    """A gate lease coupled to the legacy active-pool gauge callbacks."""
+    """An upstream operation plus its provisional connection resources."""
 
     def __init__(
         self,
-        gate_lease: AdmissionLease,
+        gate_lease: AdmissionLease | NetworkResourceLease,
         *,
+        release_on_connected: bool,
         on_release: Callable[[], None],
     ) -> None:
         self.wait_ms = gate_lease.wait_ms
         self._gate_lease = gate_lease
+        self._release_on_connected = bool(release_on_connected)
         self._on_release = on_release
+        self._connected_task: asyncio.Task[None] | None = None
         self._release_task: asyncio.Task[None] | None = None
 
     @property
@@ -187,12 +189,32 @@ class _UpstreamLease:
             await _finish_cleanup_despite_cancellation(release_task)
             raise
 
+    async def mark_connected(self) -> None:
+        """Hand provisional FD/port ownership back to live kernel counters."""
+
+        if not self._release_on_connected:
+            return
+        if self._connected_task is None:
+            self._connected_task = asyncio.create_task(
+                self._gate_lease.release()
+            )
+        connected_task = self._connected_task
+        try:
+            await asyncio.shield(connected_task)
+        except asyncio.CancelledError:
+            await _finish_cleanup_despite_cancellation(connected_task)
+            raise
+
     async def _release_once(self) -> None:
-        # End the active gauge before the gate hands capacity to the next FIFO
-        # waiter. Otherwise the promoted task can increment the legacy gauge
-        # before this task decrements it, producing an impossible active peak.
-        self._on_release()
-        await self._gate_lease.release()
+        if not self._release_on_connected:
+            # Preserve legacy gauge ordering before FIFO capacity promotion.
+            self._on_release()
+            await self._gate_lease.release()
+            return
+        try:
+            await self.mark_connected()
+        finally:
+            self._on_release()
 
 
 class _ResponseLeaseBinding:
@@ -283,6 +305,7 @@ class _ManagedStreamContext:
         response: httpx.Response | None = None
         try:
             response = await raw_context.__aenter__()
+            await lease.mark_connected()
             if diagnostics is not None:
                 diagnostics.capture_response(
                     response,
@@ -393,6 +416,7 @@ class _ManagedAsyncClient:
         lease = await self._acquire()
         try:
             async with self._client.stream(method, url, **request_kwargs) as response:
+                await lease.mark_connected()
                 if diagnostics is not None:
                     diagnostics.capture_response(response, client=self._client)
                 return await self._buffer_bounded_response(
@@ -600,6 +624,7 @@ class _ManagedAsyncClient:
         lease = await self._acquire()
         try:
             response = await self._client.send(request, stream=True, **kwargs)
+            await lease.mark_connected()
             if diagnostics is not None:
                 diagnostics.capture_response(response, client=self._client)
         except BaseException as exc:
@@ -658,17 +683,15 @@ class ClientPool:
         begin_upstream_pool: Callable[[Any], Any] | None = None,
         end_upstream_pool: Callable[[], Any] | None = None,
         record_upstream_wait: Callable[[float], Any] | None = None,
+        network_governor: AdaptiveNetworkGovernor | None = None,
     ) -> None:
-        if pool_size is None:
-            pool_size = startup_active_limit(
-                cpu_millicores=cgroup_cpu_quota_millicores(),
-                cpu_weight=cgroup_cpu_weight(),
-                cpu_affinity_count=process_cpu_affinity_count(),
-            )
-        if pool_size <= 0:
+        if pool_size is not None and pool_size <= 0:
             raise ValueError("pool_size must be greater than zero")
-        resolved_waiter_limit = pool_size if waiter_limit is None else waiter_limit
-        if resolved_waiter_limit < 0:
+        resolved_waiter_limit = (
+            pool_size if pool_size is not None and waiter_limit is None
+            else waiter_limit
+        )
+        if resolved_waiter_limit is not None and resolved_waiter_limit < 0:
             raise ValueError("waiter_limit cannot be negative")
         if wait_timeout_seconds <= 0:
             raise ValueError("wait_timeout_seconds must be greater than zero")
@@ -677,6 +700,7 @@ class ClientPool:
 
         self.pool_size = pool_size
         self.waiter_limit = resolved_waiter_limit
+        self.resource_mode = pool_size is None
         self.wait_timeout_seconds = float(wait_timeout_seconds)
         self.pool_timeout_seconds = float(pool_timeout_seconds)
         self.clients: dict[str, httpx.AsyncClient] = {}
@@ -684,6 +708,8 @@ class ClientPool:
         self._admission_gates: dict[str, BoundedAdmissionGate] = {}
         self._admission_stats: dict[str, _AdmissionStats] = {}
         self._client_labels: dict[str, str] = {}
+        self._network_governor = network_governor or AdaptiveNetworkGovernor()
+        self._active_operations = 0
         self._lifecycle_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
@@ -734,18 +760,35 @@ class ClientPool:
     def snapshot(self) -> dict[str, Any]:
         per_key: dict[str, dict[str, Any]] = {}
         rejected: Counter[str] = Counter()
-        active = 0
-        waiters = 0
+        active = self._active_operations if self.resource_mode else 0
+        network_snapshot = self._network_governor.snapshot()
+        waiters = (
+            network_snapshot.waiting_connection_attempts
+            if self.resource_mode
+            else 0
+        )
         acquired_total = 0
-        cancelled_total = 0
+        cancelled_total = (
+            network_snapshot.cancelled_total if self.resource_mode else 0
+        )
         wait_ms_total = 0.0
         wait_ms_max = 0.0
         attempts_observed = 0
 
-        for client_key, gate in self._admission_gates.items():
-            gate_snapshot = gate.snapshot()
-            stats = self._admission_stats[client_key]
+        for client_key, stats in self._admission_stats.items():
             label = self._client_labels[client_key]
+            gate = self._admission_gates.get(client_key)
+            gate_snapshot = gate.snapshot() if gate is not None else {
+                "mode": "weighted_resources",
+                "active": None,
+                "waiters": None,
+                "capacity": None,
+                "waiter_limit": None,
+                "wait_timeout_seconds": None,
+                "acquired_total": stats.attempts_observed,
+                "cancelled_total": 0,
+                "rejected": {},
+            }
             acquired = int(gate_snapshot["acquired_total"])
             key_snapshot = {
                 **gate_snapshot,
@@ -758,16 +801,21 @@ class ClientPool:
                 "attempts_observed": stats.attempts_observed,
             }
             per_key[label] = key_snapshot
-            active += int(gate_snapshot["active"])
-            waiters += int(gate_snapshot["waiters"])
+            if not self.resource_mode:
+                active += int(gate_snapshot["active"])
+                waiters += int(gate_snapshot["waiters"])
             acquired_total += acquired
-            cancelled_total += int(gate_snapshot["cancelled_total"])
+            if not self.resource_mode:
+                cancelled_total += int(gate_snapshot["cancelled_total"])
             rejected.update(gate_snapshot["rejected"])
             wait_ms_total += stats.wait_ms_total
             wait_ms_max = max(wait_ms_max, stats.wait_ms_max)
             attempts_observed += stats.attempts_observed
 
         admission = {
+            "mode": (
+                "weighted_resources" if self.resource_mode else "legacy_count"
+            ),
             "active": active,
             "waiters": waiters,
             "capacity_per_key": self.pool_size,
@@ -781,10 +829,12 @@ class ClientPool:
             if attempts_observed
             else 0.0,
             "attempts_observed": attempts_observed,
+            "network_resources": asdict(network_snapshot),
         }
         return {
             "client_count": len(self.clients),
             "pool_size": self.pool_size,
+            "resource_mode": self.resource_mode,
             "closing": self._closing,
             "closed": self._closed,
             "pool_timeout_seconds": self.pool_timeout_seconds,
@@ -795,6 +845,7 @@ class ClientPool:
             "last_sweep_closed_connections": self._last_sweep_closed_connections,
             "last_sweep_at": self._last_sweep_at.isoformat() if self._last_sweep_at else None,
             "last_sweep_error": self._last_sweep_error,
+            "network_resources": asdict(network_snapshot),
         }
 
     @asynccontextmanager
@@ -815,6 +866,8 @@ class ClientPool:
                     write=30.0,
                     pool=self.pool_timeout_seconds,
                 )
+                # ``None`` removes HTTPX's request-count pool cap. Live FD and
+                # ephemeral-port headroom gate only connection establishment.
                 limits = httpx.Limits(max_connections=self.pool_size)
                 client_config = {
                     **self.default_config,
@@ -827,11 +880,14 @@ class ClientPool:
                 raw_client = httpx.AsyncClient(**client_config)
                 install_transport_phase_observability(raw_client)
                 self.clients[client_key] = raw_client
-                self._admission_gates[client_key] = BoundedAdmissionGate(
-                    self.pool_size,
-                    waiter_limit=self.waiter_limit,
-                    wait_timeout_seconds=self.wait_timeout_seconds,
-                )
+                if not self.resource_mode:
+                    assert self.pool_size is not None
+                    assert self.waiter_limit is not None
+                    self._admission_gates[client_key] = BoundedAdmissionGate(
+                        self.pool_size,
+                        waiter_limit=self.waiter_limit,
+                        wait_timeout_seconds=self.wait_timeout_seconds,
+                    )
                 self._admission_stats[client_key] = _AdmissionStats()
                 self._client_labels[client_key] = self._client_label(
                     base_url,
@@ -855,11 +911,20 @@ class ClientPool:
         async with self._lifecycle_lock:
             if self._closing or self._closed:
                 raise self._pool_closed_rejection(client_key)
-            gate = self._admission_gates[client_key]
+            gate = self._admission_gates.get(client_key)
             stats = self._admission_stats[client_key]
             client_label = self._client_labels[client_key]
         try:
-            gate_lease = await gate.acquire()
+            if self.resource_mode:
+                gate_lease: AdmissionLease | NetworkResourceLease = (
+                    await self._network_governor.acquire(
+                        abort=lambda: self._closing or self._closed,
+                    )
+                )
+            else:
+                if gate is None:
+                    raise RuntimeError("legacy upstream admission gate is missing")
+                gate_lease = await gate.acquire()
         except asyncio.CancelledError:
             wait_ms = (monotonic() - started_at) * 1000.0
             stats.record(wait_ms)
@@ -867,6 +932,16 @@ class ClientPool:
             self._record_trace_wait(trace, wait_ms)
             self._safe_record_upstream_wait(wait_ms)
             raise
+        except NetworkGovernorClosed:
+            wait_ms = (monotonic() - started_at) * 1000.0
+            stats.record(wait_ms)
+            self._safe_trace_mark(trace, "client_pool_acquire_end")
+            self._record_trace_wait(trace, wait_ms)
+            self._safe_record_upstream_wait(wait_ms)
+            raise self._pool_closed_rejection(
+                client_key,
+                client_label=client_label,
+            ) from None
         except AdmissionRejected as exc:
             wait_ms = (monotonic() - started_at) * 1000.0
             stats.record(wait_ms)
@@ -903,13 +978,25 @@ class ClientPool:
             )
 
         callback_started = self._safe_begin_upstream_pool(trace)
+        if self.resource_mode:
+            self._active_operations += 1
+
+        def release_active_operation() -> None:
+            if self.resource_mode:
+                self._active_operations = max(
+                    0,
+                    self._active_operations - 1,
+                )
+            self._safe_end_upstream_pool(callback_started)
+
         self._safe_trace_mark(trace, "client_pool_acquire_end")
         self._safe_trace_mark(trace, "client_pool_acquired")
         self._record_trace_wait(trace, wait_ms)
         self._safe_record_upstream_wait(wait_ms)
         return _UpstreamLease(
             gate_lease,
-            on_release=lambda: self._safe_end_upstream_pool(callback_started),
+            release_on_connected=self.resource_mode,
+            on_release=release_active_operation,
         )
 
     def _pool_closed_rejection(

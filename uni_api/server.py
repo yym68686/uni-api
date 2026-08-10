@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,28 +12,35 @@ from uni_api.disconnect import DOWNSTREAM_DISCONNECT_EVENT_SCOPE_KEY
 
 @dataclass(slots=True)
 class BoundedHTTPProtocolStats:
-    connection_limit: int
+    connection_limit: int | None
     header_timeout_seconds: float
+    resource_guard_enabled: bool = False
     accepted_connections: int = 0
     rejected_connections: int = 0
+    resource_rejected_connections: int = 0
     header_timeouts: int = 0
 
-    def snapshot(self) -> dict[str, int | float]:
+    def snapshot(self) -> dict[str, int | float | bool | None]:
         return {
             "connection_limit": self.connection_limit,
             "header_timeout_seconds": self.header_timeout_seconds,
             "accepted_connections": self.accepted_connections,
             "rejected_connections": self.rejected_connections,
+            "resource_rejected_connections": (
+                self.resource_rejected_connections
+            ),
+            "resource_guard_enabled": self.resource_guard_enabled,
             "header_timeouts": self.header_timeouts,
         }
 
 
 def build_bounded_h11_protocol(
     *,
-    connection_limit: int,
+    connection_limit: int | None,
     header_timeout_seconds: float,
+    connection_admission: Callable[[], bool] | None = None,
 ) -> tuple[type[H11Protocol], BoundedHTTPProtocolStats]:
-    """Build a Uvicorn h11 protocol with an accept-time connection bound.
+    """Build a Uvicorn h11 protocol with resource-aware accept protection.
 
     Uvicorn's ``limit_concurrency`` is checked only after a complete HTTP
     request arrives and uses the number of open keep-alive connections. It can
@@ -43,14 +51,17 @@ def build_bounded_h11_protocol(
     remains the responsibility of ``RequestAdmissionMiddleware``.
     """
 
-    if connection_limit <= 0:
+    if connection_limit is not None and connection_limit <= 0:
         raise ValueError("connection_limit must be positive")
     if header_timeout_seconds <= 0:
         raise ValueError("header_timeout_seconds must be positive")
 
     stats = BoundedHTTPProtocolStats(
-        connection_limit=int(connection_limit),
+        connection_limit=(
+            int(connection_limit) if connection_limit is not None else None
+        ),
         header_timeout_seconds=float(header_timeout_seconds),
+        resource_guard_enabled=connection_admission is not None,
     )
 
     class BoundedH11Protocol(H11Protocol):
@@ -65,9 +76,17 @@ def build_bounded_h11_protocol(
             self._downstream_disconnect_event = None
 
         def connection_made(self, transport: asyncio.Transport) -> None:
-            if len(self.connections) >= stats.connection_limit:
+            if (
+                stats.connection_limit is not None
+                and len(self.connections) >= stats.connection_limit
+            ):
                 self._rejected_before_registration = True
                 stats.rejected_connections += 1
+                transport.close()
+                return
+            if connection_admission is not None and not connection_admission():
+                self._rejected_before_registration = True
+                stats.resource_rejected_connections += 1
                 transport.close()
                 return
             super().connection_made(transport)

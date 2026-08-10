@@ -28,13 +28,15 @@ async def _instant_app(scope, receive, send):
 
 async def _start_server(
     *,
-    connection_limit: int,
+    connection_limit: int | None,
     header_timeout: float,
     app=_instant_app,
+    connection_admission=None,
 ):
     protocol, stats = build_bounded_h11_protocol(
         connection_limit=connection_limit,
         header_timeout_seconds=header_timeout,
+        connection_admission=connection_admission,
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -109,6 +111,46 @@ def test_preconnected_keepalive_sockets_do_not_trigger_uvicorn_false_503s():
                 overflow_writer.close()
             for _reader, writer in connections:
                 writer.close()
+            await _stop_server(server, task, listener)
+
+    asyncio.run(scenario())
+
+
+def test_resource_guard_replaces_static_connection_count_limit():
+    async def scenario():
+        decisions = iter((False, True))
+        server, task, listener, port, stats = await _start_server(
+            connection_limit=None,
+            header_timeout=1,
+            connection_admission=lambda: next(decisions),
+        )
+        first_writer = None
+        second_writer = None
+        try:
+            first_reader, first_writer = await asyncio.open_connection(
+                "127.0.0.1",
+                port,
+            )
+            assert await asyncio.wait_for(first_reader.read(), timeout=1) == b""
+
+            second_reader, second_writer = await asyncio.open_connection(
+                "127.0.0.1",
+                port,
+            )
+            second_writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await second_writer.drain()
+            response = await asyncio.wait_for(second_reader.read(), timeout=1)
+            assert b" 200 OK\r\n" in response
+            assert stats.connection_limit is None
+            assert stats.rejected_connections == 0
+            assert stats.resource_rejected_connections == 1
+        finally:
+            if first_writer is not None:
+                first_writer.close()
+            if second_writer is not None:
+                second_writer.close()
             await _stop_server(server, task, listener)
 
     asyncio.run(scenario())

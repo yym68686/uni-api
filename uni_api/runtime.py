@@ -163,6 +163,7 @@ from uni_api.observability.middleware import (
     StatsMiddlewareDependencies,
 )
 from uni_api.admission import (
+    AdaptiveNetworkGovernor,
     Admission503ResponseWriteOutcome,
     AdmissionRejected,
     RequestAdmissionController,
@@ -177,6 +178,7 @@ from uni_api.admission.json_parsing import (
 from uni_api.admission.json_memory import DEFAULT_JSON_RAW_MEMORY_MULTIPLIER
 from uni_api.admission.memory import process_memory_governor
 from uni_api.admission.resources import (
+    kernel_somaxconn,
     startup_concurrency_from_environment,
     startup_large_request_memory_limit,
     startup_per_request_memory_limit,
@@ -905,8 +907,18 @@ class RuntimeGauges:
             "request_active": request_active,
             "request_waiters": request_waiters,
             "request_capacity": admission.get("capacity"),
+            "request_admission_mode": admission.get(
+                "mode",
+                RESOURCE_ADMISSION_MODE,
+            ),
             "request_admission_sizing_source": (
                 REQUEST_ADMISSION_ACTIVE_SIZING_SOURCE
+            ),
+            "request_control_memory_bytes_per_request": admission.get(
+                "control_memory_bytes_per_request"
+            ),
+            "request_control_memory_reserved_bytes": admission.get(
+                "control_memory_reserved_bytes"
             ),
             "cpu_phase": cpu_phase,
             "cpu_phase_capacity": cpu_phase.get("capacity"),
@@ -922,9 +934,13 @@ class RuntimeGauges:
             ),
             "request_startup_cpu_active_limit": (
                 REQUEST_ADMISSION_CPU_ACTIVE_LIMIT
+                if RESOURCE_ADMISSION_MODE == "legacy"
+                else None
             ),
             "request_startup_resource_active_limit": (
                 REQUEST_ADMISSION_RESOURCE_ACTIVE_LIMIT
+                if RESOURCE_ADMISSION_MODE == "legacy"
+                else None
             ),
             "request_startup_memory_available_bytes": (
                 REQUEST_ADMISSION_STARTUP_MEMORY_AVAILABLE_BYTES
@@ -949,7 +965,11 @@ class RuntimeGauges:
             "request_wait_timeout_seconds": admission.get(
                 "wait_timeout_seconds"
             ),
-            "request_total_limit": REQUEST_ADMISSION_TOTAL_LIMIT,
+            "request_total_limit": (
+                REQUEST_ADMISSION_TOTAL_LIMIT
+                if RESOURCE_ADMISSION_MODE == "legacy"
+                else None
+            ),
             "uvicorn_limit_concurrency": None,
             "uvicorn_connection_limit": UVICORN_CONNECTION_LIMIT,
             "uvicorn_backlog": UVICORN_BACKLOG,
@@ -1235,6 +1255,11 @@ class RuntimeGauges:
             "upstream_pool_wait_ms_avg": upstream_admission.get("wait_ms_avg"),
             "upstream_pool_wait_ms_max": upstream_admission.get("wait_ms_max"),
             "upstream_pool_rejected": upstream_admission.get("rejected", {}),
+            "upstream_admission_mode": upstream_admission.get("mode"),
+            "outbound_network_resources": upstream_admission.get(
+                "network_resources",
+                {},
+            ),
             "stream_queue_active": len(queue_snapshots),
             "stream_queue_items": sum(snapshot.items for snapshot in queue_snapshots),
             "stream_queue_bytes": sum(snapshot.bytes for snapshot in queue_snapshots),
@@ -1309,14 +1334,24 @@ _startup_memory_available = (
     if _startup_memory_snapshot.sample_error is None
     else None
 )
+# ``weighted`` is the production default: request counts remain observable but
+# never participate in admission. ``legacy`` is an emergency rollback only.
+RESOURCE_ADMISSION_MODE = str(
+    os.getenv("RESOURCE_ADMISSION_MODE", "weighted") or "weighted"
+).strip().lower()
+if RESOURCE_ADMISSION_MODE not in {"weighted", "legacy"}:
+    raise ValueError("RESOURCE_ADMISSION_MODE must be weighted or legacy")
 STARTUP_CONCURRENCY_ENVELOPE = startup_concurrency_from_environment(
     memory_available_bytes=_startup_memory_available,
+    honor_request_count_overrides=RESOURCE_ADMISSION_MODE == "legacy",
 )
 REQUEST_ADMISSION_ACTIVE_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.active_limit
 REQUEST_ADMISSION_WAITER_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.waiter_limit
 REQUEST_ADMISSION_TOTAL_LIMIT = STARTUP_CONCURRENCY_ENVELOPE.total_limit
 REQUEST_ADMISSION_ACTIVE_SIZING_SOURCE = (
-    STARTUP_CONCURRENCY_ENVELOPE.active_sizing_source
+    "weighted_resources"
+    if RESOURCE_ADMISSION_MODE == "weighted"
+    else STARTUP_CONCURRENCY_ENVELOPE.active_sizing_source
 )
 REQUEST_ADMISSION_CPU_MILLICORES = STARTUP_CONCURRENCY_ENVELOPE.cpu_millicores
 REQUEST_ADMISSION_CPU_WEIGHT = STARTUP_CONCURRENCY_ENVELOPE.cpu_weight
@@ -1351,49 +1386,49 @@ REQUEST_ADMISSION_EPHEMERAL_PORT_OCCUPANCY = (
 REQUEST_ADMISSION_EPHEMERAL_ACTIVE_LIMIT = (
     STARTUP_CONCURRENCY_ENVELOPE.ephemeral_active_limit
 )
-_uvicorn_connection_limit = _env_int(
-    "UVICORN_CONNECTION_LIMIT",
-    STARTUP_CONCURRENCY_ENVELOPE.uvicorn_limit_concurrency
-)
-if not 1 <= _uvicorn_connection_limit <= (
-    STARTUP_CONCURRENCY_ENVELOPE.uvicorn_limit_concurrency
-):
-    raise ValueError(
-        "UVICORN_CONNECTION_LIMIT must be positive and cannot exceed the "
-        "startup resource envelope"
+network_resource_governor = AdaptiveNetworkGovernor()
+if RESOURCE_ADMISSION_MODE == "legacy":
+    UVICORN_CONNECTION_LIMIT: int | None = _positive_env_int(
+        "UVICORN_CONNECTION_LIMIT",
+        STARTUP_CONCURRENCY_ENVELOPE.uvicorn_limit_concurrency,
     )
-UVICORN_CONNECTION_LIMIT = _uvicorn_connection_limit
-# Deliberately disable Uvicorn's request-time limit. It counts all keep-alive
-# connections and produces false 503s. The custom protocol owns accepted
-# sockets; RequestAdmissionMiddleware owns active work and waiters.
+else:
+    UVICORN_CONNECTION_LIMIT = None
+# Uvicorn request-count limiting stays disabled. The custom protocol rejects
+# only at live FD pressure and keeps the absolute header timeout.
 UVICORN_LIMIT_CONCURRENCY = None
-UVICORN_BACKLOG = STARTUP_CONCURRENCY_ENVELOPE.uvicorn_backlog
+UVICORN_BACKLOG = _positive_env_int(
+    "UVICORN_BACKLOG",
+    kernel_somaxconn() or 2048,
+)
 UVICORN_HEADER_TIMEOUT_SECONDS = max(
     0.1,
     _env_float("UVICORN_HEADER_TIMEOUT_SECONDS", 5.0),
 )
+INBOUND_CONNECTION_ADMISSION = (
+    network_resource_governor.allow_inbound_connection
+)
 UVICORN_HTTP_PROTOCOL, BOUNDED_HTTP_PROTOCOL_STATS = build_bounded_h11_protocol(
     connection_limit=UVICORN_CONNECTION_LIMIT,
     header_timeout_seconds=UVICORN_HEADER_TIMEOUT_SECONDS,
-)
-_request_admission_burst_waves = (
-    REQUEST_ADMISSION_TOTAL_LIMIT + REQUEST_ADMISSION_ACTIVE_LIMIT - 1
-) // REQUEST_ADMISSION_ACTIVE_LIMIT
-_request_admission_default_wait_timeout = max(
-    5.0,
-    2.0 * _request_admission_burst_waves,
+    connection_admission=INBOUND_CONNECTION_ADMISSION,
 )
 REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS = max(
     0.001,
     _env_float(
         "REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS",
-        _request_admission_default_wait_timeout,
+        5.0,
     ),
+)
+REQUEST_CONTROL_MEMORY_RESERVATION_BYTES = _positive_env_int(
+    "REQUEST_CONTROL_MEMORY_RESERVATION_BYTES",
+    64 * 1024,
 )
 _startup_process_memory_capacity = process_memory_governor.maximum_capacity_bytes()
 _startup_per_request_memory_limit = startup_per_request_memory_limit(
     process_memory_capacity_bytes=_startup_process_memory_capacity,
-    active_limit=REQUEST_ADMISSION_ACTIVE_LIMIT,
+    # Per-request byte safety no longer depends on a process request count.
+    active_limit=1,
 )
 _product_request_wire_body_max_bytes = _positive_env_int(
     "PRODUCT_REQUEST_MAX_BODY_BYTES",
@@ -1489,14 +1524,21 @@ REQUEST_LARGE_BODY_LIMIT = _bounded_env_int(
 )
 REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS = max(
     0.001,
-    _env_float("REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS", 1.0),
-)
-REQUEST_BODY_MEMORY_WAITER_LIMIT = max(
-    1,
-    _env_int(
-        "REQUEST_BODY_MEMORY_WAITER_LIMIT",
-        REQUEST_ADMISSION_ACTIVE_LIMIT,
+    _env_float(
+        "REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS",
+        30.0 if RESOURCE_ADMISSION_MODE == "weighted" else 1.0,
     ),
+)
+REQUEST_BODY_MEMORY_WAITER_LIMIT: int | None = (
+    None
+    if RESOURCE_ADMISSION_MODE == "weighted"
+    else max(
+        1,
+        _env_int(
+            "REQUEST_BODY_MEMORY_WAITER_LIMIT",
+            REQUEST_ADMISSION_ACTIVE_LIMIT,
+        ),
+    )
 )
 REQUEST_SMALL_BODY_LANE_THRESHOLD_BYTES = _bounded_env_int(
     "REQUEST_SMALL_BODY_LANE_THRESHOLD_BYTES",
@@ -1508,13 +1550,24 @@ REQUEST_SMALL_BODY_LANE_RESERVE_BYTES = _bounded_env_int(
     min(64 * 1024 * 1024, max(1, REQUEST_BODY_BUDGET_BYTES // 8)),
     REQUEST_BODY_BUDGET_BYTES,
 )
-UPSTREAM_POOL_SIZE = max(
-    1,
-    _env_int("UPSTREAM_POOL_SIZE", REQUEST_ADMISSION_CPU_ACTIVE_LIMIT),
+UPSTREAM_POOL_SIZE: int | None = (
+    None
+    if RESOURCE_ADMISSION_MODE == "weighted"
+    else max(
+        1,
+        _env_int("UPSTREAM_POOL_SIZE", REQUEST_ADMISSION_CPU_ACTIVE_LIMIT),
+    )
 )
-UPSTREAM_POOL_WAITER_LIMIT = max(
-    0,
-    _env_int("UPSTREAM_POOL_WAITER_LIMIT", REQUEST_ADMISSION_ACTIVE_LIMIT),
+UPSTREAM_POOL_WAITER_LIMIT: int | None = (
+    None
+    if RESOURCE_ADMISSION_MODE == "weighted"
+    else max(
+        0,
+        _env_int(
+            "UPSTREAM_POOL_WAITER_LIMIT",
+            REQUEST_ADMISSION_ACTIVE_LIMIT,
+        ),
+    )
 )
 UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS = max(
     0.001,
@@ -1526,16 +1579,31 @@ UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS = max(
 )
 
 request_admission_controller = RequestAdmissionController(
-    capacity=REQUEST_ADMISSION_ACTIVE_LIMIT,
-    waiter_limit=REQUEST_ADMISSION_WAITER_LIMIT,
+    capacity=(
+        REQUEST_ADMISSION_ACTIVE_LIMIT
+        if RESOURCE_ADMISSION_MODE == "legacy"
+        else None
+    ),
+    waiter_limit=(
+        REQUEST_ADMISSION_WAITER_LIMIT
+        if RESOURCE_ADMISSION_MODE == "legacy"
+        else None
+    ),
     wait_timeout_seconds=REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS,
+    control_memory_bytes=REQUEST_CONTROL_MEMORY_RESERVATION_BYTES,
     max_body_bytes=REQUEST_BODY_RESERVATION_MAX_BYTES,
     body_budget_bytes=REQUEST_BODY_BUDGET_BYTES,
     max_response_bytes=REQUEST_RESPONSE_RESERVATION_MAX_BYTES,
     large_body_threshold_weighted_bytes=(
         REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES
+        if RESOURCE_ADMISSION_MODE == "legacy"
+        else 0
     ),
-    large_body_limit=REQUEST_LARGE_BODY_LIMIT,
+    large_body_limit=(
+        REQUEST_LARGE_BODY_LIMIT
+        if RESOURCE_ADMISSION_MODE == "legacy"
+        else 0
+    ),
     body_memory_wait_timeout_seconds=(
         REQUEST_BODY_MEMORY_WAIT_TIMEOUT_SECONDS
     ),
@@ -2407,6 +2475,7 @@ async def lifespan(app: FastAPI):
             waiter_limit=UPSTREAM_POOL_WAITER_LIMIT,
             wait_timeout_seconds=UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS,
             pool_timeout_seconds=UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS,
+            network_governor=network_resource_governor,
         )
         await app.state.client_manager.init(default_config)
         runtime_gauges.attach_upstream_client(app.state.client_manager.snapshot)
@@ -3175,6 +3244,7 @@ class ClientManager(ClientPool):
         waiter_limit=UPSTREAM_POOL_WAITER_LIMIT,
         wait_timeout_seconds=UPSTREAM_POOL_WAIT_TIMEOUT_SECONDS,
         pool_timeout_seconds=UPSTREAM_HTTPX_POOL_TIMEOUT_SECONDS,
+        network_governor=network_resource_governor,
     ):
         super().__init__(
             pool_size=pool_size,
@@ -3186,6 +3256,7 @@ class ClientManager(ClientPool):
             begin_upstream_pool=runtime_gauges.begin_upstream_pool,
             end_upstream_pool=runtime_gauges.end_upstream_pool,
             record_upstream_wait=runtime_gauges.record_upstream_pool_wait,
+            network_governor=network_governor,
         )
 
 rate_limiter = InMemoryRateLimiter()
@@ -5217,8 +5288,7 @@ _responses_stream_default_queue_bytes = max(
     64 * 1024,
     min(
         2 * 1024 * 1024,
-        _responses_stream_transient_guard_bytes
-        // REQUEST_ADMISSION_ACTIVE_LIMIT,
+        _responses_stream_transient_guard_bytes,
     ),
 )
 RESPONSES_STREAM_QUEUE_MAX_BYTES = max(

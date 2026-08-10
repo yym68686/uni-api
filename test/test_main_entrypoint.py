@@ -6,6 +6,7 @@ import main
 
 def test_main_cli_preserves_common_uvicorn_overrides_with_safe_protocol(monkeypatch):
     captured = {}
+    monkeypatch.setattr(main._runtime, "RESOURCE_ADMISSION_MODE", "legacy")
     for name in (
         "UVICORN_CONNECTION_LIMIT",
         "UVICORN_HTTP_PROTOCOL",
@@ -40,17 +41,27 @@ def test_main_cli_preserves_common_uvicorn_overrides_with_safe_protocol(monkeypa
     assert captured["http"].__name__ == "BoundedH11Protocol"
 
 
-def test_main_cli_rejects_multiple_workers_and_unsafe_connection_override():
+def test_main_cli_rejects_multiple_workers_and_unsafe_connection_override(
+    monkeypatch,
+):
     with pytest.raises(SystemExit, match="--workers must remain 1"):
         main._run_uvicorn_cli(["--workers", "2"])
 
-    with pytest.raises(SystemExit, match="must not exceed"):
+    monkeypatch.setattr(main._runtime, "RESOURCE_ADMISSION_MODE", "legacy")
+    monkeypatch.setattr(main._runtime, "UVICORN_CONNECTION_LIMIT", 10)
+    with pytest.raises(SystemExit, match="cannot exceed"):
         main._run_uvicorn_cli(
             [
                 "--limit-concurrency",
-                str(main._runtime.UVICORN_CONNECTION_LIMIT + 1),
+                "11",
             ]
         )
+
+
+def test_main_cli_rejects_request_count_limit_in_weighted_mode(monkeypatch):
+    monkeypatch.setattr(main._runtime, "RESOURCE_ADMISSION_MODE", "weighted")
+    with pytest.raises(SystemExit, match="available only"):
+        main._run_uvicorn_cli(["--limit-concurrency", "10"])
 
 
 @pytest.mark.parametrize("argument", ["--help", "--version"])

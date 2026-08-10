@@ -21,6 +21,11 @@ from uni_api.admission.cpu import (
     cpu_phase_snapshot,
     run_cpu_phase,
 )
+from uni_api.admission.network import (
+    AdaptiveNetworkGovernor,
+    AdaptiveNetworkSnapshot,
+    NetworkResourceLease,
+)
 from uni_api.admission.observability import (
     Admission503ResponseWriteOutcome,
     LargeBodyAdmissionDecision,
@@ -33,11 +38,14 @@ __all__ = [
     "AdmissionLease",
     "Admission503ResponseWriteOutcome",
     "AdmissionRejected",
+    "AdaptiveNetworkGovernor",
+    "AdaptiveNetworkSnapshot",
     "BoundedAdmissionGate",
     "CPUPhaseLimiter",
     "LargeBodyCapacityExhausted",
     "LargeBodyAdmissionDecision",
     "LargeBodyHolderSnapshot",
+    "NetworkResourceLease",
     "ResponseBufferEvent",
     "PendingBodyReservation",
     "RequestAdmissionController",

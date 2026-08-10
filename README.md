@@ -412,37 +412,39 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: Optional switch for human-readable stdout request summary logs, default is `true`.
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
 
-### Startup resource sizing
+### Weighted resource admission
 
-The production launcher computes one immutable concurrency envelope whenever a
-new process starts. It reads cgroup v2/v1 CPU and memory, CPU affinity,
-`RLIMIT_NOFILE`, the ephemeral port range/TCP occupancy, and `somaxconn`.
-Whole-request ASGI ownership is resource-sized from retained-memory,
-file-descriptor, and upstream-port bounds; it is no longer capped by CPU while
-the request waits on an upstream or streams bytes. CPU entitlement instead
-sizes one shared token gate held only by request decode, JSON, and upstream
-response decode callbacks running in the dedicated executors. The historical
-CPU candidate remains visible and is the default upstream-pool capacity.
+Production defaults to `RESOURCE_ADMISSION_MODE=weighted`. There is no active,
+waiter, total-request, upstream-request, or accepted-connection count capacity.
+Each ASGI request instead reserves a small control-memory weight from the live
+cgroup memory governor. Request bodies, buffered responses, SSE parsers, and
+stream queues grow that ownership by their actual weighted bytes and release it
+when the corresponding object graph dies.
 
-The accepted TCP connection limit and absolute request-header timeout are
-enforced before ASGI admission. Active work, bounded waiters, request bodies,
-buffered responses, SSE parsers, and stream queues are separately accounted.
-`GET /v1/observability/runtime` exposes the detected inputs, selected bounds,
-reservations, rejections, and connection-protocol counters.
+The Uvicorn protocol keeps the absolute request-header timeout but rejects a
+newly accepted socket only when live `RLIMIT_NOFILE` headroom reaches its safety
+reserve. HTTPX uses `max_connections=None`. Before a connection attempt,
+uni-api provisionally reserves live FD and ephemeral-port headroom; after
+response headers establish or reuse a transport, the reservation returns to
+kernel accounting. HTTP/2 multiplexing therefore does not consume one local
+request slot per stream.
+
+CPU entitlement sizes one shared phase-token gate held only by request decode,
+JSON, Base64/media conversion, and upstream response decode callbacks. Waiting
+on an upstream and sending streaming bytes never hold a CPU token.
+`GET /v1/observability/runtime` exposes control-memory reservations, live FD and
+port headroom, CPU phase activity, and byte-governor state. Request and upstream
+active counts remain informational and never make admission decisions.
 
 JSON request sizing uses the same cgroup memory envelope instead of a fixed
 256 MiB materialization estimate. The default product wire contract is 128
-MiB on a sufficiently sized runtime. Startup budgets for the five-times raw
-JSON materialization estimate plus one wire-size unit of headroom, caps one
-large request at 25% of effective process memory, and starts with one separate
-large-body slot. Operators may raise it to two only when the detected memory
-envelope can contain both. Smaller requests keep the normal high-concurrency
-lane. The runtime observability endpoint exposes the effective
-wire, JSON estimate, weighted reservation, large-body threshold, limit, and
-active count. `REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES` is measured in
-weighted retained-memory bytes, not raw wire bytes.
+MiB on a sufficiently sized runtime. Weighted mode has no separate large-body
+request count; per-request byte ceilings plus the shared parent governor bound
+large bodies by actual retained memory. The legacy threshold/slot diagnostics
+remain available only in `RESOURCE_ADMISSION_MODE=legacy`.
 
-Large-body slot changes emit body-free `large_body_admission_decision` events
+In legacy mode, large-body slot changes emit body-free
+`large_body_admission_decision` events
 for claim, reject, and release. Each event carries `request_self_*` wire,
 decoded, JSON-estimator, weighted-reservation, request/trace/lease facts and
 `runtime_global_*` threshold, active/limit, budget, and cgroup facts. The event
@@ -458,26 +460,19 @@ counters; a joinable
 result. ASGI write completion does not claim that the remote peer consumed the
 response.
 
-Primary overrides are `REQUEST_ADMISSION_CPU_MILLICORES` (useful when a
-standalone host's default CPU weight is not meaningful),
-`REQUEST_ADMISSION_CPU_BOUND_ACTIVE` (legacy whole-request CPU sizing),
-`REQUEST_ADMISSION_ACTIVE_LIMIT`, `REQUEST_ADMISSION_WAITER_LIMIT`,
-`REQUEST_ADMISSION_TOTAL_LIMIT`, `REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`,
-`REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`,
-`MEMORY_SOFT_LIMIT_BYTES`, `MEMORY_GUARD_BYTES`, `MEMORY_GUARD_RATIO`,
+Primary weighted-mode overrides are `REQUEST_CONTROL_MEMORY_RESERVATION_BYTES`,
+`REQUEST_ADMISSION_CPU_MILLICORES` (useful when a standalone host's default CPU
+weight is not meaningful), `CPU_PHASE_TOKENS`, `MEMORY_SOFT_LIMIT_BYTES`,
+`MEMORY_GUARD_BYTES`, `MEMORY_GUARD_RATIO`, `UVICORN_BACKLOG`,
+`UVICORN_HEADER_TIMEOUT_SECONDS`,
 `PRODUCT_REQUEST_MAX_BODY_BYTES`, `REQUEST_MAX_BODY_BYTES`,
 `REQUEST_JSON_COMPLEXITY_MAX_BYTES`, `REQUEST_BODY_RESERVATION_MAX_BYTES`,
-`REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES`, `REQUEST_LARGE_BODY_LIMIT`,
-`CPU_PHASE_TOKENS`, `UPSTREAM_POOL_SIZE`, `UVICORN_CONNECTION_LIMIT`, and
-`UVICORN_HEADER_TIMEOUT_SECONDS`. Explicit limits that exceed the detected
-startup safety envelope fail startup instead of silently overcommitting. The
-formula is a resource-safety envelope, not a throughput guarantee; validate
-large CPU shapes with workload-specific load tests.
-
-Without an override, the admission wait deadline is
-`max(5 seconds, 2 seconds * ceil(total / active))`. This gives each bounded
-burst wave time to advance instead of applying the old fixed five-second
-deadline to every Pod size.
+and the byte-budget wait deadlines. `RESOURCE_ADMISSION_MODE=legacy` is an
+emergency rollback and is the only mode that honors the old
+`REQUEST_ADMISSION_*_LIMIT`, `UPSTREAM_POOL_SIZE`, and large-body count
+settings. Weighted mode deliberately ignores those request-count controls.
+The CLI `--limit-concurrency` override is likewise rejected outside legacy
+mode, so an old deployment flag cannot silently restore a request slot.
 
 When DB_TYPE is postgres, the following environment variables need to be set:
 

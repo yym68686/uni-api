@@ -66,16 +66,29 @@ def _run_uvicorn_cli(argv: list[str] | None = None) -> None:
     requested_connection_limit = parameters.get("limit_concurrency")
     connection_limit = _runtime.UVICORN_CONNECTION_LIMIT
     if requested_connection_limit is not None:
-        requested_connection_limit = int(requested_connection_limit)
-        if not 1 <= requested_connection_limit <= connection_limit:
+        if _runtime.RESOURCE_ADMISSION_MODE != "legacy":
             raise SystemExit(
-                "--limit-concurrency is treated as the accepted-connection "
-                "limit and must not exceed the startup resource envelope"
+                "--limit-concurrency is available only when "
+                "RESOURCE_ADMISSION_MODE=legacy"
+            )
+        requested_connection_limit = int(requested_connection_limit)
+        if requested_connection_limit <= 0:
+            raise SystemExit(
+                "--limit-concurrency must be positive when explicitly set"
+            )
+        if (
+            connection_limit is not None
+            and requested_connection_limit > connection_limit
+        ):
+            raise SystemExit(
+                "--limit-concurrency cannot exceed the configured legacy "
+                "connection limit"
             )
         connection_limit = requested_connection_limit
     protocol, protocol_stats = _runtime.build_bounded_h11_protocol(
         connection_limit=connection_limit,
         header_timeout_seconds=_runtime.UVICORN_HEADER_TIMEOUT_SECONDS,
+        connection_admission=_runtime.INBOUND_CONNECTION_ADMISSION,
     )
     _runtime.UVICORN_CONNECTION_LIMIT = connection_limit
     _runtime.UVICORN_HTTP_PROTOCOL = protocol

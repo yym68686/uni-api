@@ -73,12 +73,12 @@ class _BodyMemoryWaiter:
 
 
 class _FairBodyMemoryWaitQueue:
-    """Bounded two-lane, tenant-round-robin admission for memory waiters."""
+    """Two-lane, tenant-round-robin ordering for memory waiters."""
 
-    def __init__(self, limit: int) -> None:
-        if limit < 0:
+    def __init__(self, limit: int | None) -> None:
+        if limit is not None and limit < 0:
             raise ValueError("body memory waiter limit cannot be negative")
-        self.limit = int(limit)
+        self.limit = int(limit) if limit is not None else None
         self._queues: dict[bool, dict[str, deque[_BodyMemoryWaiter]]] = {
             True: {},
             False: {},
@@ -108,7 +108,7 @@ class _FairBodyMemoryWaitQueue:
     ) -> None:
         if timeout_seconds <= 0:
             raise TimeoutError
-        if self._count >= self.limit:
+        if self.limit is not None and self._count >= self.limit:
             self._queue_full += 1
             raise TimeoutError
         loop = asyncio.get_running_loop()
@@ -277,13 +277,13 @@ async def _await_owned_acquisition(
 
 
 class AdmissionLease:
-    """One active-capacity slot.
+    """One request-ownership lease.
 
-    Releasing a lease is idempotent. Cleanup runs in its own shielded task so
-    cancellation of the request task cannot strand the slot.
+    The backing gate may own a legacy count slot or a weighted control-memory
+    reservation. Releasing is idempotent and cancellation-safe.
     """
 
-    def __init__(self, gate: BoundedAdmissionGate, *, wait_ms: float) -> None:
+    def __init__(self, gate: Any, *, wait_ms: float) -> None:
         self._gate = gate
         self.wait_ms = max(0.0, wait_ms)
         self._released = False
@@ -515,11 +515,102 @@ class BoundedAdmissionGate:
         """Return an event-loop-consistent metrics snapshot without awaiting."""
 
         return {
+            "mode": "legacy_count",
             "active": self._active,
             "waiters": sum(waiter.state == "queued" for waiter in self._waiters),
             "capacity": self.capacity,
             "waiter_limit": self.waiter_limit,
             "wait_timeout_seconds": self.wait_timeout_seconds,
+            "acquired_total": self._acquired_total,
+            "cancelled_total": self._cancelled_total,
+            "rejected": dict(self._rejected),
+        }
+
+
+class MemoryResourceAdmissionGate:
+    """Own request control memory without imposing a request-count limit."""
+
+    def __init__(
+        self,
+        memory_governor: AdaptiveMemoryGovernor,
+        *,
+        control_memory_bytes: int,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
+        if control_memory_bytes <= 0:
+            raise ValueError("control_memory_bytes must be positive")
+        self._memory_governor = memory_governor
+        self.control_memory_bytes = int(control_memory_bytes)
+        self._clock = clock
+        self._active = 0
+        self._acquired_total = 0
+        self._cancelled_total = 0
+        self._rejected: Counter[str] = Counter()
+
+    def _try_acquire_nowait(self, *, started_at: float) -> AdmissionLease | None:
+        if not self._memory_governor.reserve_nowait(
+            "request_control",
+            self.control_memory_bytes,
+        ):
+            return None
+        self._active += 1
+        self._acquired_total += 1
+        return AdmissionLease(
+            self,
+            wait_ms=(self._clock() - started_at) * 1000.0,
+        )
+
+    async def begin_acquire(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> asyncio.Future[AdmissionLease]:
+        del timeout_seconds
+        started_at = self._clock()
+        lease = self._try_acquire_nowait(started_at=started_at)
+        if lease is None:
+            self._rejected["memory_hard_guard"] += 1
+            raise AdmissionRejected("memory_hard_guard")
+        resolved: asyncio.Future[AdmissionLease] = (
+            asyncio.get_running_loop().create_future()
+        )
+        resolved.set_result(lease)
+        return resolved
+
+    async def acquire(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> AdmissionLease:
+        acquisition = await self.begin_acquire(
+            timeout_seconds=timeout_seconds
+        )
+        return acquisition.result()
+
+    async def try_acquire(self) -> AdmissionLease | None:
+        return self._try_acquire_nowait(started_at=self._clock())
+
+    async def _release_slot(self) -> None:
+        if self._active <= 0:
+            raise RuntimeError("resource admission active count underflow")
+        self._active -= 1
+        self._memory_governor.release(
+            "request_control",
+            self.control_memory_bytes,
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "mode": "weighted_resources",
+            "active": self._active,
+            "waiters": 0,
+            "capacity": None,
+            "waiter_limit": None,
+            "wait_timeout_seconds": None,
+            "control_memory_bytes_per_request": self.control_memory_bytes,
+            "control_memory_reserved_bytes": (
+                self._active * self.control_memory_bytes
+            ),
             "acquired_total": self._acquired_total,
             "cancelled_total": self._cancelled_total,
             "rejected": dict(self._rejected),
@@ -1044,14 +1135,15 @@ class MemoryReleaseDeferral:
 
 
 class RequestAdmissionController:
-    """Bound active requests and all in-memory request-body reservations."""
+    """Own request control memory and all retained request bytes."""
 
     def __init__(
         self,
         *,
-        capacity: int,
-        waiter_limit: int,
+        capacity: int | None,
+        waiter_limit: int | None,
         wait_timeout_seconds: float,
+        control_memory_bytes: int = 0,
         max_body_bytes: int,
         body_budget_bytes: int,
         max_response_bytes: int | None = None,
@@ -1059,7 +1151,7 @@ class RequestAdmissionController:
         large_body_threshold_weighted_bytes: int = 0,
         large_body_limit: int = 0,
         body_memory_wait_timeout_seconds: float = 0.0,
-        body_memory_waiter_limit: int = 0,
+        body_memory_waiter_limit: int | None = 0,
         small_body_lane_threshold_bytes: int = 256 * 1024,
         small_body_lane_reserve_bytes: int = 0,
         memory_governor: AdaptiveMemoryGovernor | None = None,
@@ -1080,7 +1172,10 @@ class RequestAdmissionController:
             raise ValueError("max_response_bytes cannot be negative")
         if large_body_threshold_weighted_bytes < 0 or large_body_limit < 0:
             raise ValueError("large body admission settings cannot be negative")
-        if body_memory_wait_timeout_seconds < 0 or body_memory_waiter_limit < 0:
+        if body_memory_wait_timeout_seconds < 0 or (
+            body_memory_waiter_limit is not None
+            and body_memory_waiter_limit < 0
+        ):
             raise ValueError("body memory wait settings cannot be negative")
         if small_body_lane_threshold_bytes < 0 or small_body_lane_reserve_bytes < 0:
             raise ValueError("small body lane settings cannot be negative")
@@ -1112,7 +1207,11 @@ class RequestAdmissionController:
         self.body_memory_wait_timeout_seconds = float(
             body_memory_wait_timeout_seconds
         )
-        self.body_memory_waiter_limit = int(body_memory_waiter_limit)
+        self.body_memory_waiter_limit = (
+            int(body_memory_waiter_limit)
+            if body_memory_waiter_limit is not None
+            else None
+        )
         self.small_body_lane_threshold_bytes = int(
             small_body_lane_threshold_bytes
         )
@@ -1152,12 +1251,27 @@ class RequestAdmissionController:
         self._response_event_observer_enqueue_failures = 0
         self._response_rejected_by_branch: Counter[str] = Counter()
         self._response_rejection_timestamps: deque[float] = deque()
-        self._active_gate = BoundedAdmissionGate(
-            capacity,
-            waiter_limit=waiter_limit,
-            wait_timeout_seconds=wait_timeout_seconds,
-            clock=clock,
-        )
+        if capacity is None:
+            if memory_governor is None:
+                raise ValueError(
+                    "weighted request admission requires a memory governor"
+                )
+            self._active_gate = MemoryResourceAdmissionGate(
+                memory_governor,
+                control_memory_bytes=control_memory_bytes,
+                clock=clock,
+            )
+        else:
+            if waiter_limit is None:
+                raise ValueError(
+                    "legacy request admission requires a waiter limit"
+                )
+            self._active_gate = BoundedAdmissionGate(
+                capacity,
+                waiter_limit=waiter_limit,
+                wait_timeout_seconds=wait_timeout_seconds,
+                clock=clock,
+            )
         self._body_lock = asyncio.Lock()
         self._reserved_body_bytes = 0
         self._pending_body_reserved_bytes = 0
@@ -1499,7 +1613,7 @@ class RequestAdmissionController:
                 self._publish_decision_events(decision_events)
 
             remaining = deadline - loop.time()
-            if remaining <= 0 or self.body_memory_waiter_limit <= 0:
+            if remaining <= 0 or self.body_memory_waiter_limit == 0:
                 await self._raise_body_wait_rejection(
                     owner,
                     additional,

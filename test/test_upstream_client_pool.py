@@ -680,20 +680,79 @@ def test_httpx_pool_timeout_is_explicit_and_not_the_connection_count(monkeypatch
     asyncio.run(run())
 
 
-def test_default_pool_size_is_startup_resource_derived(monkeypatch):
+def test_resource_mode_disables_httpx_max_connections(monkeypatch):
+    created = []
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created.append(self)
+
+        async def aclose(self):
+            return None
+
     monkeypatch.setattr(
-        "uni_api.upstream.client_pool.cgroup_cpu_quota_millicores",
-        lambda: 1000,
+        "uni_api.upstream.client_pool.httpx.AsyncClient",
+        FakeAsyncClient,
     )
-    monkeypatch.setattr(
-        "uni_api.upstream.client_pool.cgroup_cpu_weight",
-        lambda: 100,
-    )
-    monkeypatch.setattr(
-        "uni_api.upstream.client_pool.process_cpu_affinity_count",
-        lambda: 2,
-    )
-    assert ClientPool().pool_size == 137
+
+    async def run():
+        pool = ClientPool()
+        await pool.init({"headers": {}})
+        await _borrow(pool)
+
+        assert created[0].kwargs["limits"].max_connections is None
+        assert pool.snapshot()["admission"]["capacity_per_key"] is None
+        await pool.close()
+
+    asyncio.run(run())
+
+
+def test_default_pool_has_no_request_count_capacity():
+    pool = ClientPool()
+
+    assert pool.pool_size is None
+    assert pool.waiter_limit is None
+    assert pool.resource_mode is True
+
+
+def test_resource_mode_does_not_serialize_upstream_requests():
+    async def run():
+        entered = 0
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(_request):
+            nonlocal entered
+            entered += 1
+            if entered == 128:
+                all_entered.set()
+            await release.wait()
+            return httpx.Response(200, content=b"ok")
+
+        pool = ClientPool()
+        await pool.init({"transport": httpx.MockTransport(handler)})
+        client = await _borrow(pool)
+        requests = [
+            asyncio.create_task(
+                client.get(f"https://upstream.example/{index}")
+            )
+            for index in range(128)
+        ]
+        await asyncio.wait_for(all_entered.wait(), timeout=2)
+
+        snapshot = pool.snapshot()
+        assert snapshot["admission"]["mode"] == "weighted_resources"
+        assert snapshot["admission"]["capacity_per_key"] is None
+        assert snapshot["admission"]["active"] == 128
+
+        release.set()
+        responses = await asyncio.gather(*requests)
+        assert all(response.status_code == 200 for response in responses)
+        assert pool.snapshot()["admission"]["active"] == 0
+        await pool.close()
+
+    asyncio.run(run())
 
 
 def test_close_racing_an_active_request_and_waiter_rejects_without_leaking():

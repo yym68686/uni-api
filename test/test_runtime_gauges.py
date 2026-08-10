@@ -18,10 +18,13 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
     gauges.inflight_requests = 99
     gauges.attach_request_admission(
         lambda: {
+            "mode": "weighted_resources",
             "active": 7,
             "waiters": 11,
-            "capacity": 256,
-            "waiter_limit": 1024,
+            "capacity": None,
+            "waiter_limit": None,
+            "control_memory_bytes_per_request": 65536,
+            "control_memory_reserved_bytes": 458752,
             "reserved_body_bytes": 1234,
             "reserved_response_bytes": 4321,
             "reserved_retained_bytes": 5555,
@@ -76,6 +79,11 @@ def test_runtime_snapshot_uses_authoritative_admission_and_cached_network_state(
     assert snapshot["inflight_requests"] == 7
     assert snapshot["request_active"] == 7
     assert snapshot["request_waiters"] == 11
+    assert snapshot["request_capacity"] is None
+    assert snapshot["request_waiter_limit"] is None
+    assert snapshot["request_admission_mode"] == "weighted_resources"
+    assert snapshot["request_control_memory_bytes_per_request"] == 65536
+    assert snapshot["request_control_memory_reserved_bytes"] == 458752
     assert snapshot["cpu_phase_capacity"] == 2
     assert snapshot["cpu_phase_active"] == 1
     assert snapshot["cpu_phase_waiters"] == 3

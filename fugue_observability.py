@@ -1651,6 +1651,12 @@ def build_uni_api_ember_request_telemetry(
     request_body_complexity_attrs = _request_body_complexity_attrs(
         current_info
     )
+    runtime_snapshot = runtime_metrics if isinstance(runtime_metrics, dict) else {}
+    outbound_network_resources = runtime_snapshot.get(
+        "outbound_network_resources"
+    )
+    if not isinstance(outbound_network_resources, dict):
+        outbound_network_resources = {}
 
     base = _base_attrs(
         service_name=service_name,
@@ -1823,8 +1829,14 @@ def build_uni_api_ember_request_telemetry(
                     "event_loop_lag_ms": _int_text(_runtime_int(runtime_metrics, "event_loop_lag_ms")),
                     "inflight_requests": _int_text(_runtime_int(runtime_metrics, "inflight_requests")),
                     "request_waiters": _int_text(_runtime_int(runtime_metrics, "request_waiters")),
-                    "request_capacity": _int_text(
-                        _runtime_int(runtime_metrics, "request_capacity")
+                    "request_admission_mode": _safe_text(
+                        runtime_snapshot.get("request_admission_mode")
+                    ),
+                    "request_control_memory_reserved_bytes": _int_text(
+                        _runtime_int(
+                            runtime_metrics,
+                            "request_control_memory_reserved_bytes",
+                        )
                     ),
                     "cpu_phase_capacity": _int_text(
                         _runtime_int(runtime_metrics, "cpu_phase_capacity")
@@ -1962,6 +1974,20 @@ def build_uni_api_ember_request_telemetry(
                     ),
                     "upstream_pool_waiters": _int_text(
                         _runtime_int(runtime_metrics, "upstream_pool_waiters")
+                    ),
+                    "outbound_fd_headroom": _int_text(
+                        _safe_int(
+                            outbound_network_resources.get("fd_headroom"),
+                            0,
+                        )
+                    ),
+                    "outbound_ephemeral_port_headroom": _int_text(
+                        _safe_int(
+                            outbound_network_resources.get(
+                                "ephemeral_port_headroom"
+                            ),
+                            0,
+                        )
                     ),
                     "stream_queue_bytes": _int_text(
                         _runtime_int(runtime_metrics, "stream_queue_bytes")
@@ -2293,6 +2319,18 @@ def build_uni_api_ember_request_telemetry(
             "uniapi_ember_client_pool_in_use": _runtime_int(runtime_metrics, "upstream_pool_in_use"),
             "uniapi_ember_client_pool_waiters": _runtime_int(
                 runtime_metrics, "upstream_pool_waiters"
+            ),
+            "uniapi_ember_request_control_memory_reserved_bytes": _runtime_int(
+                runtime_metrics,
+                "request_control_memory_reserved_bytes",
+            ),
+            "uniapi_ember_outbound_fd_headroom": _safe_int(
+                outbound_network_resources.get("fd_headroom"),
+                0,
+            ),
+            "uniapi_ember_outbound_ephemeral_port_headroom": _safe_int(
+                outbound_network_resources.get("ephemeral_port_headroom"),
+                0,
             ),
             "uniapi_ember_client_pool_wait_ms": _span_ms(spans, "upstream_pool_wait_ms"),
             "uniapi_ember_stream_queue_bytes": _runtime_int(
@@ -3291,6 +3329,9 @@ def _request_metric_events(
         "uniapi_ember_request_waiters",
         "uniapi_ember_cpu_phase_active",
         "uniapi_ember_cpu_phase_waiters",
+        "uniapi_ember_request_control_memory_reserved_bytes",
+        "uniapi_ember_outbound_fd_headroom",
+        "uniapi_ember_outbound_ephemeral_port_headroom",
         "uniapi_ember_request_large_body_active",
         "uniapi_ember_runtime_global_large_body_active",
         "uniapi_ember_request_body_reserved_weighted_bytes",

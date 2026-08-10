@@ -949,7 +949,8 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
         },
         runtime_metrics={
             "inflight_requests": 12,
-            "request_capacity": 812,
+            "request_admission_mode": "weighted_resources",
+            "request_control_memory_reserved_bytes": 786432,
             "cpu_phase_capacity": 1,
             "cpu_phase_active": 1,
             "cpu_phase_waiters": 3,
@@ -970,6 +971,10 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
             "waiting_first_byte": 4,
             "event_loop_lag_ms": 2,
             "upstream_pool_in_use": 3,
+            "outbound_network_resources": {
+                "fd_headroom": 900000,
+                "ephemeral_port_headroom": 11000,
+            },
             "stream_parser_reserved_bytes": 2048,
             "stream_parser_rejected_total": 1,
         },
@@ -1014,6 +1019,10 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert summary["downstream_terminal_seen"] == "false"
     assert summary["usage_seen"] == "false"
     assert summary["diagnosis"] == "responses_partial_event_abort"
+    assert summary["request_admission_mode"] == "weighted_resources"
+    assert summary["request_control_memory_reserved_bytes"] == "786432"
+    assert summary["outbound_fd_headroom"] == "900000"
+    assert summary["outbound_ephemeral_port_headroom"] == "11000"
     assert summary["failure_stage"] == "postcommit"
     assert summary["oaix_connection_id"] == "oaixc-observe-1"
     attempt_event = next(event for event in telemetry["logs"] if event["event"] == "upstream_attempt")
@@ -1084,6 +1093,13 @@ def test_uni_api_ember_telemetry_redacts_secrets_and_body():
     assert metrics["uniapi_ember_attempt_total"]["value"] == 2
     assert metrics["uniapi_ember_cpu_phase_active"]["value"] == 1
     assert metrics["uniapi_ember_cpu_phase_waiters"]["value"] == 3
+    assert metrics[
+        "uniapi_ember_request_control_memory_reserved_bytes"
+    ]["value"] == 786432
+    assert metrics["uniapi_ember_outbound_fd_headroom"]["value"] == 900000
+    assert metrics[
+        "uniapi_ember_outbound_ephemeral_port_headroom"
+    ]["value"] == 11000
     assert metrics["uniapi_ember_retry_decision_total"]["value"] == 1
     assert metrics["uniapi_ember_retry_transition_total"]["value"] == 1
     assert metrics["uniapi_ember_retry_total"]["value"] == 1

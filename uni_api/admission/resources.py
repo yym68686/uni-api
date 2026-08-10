@@ -823,25 +823,37 @@ def calculate_startup_concurrency(
 def startup_concurrency_from_environment(
     *,
     memory_available_bytes: int | None,
+    honor_request_count_overrides: bool = True,
 ) -> StartupConcurrencyEnvelope:
     configured_cpu = _optional_positive_int_environment(
         "REQUEST_ADMISSION_CPU_MILLICORES"
     )
-    requested_active = _optional_positive_int_environment(
-        "REQUEST_ADMISSION_ACTIVE_LIMIT"
+    requested_active = (
+        _optional_positive_int_environment("REQUEST_ADMISSION_ACTIVE_LIMIT")
+        if honor_request_count_overrides
+        else None
     )
-    requested_waiters = _nonnegative_int_environment(
-        "REQUEST_ADMISSION_WAITER_LIMIT"
+    requested_waiters = (
+        _nonnegative_int_environment("REQUEST_ADMISSION_WAITER_LIMIT")
+        if honor_request_count_overrides
+        else None
     )
-    requested_total = _optional_positive_int_environment(
-        "REQUEST_ADMISSION_TOTAL_LIMIT"
+    requested_total = (
+        _optional_positive_int_environment("REQUEST_ADMISSION_TOTAL_LIMIT")
+        if honor_request_count_overrides
+        else None
     )
-    explicit_max = _optional_positive_int_environment(
-        "REQUEST_ADMISSION_MAX_ACTIVE_LIMIT"
+    explicit_max = (
+        _optional_positive_int_environment(
+            "REQUEST_ADMISSION_MAX_ACTIVE_LIMIT"
+        )
+        if honor_request_count_overrides
+        else None
     )
-    cpu_bound_active = _bool_environment(
-        "REQUEST_ADMISSION_CPU_BOUND_ACTIVE",
-        False,
+    cpu_bound_active = (
+        _bool_environment("REQUEST_ADMISSION_CPU_BOUND_ACTIVE", False)
+        if honor_request_count_overrides
+        else False
     )
     base_active = _positive_int_environment(
         "REQUEST_ADMISSION_BASE_ACTIVE_LIMIT",

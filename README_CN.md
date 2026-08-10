@@ -414,32 +414,30 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: 可选人类可读 stdout 请求摘要日志开关，默认 `true`。
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: 可选人类可读 stdout 请求摘要日志采样率，默认 `1.0`。高并发压测时可以调低或关闭。
 
-### 启动时资源定容
+### 加权资源接入
 
-生产入口会在每个新进程启动时计算一次不可变的并发包络。计算会读取 cgroup
-v2/v1 CPU 与内存、CPU affinity、`RLIMIT_NOFILE`、临时端口范围与当前 TCP
-占用以及 `somaxconn`。完整 ASGI 请求的所有权包络默认只由保留内存、文件描述符
-和上游端口预算定容，不再因为请求等待上游或持续传输流式字节而长期占用 CPU
-派生槽位。CPU entitlement 改为控制三组专用 executor 共享的阶段 token，仅在
-request decode、JSON 和 upstream response decode 回调实际执行期间持有。历史
-CPU 候选值仍进入观测，并作为默认上游连接池容量。
+生产默认使用 `RESOURCE_ADMISSION_MODE=weighted`。完整请求、waiter、上游请求和
+accepted connection 都不再设置数量容量。每个 ASGI 请求只向实时 cgroup 内存
+governor 申请少量 control-memory 字节；request body、buffered response、SSE
+parser 和 stream queue 再按实际加权字节增加和释放所有权。
 
-TCP accepted connection 硬上限与绝对请求头超时在进入 ASGI admission 前执行。
-active、有限 waiter、request body、buffered response、SSE parser 和 stream
-queue 分别记账。`GET /v1/observability/runtime` 会暴露探测输入、最终边界、
-reservation、rejection 与连接协议计数。
+Uvicorn 继续执行绝对请求头超时，但只有实时 `RLIMIT_NOFILE` headroom 到达安全
+reserve 时才关闭新 socket。HTTPX 使用 `max_connections=None`。每次可能建立连接
+前临时申请实时 FD/临时端口 headroom；响应头确认连接已建立或复用后，临时预留立即
+交还内核计数。HTTP/2 多路复用因此不会按请求占用本地槽位。
+
+CPU entitlement 只控制 request decode、JSON、Base64/媒体转换和 upstream
+response decode 的共享阶段 token。等待上游和发送流式字节不持有 CPU token。
+`GET /v1/observability/runtime` 会暴露 control-memory、实时 FD/端口 headroom、
+CPU 阶段和各字节 governor；request/upstream active 仅用于观测，不参与接入决策。
 
 JSON 请求大小使用同一套 cgroup 内存包络，不再采用固定的 256 MiB
 物化估算上限。在资源足够的 runtime 上，默认产品 wire 契约为 128 MiB。启动时
-按“原始 JSON 的五倍物化估算 + 一份 wire 大小余量”计算预算，单个大请求最多使用
-有效进程内存的 25%，并默认只启用 1 个独立的大请求槽位；只有探测到的内存包络能
-同时容纳两个大请求时，运维人员才可显式提高到 2。小请求继续使用原有的高并发通道。
-运行时观测端点会暴露实际 wire 上限、JSON 估算上限、加权
-reservation、大请求阈值、槽位数和当前占用。
-`REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES` 的单位是加权保留内存字节，
-不是原始 wire body 字节。
+按“原始 JSON 的五倍物化估算 + 一份 wire 大小余量”计算预算。weighted 模式不再
+设置大请求数量槽位，而是由单请求字节上限和共享父 governor 按实际保留内存约束。
+旧的大请求阈值/槽位只在 `RESOURCE_ADMISSION_MODE=legacy` 回滚模式启用。
 
-大请求槽位的 claim、reject、release 会输出不含 body 的
+legacy 模式下，大请求槽位的 claim、reject、release 会输出不含 body 的
 `large_body_admission_decision` 事件。事件用 `request_self_*` 保存当前请求的
 wire、decoded、JSON estimator 分项、加权 reservation 与 request/trace/lease
 事实，用 `runtime_global_*` 保存阈值、active/limit、预算与 cgroup 事实。事件同时保存
@@ -451,23 +449,17 @@ age 字段明确表达这一边界，而不是把缓存值冒充成内核原子�
 `admission_503_response_write_outcome` 事件记录单次写回结果。ASGI write completed
 仅表示发送调用完成，不代表远端调用方已经消费响应。
 
-主要覆盖项包括：`REQUEST_ADMISSION_CPU_MILLICORES`（适合 CPU weight
-没有平台含义的独立服务器）、`REQUEST_ADMISSION_CPU_BOUND_ACTIVE`（恢复旧的
-完整请求 CPU 定容）、`CPU_PHASE_TOKENS`、`REQUEST_ADMISSION_ACTIVE_LIMIT`、
-`REQUEST_ADMISSION_WAITER_LIMIT`、`REQUEST_ADMISSION_TOTAL_LIMIT`、
-`REQUEST_ADMISSION_MAX_ACTIVE_LIMIT`、`MEMORY_SOFT_LIMIT_BYTES`、
-`REQUEST_ADMISSION_WAIT_TIMEOUT_SECONDS`、
-`MEMORY_GUARD_BYTES`、`MEMORY_GUARD_RATIO`、`UPSTREAM_POOL_SIZE`、
+weighted 模式主要覆盖项包括：`REQUEST_CONTROL_MEMORY_RESERVATION_BYTES`、
+`REQUEST_ADMISSION_CPU_MILLICORES`（适合 CPU weight 没有平台含义的独立服务器）、
+`CPU_PHASE_TOKENS`、`MEMORY_SOFT_LIMIT_BYTES`、`MEMORY_GUARD_BYTES`、
+`MEMORY_GUARD_RATIO`、`UVICORN_BACKLOG`、`UVICORN_HEADER_TIMEOUT_SECONDS`、
 `PRODUCT_REQUEST_MAX_BODY_BYTES`、`REQUEST_MAX_BODY_BYTES`、
-`REQUEST_JSON_COMPLEXITY_MAX_BYTES`、`REQUEST_BODY_RESERVATION_MAX_BYTES`、
-`REQUEST_LARGE_BODY_THRESHOLD_WEIGHTED_BYTES`、`REQUEST_LARGE_BODY_LIMIT`、
-`UVICORN_CONNECTION_LIMIT` 和 `UVICORN_HEADER_TIMEOUT_SECONDS`。显式配置若超过
-启动时安全包络会直接阻止启动，不会静默超配。该公式是资源安全上界，不是吞吐量承诺；
-大 CPU 规格仍必须使用真实业务负载压测。
-
-未显式覆盖时，admission waiter deadline 为
-`max(5 秒, 2 秒 * ceil(total / active))`。它会给有限突发队列中的每个处理波次
-留出推进时间，不再对所有 Pod 规格一律使用原来的 5 秒。
+`REQUEST_JSON_COMPLEXITY_MAX_BYTES`、`REQUEST_BODY_RESERVATION_MAX_BYTES` 和各字节
+预算等待 deadline。`RESOURCE_ADMISSION_MODE=legacy` 只用于紧急回滚，并且只有该
+模式会读取旧的 `REQUEST_ADMISSION_*_LIMIT`、`UPSTREAM_POOL_SIZE` 和大请求数量设置；
+weighted 模式会明确忽略这些请求数量控制。
+CLI 的 `--limit-concurrency` 在非 legacy 模式也会被拒绝，避免旧部署参数静默恢复
+请求槽位。
 
 当 DB_TYPE 为 postgres 时，需要设置以下环境变量：
 
