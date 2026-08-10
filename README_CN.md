@@ -413,6 +413,7 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED、FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED、FUGUE_OBSERVABILITY_METRICS_ENABLED: 可选开关，用于控制 Fugue 请求摘要、spans 和 metrics。观测导出失败只会丢弃观测数据，不影响业务请求。
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: 可选人类可读 stdout 请求摘要日志开关，默认 `true`。
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: 可选人类可读 stdout 请求摘要日志采样率，默认 `1.0`。高并发压测时可以调低或关闭。
+- UNI_API_RUST_RESPONSES_DATA_PLANE: 是否为流式 `/v1/responses` 启用 Rust 的 socket→SSE→下游数据路径，默认 `true`。设为 `false` 并重启进程即可在不更换镜像的情况下立即回退到 Python 数据路径。
 
 ### 加权资源接入
 
@@ -426,6 +427,9 @@ reserve 时才关闭新 socket。HTTPX 使用 `max_connections=None`。每次可
 前临时申请实时 FD/临时端口 headroom；响应头确认连接已建立或复用后，临时预留会在
 下一次短缓存采样后交还内核计数。采样窗口内继续保守计费，避免每个请求扫描 procfs。
 HTTP/2 多路复用因此不会按请求占用本地槽位。
+
+公网 Rust 前端沿用同一套无数量槽位策略：采样实时 cgroup 内存、`RLIMIT_NOFILE`
+和临时端口占用，仅在安全 reserve 耗尽时拒绝接入，不引入固定请求槽数量。
 
 CPU entitlement 只控制 request decode、JSON、Base64/媒体转换和 upstream
 response decode 的共享阶段 token。等待上游和发送流式字节不持有 CPU token。

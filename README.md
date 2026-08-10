@@ -411,6 +411,7 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED, FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED, FUGUE_OBSERVABILITY_METRICS_ENABLED: Optional switches for Fugue request summaries, spans, and metrics. Export failure only drops observability data and does not fail business requests.
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: Optional switch for human-readable stdout request summary logs, default is `true`.
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
+- UNI_API_RUST_RESPONSES_DATA_PLANE: Enables the Rust socket-to-SSE-to-downstream path for streaming `/v1/responses`, default is `true`. Set it to `false` for an immediate process-restart fallback to the Python data path without changing the image.
 
 ### Weighted resource admission
 
@@ -429,6 +430,11 @@ response headers establish or reuse a transport, the reservation returns to
 kernel accounting after the next short cached sample. Completed attempts stay
 pessimistically charged inside that window, avoiding a procfs scan per request.
 HTTP/2 multiplexing therefore does not consume one local request slot per stream.
+
+The public Rust frontend applies the same count-free policy: it samples live
+cgroup memory, `RLIMIT_NOFILE`, and ephemeral-port occupancy and rejects only
+when the configured resource reserve is exhausted. It does not introduce a
+fixed request-slot count.
 
 CPU entitlement sizes one shared phase-token gate held only by request decode,
 JSON, Base64/media conversion, and upstream response decode callbacks. Waiting

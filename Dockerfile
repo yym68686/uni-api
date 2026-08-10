@@ -8,6 +8,7 @@ COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 WORKDIR /build
 COPY rust/uni-api-native/Cargo.toml rust/uni-api-native/Cargo.lock ./
+COPY rust/uni-api-native/.cargo ./.cargo
 COPY rust/uni-api-native/src ./src
 RUN cargo build --release --locked
 
@@ -26,4 +27,5 @@ WORKDIR /home
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY . .
 COPY --from=native-builder /build/target/release/lib_uni_api_native.so /home/uni_api/_uni_api_native.so
-ENTRYPOINT ["python", "main.py"]
+COPY --from=native-builder /build/target/release/uni-api-front /usr/local/bin/uni-api-front
+ENTRYPOINT ["/usr/local/bin/uni-api-front"]

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import uuid
 import functools
 from dataclasses import dataclass, field
@@ -258,6 +259,11 @@ from uni_api.streaming.usage import (
     stream_usage_snapshot_from_payload,
 )
 from uni_api.server import build_bounded_h11_protocol
+from uni_api.rust_responses_control import (
+    RustResponsesControlError,
+    RustResponsesControlPlane,
+    RustResponsesResolvedOutcome,
+)
 from uni_api.upstream.client_pool import ClientPool
 from uni_api.upstream.response_limits import (
     UPSTREAM_RESPONSE_CPU_WORKERS,
@@ -388,6 +394,17 @@ def _log_stdout_request_summary(provider: str, model: str, engine: str, role: st
 
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
+RUST_RESPONSES_CONTROL_HEADER = "x-uni-api-rust-control-token"
+RUST_RESPONSES_SESSION_HEADER = "x-uni-api-rust-responses-session"
+RUST_RESPONSES_INTERNAL_PREFIX = "/_internal/rust-responses"
+RUST_RESPONSES_CONTROL_TOKEN = os.getenv(
+    "UNI_API_RUST_CONTROL_TOKEN",
+    "",
+).strip()
+RUST_RESPONSES_DATA_PLANE_ENABLED = bool(
+    RUST_RESPONSES_CONTROL_TOKEN
+    and _env_bool("UNI_API_RUST_RESPONSES_DATA_PLANE", True)
+)
 # Responses data-only events gain this bounded header during normalization.
 # Define the resulting event limit before middleware construction so its
 # downstream usage observer accepts exactly the frames this proxy can emit.
@@ -2136,10 +2153,34 @@ except Exception:
 logger.info("VERSION: %s", VERSION)
 
 PUBLIC_HEALTH_PATHS = {"/healthz"}
+rust_responses_control_plane = RustResponsesControlPlane()
 
 
 def _is_public_health_request(request: Request) -> bool:
     return request.method in {"GET", "HEAD"} and request.url.path in PUBLIC_HEALTH_PATHS
+
+
+def _has_valid_rust_control_token(request: Request) -> bool:
+    if not RUST_RESPONSES_CONTROL_TOKEN:
+        return False
+    supplied = str(request.headers.get(RUST_RESPONSES_CONTROL_HEADER) or "")
+    return bool(supplied) and secrets.compare_digest(
+        supplied,
+        RUST_RESPONSES_CONTROL_TOKEN,
+    )
+
+
+def _is_internal_rust_control_request(request: Request) -> bool:
+    return bool(
+        request.url.path.startswith(RUST_RESPONSES_INTERNAL_PREFIX)
+        and _has_valid_rust_control_token(request)
+    )
+
+
+def _is_middleware_bypass_request(request: Request) -> bool:
+    return _is_public_health_request(request) or _is_internal_rust_control_request(
+        request
+    )
 
 
 async def create_tables():
@@ -2930,7 +2971,7 @@ app.add_middleware(
         parse_request_body=parse_request_body,
         message_role_summary=_message_role_summary,
         messages_request_last_text=_messages_request_last_text,
-        is_public_health_request=_is_public_health_request,
+        is_public_health_request=_is_middleware_bypass_request,
         is_video_or_asset_request_path=lambda path: _is_video_or_asset_request_path(path),
         lingjing_request_model_for_openapi=lambda payload, query_params=None: _lingjing_request_model_for_openapi(payload, query_params),
         video_prompt_from_body=lambda request_body: _video_prompt_from_body(request_body),
@@ -2958,7 +2999,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
-    if _is_public_health_request(request):
+    if _is_middleware_bypass_request(request):
         return await call_next(request)
     if not hasattr(app.state, "global_rate_limit"):
         app.state.global_rate_limit = parse_rate_limit(
@@ -3020,10 +3061,22 @@ app.add_middleware(
 
 
 def _bypass_request_admission(scope: dict[str, Any]) -> bool:
+    path = str(scope.get("path") or "")
+    if path.startswith(RUST_RESPONSES_INTERNAL_PREFIX):
+        headers = {
+            name.decode("latin-1").lower(): value.decode("latin-1")
+            for name, value in (scope.get("headers") or [])
+        }
+        supplied = headers.get(RUST_RESPONSES_CONTROL_HEADER, "")
+        if (
+            RUST_RESPONSES_CONTROL_TOKEN
+            and supplied
+            and secrets.compare_digest(supplied, RUST_RESPONSES_CONTROL_TOKEN)
+        ):
+            return True
     return (
         str(scope.get("method") or "").upper() in {"GET", "HEAD"}
-        and str(scope.get("path") or "")
-        in {*PUBLIC_HEALTH_PATHS, "/v1/observability/runtime"}
+        and path in {*PUBLIC_HEALTH_PATHS, "/v1/observability/runtime"}
     )
 
 
@@ -3217,6 +3270,87 @@ app.add_middleware(
     on_early_response=_observe_early_body_response,
     on_rejection_response_write=_observe_request_admission_response_write,
 )
+
+
+def _require_rust_control_request(request: Request) -> None:
+    if not _is_internal_rust_control_request(request):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.get(
+    f"{RUST_RESPONSES_INTERNAL_PREFIX}/{{session_id}}/plan",
+    include_in_schema=False,
+)
+async def rust_responses_plan(request: Request, session_id: str):
+    _require_rust_control_request(request)
+    try:
+        session = rust_responses_control_plane.get(session_id)
+        return JSONResponse(content=await session.next_message())
+    except RustResponsesControlError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post(
+    f"{RUST_RESPONSES_INTERNAL_PREFIX}/{{session_id}}/advance",
+    include_in_schema=False,
+)
+async def rust_responses_advance(
+    request: Request,
+    session_id: str,
+    outcome: dict[str, Any] = Body(...),
+):
+    _require_rust_control_request(request)
+    try:
+        session = rust_responses_control_plane.get(session_id)
+        message = await session.advance(
+            attempt_id=str(outcome.get("attempt_id") or ""),
+            outcome=outcome,
+        )
+        return JSONResponse(content=message)
+    except RustResponsesControlError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post(
+    f"{RUST_RESPONSES_INTERNAL_PREFIX}/{{session_id}}/commit",
+    include_in_schema=False,
+)
+async def rust_responses_commit(
+    request: Request,
+    session_id: str,
+    observation: dict[str, Any] = Body(...),
+):
+    _require_rust_control_request(request)
+    try:
+        session = rust_responses_control_plane.get(session_id)
+        message = await session.observe_commit(
+            attempt_id=str(observation.get("attempt_id") or ""),
+            observation=observation,
+        )
+        return JSONResponse(content=message)
+    except RustResponsesControlError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post(
+    f"{RUST_RESPONSES_INTERNAL_PREFIX}/{{session_id}}/complete",
+    include_in_schema=False,
+)
+async def rust_responses_complete(
+    request: Request,
+    session_id: str,
+    outcome: dict[str, Any] = Body(...),
+):
+    _require_rust_control_request(request)
+    try:
+        session = rust_responses_control_plane.get(session_id)
+        message = await session.complete(
+            attempt_id=str(outcome.get("attempt_id") or ""),
+            outcome=outcome,
+        )
+        return JSONResponse(content=message)
+    except RustResponsesControlError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -6311,6 +6445,31 @@ class ResponsesRequestHandler:
             background_tasks=background_tasks,
             endpoint=endpoint,
         )
+        if (
+            endpoint == "/v1/responses"
+            and bool(request_data.stream)
+            and RUST_RESPONSES_DATA_PLANE_ENABLED
+            and _has_valid_rust_control_token(http_request)
+            and not http_request.headers.get("idempotency-key")
+        ):
+            execution.current_info["rust_responses_data_plane"] = True
+            execution.current_info["rust_responses_control_version"] = 1
+            session = await rust_responses_control_plane.create(execution)
+
+            async def control_body() -> AsyncIterator[bytes]:
+                try:
+                    async for chunk in session.control_body():
+                        yield chunk
+                finally:
+                    await rust_responses_control_plane.release(session)
+
+            response = StarletteStreamingResponse(
+                control_body(),
+                media_type="application/octet-stream",
+                headers={RUST_RESPONSES_SESSION_HEADER: session.session_id},
+            )
+            setattr(response, "current_info", execution.current_info)
+            return response
         return await execution.run()
 
 
@@ -6532,9 +6691,9 @@ class ResponsesRequestExecution:
         if lease is not None and lease.reserved_body_bytes:
             await lease.release_body_bytes(lease.reserved_body_bytes)
 
-    async def _run_attempts(self):
+    async def _run_attempts(self, *, execute_attempt: Any = None):
         return await self.runner.run(
-            self._execute_attempt,
+            execute_attempt or self._execute_attempt,
             prepare_attempt=self._prepare_attempt,
             before_next_attempt=self._before_next_attempt,
             after_failure=self._after_failure,
@@ -7138,6 +7297,250 @@ class ResponsesRequestExecution:
             if self.request_data.stream:
                 return await self._execute_stream_attempt(client, attempt, headers, json_payload)
             return await self._execute_non_stream_attempt(client, attempt, headers, json_payload)
+
+    async def _build_rust_stream_plan(self, attempt: Any) -> dict[str, Any]:
+        """Serialize one prepared retry attempt for the loopback Rust worker."""
+
+        headers = self._build_headers(attempt)
+        attempt.state["failure_stage"] = "validation"
+        payload = self._build_payload(attempt)
+        json_payload = await run_json_cpu(
+            json.dumps,
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        payload_bytes = len(json_payload.encode("utf-8"))
+        attempt.state["payload_bytes"] = payload_bytes
+        attempt.state["failure_stage"] = "upstream"
+        attempt.state["track_channel_stats"] = True
+        self._record_upstream_attempt_start(attempt)
+        self._log_attempt(attempt, headers, payload)
+        _mark_current_info_stage(self.current_info, "upstream_send_start")
+        runtime_gauges.begin_waiting_first_byte(self.current_info)
+        attempt.state["rust_waiting_first_byte"] = True
+
+        return {
+            "kind": "plan",
+            "protocol_version": 1,
+            "session_id": str(
+                self.current_info.get("rust_responses_session_id") or ""
+            ),
+            "attempt_id": str(attempt.routing_attempt_id),
+            "url": str(attempt.state["upstream_url"]),
+            "headers": headers,
+            "body": json_payload,
+            "proxy": attempt.state.get("proxy"),
+            "engine": str(attempt.state.get("engine") or "gpt"),
+            "http1_only": attempt.state.get("engine") == "codex",
+            "commit_policy": str(
+                attempt.state.get("responses_stream_commit_policy")
+                or "real_output"
+            ),
+            "normalize_custom_tool_call_ids": bool(
+                self._custom_tool_call_id_normalization_enabled(attempt)
+            ),
+            "first_byte_timeout_seconds": attempt.state.get(
+                "first_byte_timeout"
+            ),
+            "idle_timeout_seconds": attempt.state.get("idle_timeout"),
+            "total_timeout_seconds": attempt.state.get("total_timeout"),
+            "max_event_bytes": DEFAULT_MAX_EVENT_BYTES,
+            "max_precommit_items": RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS,
+            "max_precommit_bytes": RESPONSES_STREAM_PRECOMMIT_MAX_BYTES,
+        }
+
+    def _finish_rust_first_byte_wait(self, attempt: Any) -> None:
+        if not attempt.state.pop("rust_waiting_first_byte", False):
+            return
+        runtime_gauges.end_waiting_first_byte(self.current_info)
+
+    async def _observe_rust_stream_commit(
+        self,
+        attempt: Any,
+        observation: dict[str, Any],
+    ) -> None:
+        business_committed = bool(observation.get("business_committed", True))
+        if business_committed and attempt.state.get("rust_stream_committed"):
+            return
+        attempt.state["rust_stream_response_started"] = True
+        self.current_info["rust_responses_external_committed"] = True
+        if business_committed:
+            attempt.state["rust_stream_committed"] = True
+        self._finish_rust_first_byte_wait(attempt)
+        _mark_current_info_stage(self.current_info, "upstream_headers_received")
+        _mark_first_byte_observed(self.current_info)
+        upstream_status = int(observation.get("upstream_status_code") or 200)
+        self.current_info["status_code"] = upstream_status
+        attempt.state["routing_wire_status_code"] = upstream_status
+        attempt.state["stream_upstream_status_code"] = upstream_status
+        self.current_info["rust_responses_commit_reason"] = str(
+            observation.get("commit_reason") or "stream_event"
+        )[:80]
+        self.current_info["rust_responses_precommit_events"] = max(
+            0,
+            int(observation.get("precommit_events") or 0),
+        )
+        self.current_info["rust_responses_precommit_bytes"] = max(
+            0,
+            int(observation.get("precommit_bytes") or 0),
+        )
+        if business_committed:
+            await self._release_request_retry_payload()
+
+    def _apply_rust_stream_report(self, outcome: dict[str, Any]) -> None:
+        integer_fields = {
+            "rust_responses_upstream_bytes": "upstream_bytes",
+            "rust_responses_downstream_bytes": "downstream_bytes",
+            "rust_responses_sse_events": "event_count",
+            "rust_responses_delta_events": "delta_events",
+            "rust_responses_normalized_events": "normalized_events",
+        }
+        for target, source in integer_fields.items():
+            try:
+                self.current_info[target] = max(0, int(outcome.get(source) or 0))
+            except (TypeError, ValueError):
+                self.current_info[target] = 0
+        usage = outcome.get("usage")
+        if isinstance(usage, dict):
+            snapshot = stream_usage_snapshot(usage)
+            if snapshot is not None and snapshot.parse_error is None:
+                if snapshot.prompt_tokens is not None:
+                    self.current_info["prompt_tokens"] = snapshot.prompt_tokens
+                if snapshot.completion_tokens is not None:
+                    self.current_info["completion_tokens"] = snapshot.completion_tokens
+                if snapshot.total_tokens is not None:
+                    self.current_info["total_tokens"] = snapshot.total_tokens
+                if snapshot.complete:
+                    self.current_info["usage_seen"] = True
+
+    async def _resolve_rust_stream_outcome(
+        self,
+        attempt: Any,
+        outcome: dict[str, Any],
+    ) -> Any:
+        kind = str(outcome.get("kind") or "protocol_error")
+        upstream_status = int(outcome.get("upstream_status_code") or 200)
+        attempt.state["routing_wire_status_code"] = upstream_status
+        self._apply_rust_stream_report(outcome)
+
+        if kind in {
+            "http_error",
+            "semantic_error",
+            "transport_error",
+            "protocol_error",
+        } and not bool(outcome.get("committed")):
+            self._finish_rust_first_byte_wait(attempt)
+            if kind == "semantic_error":
+                semantic = _responses_failure_http_exception(
+                    outcome.get("payload"),
+                    event_type=str(outcome.get("event_type") or "") or None,
+                    wire_status_code=upstream_status,
+                    validated_provider_sse=True,
+                )
+                if semantic is not None:
+                    raise semantic
+            status_code = int(outcome.get("status_code") or 502)
+            detail = bounded_stream_error_text(
+                outcome.get("detail")
+                or outcome.get("body")
+                or f"Rust upstream {kind}"
+            )
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        if not attempt.state.get("rust_stream_committed"):
+            await self._observe_rust_stream_commit(
+                attempt,
+                {
+                    "upstream_status_code": upstream_status,
+                    "commit_reason": kind,
+                    "precommit_events": outcome.get("precommit_events"),
+                    "precommit_bytes": outcome.get("precommit_bytes"),
+                },
+            )
+
+        if kind == "downstream_disconnected":
+            self._finalize_stream_attempt_cancelled(
+                attempt,
+                downstream_disconnected=True,
+            )
+            return Response(content="", status_code=499)
+
+        if kind in {"completed", "incomplete"}:
+            self.current_info["stream_outcome"] = kind
+            self._finalize_stream_attempt_success(attempt)
+            response = Response(content="", status_code=upstream_status)
+            setattr(
+                response,
+                "_uni_api_response_attempt_terminal_outcome",
+                "stream_completed",
+            )
+            return response
+
+        status_code = int(outcome.get("status_code") or 502)
+        event_type = str(outcome.get("event_type") or "") or None
+        error_code = str(outcome.get("error_code") or "") or None
+        failure = SSEProtocolError(
+            bounded_stream_error_text(
+                outcome.get("detail") or f"Rust post-commit {kind}"
+            )
+        )
+        terminal_bytes = b""
+        if kind == "semantic_failure":
+            semantic = _responses_failure_http_exception(
+                outcome.get("payload"),
+                event_type=event_type,
+                wire_status_code=upstream_status,
+                validated_provider_sse=True,
+            )
+            if semantic is not None:
+                status_code = int(semantic.status_code)
+                error_code = semantic.error_code
+                event_type = semantic.responses_sse_event_type
+                terminal_bytes = _encode_responses_sse_event(
+                    semantic.responses_sse_event_type,
+                    semantic.responses_sse_payload,
+                )
+                failure = SSEProtocolError(
+                    "Responses upstream emitted a failure terminal: "
+                    f"{semantic.detail_json[:1000]}"
+                )
+        self.current_info["stream_error_status_code"] = status_code
+        self.current_info["stream_error_event_type"] = event_type
+        self.current_info["stream_error_code"] = error_code
+        self.current_info["stream_outcome"] = (
+            "upstream_failure_terminal"
+            if kind == "semantic_failure"
+            else "upstream_stream_abort"
+        )
+        self.current_info["success"] = False
+        self._finalize_stream_attempt_failure(
+            attempt,
+            failure,
+            status_code=status_code,
+            error_type=(
+                "UpstreamSemanticFailure"
+                if kind == "semantic_failure"
+                else type(failure).__name__
+            ),
+            terminal_event_type=event_type,
+            error_code=error_code,
+        )
+        response = Response(
+            content=terminal_bytes,
+            status_code=status_code,
+            media_type="text/event-stream" if terminal_bytes else None,
+        )
+        return RustResponsesResolvedOutcome(
+            runner_result=response,
+            reply={
+                "terminal_b64": (
+                    base64.b64encode(terminal_bytes).decode("ascii")
+                    if terminal_bytes
+                    else ""
+                )
+            },
+        )
 
     def _build_headers(self, attempt: Any) -> dict[str, str]:
         engine = attempt.state["engine"]
