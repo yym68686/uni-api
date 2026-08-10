@@ -64,6 +64,44 @@ def test_network_governor_cancellation_does_not_leak_a_reservation():
     asyncio.run(scenario())
 
 
+def test_release_keeps_a_cached_charge_without_forcing_procfs_resampling():
+    now = 0.0
+    samples = 0
+
+    def open_fds():
+        nonlocal samples
+        samples += 1
+        return 10
+
+    governor = AdaptiveNetworkGovernor(
+        nofile_supplier=lambda: 100,
+        open_fds_supplier=open_fds,
+        ephemeral_ports_supplier=lambda: 100,
+        ephemeral_occupancy_supplier=lambda: 0,
+        fd_reserve_min=10,
+        fd_reserve_ratio=0,
+        ephemeral_port_utilization=0.8,
+        sample_cache_seconds=60,
+        clock=lambda: now,
+    )
+
+    lease = governor.try_acquire()
+    assert lease is not None
+    asyncio.run(lease.release())
+    cached = governor.snapshot()
+    assert samples == 1
+    assert cached.completed_connection_attempts_since_sample == 1
+    assert cached.fd_headroom == 79
+    assert cached.ephemeral_port_headroom == 79
+
+    now = 61
+    refreshed = governor.snapshot()
+    assert samples == 2
+    assert refreshed.completed_connection_attempts_since_sample == 0
+    assert refreshed.fd_headroom == 80
+    assert refreshed.ephemeral_port_headroom == 80
+
+
 def test_inbound_guard_uses_fd_headroom_instead_of_connection_count():
     open_fds = 90
     governor = AdaptiveNetworkGovernor(

@@ -426,8 +426,9 @@ newly accepted socket only when live `RLIMIT_NOFILE` headroom reaches its safety
 reserve. HTTPX uses `max_connections=None`. Before a connection attempt,
 uni-api provisionally reserves live FD and ephemeral-port headroom; after
 response headers establish or reuse a transport, the reservation returns to
-kernel accounting. HTTP/2 multiplexing therefore does not consume one local
-request slot per stream.
+kernel accounting after the next short cached sample. Completed attempts stay
+pessimistically charged inside that window, avoiding a procfs scan per request.
+HTTP/2 multiplexing therefore does not consume one local request slot per stream.
 
 CPU entitlement sizes one shared phase-token gate held only by request decode,
 JSON, Base64/media conversion, and upstream response decode callbacks. Waiting

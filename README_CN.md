@@ -423,8 +423,9 @@ parser 和 stream queue 再按实际加权字节增加和释放所有权。
 
 Uvicorn 继续执行绝对请求头超时，但只有实时 `RLIMIT_NOFILE` headroom 到达安全
 reserve 时才关闭新 socket。HTTPX 使用 `max_connections=None`。每次可能建立连接
-前临时申请实时 FD/临时端口 headroom；响应头确认连接已建立或复用后，临时预留立即
-交还内核计数。HTTP/2 多路复用因此不会按请求占用本地槽位。
+前临时申请实时 FD/临时端口 headroom；响应头确认连接已建立或复用后，临时预留会在
+下一次短缓存采样后交还内核计数。采样窗口内继续保守计费，避免每个请求扫描 procfs。
+HTTP/2 多路复用因此不会按请求占用本地槽位。
 
 CPU entitlement 只控制 request decode、JSON、Base64/媒体转换和 upstream
 response decode 的共享阶段 token。等待上游和发送流式字节不持有 CPU token。

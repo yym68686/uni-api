@@ -29,6 +29,7 @@ class AdaptiveNetworkSnapshot:
     ephemeral_port_occupancy: int | None
     ephemeral_port_headroom: int | None
     pending_connection_attempts: int
+    completed_connection_attempts_since_sample: int
     inbound_accepts_since_sample: int
     waiting_connection_attempts: int
     acquired_total: int
@@ -117,6 +118,10 @@ class AdaptiveNetworkGovernor:
         self._ephemeral_ports: int | None = None
         self._ephemeral_occupancy: int | None = None
         self._pending_attempts = 0
+        # A completed attempt may have opened a socket that is not represented
+        # in the cached kernel sample yet. Preserve that provisional charge
+        # until the normal refresh instead of forcing a procfs scan per request.
+        self._completed_attempts_since_sample = 0
         # Accepted sockets are already kernel-owned when the protocol callback
         # runs. Count accepts inside the sampling window pessimistically so a
         # connection burst cannot spend the same cached FD headroom twice.
@@ -141,6 +146,7 @@ class AdaptiveNetworkGovernor:
             self._open_fds = self._open_fds_supplier()
             self._ephemeral_ports = self._ephemeral_ports_supplier()
             self._ephemeral_occupancy = self._ephemeral_occupancy_supplier()
+            self._completed_attempts_since_sample = 0
             self._inbound_accepts_since_sample = 0
             self._sample_error = None
         except Exception as exc:
@@ -171,6 +177,7 @@ class AdaptiveNetworkGovernor:
                 - reserve
                 - self._open_fds
                 - self._pending_attempts
+                - self._completed_attempts_since_sample
                 - self._inbound_accepts_since_sample,
             )
 
@@ -186,7 +193,8 @@ class AdaptiveNetworkGovernor:
                 0,
                 usable
                 - self._ephemeral_occupancy
-                - self._pending_attempts,
+                - self._pending_attempts
+                - self._completed_attempts_since_sample,
             )
         return fd_headroom, port_headroom
 
@@ -262,9 +270,10 @@ class AdaptiveNetworkGovernor:
             if self._pending_attempts <= 0:
                 raise RuntimeError("network connection-attempt reservation underflow")
             self._pending_attempts -= 1
-            # The next caller must observe the socket opened by this attempt,
-            # or the unchanged kernel state when HTTP/2/keep-alive was reused.
-            self._sampled_at = float("-inf")
+            # Keep charging a possibly new socket until the regular cached
+            # sample observes it. Reuse is deliberately overcharged for at
+            # most one short sample window; no request triggers a forced scan.
+            self._completed_attempts_since_sample += 1
             waiters = tuple(self._waiters)
         for loop, event in waiters:
             try:
@@ -301,6 +310,9 @@ class AdaptiveNetworkGovernor:
                 ephemeral_port_occupancy=self._ephemeral_occupancy,
                 ephemeral_port_headroom=port_headroom,
                 pending_connection_attempts=self._pending_attempts,
+                completed_connection_attempts_since_sample=(
+                    self._completed_attempts_since_sample
+                ),
                 inbound_accepts_since_sample=self._inbound_accepts_since_sample,
                 waiting_connection_attempts=self._waiting_attempts,
                 acquired_total=self._acquired_total,
