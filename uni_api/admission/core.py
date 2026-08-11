@@ -625,6 +625,7 @@ class PendingBodyReservation:
         controller: RequestAdmissionController,
         *,
         fairness_key: str = "anonymous",
+        resource_only_body_admission: bool = False,
     ) -> None:
         self._controller = controller
         self._reserved_bytes = 0
@@ -636,6 +637,9 @@ class PendingBodyReservation:
         self._body_observation = RequestBodyObservation()
         self._release_reason = "pending_released"
         self._fairness_key = str(fairness_key or "anonymous")[:96]
+        self._resource_only_body_admission = bool(
+            resource_only_body_admission
+        )
 
     @property
     def reserved_bytes(self) -> int:
@@ -699,6 +703,7 @@ class RequestAdmissionLease:
         active_lease: AdmissionLease,
         *,
         reserved_body_bytes: int,
+        resource_only_body_admission: bool = False,
     ) -> None:
         self._controller = controller
         self._active_lease = active_lease
@@ -715,6 +720,9 @@ class RequestAdmissionLease:
         self._release_reason = "request_completed"
         self._release_task: asyncio.Task[None] | None = None
         self._fairness_key = "anonymous"
+        self._resource_only_body_admission = bool(
+            resource_only_body_admission
+        )
         self._response_attempt: dict[str, Any] | None = None
         self._response_attempts_started = 0
         self._response_committed_allocations: dict[str, dict[str, Any]] = {}
@@ -1302,11 +1310,22 @@ class RequestAdmissionController:
         *,
         initial_body_bytes: int = 0,
         timeout_seconds: float | None = None,
+        resource_only_body_admission: bool = False,
     ) -> RequestAdmissionLease:
         if initial_body_bytes < 0:
             raise ValueError("initial_body_bytes cannot be negative")
 
-        acquisition = await self.begin_acquire(timeout_seconds=timeout_seconds)
+        if resource_only_body_admission:
+            acquisition = await self.begin_acquire(
+                timeout_seconds=timeout_seconds,
+                resource_only_body_admission=True,
+            )
+        else:
+            # Keep the ordinary path source-compatible with instrumentation
+            # wrappers that implement the long-standing timeout-only call.
+            acquisition = await self.begin_acquire(
+                timeout_seconds=timeout_seconds,
+            )
         lease = await _await_owned_acquisition(acquisition)
         if initial_body_bytes == 0:
             return lease
@@ -1321,6 +1340,7 @@ class RequestAdmissionController:
         self,
         *,
         timeout_seconds: float | None = None,
+        resource_only_body_admission: bool = False,
     ) -> asyncio.Future[RequestAdmissionLease]:
         active_acquisition = await self._active_gate.begin_acquire(
             timeout_seconds=timeout_seconds
@@ -1334,6 +1354,9 @@ class RequestAdmissionController:
                     self,
                     active_lease,
                     reserved_body_bytes=0,
+                    resource_only_body_admission=(
+                        resource_only_body_admission
+                    ),
                 )
             )
             return resolved
@@ -1347,6 +1370,7 @@ class RequestAdmissionController:
                 self,
                 active_lease,
                 reserved_body_bytes=0,
+                resource_only_body_admission=resource_only_body_admission,
             )
 
         task = asyncio.create_task(convert())
@@ -1367,7 +1391,11 @@ class RequestAdmissionController:
             raise
         return task
 
-    async def try_acquire(self) -> RequestAdmissionLease | None:
+    async def try_acquire(
+        self,
+        *,
+        resource_only_body_admission: bool = False,
+    ) -> RequestAdmissionLease | None:
         active_lease = await self._active_gate.try_acquire()
         if active_lease is None:
             return None
@@ -1375,14 +1403,20 @@ class RequestAdmissionController:
             self,
             active_lease,
             reserved_body_bytes=0,
+            resource_only_body_admission=resource_only_body_admission,
         )
 
     def pending_body_reservation(
         self,
         *,
         fairness_key: str = "anonymous",
+        resource_only_body_admission: bool = False,
     ) -> PendingBodyReservation:
-        return PendingBodyReservation(self, fairness_key=fairness_key)
+        return PendingBodyReservation(
+            self,
+            fairness_key=fairness_key,
+            resource_only_body_admission=resource_only_body_admission,
+        )
 
     async def _reserve_pending_body_additional(
         self,
@@ -1413,8 +1447,18 @@ class RequestAdmissionController:
                 next_request_bytes = request_before + transferred
                 global_body_before = self._reserved_body_bytes
                 global_response_before = self._reserved_response_bytes
-                if next_request_bytes > self.max_body_bytes:
+                if (
+                    not lease._resource_only_body_admission
+                    and next_request_bytes > self.max_body_bytes
+                ):
                     raise RuntimeError("pending body transfer exceeds request limit")
+                if (
+                    reservation._resource_only_body_admission
+                    != lease._resource_only_body_admission
+                ):
+                    raise RuntimeError(
+                        "pending body admission mode changed during transfer"
+                    )
                 if transferred > self._pending_body_reserved_bytes:
                     raise RuntimeError("pending body reservation underflow")
                 lease._body_observation = reservation._body_observation
@@ -1736,11 +1780,15 @@ class RequestAdmissionController:
         *,
         pending: bool,
     ) -> None:
-        if next_request_bytes > self.max_body_bytes:
+        if (
+            not owner._resource_only_body_admission
+            and next_request_bytes > self.max_body_bytes
+        ):
             self._body_rejected["body_too_large"] += 1
             raise RequestBodyTooLarge()
         if (
             not pending
+            and not owner._resource_only_body_admission
             and next_request_bytes + owner._reserved_response_bytes
             > self.max_retained_bytes_per_request
         ):

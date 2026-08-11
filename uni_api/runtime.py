@@ -398,6 +398,17 @@ DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
 RUST_RESPONSES_CONTROL_HEADER = "x-uni-api-rust-control-token"
 RUST_RESPONSES_SESSION_HEADER = "x-uni-api-rust-responses-session"
 RUST_RESPONSES_INTERNAL_PREFIX = "/_internal/rust-responses"
+RUST_REQUEST_SPOOL_INT_HEADERS = {
+    "x-uni-api-rust-request-spool-body-bytes": "rust_request_spool_body_bytes",
+    "x-uni-api-rust-request-spool-memory-peak-bytes": "rust_request_spool_memory_peak_bytes",
+    "x-uni-api-rust-request-spool-local-disk-bytes": "rust_request_spool_local_disk_bytes",
+    "x-uni-api-rust-request-spool-local-free-bytes-start": "rust_request_spool_local_free_bytes_start",
+    "x-uni-api-rust-request-spool-local-writable-bytes-start": "rust_request_spool_local_writable_bytes_start",
+    "x-uni-api-rust-request-spool-local-free-inodes-start": "rust_request_spool_local_free_inodes_start",
+    "x-uni-api-rust-request-spool-local-writable-inodes-start": "rust_request_spool_local_writable_inodes_start",
+    "x-uni-api-rust-request-spool-resource-wait-ms": "rust_request_spool_resource_wait_ms",
+}
+RUST_REQUEST_SPOOL_TIER_HEADER = "x-uni-api-rust-request-spool-final-tier"
 RUST_RESPONSES_CONTROL_TOKEN = os.getenv(
     "UNI_API_RUST_CONTROL_TOKEN",
     "",
@@ -2162,12 +2173,73 @@ def _is_public_health_request(request: Request) -> bool:
 
 
 def _has_valid_rust_control_token(request: Request) -> bool:
+    scope = getattr(request, "scope", None)
+    if isinstance(scope, dict):
+        return _has_valid_rust_control_scope(scope)
     if not RUST_RESPONSES_CONTROL_TOKEN:
         return False
-    supplied = str(request.headers.get(RUST_RESPONSES_CONTROL_HEADER) or "")
+    headers = getattr(request, "headers", None)
+    supplied = str(
+        headers.get(RUST_RESPONSES_CONTROL_HEADER) or ""
+        if hasattr(headers, "get")
+        else ""
+    )
     return bool(supplied) and secrets.compare_digest(
         supplied,
         RUST_RESPONSES_CONTROL_TOKEN,
+    )
+
+
+def _scope_header_values(scope: dict[str, Any], header: str) -> list[str]:
+    wanted = header.encode("ascii")
+    return [
+        value.decode("latin-1", errors="replace")
+        for name, value in (scope.get("headers") or [])
+        if name.lower() == wanted
+    ]
+
+
+def _has_valid_rust_control_scope(scope: dict[str, Any]) -> bool:
+    if not RUST_RESPONSES_CONTROL_TOKEN:
+        return False
+    supplied_values = _scope_header_values(
+        scope,
+        RUST_RESPONSES_CONTROL_HEADER,
+    )
+    return len(supplied_values) == 1 and secrets.compare_digest(
+        supplied_values[0],
+        RUST_RESPONSES_CONTROL_TOKEN,
+    )
+
+
+def _is_trusted_rust_spooled_request(scope: dict[str, Any]) -> bool:
+    if (
+        str(scope.get("method") or "").upper() != "POST"
+        or str(scope.get("path") or "") != "/v1/responses"
+        or not _has_valid_rust_control_scope(scope)
+    ):
+        return False
+    tiers = _scope_header_values(scope, RUST_REQUEST_SPOOL_TIER_HEADER)
+    body_bytes = _scope_header_values(
+        scope,
+        "x-uni-api-rust-request-spool-body-bytes",
+    )
+    disk_bytes = _scope_header_values(
+        scope,
+        "x-uni-api-rust-request-spool-local-disk-bytes",
+    )
+    if len(tiers) != 1 or tiers[0] != "local_disk":
+        return False
+    if len(body_bytes) != 1 or len(disk_bytes) != 1:
+        return False
+    try:
+        observed_body_bytes = int(body_bytes[0])
+        observed_disk_bytes = int(disk_bytes[0])
+    except ValueError:
+        return False
+    return (
+        observed_body_bytes >= 0
+        and observed_body_bytes == observed_disk_bytes
     )
 
 
@@ -2176,6 +2248,60 @@ def _is_internal_rust_control_request(request: Request) -> bool:
         request.url.path.startswith(RUST_RESPONSES_INTERNAL_PREFIX)
         and _has_valid_rust_control_token(request)
     )
+
+
+def _record_rust_request_spool_observability(
+    request: Request,
+    current_info: dict[str, Any],
+) -> None:
+    scope = getattr(request, "scope", None)
+    if isinstance(scope, dict):
+        _record_rust_request_spool_observability_from_scope(
+            scope,
+            current_info,
+        )
+        return
+    if not _has_valid_rust_control_token(request):
+        return
+    observed = False
+    for header, field in RUST_REQUEST_SPOOL_INT_HEADERS.items():
+        raw = request.headers.get(header)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value < 0:
+            continue
+        current_info[field] = value
+        observed = True
+    tier = str(request.headers.get(RUST_REQUEST_SPOOL_TIER_HEADER) or "").strip()
+    if tier == "local_disk":
+        current_info["rust_request_spool_final_tier"] = tier
+        observed = True
+    if observed:
+        current_info["rust_request_spool"] = True
+
+
+def _record_rust_request_spool_observability_from_scope(
+    scope: dict[str, Any],
+    current_info: dict[str, Any],
+) -> None:
+    if not _is_trusted_rust_spooled_request(scope):
+        return
+    for header, field in RUST_REQUEST_SPOOL_INT_HEADERS.items():
+        values = _scope_header_values(scope, header)
+        if len(values) != 1:
+            continue
+        try:
+            value = int(values[0])
+        except ValueError:
+            continue
+        if value >= 0:
+            current_info[field] = value
+    current_info["rust_request_spool_final_tier"] = "local_disk"
+    current_info["rust_request_spool"] = True
 
 
 def _is_middleware_bypass_request(request: Request) -> bool:
@@ -2996,6 +3122,7 @@ app.add_middleware(
     max_zstd_compressed_body_bytes=ZSTD_REQUEST_COMPRESSED_MAX_BYTES,
     max_zstd_decompressed_body_bytes=ZSTD_REQUEST_DECOMPRESSED_MAX_BYTES,
     json_max_estimated_bytes=REQUEST_JSON_COMPLEXITY_MAX_BYTES,
+    resource_only_body_admission=_is_trusted_rust_spooled_request,
 )
 
 @app.middleware("http")
@@ -3063,18 +3190,10 @@ app.add_middleware(
 
 def _bypass_request_admission(scope: dict[str, Any]) -> bool:
     path = str(scope.get("path") or "")
-    if path.startswith(RUST_RESPONSES_INTERNAL_PREFIX):
-        headers = {
-            name.decode("latin-1").lower(): value.decode("latin-1")
-            for name, value in (scope.get("headers") or [])
-        }
-        supplied = headers.get(RUST_RESPONSES_CONTROL_HEADER, "")
-        if (
-            RUST_RESPONSES_CONTROL_TOKEN
-            and supplied
-            and secrets.compare_digest(supplied, RUST_RESPONSES_CONTROL_TOKEN)
-        ):
-            return True
+    if path.startswith(
+        RUST_RESPONSES_INTERNAL_PREFIX
+    ) and _has_valid_rust_control_scope(scope):
+        return True
     return (
         str(scope.get("method") or "").upper() in {"GET", "HEAD"}
         and path in {*PUBLIC_HEALTH_PATHS, "/v1/observability/runtime"}
@@ -3181,12 +3300,23 @@ def _observe_early_request_outcome(
     if isinstance(state, dict):
         existing_info = state.get("uni_api_request_info")
         if isinstance(existing_info, dict):
+            _record_rust_request_spool_observability_from_scope(
+                scope,
+                existing_info,
+            )
             existing_info["status_code"] = int(status_code)
             existing_info["error_type"] = str(reason)
             existing_info["success"] = False
             if admission_rejected:
                 existing_info["admission_rejected"] = True
                 existing_info["admission_reason"] = str(reason)
+            if (
+                int(status_code) in {503, 507}
+                and existing_info.get("rust_request_spool")
+            ):
+                existing_info["rust_request_spool_failure_resource"] = str(
+                    reason
+                )
             if downstream_disconnected:
                 existing_info["downstream_disconnected"] = True
                 existing_info["stream_outcome"] = "downstream_disconnected"
@@ -3248,9 +3378,14 @@ def _observe_early_request_outcome(
         "trace": trace,
         "timing_spans": trace.snapshot(),
     }
+    _record_rust_request_spool_observability_from_scope(scope, current_info)
     if admission_rejected:
         current_info["admission_rejected"] = True
         current_info["admission_reason"] = str(reason)
+    if int(status_code) in {503, 507} and current_info.get(
+        "rust_request_spool"
+    ):
+        current_info["rust_request_spool_failure_resource"] = str(reason)
     if body_complexity_diagnostics:
         current_info[REQUEST_BODY_COMPLEXITY_INFO_KEY] = (
             body_complexity_diagnostics
@@ -3267,6 +3402,7 @@ app.add_middleware(
     RequestAdmissionMiddleware,
     controller=request_admission_controller,
     bypass=_bypass_request_admission,
+    resource_only_body_admission=_is_trusted_rust_spooled_request,
     on_rejection=_observe_request_admission_rejection,
     on_early_response=_observe_early_body_response,
     on_rejection_response_write=_observe_request_admission_response_write,
@@ -6619,6 +6755,7 @@ class ResponsesRequestExecution:
 
         current_info = _request_state_current_info(http_request) or get_request_info()
         _coerce_request_trace(current_info)
+        _record_rust_request_spool_observability(http_request, current_info)
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
         request_body_bytes = _request_body_size_bytes(http_request, request_data)

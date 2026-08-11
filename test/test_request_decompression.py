@@ -264,6 +264,93 @@ def test_identity_chunked_body_over_limit_is_rejected_cumulatively():
     assert dict(start["headers"])[b"connection"] == b"close"
 
 
+def test_trusted_spooled_identity_body_uses_global_resource_budget_only():
+    payload = b'{"input":"0123456789abcdef"}'
+    trusted = lambda scope: _scope_header(scope, b"x-trusted-spool") == "yes"
+    controller = RequestAdmissionController(
+        capacity=1,
+        waiter_limit=0,
+        wait_timeout_seconds=1,
+        max_body_bytes=8,
+        body_budget_bytes=256 * 1024,
+    )
+    app = RequestAdmissionMiddleware(
+        RequestBodyDecompressionMiddleware(
+            _echo_asgi,
+            max_identity_body_bytes=8,
+            json_max_estimated_bytes=8,
+            resource_only_body_admission=trusted,
+        ),
+        controller=controller,
+        resource_only_body_admission=trusted,
+    )
+
+    messages = asyncio.run(
+        _run_asgi(
+            app,
+            [{"type": "http.request", "body": payload, "more_body": False}],
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+                (b"x-trusted-spool", b"yes"),
+            ],
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages)[0] == 200
+    assert controller.snapshot()["reserved_body_bytes"] == 0
+    assert controller.snapshot()["rejected"] == {}
+
+
+def test_trusted_spooled_zstd_body_uses_global_resource_budget_only():
+    payload = b'{"input":"' + b"x" * 4096 + b'"}'
+    compressed = _zstd_compress(payload)
+    trusted = lambda scope: _scope_header(scope, b"x-trusted-spool") == "yes"
+    controller = RequestAdmissionController(
+        capacity=1,
+        waiter_limit=0,
+        wait_timeout_seconds=1,
+        max_body_bytes=8,
+        body_budget_bytes=512 * 1024,
+    )
+    app = RequestAdmissionMiddleware(
+        RequestBodyDecompressionMiddleware(
+            _echo_asgi,
+            max_zstd_compressed_body_bytes=8,
+            max_zstd_decompressed_body_bytes=8,
+            json_max_estimated_bytes=8,
+            resource_only_body_admission=trusted,
+        ),
+        controller=controller,
+        resource_only_body_admission=trusted,
+    )
+
+    messages = asyncio.run(
+        _run_asgi(
+            app,
+            [
+                {
+                    "type": "http.request",
+                    "body": compressed,
+                    "more_body": False,
+                }
+            ],
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-encoding", b"zstd"),
+                (b"content-length", str(len(compressed)).encode("ascii")),
+                (b"x-trusted-spool", b"yes"),
+            ],
+            path="/v1/responses",
+        )
+    )
+
+    assert _asgi_response(messages)[0] == 200
+    assert controller.snapshot()["reserved_body_bytes"] == 0
+    assert controller.snapshot()["rejected"] == {}
+
+
 def test_body_rejection_does_not_emit_illegal_http2_connection_header():
     middleware = RequestBodyDecompressionMiddleware(
         _echo_asgi,

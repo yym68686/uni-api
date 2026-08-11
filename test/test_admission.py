@@ -368,6 +368,29 @@ def test_request_controller_enforces_per_request_body_limit():
     asyncio.run(run())
 
 
+def test_resource_only_body_admission_uses_global_budget_not_request_limit():
+    async def run():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=4,
+            body_budget_bytes=32,
+        )
+        lease = await controller.acquire(
+            resource_only_body_admission=True,
+        )
+
+        assert await lease.reserve_body_bytes(16) == 16
+        assert controller.snapshot()["reserved_body_bytes"] == 16
+        assert controller.snapshot()["rejected"] == {}
+
+        await lease.release()
+        assert controller.snapshot()["reserved_body_bytes"] == 0
+
+    asyncio.run(run())
+
+
 def test_request_controller_enforces_global_body_budget_and_recovers_on_release():
     async def run():
         controller = RequestAdmissionController(

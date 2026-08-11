@@ -1,5 +1,7 @@
 mod idempotency;
 mod proxy;
+mod request_spool;
+mod resources;
 mod responses;
 
 use std::future::IntoFuture;

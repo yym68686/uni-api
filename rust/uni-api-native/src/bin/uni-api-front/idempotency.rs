@@ -26,13 +26,8 @@ struct Inner {
     max_entries: usize,
     max_stored_bytes: usize,
     max_response_bytes: usize,
-    max_request_body_bytes: usize,
-    max_inflight_request_bytes: usize,
-    inflight_request_bytes: AtomicUsize,
     max_inflight_response_bytes: usize,
     inflight_response_bytes: AtomicUsize,
-    request_body_idle_timeout: Duration,
-    request_body_total_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -71,6 +66,16 @@ pub struct Owner {
     armed: bool,
 }
 
+pub struct RequestIdentity {
+    record_key: String,
+    request_hash: String,
+}
+
+pub struct RequestHasher {
+    record_key: String,
+    request: Sha256,
+}
+
 impl Coordinator {
     pub fn new() -> Self {
         Self {
@@ -82,63 +87,20 @@ impl Coordinator {
                 max_entries: env_usize("IDEMPOTENCY_MAX_ENTRIES", 4096),
                 max_stored_bytes: env_usize("IDEMPOTENCY_MAX_STORED_BYTES", 128 * 1024 * 1024),
                 max_response_bytes: env_usize("IDEMPOTENCY_MAX_RESPONSE_BYTES", 16 * 1024 * 1024),
-                max_request_body_bytes: env_usize("REQUEST_MAX_BODY_BYTES", 16 * 1024 * 1024),
-                max_inflight_request_bytes: env_usize(
-                    "RUST_IDEMPOTENCY_MAX_INFLIGHT_REQUEST_BYTES",
-                    128 * 1024 * 1024,
-                ),
-                inflight_request_bytes: AtomicUsize::new(0),
                 max_inflight_response_bytes: env_usize(
                     "RUST_IDEMPOTENCY_MAX_INFLIGHT_RESPONSE_BYTES",
                     128 * 1024 * 1024,
                 ),
                 inflight_response_bytes: AtomicUsize::new(0),
-                request_body_idle_timeout: env_duration("REQUEST_BODY_IDLE_TIMEOUT_SECONDS", 15.0),
-                request_body_total_timeout: env_duration(
-                    "REQUEST_BODY_TOTAL_TIMEOUT_SECONDS",
-                    120.0,
-                ),
             }),
         }
     }
 
-    pub fn max_request_body_bytes(&self) -> usize {
-        self.inner.max_request_body_bytes
-    }
-
-    pub fn request_body_idle_timeout(&self) -> Duration {
-        self.inner.request_body_idle_timeout
-    }
-
-    pub fn request_body_total_timeout(&self) -> Duration {
-        self.inner.request_body_total_timeout
-    }
-
-    pub fn begin_request_body(&self) -> BodyReservation {
-        BodyReservation {
-            coordinator: self.clone(),
-            bytes: 0,
-        }
-    }
-
-    pub async fn claim(
-        &self,
-        method: &Method,
-        uri: &Uri,
-        headers: &HeaderMap,
-        idempotency_key: &str,
-        body: &[u8],
-    ) -> Claim {
-        if !valid_key(idempotency_key) {
-            return Claim::Response(error_response(
-                StatusCode::BAD_REQUEST,
-                "Idempotency-Key must contain 1-128 safe ASCII characters",
-                "invalid-key",
-                false,
-            ));
-        }
-        let (record_key, request_hash) =
-            request_identity(method, uri, headers, idempotency_key, body);
+    pub async fn claim(&self, identity: RequestIdentity) -> Claim {
+        let RequestIdentity {
+            record_key,
+            request_hash,
+        } = identity;
 
         loop {
             let wait = {
@@ -213,6 +175,78 @@ impl Coordinator {
                     ));
                 }
             }
+        }
+    }
+}
+
+impl RequestHasher {
+    pub fn new(
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        idempotency_key: &str,
+    ) -> Result<Self, Response<Body>> {
+        if !valid_key(idempotency_key) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "Idempotency-Key must contain 1-128 safe ASCII characters",
+                "invalid-key",
+                false,
+            ));
+        }
+        let credential = ["authorization", "x-api-key"]
+            .into_iter()
+            .map(|name| joined_header_values(headers, name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let credential_hash = Sha256::digest(credential.as_bytes());
+        let method_bytes = method.as_str().as_bytes();
+        let path_bytes = uri.path().as_bytes();
+        let query = uri.query().unwrap_or_default().as_bytes();
+
+        let mut record = Sha256::new();
+        for (index, value) in [
+            method_bytes,
+            path_bytes,
+            query,
+            format!("{credential_hash:x}").as_bytes(),
+            idempotency_key.as_bytes(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index > 0 {
+                record.update([0]);
+            }
+            record.update(value);
+        }
+
+        let mut request = Sha256::new();
+        request.update(method_bytes);
+        for value in [
+            path_bytes,
+            query,
+            joined_header_values(headers, "content-type").as_bytes(),
+            joined_header_values(headers, "content-encoding").as_bytes(),
+        ] {
+            request.update([0]);
+            request.update(value);
+        }
+        request.update([0]);
+        Ok(Self {
+            record_key: format!("{:x}", record.finalize()),
+            request,
+        })
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.request.update(bytes);
+    }
+
+    pub fn finish(self) -> RequestIdentity {
+        RequestIdentity {
+            record_key: self.record_key,
+            request_hash: format!("{:x}", self.request.finalize()),
         }
     }
 }
@@ -344,32 +378,6 @@ impl Owner {
     }
 }
 
-pub struct BodyReservation {
-    coordinator: Coordinator,
-    bytes: usize,
-}
-
-impl BodyReservation {
-    pub fn try_grow(&mut self, bytes: usize) -> bool {
-        if try_reserve_atomic(
-            &self.coordinator.inner.inflight_request_bytes,
-            self.coordinator.inner.max_inflight_request_bytes,
-            bytes,
-        ) {
-            self.bytes = self.bytes.saturating_add(bytes);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl Drop for BodyReservation {
-    fn drop(&mut self) {
-        atomic_saturating_sub(&self.coordinator.inner.inflight_request_bytes, self.bytes);
-    }
-}
-
 impl Drop for Owner {
     fn drop(&mut self) {
         if !self.armed {
@@ -466,6 +474,7 @@ fn valid_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
+#[cfg(test)]
 fn request_identity(
     method: &Method,
     uri: &Uri,
@@ -473,49 +482,10 @@ fn request_identity(
     idempotency_key: &str,
     body: &[u8],
 ) -> (String, String) {
-    let credential = ["authorization", "x-api-key"]
-        .into_iter()
-        .map(|name| joined_header_values(headers, name))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let credential_hash = Sha256::digest(credential.as_bytes());
-    let method_bytes = method.as_str().as_bytes();
-    let path_bytes = uri.path().as_bytes();
-    let query = uri.query().unwrap_or_default().as_bytes();
-
-    let mut record = Sha256::new();
-    for (index, value) in [
-        method_bytes,
-        path_bytes,
-        query,
-        format!("{credential_hash:x}").as_bytes(),
-        idempotency_key.as_bytes(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if index > 0 {
-            record.update([0]);
-        }
-        record.update(value);
-    }
-
-    let mut request = Sha256::new();
-    request.update(method_bytes);
-    for value in [
-        path_bytes,
-        query,
-        joined_header_values(headers, "content-type").as_bytes(),
-        joined_header_values(headers, "content-encoding").as_bytes(),
-        body,
-    ] {
-        request.update([0]);
-        request.update(value);
-    }
-    (
-        format!("{:x}", record.finalize()),
-        format!("{:x}", request.finalize()),
-    )
+    let mut hasher = RequestHasher::new(method, uri, headers, idempotency_key).unwrap();
+    hasher.update(body);
+    let identity = hasher.finish();
+    (identity.record_key, identity.request_hash)
 }
 
 fn joined_header_values(headers: &HeaderMap, name: &str) -> String {
@@ -619,12 +589,24 @@ mod tests {
         (Method::POST, "/v1/responses".parse().unwrap(), headers)
     }
 
+    fn identity(
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        key: &str,
+        body: &[u8],
+    ) -> RequestIdentity {
+        let mut hasher = RequestHasher::new(method, uri, headers, key).unwrap();
+        hasher.update(body);
+        hasher.finish()
+    }
+
     #[tokio::test]
     async fn replays_completed_response_and_rejects_conflicts() {
         let coordinator = Coordinator::new();
         let (method, uri, headers) = request_parts();
         let Claim::Owner(owner) = coordinator
-            .claim(&method, &uri, &headers, "request-1", b"one")
+            .claim(identity(&method, &uri, &headers, "request-1", b"one"))
             .await
         else {
             panic!("first claim was not owner");
@@ -638,7 +620,7 @@ mod tests {
             )
             .await;
         let Claim::Response(replay) = coordinator
-            .claim(&method, &uri, &headers, "request-1", b"one")
+            .claim(identity(&method, &uri, &headers, "request-1", b"one"))
             .await
         else {
             panic!("completed claim was not replayed");
@@ -647,7 +629,7 @@ mod tests {
         assert_eq!(replay.headers()[STATUS_HEADER], "replayed");
 
         let Claim::Response(conflict) = coordinator
-            .claim(&method, &uri, &headers, "request-1", b"two")
+            .claim(identity(&method, &uri, &headers, "request-1", b"two"))
             .await
         else {
             panic!("conflicting claim became owner");
@@ -661,7 +643,7 @@ mod tests {
         let coordinator = Coordinator::new();
         let (method, uri, headers) = request_parts();
         let Claim::Owner(owner) = coordinator
-            .claim(&method, &uri, &headers, "request-2", b"body")
+            .claim(identity(&method, &uri, &headers, "request-2", b"body"))
             .await
         else {
             panic!("first claim was not owner");
@@ -673,7 +655,7 @@ mod tests {
             let headers = headers.clone();
             tokio::spawn(async move {
                 coordinator
-                    .claim(&method, &uri, &headers, "request-2", b"body")
+                    .claim(identity(&method, &uri, &headers, "request-2", b"body"))
                     .await
             })
         };

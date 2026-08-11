@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from sys import maxsize
 from time import monotonic
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -85,6 +86,7 @@ register_dedicated_threadpool(
 
 BodyBytesReservationCallback = Callable[[int], Awaitable[None]]
 BodyBytesReleaseCallback = Callable[[int], Awaitable[Any]]
+ResourceOnlyBodyAdmissionPredicate = Callable[[Scope], bool]
 BODY_BYTES_RESERVATION_SCOPE_KEY = "uni_api_reserve_body_bytes"
 BODY_BYTES_RELEASE_SCOPE_KEY = "uni_api_release_body_bytes"
 BODY_REJECTION_RECORDER_SCOPE_KEY = "uni_api_record_body_rejection"
@@ -419,6 +421,9 @@ class RequestBodyDecompressionMiddleware:
         json_max_estimated_bytes: int = DEFAULT_JSON_MAX_ESTIMATED_BYTES,
         body_idle_timeout_seconds: float | None = None,
         body_total_timeout_seconds: float | None = None,
+        resource_only_body_admission: (
+            ResourceOnlyBodyAdmissionPredicate | None
+        ) = None,
     ) -> None:
         self.app = app
 
@@ -486,6 +491,9 @@ class RequestBodyDecompressionMiddleware:
                 DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_SECONDS,
             )
         )
+        self.resource_only_body_admission = (
+            resource_only_body_admission or (lambda scope: False)
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -493,6 +501,9 @@ class RequestBodyDecompressionMiddleware:
             return
 
         headers = scope.get("headers") or []
+        resource_only_body_admission = bool(
+            self.resource_only_body_admission(scope)
+        )
         disconnect_event = _disconnect_event(scope)
         content_type_count = sum(
             name.lower() == b"content-type" for name, _value in headers
@@ -512,7 +523,11 @@ class RequestBodyDecompressionMiddleware:
         body_memory_budget = _request_body_memory_budget(
             scope,
             headers,
-            json_max_estimated_bytes=self.json_max_estimated_bytes,
+            json_max_estimated_bytes=(
+                maxsize
+                if resource_only_body_admission
+                else self.json_max_estimated_bytes
+            ),
         )
         encodings = _content_encodings(headers)
         if not encodings or _is_identity(encodings):
@@ -521,6 +536,9 @@ class RequestBodyDecompressionMiddleware:
                 receive,
                 send,
                 disconnect_event=disconnect_event,
+                resource_only_body_admission=(
+                    resource_only_body_admission
+                ),
             )
             return
         if encodings != ["zstd"]:
@@ -535,20 +553,33 @@ class RequestBodyDecompressionMiddleware:
             return
 
         try:
-            _ensure_content_length_within(
-                headers,
-                self.max_zstd_compressed_body_bytes,
-            )
+            if not resource_only_body_admission:
+                _ensure_content_length_within(
+                    headers,
+                    self.max_zstd_compressed_body_bytes,
+                )
             compressed = await _read_body(
                 receive,
-                self.max_zstd_compressed_body_bytes,
+                (
+                    None
+                    if resource_only_body_admission
+                    else self.max_zstd_compressed_body_bytes
+                ),
                 reserve_body_bytes,
                 idle_timeout_seconds=self.body_idle_timeout_seconds,
-                total_timeout_seconds=self.body_total_timeout_seconds,
+                total_timeout_seconds=(
+                    None
+                    if resource_only_body_admission
+                    else self.body_total_timeout_seconds
+                ),
             )
             body = await _decompress_zstd(
                 compressed,
-                self.max_zstd_decompressed_body_bytes,
+                (
+                    None
+                    if resource_only_body_admission
+                    else self.max_zstd_decompressed_body_bytes
+                ),
                 reserve_body_bytes,
                 release_body_bytes,
                 memory_budget=body_memory_budget,
@@ -674,12 +705,14 @@ class RequestBodyDecompressionMiddleware:
         send: Send,
         *,
         disconnect_event: asyncio.Event,
+        resource_only_body_admission: bool,
     ) -> None:
         try:
-            _ensure_content_length_within(
-                scope.get("headers") or [],
-                self.max_identity_body_bytes,
-            )
+            if not resource_only_body_admission:
+                _ensure_content_length_within(
+                    scope.get("headers") or [],
+                    self.max_identity_body_bytes,
+                )
         except _RequestBodyHardLimitExceeded:
             _record_body_rejection(scope, "body_too_large")
             await _json_error(
@@ -703,7 +736,11 @@ class RequestBodyDecompressionMiddleware:
             return
 
         total = 0
-        body_deadline = monotonic() + self.body_total_timeout_seconds
+        body_deadline = (
+            None
+            if resource_only_body_admission
+            else monotonic() + self.body_total_timeout_seconds
+        )
         body_complete = False
         empty_request_pending = False
         disconnect_monitor: asyncio.Task[None] | None = None
@@ -712,7 +749,11 @@ class RequestBodyDecompressionMiddleware:
         body_memory_budget = _request_body_memory_budget(
             scope,
             scope.get("headers") or [],
-            json_max_estimated_bytes=self.json_max_estimated_bytes,
+            json_max_estimated_bytes=(
+                maxsize
+                if resource_only_body_admission
+                else self.json_max_estimated_bytes
+            ),
         )
 
         async def limited_receive() -> Message:
@@ -741,7 +782,10 @@ class RequestBodyDecompressionMiddleware:
             chunk = message.get("body", b"")
             if chunk:
                 total += len(chunk)
-                if total > self.max_identity_body_bytes:
+                if (
+                    not resource_only_body_admission
+                    and total > self.max_identity_body_bytes
+                ):
                     _observe_request_decoded_bytes(scope, len(chunk))
                     if reserve_body_bytes is not None:
                         await _reserve_body_bytes(reserve_body_bytes, 0)
@@ -901,16 +945,20 @@ async def _observe_body_early_response(
 
 async def _read_body(
     receive: Receive,
-    max_body_bytes: int,
+    max_body_bytes: int | None,
     reserve_body_bytes: BodyBytesReservationCallback | None = None,
     *,
     idle_timeout_seconds: float,
-    total_timeout_seconds: float,
+    total_timeout_seconds: float | None,
 ) -> bytearray:
     body = bytearray()
     total = 0
     more_body = True
-    total_deadline = monotonic() + total_timeout_seconds
+    total_deadline = (
+        None
+        if total_timeout_seconds is None
+        else monotonic() + total_timeout_seconds
+    )
     while more_body:
         message = await _receive_body_message(
             receive,
@@ -924,7 +972,7 @@ async def _read_body(
         chunk = message.get("body", b"")
         if chunk:
             total += len(chunk)
-            if total > max_body_bytes:
+            if max_body_bytes is not None and total > max_body_bytes:
                 raise _RequestBodyHardLimitExceeded()
             if reserve_body_bytes is not None:
                 await _reserve_body_bytes(reserve_body_bytes, len(chunk))
@@ -937,12 +985,14 @@ async def _receive_body_message(
     receive: Receive,
     *,
     idle_timeout_seconds: float,
-    total_deadline: float,
+    total_deadline: float | None,
 ) -> Message:
-    remaining_total = total_deadline - monotonic()
-    if remaining_total <= 0:
-        raise RequestBodyReadTimeout()
-    timeout = min(idle_timeout_seconds, remaining_total)
+    timeout = idle_timeout_seconds
+    if total_deadline is not None:
+        remaining_total = total_deadline - monotonic()
+        if remaining_total <= 0:
+            raise RequestBodyReadTimeout()
+        timeout = min(timeout, remaining_total)
     try:
         return await asyncio.wait_for(receive(), timeout=timeout)
     except TimeoutError as exc:
@@ -951,7 +1001,7 @@ async def _receive_body_message(
 
 async def _decompress_zstd(
     body: bytes | bytearray,
-    max_body_bytes: int,
+    max_body_bytes: int | None,
     reserve_body_bytes: BodyBytesReservationCallback | None = None,
     release_body_bytes: BodyBytesReleaseCallback | None = None,
     *,
@@ -959,13 +1009,24 @@ async def _decompress_zstd(
 ) -> bytes:
     max_window_size = await _run_body_cpu(_ensure_complete_zstd_frames, body)
     declared_size = await _run_body_cpu(zstd.frame_content_size, body)
-    if declared_size >= 0 and declared_size > max_body_bytes:
+    if (
+        max_body_bytes is not None
+        and declared_size >= 0
+        and declared_size > max_body_bytes
+    ):
         raise _RequestBodyHardLimitExceeded()
-    allowed_window_size = max(
-        1024,
-        max_body_bytes + max(1024, max_body_bytes // 8),
+    allowed_window_size = (
+        max(1024, max_window_size)
+        if max_body_bytes is None
+        else max(
+            1024,
+            max_body_bytes + max(1024, max_body_bytes // 8),
+        )
     )
-    if max_window_size > allowed_window_size:
+    if (
+        max_body_bytes is not None
+        and max_window_size > allowed_window_size
+    ):
         raise zstd.ZstdError(
             "zstd frame window exceeds decoded-body envelope"
         )
@@ -992,14 +1053,22 @@ async def _decompress_zstd(
     try:
         with decoder.stream_reader(body, read_across_frames=True) as reader:
             while True:
-                remaining = max_body_bytes - len(decoded)
+                remaining = (
+                    None
+                    if max_body_bytes is None
+                    else max_body_bytes - len(decoded)
+                )
                 chunk = await _run_body_cpu(
                     reader.read,
-                    min(64 * 1024, remaining + 1),
+                    (
+                        64 * 1024
+                        if remaining is None
+                        else min(64 * 1024, remaining + 1)
+                    ),
                 )
                 if not chunk:
                     break
-                if len(chunk) > remaining:
+                if remaining is not None and len(chunk) > remaining:
                     # Record the attempted decoded output even though this
                     # byte cannot be retained. The early-response callback
                     # syncs the observation before release.

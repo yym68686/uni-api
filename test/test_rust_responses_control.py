@@ -2,9 +2,14 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 from starlette.responses import Response
 
-from uni_api.runtime import ResponsesRequestExecution
+from uni_api.runtime import (
+    ResponsesRequestExecution,
+    _is_trusted_rust_spooled_request,
+    _record_rust_request_spool_observability,
+)
 from uni_api.rust_responses_control import (
     RustResponsesControlError,
     RustResponsesControlPlane,
@@ -39,6 +44,71 @@ def test_rust_stream_report_records_usage_without_completion_error():
         "total_tokens": 18,
         "usage_seen": True,
     }
+
+
+def test_rust_spool_observability_only_accepts_trusted_internal_headers(monkeypatch):
+    monkeypatch.setattr("uni_api.runtime.RUST_RESPONSES_CONTROL_TOKEN", "control-token")
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": [
+            (b"x-uni-api-rust-control-token", b"control-token"),
+            (b"x-uni-api-rust-request-spool-body-bytes", b"20000000"),
+            (b"x-uni-api-rust-request-spool-memory-peak-bytes", b"65536"),
+            (b"x-uni-api-rust-request-spool-local-disk-bytes", b"20000000"),
+            (b"x-uni-api-rust-request-spool-resource-wait-ms", b"19"),
+            (b"x-uni-api-rust-request-spool-final-tier", b"local_disk"),
+        ],
+    }
+    current_info = {}
+    _record_rust_request_spool_observability(Request(scope), current_info)
+    assert current_info == {
+        "rust_request_spool": True,
+        "rust_request_spool_body_bytes": 20_000_000,
+        "rust_request_spool_memory_peak_bytes": 65_536,
+        "rust_request_spool_local_disk_bytes": 20_000_000,
+        "rust_request_spool_resource_wait_ms": 19,
+        "rust_request_spool_final_tier": "local_disk",
+    }
+
+    spoofed_scope = dict(scope)
+    spoofed_scope["headers"] = [
+        (b"x-uni-api-rust-control-token", b"wrong"),
+        (b"x-uni-api-rust-request-spool-body-bytes", b"999"),
+    ]
+    spoofed = {}
+    _record_rust_request_spool_observability(Request(spoofed_scope), spoofed)
+    assert spoofed == {}
+
+
+def test_resource_only_body_admission_requires_complete_trusted_local_spool(
+    monkeypatch,
+):
+    monkeypatch.setattr("uni_api.runtime.RUST_RESPONSES_CONTROL_TOKEN", "control-token")
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": [
+            (b"x-uni-api-rust-control-token", b"control-token"),
+            (b"x-uni-api-rust-request-spool-body-bytes", b"20000000"),
+            (b"x-uni-api-rust-request-spool-local-disk-bytes", b"20000000"),
+            (b"x-uni-api-rust-request-spool-final-tier", b"local_disk"),
+        ],
+    }
+
+    assert _is_trusted_rust_spooled_request(scope) is True
+
+    for header_index, replacement in (
+        (0, (b"x-uni-api-rust-control-token", b"wrong")),
+        (2, (b"x-uni-api-rust-request-spool-local-disk-bytes", b"19999999")),
+        (3, (b"x-uni-api-rust-request-spool-final-tier", b"invalid")),
+    ):
+        untrusted = dict(scope)
+        untrusted["headers"] = list(scope["headers"])
+        untrusted["headers"][header_index] = replacement
+        assert _is_trusted_rust_spooled_request(untrusted) is False
 
 
 class _FakeExecution:

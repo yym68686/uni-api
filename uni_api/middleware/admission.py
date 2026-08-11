@@ -228,6 +228,7 @@ class RequestAdmissionMiddleware:
         *,
         controller: RequestAdmissionController,
         bypass: Callable[[Scope], bool] | None = None,
+        resource_only_body_admission: Callable[[Scope], bool] | None = None,
         retry_after_seconds: int = 1,
         on_rejection: Callable[[Scope, AdmissionRejected, float], Any] | None = None,
         on_early_response: Callable[[Scope, int, str], Any] | None = None,
@@ -241,6 +242,9 @@ class RequestAdmissionMiddleware:
         self.app = app
         self.controller = controller
         self.bypass = bypass or (lambda scope: False)
+        self.resource_only_body_admission = (
+            resource_only_body_admission or (lambda scope: False)
+        )
         self.retry_after_seconds = retry_after_seconds
         self.on_rejection = on_rejection
         self.on_early_response = on_early_response
@@ -292,6 +296,9 @@ class RequestAdmissionMiddleware:
         pre_reserved_wire_credit = 0
         admission_started_at = monotonic()
         release_reason = "request_completed"
+        resource_only_body_admission = bool(
+            self.resource_only_body_admission(scope)
+        )
 
         def no_response_expected_disconnect() -> bool:
             state = scope.get("state")
@@ -308,14 +315,25 @@ class RequestAdmissionMiddleware:
             )
 
         try:
-            lease = await self.controller.try_acquire()
+            if resource_only_body_admission:
+                lease = await self.controller.try_acquire(
+                    resource_only_body_admission=True,
+                )
+            else:
+                lease = await self.controller.try_acquire()
             if lease is None:
                 (
                     lease,
                     replayed_messages,
                     handed_off_receive_task,
                     disconnected_while_queued,
-                ) = await self._acquire_queued_request(scope, receive)
+                ) = await self._acquire_queued_request(
+                    scope,
+                    receive,
+                    resource_only_body_admission=(
+                        resource_only_body_admission
+                    ),
+                )
                 if disconnected_while_queued:
                     state = scope.setdefault("state", {})
                     state[ADMISSION_WAIT_MS_STATE_KEY] = (
@@ -549,6 +567,8 @@ class RequestAdmissionMiddleware:
         self,
         scope: Scope,
         receive: Receive,
+        *,
+        resource_only_body_admission: bool = False,
     ) -> tuple[
         Any,
         deque[tuple[Message, int]],
@@ -557,10 +577,15 @@ class RequestAdmissionMiddleware:
     ]:
         """Observe a queued peer without allowing an unbounded body prebuffer."""
 
-        # Claim a bounded waiter position before starting any receive.  A
-        # queue-full request must not be allowed to allocate even one body
-        # chunk outside the 64-active/936-waiter envelope.
-        acquire_task = await self.controller.begin_acquire()
+        # Establish control-memory ownership before starting any receive. A
+        # request waiting in legacy mode must not allocate body chunks outside
+        # its bounded queue; weighted mode normally resolves this immediately.
+        if resource_only_body_admission:
+            acquire_task = await self.controller.begin_acquire(
+                resource_only_body_admission=True,
+            )
+        else:
+            acquire_task = await self.controller.begin_acquire()
         receive_task: asyncio.Task[Message] | None = (
             None if acquire_task.done() else asyncio.create_task(receive())
         )
@@ -578,7 +603,8 @@ class RequestAdmissionMiddleware:
         )
         buffered: deque[tuple[Message, int]] = deque()
         pending = self.controller.pending_body_reservation(
-            fairness_key=_admission_fairness_key(scope)
+            fairness_key=_admission_fairness_key(scope),
+            resource_only_body_admission=resource_only_body_admission,
         )
         lease = None
         queued_body_complete = False

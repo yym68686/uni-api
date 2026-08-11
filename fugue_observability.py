@@ -2047,6 +2047,41 @@ def build_uni_api_ember_request_telemetry(
                     "rust_responses_normalized_events": _optional_int_text(
                         current_info.get("rust_responses_normalized_events")
                     ),
+                    "rust_request_spool": _bool_text(
+                        _safe_bool(current_info.get("rust_request_spool"))
+                    ),
+                    "rust_request_spool_body_bytes": _optional_int_text(
+                        current_info.get("rust_request_spool_body_bytes")
+                    ),
+                    "rust_request_spool_memory_peak_bytes": _optional_int_text(
+                        current_info.get("rust_request_spool_memory_peak_bytes")
+                    ),
+                    "rust_request_spool_local_disk_bytes": _optional_int_text(
+                        current_info.get("rust_request_spool_local_disk_bytes")
+                    ),
+                    "rust_request_spool_local_free_bytes_start": _optional_int_text(
+                        current_info.get("rust_request_spool_local_free_bytes_start")
+                    ),
+                    "rust_request_spool_local_writable_bytes_start": _optional_int_text(
+                        current_info.get("rust_request_spool_local_writable_bytes_start")
+                    ),
+                    "rust_request_spool_local_free_inodes_start": _optional_int_text(
+                        current_info.get("rust_request_spool_local_free_inodes_start")
+                    ),
+                    "rust_request_spool_local_writable_inodes_start": _optional_int_text(
+                        current_info.get("rust_request_spool_local_writable_inodes_start")
+                    ),
+                    "rust_request_spool_resource_wait_ms": _optional_int_text(
+                        current_info.get("rust_request_spool_resource_wait_ms")
+                    ),
+                    "rust_request_spool_final_tier": _safe_text(
+                        current_info.get("rust_request_spool_final_tier"),
+                        max_len=32,
+                    ),
+                    "rust_request_spool_failure_resource": _safe_text(
+                        current_info.get("rust_request_spool_failure_resource"),
+                        max_len=80,
+                    ),
                     "wire_status_code": _optional_int_text(
                         current_info.get("wire_status_code")
                     ),

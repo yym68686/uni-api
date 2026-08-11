@@ -411,7 +411,7 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED, FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED, FUGUE_OBSERVABILITY_METRICS_ENABLED: Optional switches for Fugue request summaries, spans, and metrics. Export failure only drops observability data and does not fail business requests.
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: Optional switch for human-readable stdout request summary logs, default is `true`.
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
-- UNI_API_RUST_RESPONSES_DATA_PLANE: Enables the Rust socket-to-SSE-to-downstream path for streaming `/v1/responses`, default is `true`. Requests with `Idempotency-Key` stay on the Rust data plane: Rust performs the credential-scoped request hash, owner/wait/replay/conflict coordination, and bounded zero-copy response caching. `IDEMPOTENCY_*` TTL/entry/stored/response limits remain authoritative; `RUST_IDEMPOTENCY_MAX_INFLIGHT_REQUEST_BYTES` and `RUST_IDEMPOTENCY_MAX_INFLIGHT_RESPONSE_BYTES` bound unfinished Rust-side bytes (both default to 128 MiB). Set the switch to `false` for an immediate process-restart fallback to the Python data path without changing the image.
+- UNI_API_RUST_RESPONSES_DATA_PLANE: Enables the Rust socket-to-SSE-to-downstream path for `/v1/responses`, default is `true`. Every enabled request is incrementally spooled to local disk without retaining the complete request in Rust memory. When `Idempotency-Key` is present, Rust also hashes each incoming chunk and performs credential-scoped owner/wait/replay/conflict coordination. There is no fixed Rust request-body byte ceiling. Admission follows live cgroup-memory, FD, connection, ephemeral-port, disk-byte, and inode headroom; pressure backpressures until `RUST_RESOURCE_WAIT_TIMEOUT_SECONDS`, then returns 503 or 507. `RUST_REQUEST_SPOOL_DIRECTORY` defaults to `/tmp/uni-api-request-spool`; memory headroom is the larger of `RUST_MEMORY_RESERVE_BYTES` and `RUST_MEMORY_RESERVE_BPS`, while the other reserve ratios use `RUST_FD_RESERVE_BPS`, `RUST_EPHEMERAL_PORT_RESERVE_BPS`, `RUST_REQUEST_SPOOL_DISK_RESERVE_BPS`, and `RUST_REQUEST_SPOOL_INODE_RESERVE_BPS`. `IDEMPOTENCY_*` response-cache limits and `RUST_IDEMPOTENCY_MAX_INFLIGHT_RESPONSE_BYTES` remain authoritative. Set the switch to `false` for an immediate process-restart fallback to the Python data path without changing the image.
 
 ### Weighted resource admission
 
@@ -444,11 +444,14 @@ port headroom, CPU phase activity, and byte-governor state. Request and upstream
 active counts remain informational and never make admission decisions.
 
 JSON request sizing uses the same cgroup memory envelope instead of a fixed
-256 MiB materialization estimate. The default product wire contract is 128
-MiB on a sufficiently sized runtime. Weighted mode has no separate large-body
-request count; per-request byte ceilings plus the shared parent governor bound
-large bodies by actual retained memory. The legacy threshold/slot diagnostics
-remain available only in `RESOURCE_ADMISSION_MODE=legacy`.
+256 MiB materialization estimate. A `/v1/responses` request carrying a valid
+Rust control token and matching completed-local-spool metadata has no separate
+wire-size or per-request retained-memory ceiling in Python; its incremental
+memory estimate grows only against the shared parent governor and waits for
+capacity before a 503 timeout. Untrusted/direct Python request paths retain the
+configured product limits. Weighted mode has no separate large-body request
+count. The legacy threshold/slot diagnostics remain available only in
+`RESOURCE_ADMISSION_MODE=legacy`.
 
 In legacy mode, large-body slot changes emit body-free
 `large_body_admission_decision` events

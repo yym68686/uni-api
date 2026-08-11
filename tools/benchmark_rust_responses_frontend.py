@@ -112,6 +112,22 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.server.request_counts[input_value] = request_number  # type: ignore[attr-defined]
         if input_value == "idempotency-wait-probe":
             time.sleep(0.2)
+        if not payload.get("stream"):
+            body = json.dumps(
+                {
+                    "id": "resp-benchmark",
+                    "status": "completed",
+                    "input": input_value,
+                },
+                separators=(",", ":"),
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("x-fixture-request-number", str(request_number))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -222,6 +238,41 @@ def _post_stream(
     return wire, headers, time.perf_counter() - started
 
 
+def _post_nonstream(
+    port: int,
+    input_value: str,
+    *,
+    idempotency_key: str | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(
+        {
+            "model": "gpt-benchmark",
+            "input": input_value,
+            "stream": False,
+        }
+    ).encode()
+    headers = {
+        "authorization": "Bearer sk-benchmark",
+        "content-type": "application/json",
+    }
+    if idempotency_key is not None:
+        headers["idempotency-key"] = idempotency_key
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/responses",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        wire = response.read()
+        response_headers = {
+            name.lower(): value for name, value in response.headers.items()
+        }
+        if response.status != 200:
+            raise RuntimeError(f"unexpected response status {response.status}")
+    return wire, response_headers
+
+
 def _worker_cpu_seconds(port: int) -> float | None:
     snapshot = _request_json(
         f"http://127.0.0.1:{port}/v1/observability/runtime",
@@ -264,6 +315,7 @@ def _run_service(
     config_url: str,
     requests: int,
     event_count: int,
+    large_request_mib: int = 0,
 ) -> dict[str, Any]:
     public_port = _free_port()
     backend_port = _free_port()
@@ -288,6 +340,9 @@ def _run_service(
                     "UNI_API_PYTHON_MAIN": str(ROOT / "main.py"),
                     "UNI_API_PYTHON_PORT": str(backend_port),
                     "PYTHONPATH": str(ROOT),
+                    "RUST_REQUEST_SPOOL_DIRECTORY": str(Path(workdir) / "request-spool"),
+                    "RUST_REQUEST_SPOOL_DISK_RESERVE_BPS": "0",
+                    "RUST_REQUEST_SPOOL_INODE_RESERVE_BPS": "0",
                 }
             )
         process = subprocess.Popen(
@@ -334,6 +389,26 @@ def _run_service(
                     raise RuntimeError("Rust idempotency replay lost data-plane provenance")
                 if replay_headers.get("x-fixture-request-number") != "1":
                     raise RuntimeError("Rust idempotency replay called the provider twice")
+                nonstream, nonstream_headers = _post_nonstream(
+                    public_port,
+                    "idempotency-nonstream-probe",
+                    idempotency_key="benchmark-idempotency-nonstream-1",
+                )
+                nonstream_replay, nonstream_replay_headers = _post_nonstream(
+                    public_port,
+                    "idempotency-nonstream-probe",
+                    idempotency_key="benchmark-idempotency-nonstream-1",
+                )
+                if nonstream != nonstream_replay:
+                    raise RuntimeError(
+                        "Rust non-stream idempotency replay changed the response body"
+                    )
+                if nonstream_headers.get("x-uni-api-idempotency-status") != "executed":
+                    raise RuntimeError("Rust non-stream idempotency owner status is missing")
+                if nonstream_replay_headers.get("x-uni-api-idempotency-status") != "replayed":
+                    raise RuntimeError("Rust non-stream idempotency replay status is missing")
+                if nonstream_replay_headers.get("x-fixture-request-number") != "1":
+                    raise RuntimeError("Rust non-stream idempotency called the provider twice")
                 try:
                     _post_stream(
                         public_port,
@@ -373,6 +448,41 @@ def _run_service(
                     for result in waiting_results
                 ):
                     raise RuntimeError("Rust idempotency waiter called the provider twice")
+                if large_request_mib > 0:
+                    large_input = "large-request-probe:" + (
+                        "x" * (large_request_mib * 1024 * 1024)
+                    )
+                    large_wire, large_headers, _ = _post_stream(
+                        public_port,
+                        large_input,
+                        idempotency_key="benchmark-large-idempotency-1",
+                    )
+                    replay_wire, replay_headers, _ = _post_stream(
+                        public_port,
+                        large_input,
+                        idempotency_key="benchmark-large-idempotency-1",
+                    )
+                    if large_wire != replay_wire:
+                        raise RuntimeError("large Rust idempotency replay changed the SSE wire")
+                    if large_headers.get("x-uni-api-idempotency-status") != "executed":
+                        raise RuntimeError("large Rust idempotency request was not executed")
+                    if replay_headers.get("x-uni-api-idempotency-status") != "replayed":
+                        raise RuntimeError("large Rust idempotency request was not replayed")
+                    if replay_headers.get("x-fixture-request-number") != "1":
+                        raise RuntimeError("large Rust idempotency request called the provider twice")
+                    direct_large_wire, direct_large_headers, _ = _post_stream(
+                        public_port,
+                        "large-request-no-idempotency:"
+                        + ("y" * (large_request_mib * 1024 * 1024)),
+                    )
+                    if b"event: response.completed" not in direct_large_wire:
+                        raise RuntimeError(
+                            "large non-idempotent Rust request lost its terminal event"
+                        )
+                    if direct_large_headers.get("x-uni-api-data-plane") != "rust-v1":
+                        raise RuntimeError(
+                            "large non-idempotent request left the Rust data plane"
+                        )
             warmup, warmup_headers, _ = _post_stream(public_port, "warmup")
             if warmup.count(b"response.output_text.delta") != 200:
                 raise RuntimeError(
@@ -427,9 +537,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--events", type=int, default=20_000)
     parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument("--large-request-mib", type=int, default=0)
     args = parser.parse_args()
-    if args.events <= 0 or args.requests <= 0:
-        parser.error("--events and --requests must be positive")
+    if args.events <= 0 or args.requests <= 0 or args.large_request_mib < 0:
+        parser.error("--events/--requests must be positive and --large-request-mib non-negative")
     if not RUST_BINARY.exists():
         raise SystemExit(
             f"Rust release binary is missing: run cargo build --release in "
@@ -446,12 +557,14 @@ def main() -> None:
             config_url=config_url,
             requests=args.requests,
             event_count=args.events,
+            large_request_mib=0,
         )
         rust_result = _run_service(
             mode="rust",
             config_url=config_url,
             requests=args.requests,
             event_count=args.events,
+            large_request_mib=args.large_request_mib,
         )
     finally:
         fixture.shutdown()
