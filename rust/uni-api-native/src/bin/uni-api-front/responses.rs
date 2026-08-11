@@ -40,6 +40,8 @@ pub(crate) struct Plan {
     pub(crate) proxy: Option<String>,
     pub(crate) engine: String,
     #[serde(default)]
+    pub(crate) precommit_semantic_guard: Option<bool>,
+    #[serde(default)]
     pub(crate) http1_only: bool,
     #[serde(default = "default_commit_policy")]
     pub(crate) commit_policy: String,
@@ -70,6 +72,11 @@ fn default_max_precommit_items() -> usize {
 
 fn default_max_precommit_bytes() -> usize {
     8 * 1024 * 1024 + 128 * 266
+}
+
+fn precommit_semantic_guard(plan: &Plan) -> bool {
+    plan.precommit_semantic_guard
+        .unwrap_or_else(|| plan.engine.eq_ignore_ascii_case("codex"))
 }
 
 #[derive(Default)]
@@ -689,6 +696,7 @@ fn process_preflight_frames(
     frames: Vec<SseFrame>,
 ) -> Result<Option<PreflightResult>, String> {
     let mut started = false;
+    let semantic_guard = precommit_semantic_guard(&active.plan);
     for frame in frames {
         let processed = active.processor.process(frame, &mut active.stats)?;
         if let Some(Terminal::SemanticFailure {
@@ -701,15 +709,20 @@ fn process_preflight_frames(
                     active, event_type, payload, false,
                 ))));
             }
+            if active.business_committed {
+                if let Some(wire) = processed.wire {
+                    active.buffered.push(wire);
+                }
+            }
             active.terminal = processed.terminal;
             return Ok(Some(PreflightResult::Started(take_active(active)?)));
         }
-        let early_keepalive = !active.precommit_keepalive_sent
-            && processed.canonical_keepalive
-            && active.plan.engine == "codex";
+        let early_keepalive =
+            !active.precommit_keepalive_sent && processed.canonical_keepalive && semantic_guard;
         let suppress_repeated_keepalive =
             active.precommit_keepalive_sent && processed.event_type.as_deref() == Some("keepalive");
         if processed.event_type.as_deref() == Some("response.created")
+            && semantic_guard
             && !active.precommit_keepalive_sent
         {
             active.buffered.push(Bytes::from_static(
@@ -752,9 +765,15 @@ fn process_preflight_frames(
             }
             started = true;
         }
-        if processed.commits {
+        let transparent_response_created =
+            !semantic_guard && processed.event_type.as_deref() == Some("response.created");
+        if processed.commits || transparent_response_created {
             if !started {
-                active.commit_reason = "real_output";
+                active.commit_reason = if transparent_response_created {
+                    "response_created"
+                } else {
+                    "real_output"
+                };
             }
             started = true;
             active.business_committed = true;
@@ -2426,6 +2445,7 @@ mod tests {
             body: "{}".into(),
             proxy: None,
             engine: engine.into(),
+            precommit_semantic_guard: None,
             http1_only: false,
             commit_policy: "real_output".into(),
             normalize_custom_tool_call_ids: false,
@@ -2526,7 +2546,30 @@ mod tests {
     }
 
     #[test]
-    fn preflight_keeps_every_frame_after_commit_in_the_same_chunk() {
+    fn gpt_preflight_commits_response_created_without_synthetic_keepalive() {
+        let mut active = test_active("gpt");
+        let frames = active
+            .decoder
+            .feed(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+            )
+            .unwrap();
+        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected response.created to commit the transparent stream");
+        };
+        assert!(active.business_committed);
+        assert_eq!(active.commit_reason, "response_created");
+        assert!(active.early_output.is_empty());
+        assert_eq!(active.buffered.len(), 1);
+        assert!(active.buffered[0].starts_with(b"event: response.created\n"));
+        assert!(!active.buffered[0].starts_with(b"event: keepalive\n"));
+    }
+
+    #[test]
+    fn gpt_preflight_keeps_every_frame_after_commit_in_the_same_chunk() {
         let mut active = test_active("gpt");
         let frames = active
             .decoder
@@ -2547,9 +2590,58 @@ mod tests {
         assert!(matches!(active.terminal, Some(Terminal::Completed)));
         assert_eq!(
             active.buffered.len(),
-            5,
-            "synthetic keepalive + four frames"
+            4,
+            "transparent response.created + three following frames"
         );
+        assert!(active.buffered[0].starts_with(b"event: response.created\n"));
+    }
+
+    #[test]
+    fn gpt_failure_after_response_created_remains_in_band() {
+        let mut active = test_active("gpt");
+        let frames = active
+            .decoder
+            .feed(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+                  event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"forward me\"}}}\n\n",
+            )
+            .unwrap();
+        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected the transparent stream to remain committed");
+        };
+        assert!(active.business_committed);
+        assert_eq!(active.buffered.len(), 2);
+        assert!(active.buffered[0].starts_with(b"event: response.created\n"));
+        assert!(active.buffered[1].starts_with(b"event: response.failed\n"));
+        assert!(matches!(
+            active.terminal,
+            Some(Terminal::SemanticFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn codex_response_created_still_injects_the_precommit_keepalive() {
+        let mut active = test_active("codex");
+        let frames = active
+            .decoder
+            .feed(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+                  event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            )
+            .unwrap();
+        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected substantive Codex output to commit");
+        };
+        assert!(active.business_committed);
+        assert_eq!(active.buffered.len(), 3);
+        assert!(active.buffered[0].starts_with(b"event: keepalive\n"));
+        assert!(active.buffered[1].starts_with(b"event: response.created\n"));
     }
 
     #[test]

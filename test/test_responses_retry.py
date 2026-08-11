@@ -1704,7 +1704,7 @@ def test_responses_stream_retries_next_provider_before_output(monkeypatch):
         ]
 
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
-    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
 
     main.app.state.config = {
         "api_keys": [
@@ -3692,7 +3692,7 @@ def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
         ]
 
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
-    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
 
     main.app.state.config = {
         "api_keys": [
@@ -3727,6 +3727,19 @@ def test_responses_stream_keepalive_does_not_commit_and_retries(monkeypatch):
                     _responses_sse("response.created", {"type": "response.created", "provider": "b"}),
                     _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "b"}),
                     _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-b"}),
+                    _responses_sse(
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 1,
+                                    "total_tokens": 2,
+                                }
+                            },
+                        },
+                    ),
                     _responses_sse(None, "[DONE]"),
                 ],
                 headers={
@@ -3786,7 +3799,7 @@ def test_responses_stream_forwards_initial_upstream_keepalive_once_and_retries(m
         ]
 
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
-    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
 
     main.app.state.config = {
         "api_keys": [
@@ -3814,6 +3827,19 @@ def test_responses_stream_forwards_initial_upstream_keepalive_once_and_retries(m
                 chunks=[
                     _responses_sse("response.created", {"type": "response.created", "provider": "b"}),
                     _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-b"}),
+                    _responses_sse(
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 1,
+                                    "total_tokens": 2,
+                                }
+                            },
+                        },
+                    ),
                     _responses_sse(None, "[DONE]"),
                 ]
             ),
@@ -3831,8 +3857,10 @@ def test_responses_stream_forwards_initial_upstream_keepalive_once_and_retries(m
     assert response.status_code == 200
     first_event = body.split("\n\n", 1)[0]
     assert first_event.startswith("event: keepalive\ndata: ")
-    assert '"type":"keepalive"' in first_event
-    assert '"sequence_number":0' in first_event
+    assert json.loads(first_event.split("data: ", 1)[1]) == {
+        "type": "keepalive",
+        "sequence_number": 0,
+    }
     assert body.count("event: keepalive") == 1
     assert '"provider": "a"' not in body
     assert '"provider": "b"' in body
@@ -4515,6 +4543,41 @@ def test_responses_stream_emits_oaix_keepalive_before_real_output(monkeypatch):
     assert body.index("event: response.created") < body.index("event: response.output_text.delta")
     assert client_manager.stream_calls[0]["timeout"] is None
     assert current_info["timing_spans"]["upstream_first_chunk"] >= 1
+
+
+def test_gpt_responses_stream_starts_with_response_created_without_keepalive(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="gpt")
+    upstream_response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "hello"},
+            ),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        }
+                    },
+                },
+            ),
+        ]
+    )
+    main.app.state.client_manager = DummyClientManager(upstream_response)
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(model="gpt-5.4", input=["hello"], stream=True)
+    )
+
+    assert response.status_code == 200
+    assert body.startswith("event: response.created\ndata: ")
+    assert "event: keepalive" not in body
 
 
 def test_responses_stream_observability_uses_request_state_current_info(monkeypatch):

@@ -567,6 +567,7 @@ impl NativeRoute {
                 proxy: preference_string(&provider.preferences, "proxy")
                     .or_else(|| preference_string(&self.snapshot.preferences, "proxy")),
                 engine: engine.clone(),
+                precommit_semantic_guard: Some(engine == "codex"),
                 http1_only: engine == "codex",
                 commit_policy: preference_string(
                     &provider.preferences,

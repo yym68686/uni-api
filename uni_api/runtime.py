@@ -6066,9 +6066,19 @@ def _responses_stream_event_has_real_output(event_type: str, payload: Any) -> bo
 
     return False
 
-def _responses_stream_event_commits(event_type: str, payload: Any, commit_policy: str) -> bool:
+def _responses_precommit_semantic_guard(engine: str) -> bool:
+    return engine == "codex"
+
+
+def _responses_stream_event_commits(
+    event_type: str,
+    payload: Any,
+    commit_policy: str,
+    *,
+    precommit_semantic_guard: bool = True,
+) -> bool:
     if event_type in RESPONSES_STREAM_PREFLIGHT_EVENTS:
-        return False
+        return not precommit_semantic_guard and event_type == "response.created"
 
     if event_type in {"response.completed", "response.incomplete"}:
         return True
@@ -6164,14 +6174,15 @@ async def _prime_responses_upstream_stream(
     upstream_status_code: Optional[int] = None,
     disconnect_event: Optional[asyncio.Event] = None,
     commit_policy: str = "real_output",
+    precommit_semantic_guard: bool = True,
     precommit_keepalive_callback: Optional[Callable[[Optional[bytes]], Awaitable[bool]]] = None,
     retained_byte_budget: RetainedByteBudget | None = None,
     diagnostics: ResponsesStreamDiagnostics | None = None,
 ) -> tuple[ReservedChunkBuffer, bool]:
     """
-    Buffer structural Responses events until we see substantive output or a
-    completed response with usage. Optional precommit keepalive emission does
-    not commit the real Responses stream.
+    With the semantic guard enabled, buffer structural Responses events until
+    substantive output or a completed response with usage. Transparent
+    providers commit on response.created and never synthesize a keepalive.
     """
     buffered_chunks = ReservedChunkBuffer(
         max_items=RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS,
@@ -6503,16 +6514,29 @@ async def _prime_responses_upstream_stream(
                             "canonicalized_data_only_event",
                             event_type,
                         )
-                    if event_type == "keepalive" and precommit_keepalive_callback is not None:
+                    if (
+                        precommit_semantic_guard
+                        and event_type == "keepalive"
+                        and precommit_keepalive_callback is not None
+                    ):
                         handled = await precommit_keepalive_callback(event_bytes)
                         if not handled:
                             await append_buffered(event_bytes)
                     else:
-                        if event_type == "response.created" and precommit_keepalive_callback is not None:
+                        if (
+                            precommit_semantic_guard
+                            and event_type == "response.created"
+                            and precommit_keepalive_callback is not None
+                        ):
                             await precommit_keepalive_callback(None)
                         await append_buffered(event_bytes)
 
-                    if _responses_stream_event_commits(event_type, event_payload, commit_policy):
+                    if _responses_stream_event_commits(
+                        event_type,
+                        event_payload,
+                        commit_policy,
+                        precommit_semantic_guard=precommit_semantic_guard,
+                    ):
                         for remaining_index in range(
                             event_index + 1,
                             len(raw_events),
@@ -7357,12 +7381,16 @@ class ResponsesRequestExecution:
         _set_current_info_trace_tag(self.current_info, "model", self.request_model_name)
 
         commit_policy = safe_get(provider, "preferences", "responses_stream_commit_policy", default="real_output")
+        precommit_semantic_guard = _responses_precommit_semantic_guard(
+            engine,
+        )
         attempt.state.update(
             {
                 "upstream_url": upstream_url,
                 "channel_id": channel_id,
                 "engine": engine,
                 "responses_stream_commit_policy": str(commit_policy or "real_output"),
+                "responses_precommit_semantic_guard": precommit_semantic_guard,
                 "failure_stage": "auth",
             }
         )
@@ -7484,6 +7512,9 @@ class ResponsesRequestExecution:
             "body": json_payload,
             "proxy": attempt.state.get("proxy"),
             "engine": str(attempt.state.get("engine") or "gpt"),
+            "precommit_semantic_guard": bool(
+                attempt.state.get("responses_precommit_semantic_guard", True)
+            ),
             "http1_only": attempt.state.get("engine") == "codex",
             "commit_policy": str(
                 attempt.state.get("responses_stream_commit_policy")
@@ -8107,11 +8138,14 @@ class ResponsesRequestExecution:
             diagnostics,
         )
         try:
+            precommit_semantic_guard = bool(
+                attempt.state.get("responses_precommit_semantic_guard", True)
+            )
             precommit_keepalive_callback = None
-            if self.stream_output_queue is not None:
+            if self.stream_output_queue is not None and precommit_semantic_guard:
                 precommit_keepalive_callback = functools.partial(
                     self._emit_precommit_keepalive,
-                    passthrough=attempt.state.get("engine") == "codex",
+                    passthrough=True,
                 )
             async def cleanup_cancelled_precommit(result: Any) -> None:
                 buffer, _committed = result
@@ -8123,6 +8157,7 @@ class ResponsesRequestExecution:
                     upstream_status_code=upstream_resp.status_code,
                     disconnect_event=self.disconnect_event,
                     commit_policy=attempt.state.get("responses_stream_commit_policy", "real_output"),
+                    precommit_semantic_guard=precommit_semantic_guard,
                     precommit_keepalive_callback=precommit_keepalive_callback,
                     retained_byte_budget=responses_stream_byte_budget,
                     diagnostics=diagnostics,

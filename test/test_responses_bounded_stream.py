@@ -373,6 +373,75 @@ def test_responses_precommit_rejects_incomplete_sse_eof():
     asyncio.run(scenario())
 
 
+def test_responses_transparent_precommit_commits_response_created_without_keepalive():
+    async def scenario():
+        created = (
+            "event: response.created\n"
+            'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+        ).encode()
+        callbacks = []
+
+        async def upstream_chunks():
+            yield created
+
+        async def emit_keepalive(chunk):
+            callbacks.append(chunk)
+            return True
+
+        buffered, committed = await _prime_responses_upstream_stream(
+            upstream_chunks(),
+            precommit_semantic_guard=False,
+            precommit_keepalive_callback=emit_keepalive,
+        )
+        try:
+            assert committed is True
+            assert b"".join(buffered) == created
+            assert callbacks == []
+        finally:
+            await buffered.clear()
+
+    asyncio.run(scenario())
+
+
+def test_responses_precommit_guard_is_only_enabled_for_codex_engine():
+    assert runtime._responses_precommit_semantic_guard("gpt") is False
+    assert runtime._responses_precommit_semantic_guard("codex") is True
+
+
+def test_responses_guarded_precommit_keeps_response_created_private_and_emits_keepalive():
+    async def scenario():
+        created = (
+            "event: response.created\n"
+            'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+        ).encode()
+        delta = (
+            "event: response.output_text.delta\n"
+            'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+        ).encode()
+        callbacks = []
+
+        async def upstream_chunks():
+            yield created + delta
+
+        async def emit_keepalive(chunk):
+            callbacks.append(chunk)
+            return True
+
+        buffered, committed = await _prime_responses_upstream_stream(
+            upstream_chunks(),
+            precommit_semantic_guard=True,
+            precommit_keepalive_callback=emit_keepalive,
+        )
+        try:
+            assert committed is True
+            assert b"".join(buffered) == created + delta
+            assert callbacks == [None]
+        finally:
+            await buffered.clear()
+
+    asyncio.run(scenario())
+
+
 def test_responses_precommit_preserves_split_utf8_pending_bytes_after_commit():
     async def scenario():
         first_event = (
