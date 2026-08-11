@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +13,9 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
+use memchr::{memchr2, memmem};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -79,35 +82,119 @@ fn precommit_semantic_guard(plan: &Plan) -> bool {
         .unwrap_or_else(|| plan.engine.eq_ignore_ascii_case("codex"))
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamMode {
+    OpaqueRaw,
+    GuardedThenRaw,
+    SelectiveRewrite,
+}
+
+impl StreamMode {
+    fn for_plan(plan: &Plan) -> Self {
+        if plan.normalize_custom_tool_call_ids {
+            Self::SelectiveRewrite
+        } else if precommit_semantic_guard(plan) {
+            Self::GuardedThenRaw
+        } else {
+            Self::OpaqueRaw
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpaqueRaw => "opaque_raw",
+            Self::GuardedThenRaw => "guarded_then_raw",
+            Self::SelectiveRewrite => "selective_rewrite",
+        }
+    }
+
+    fn relays_raw_after_commit(self) -> bool {
+        matches!(self, Self::OpaqueRaw | Self::GuardedThenRaw)
+    }
+}
+
 struct StreamStats {
+    stream_mode: &'static str,
     upstream_bytes: u64,
+    upstream_chunks: u64,
     downstream_bytes: u64,
+    downstream_chunks: u64,
     event_count: u64,
     delta_events: u64,
     normalized_events: u64,
     usage: Option<Value>,
-    wire_hash: Sha256,
+    wire_hash: Option<Sha256>,
 }
 
 impl StreamStats {
+    fn new(attempt_id: &str) -> Self {
+        let sample_bps = wire_hash_sample_bps();
+        let mut sampler = DefaultHasher::new();
+        attempt_id.hash(&mut sampler);
+        let sampled = sample_bps >= 10_000 || sampler.finish() % 10_000 < sample_bps;
+        Self {
+            stream_mode: "unknown",
+            upstream_bytes: 0,
+            upstream_chunks: 0,
+            downstream_bytes: 0,
+            downstream_chunks: 0,
+            event_count: 0,
+            delta_events: 0,
+            normalized_events: 0,
+            usage: None,
+            wire_hash: sampled.then(Sha256::new),
+        }
+    }
+
     fn report(&self) -> Value {
-        let hash = self.wire_hash.clone().finalize();
+        let hash = self
+            .wire_hash
+            .as_ref()
+            .map(|hasher| format!("{:x}", hasher.clone().finalize()));
         json!({
             "upstream_bytes": self.upstream_bytes,
+            "upstream_chunks": self.upstream_chunks,
             "downstream_bytes": self.downstream_bytes,
+            "downstream_chunks": self.downstream_chunks,
             "event_count": self.event_count,
             "delta_events": self.delta_events,
             "normalized_events": self.normalized_events,
             "usage": self.usage,
-            "wire_sha256": format!("{hash:x}"),
+            "wire_sha256": hash,
+            "wire_hash_sampled": self.wire_hash.is_some(),
+            "stream_mode": self.stream_mode,
         })
+    }
+
+    fn observe_upstream(&mut self, chunk: &[u8]) {
+        self.upstream_bytes = self.upstream_bytes.saturating_add(chunk.len() as u64);
+        self.upstream_chunks = self.upstream_chunks.saturating_add(1);
     }
 
     fn observe_wire(&mut self, wire: &[u8]) {
         self.downstream_bytes = self.downstream_bytes.saturating_add(wire.len() as u64);
-        self.wire_hash.update(wire);
+        self.downstream_chunks = self.downstream_chunks.saturating_add(1);
+        if let Some(hasher) = self.wire_hash.as_mut() {
+            hasher.update(wire);
+        }
     }
+}
+
+impl Default for StreamStats {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+fn wire_hash_sample_bps() -> u64 {
+    static SAMPLE_BPS: OnceLock<u64> = OnceLock::new();
+    *SAMPLE_BPS.get_or_init(|| {
+        std::env::var("RUST_RESPONSES_WIRE_HASH_SAMPLE_BPS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(100)
+            .min(10_000)
+    })
 }
 
 #[derive(Debug)]
@@ -124,6 +211,7 @@ struct ActiveAttempt {
     stream: ByteStream,
     decoder: SseDecoder,
     processor: ResponsesProcessor,
+    mode: StreamMode,
     early_output: Vec<Bytes>,
     buffered: Vec<Bytes>,
     stats: StreamStats,
@@ -132,6 +220,7 @@ struct ActiveAttempt {
     commit_reason: &'static str,
     precommit_keepalive_sent: bool,
     business_committed: bool,
+    raw_pending_forwarded: bool,
 }
 
 enum PreflightResult {
@@ -180,8 +269,12 @@ impl Coordinator {
                         "status_code": outcome.get("status_code").and_then(Value::as_u64),
                         "upstream_status_code": outcome.get("upstream_status_code").and_then(Value::as_u64),
                         "upstream_bytes": outcome.get("upstream_bytes").and_then(Value::as_u64),
+                        "upstream_chunks": outcome.get("upstream_chunks").and_then(Value::as_u64),
                         "downstream_bytes": outcome.get("downstream_bytes").and_then(Value::as_u64),
+                        "downstream_chunks": outcome.get("downstream_chunks").and_then(Value::as_u64),
                         "event_count": outcome.get("event_count").and_then(Value::as_u64),
+                        "stream_mode": outcome.get("stream_mode").and_then(Value::as_str),
+                        "wire_hash_sampled": outcome.get("wire_hash_sampled").and_then(Value::as_bool),
                     })
                 );
                 None
@@ -621,6 +714,9 @@ async fn preflight_attempt(
         })));
     }
 
+    let mode = StreamMode::for_plan(&plan);
+    let mut stats = StreamStats::new(&plan.attempt_id);
+    stats.stream_mode = mode.as_str();
     let stream = Box::pin(response.bytes_stream());
     let mut active = ActiveAttempt {
         decoder: SseDecoder::new(plan.max_event_bytes),
@@ -628,19 +724,27 @@ async fn preflight_attempt(
             plan.commit_policy.clone(),
             plan.normalize_custom_tool_call_ids,
         ),
+        mode,
         plan,
         status,
         headers: response_headers,
         stream,
         early_output: Vec::new(),
         buffered: Vec::new(),
-        stats: StreamStats::default(),
+        stats,
         terminal: None,
         total_deadline,
         commit_reason: "real_output",
         precommit_keepalive_sent: keepalive_already_sent,
         business_committed: false,
+        raw_pending_forwarded: false,
     };
+
+    if active.mode == StreamMode::OpaqueRaw {
+        active.commit_reason = "upstream_http_200";
+        active.business_committed = true;
+        return Ok(PreflightResult::Started(active));
+    }
 
     loop {
         let next_deadline = earlier_deadline(first_deadline, active.total_deadline);
@@ -680,10 +784,7 @@ async fn preflight_attempt(
                 })))
             }
         };
-        active.stats.upstream_bytes = active
-            .stats
-            .upstream_bytes
-            .saturating_add(chunk.len() as u64);
+        active.stats.observe_upstream(&chunk);
         let frames = active.decoder.feed(&chunk)?;
         if let Some(result) = process_preflight_frames(&mut active, frames)? {
             return Ok(result);
@@ -787,6 +888,7 @@ fn process_preflight_frames(
 }
 
 fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
+    stage_raw_pending(active);
     let placeholder = ActiveAttempt {
         plan: active.plan.clone(),
         status: active.status,
@@ -794,16 +896,30 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
         stream: Box::pin(futures_util::stream::empty()),
         decoder: SseDecoder::new(active.plan.max_event_bytes),
         processor: ResponsesProcessor::new("real_output".into(), false),
+        mode: active.mode,
         early_output: Vec::new(),
         buffered: Vec::new(),
-        stats: StreamStats::default(),
+        stats: StreamStats::new(&active.plan.attempt_id),
         terminal: None,
         total_deadline: active.total_deadline,
         commit_reason: active.commit_reason,
         precommit_keepalive_sent: active.precommit_keepalive_sent,
         business_committed: active.business_committed,
+        raw_pending_forwarded: false,
     };
     Ok(std::mem::replace(active, placeholder))
+}
+
+fn stage_raw_pending(active: &mut ActiveAttempt) {
+    if active.business_committed
+        && active.mode.relays_raw_after_commit()
+        && !active.raw_pending_forwarded
+    {
+        if let Some(pending) = active.decoder.pending_copy() {
+            active.buffered.push(pending);
+        }
+        active.raw_pending_forwarded = true;
+    }
 }
 
 fn start_public_stream(
@@ -1021,6 +1137,29 @@ async fn run_active_attempt(
         }
 
         loop {
+            if active.business_committed {
+                let mode = active.mode;
+                if mode.relays_raw_after_commit() {
+                    break 'request run_raw_committed(
+                        &state,
+                        &mut coordinator,
+                        &mut active,
+                        &mut output,
+                        &cancellation,
+                    )
+                    .await;
+                }
+                if mode == StreamMode::SelectiveRewrite {
+                    break 'request run_selective_committed(
+                        &state,
+                        &mut coordinator,
+                        &mut active,
+                        &mut output,
+                        &cancellation,
+                    )
+                    .await;
+                }
+            }
             let idle_deadline = deadline(
                 tokio::time::Instant::now(),
                 active.plan.idle_timeout_seconds,
@@ -1042,10 +1181,7 @@ async fn run_active_attempt(
             };
             let frames = match next {
                 Ok(Some(Ok(chunk))) => {
-                    active.stats.upstream_bytes = active
-                        .stats
-                        .upstream_bytes
-                        .saturating_add(chunk.len() as u64);
+                    active.stats.observe_upstream(&chunk);
                     match active.decoder.feed(&chunk) {
                         Ok(frames) => frames,
                         Err(error) => {
@@ -1252,6 +1388,368 @@ async fn run_active_attempt(
         task.abort();
     }
     output.finish(cacheable).await;
+}
+
+async fn run_raw_committed(
+    state: &AppState,
+    coordinator: &mut Coordinator,
+    active: &mut ActiveAttempt,
+    output: &mut OutputSink,
+    cancellation: &CancellationToken,
+) -> bool {
+    if !active.raw_pending_forwarded {
+        if let Some(pending) = active.decoder.pending_copy() {
+            active.stats.observe_wire(&pending);
+            if output.send_wire(pending).await.is_err() {
+                complete_disconnect(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                )
+                .await;
+                return false;
+            }
+        }
+        active.raw_pending_forwarded = true;
+    }
+
+    loop {
+        let idle_deadline = deadline(
+            tokio::time::Instant::now(),
+            active.plan.idle_timeout_seconds,
+        );
+        let next_deadline = earlier_deadline(idle_deadline, active.total_deadline);
+        let next = tokio::select! {
+            _ = cancellation.cancelled(), if output.capture.is_none() => {
+                complete_disconnect(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                )
+                .await;
+                return false;
+            }
+            result = await_deadline(active.stream.next(), next_deadline) => result,
+        };
+        match next {
+            Ok(Some(Ok(chunk))) => {
+                active.stats.observe_upstream(&chunk);
+                let inspection = match active.decoder.feed(&chunk) {
+                    Ok(frames) => inspect_raw_frames(frames, &mut active.stats),
+                    Err(error) => Err(error),
+                };
+                active.stats.observe_wire(&chunk);
+                if output.send_wire(chunk).await.is_err() {
+                    complete_disconnect(
+                        state,
+                        coordinator,
+                        active.plan.attempt_id.clone(),
+                        active.status,
+                        &mut active.stats,
+                    )
+                    .await;
+                    return false;
+                }
+                match inspection {
+                    Ok(Some(terminal)) => {
+                        finish_observed_terminal(state, coordinator, active, terminal).await;
+                        return true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        complete_failure(
+                            state,
+                            coordinator,
+                            active.plan.attempt_id.clone(),
+                            active.status,
+                            &mut active.stats,
+                            "protocol_error",
+                            &error,
+                        )
+                        .await;
+                        return false;
+                    }
+                }
+            }
+            Ok(None) => {
+                let inspection = match active.decoder.finish() {
+                    Ok(frames) => inspect_raw_frames(frames, &mut active.stats),
+                    Err(error) => Err(error),
+                };
+                match inspection {
+                    Ok(Some(terminal)) => {
+                        finish_observed_terminal(state, coordinator, active, terminal).await;
+                        return true;
+                    }
+                    Ok(None) => {
+                        complete_failure(
+                            state,
+                            coordinator,
+                            active.plan.attempt_id.clone(),
+                            active.status,
+                            &mut active.stats,
+                            "protocol_error",
+                            "Responses upstream ended without a terminal response event",
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        complete_failure(
+                            state,
+                            coordinator,
+                            active.plan.attempt_id.clone(),
+                            active.status,
+                            &mut active.stats,
+                            "protocol_error",
+                            &error,
+                        )
+                        .await;
+                    }
+                }
+                return false;
+            }
+            Ok(Some(Err(error))) => {
+                complete_failure(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                    "transport_error",
+                    &format!("upstream stream read failed: {error}"),
+                )
+                .await;
+                return false;
+            }
+            Err(error) => {
+                complete_failure(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                    "transport_error",
+                    &error,
+                )
+                .await;
+                return false;
+            }
+        }
+    }
+}
+
+fn inspect_raw_frames(
+    frames: Vec<SseFrame>,
+    stats: &mut StreamStats,
+) -> Result<Option<Terminal>, String> {
+    for frame in frames {
+        if let Some(terminal) = inspect_terminal_frame(&frame, stats)? {
+            return Ok(Some(terminal));
+        }
+    }
+    Ok(None)
+}
+
+async fn finish_observed_terminal(
+    state: &AppState,
+    coordinator: &mut Coordinator,
+    active: &mut ActiveAttempt,
+    terminal: Terminal,
+) {
+    if let Terminal::SemanticFailure {
+        event_type,
+        payload,
+    } = &terminal
+    {
+        let outcome = semantic_failure_outcome(active, event_type, payload, true);
+        let _ = coordinator.complete(state, &outcome).await;
+        return;
+    }
+    finish_terminal(
+        state,
+        coordinator,
+        active.plan.attempt_id.clone(),
+        active.status,
+        &mut active.stats,
+        terminal,
+    )
+    .await;
+}
+
+async fn run_selective_committed(
+    state: &AppState,
+    coordinator: &mut Coordinator,
+    active: &mut ActiveAttempt,
+    output: &mut OutputSink,
+    cancellation: &CancellationToken,
+) -> bool {
+    loop {
+        let idle_deadline = deadline(
+            tokio::time::Instant::now(),
+            active.plan.idle_timeout_seconds,
+        );
+        let next_deadline = earlier_deadline(idle_deadline, active.total_deadline);
+        let next = tokio::select! {
+            _ = cancellation.cancelled(), if output.capture.is_none() => {
+                complete_disconnect(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                )
+                .await;
+                return false;
+            }
+            result = await_deadline(active.stream.next(), next_deadline) => result,
+        };
+        match next {
+            Ok(Some(Ok(chunk))) => {
+                active.stats.observe_upstream(&chunk);
+                let frames = match active.decoder.feed(&chunk) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        complete_failure(
+                            state,
+                            coordinator,
+                            active.plan.attempt_id.clone(),
+                            active.status,
+                            &mut active.stats,
+                            "protocol_error",
+                            &error,
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                if let Some(cacheable) =
+                    relay_selective_frames(state, coordinator, active, output, frames).await
+                {
+                    return cacheable;
+                }
+            }
+            Ok(None) => {
+                let frames = match active.decoder.finish() {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        complete_failure(
+                            state,
+                            coordinator,
+                            active.plan.attempt_id.clone(),
+                            active.status,
+                            &mut active.stats,
+                            "protocol_error",
+                            &error,
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                if let Some(cacheable) =
+                    relay_selective_frames(state, coordinator, active, output, frames).await
+                {
+                    return cacheable;
+                }
+                complete_failure(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                    "protocol_error",
+                    "Responses upstream ended without a terminal response event",
+                )
+                .await;
+                return false;
+            }
+            Ok(Some(Err(error))) => {
+                complete_failure(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                    "transport_error",
+                    &format!("upstream stream read failed: {error}"),
+                )
+                .await;
+                return false;
+            }
+            Err(error) => {
+                complete_failure(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                    "transport_error",
+                    &error,
+                )
+                .await;
+                return false;
+            }
+        }
+    }
+}
+
+async fn relay_selective_frames(
+    state: &AppState,
+    coordinator: &mut Coordinator,
+    active: &mut ActiveAttempt,
+    output: &mut OutputSink,
+    frames: Vec<SseFrame>,
+) -> Option<bool> {
+    let mut batch = BytesMut::new();
+    for frame in frames {
+        let special = selective_rewrite_candidate(&frame)
+            || frame_is_comment_only(frame.raw())
+            || terminal_candidate(&frame);
+        if !special {
+            observe_light_frame(&mut active.stats, &frame);
+            batch.extend_from_slice(&frame.canonical_wire());
+            continue;
+        }
+        if !batch.is_empty() {
+            let wire = batch.split().freeze();
+            active.stats.observe_wire(&wire);
+            if output.send_wire(wire).await.is_err() {
+                complete_disconnect(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                )
+                .await;
+                return Some(false);
+            }
+        }
+        match process_active_frames(state, coordinator, active, output, vec![frame]).await {
+            ActiveFrameResult::Continue => {}
+            ActiveFrameResult::Done(cacheable) => return Some(cacheable),
+            ActiveFrameResult::Retry(_) => return Some(false),
+        }
+    }
+    if !batch.is_empty() {
+        let wire = batch.freeze();
+        active.stats.observe_wire(&wire);
+        if output.send_wire(wire).await.is_err() {
+            complete_disconnect(
+                state,
+                coordinator,
+                active.plan.attempt_id.clone(),
+                active.status,
+                &mut active.stats,
+            )
+            .await;
+            return Some(false);
+        }
+    }
+    None
 }
 
 async fn flush_initial_output(
@@ -1766,8 +2264,9 @@ impl ResponsesProcessor {
         stats: &mut StreamStats,
     ) -> Result<ProcessedEvent, String> {
         stats.event_count = stats.event_count.saturating_add(1);
-        if frame.comment_only {
-            if frame.raw.starts_with(": oaix-terminal-flush-v1 ") {
+        let parsed = parse_sse_frame(&frame)?;
+        if parsed.comment_only {
+            if parsed.raw.starts_with(": oaix-terminal-flush-v1 ") {
                 return Ok(ProcessedEvent {
                     wire: None,
                     event_type: None,
@@ -1777,14 +2276,14 @@ impl ResponsesProcessor {
                 });
             }
             return Ok(ProcessedEvent {
-                wire: Some(Bytes::from(format!("{}\n\n", frame.raw))),
+                wire: Some(frame.canonical_wire()),
                 event_type: None,
                 commits: false,
                 canonical_keepalive: false,
                 terminal: None,
             });
         }
-        let Some(data) = frame.data else {
+        let Some(data) = parsed.data else {
             return Ok(ProcessedEvent {
                 wire: None,
                 event_type: None,
@@ -1808,7 +2307,7 @@ impl ResponsesProcessor {
         if event_type.len() > 256 || event_type.contains(['\r', '\n']) {
             return Err("Responses upstream event type is invalid".into());
         }
-        if let Some(declared) = frame.declared_event.as_deref() {
+        if let Some(declared) = parsed.declared_event.as_deref() {
             if declared != event_type {
                 return Err(format!(
                     "Responses event field {declared:?} does not match payload type {event_type:?}"
@@ -1825,11 +2324,11 @@ impl ResponsesProcessor {
         let wire = if normalized {
             stats.normalized_events = stats.normalized_events.saturating_add(1);
             encode_event(&event_type, &payload)?
-        } else if frame.declared_event.is_none() {
+        } else if parsed.declared_event.is_none() {
             stats.normalized_events = stats.normalized_events.saturating_add(1);
-            Bytes::from(format!("event: {event_type}\n{}\n\n", frame.raw))
+            Bytes::from(format!("event: {event_type}\n{}\n\n", parsed.raw))
         } else {
-            Bytes::from(format!("{}\n\n", frame.raw))
+            frame.canonical_wire()
         };
         if event_type.ends_with(".delta") {
             stats.delta_events = stats.delta_events.saturating_add(1);
@@ -1865,6 +2364,145 @@ impl ResponsesProcessor {
             terminal,
         })
     }
+}
+
+fn declared_event_bytes(raw: &[u8]) -> Option<&[u8]> {
+    for line in raw.split(|byte| matches!(*byte, b'\r' | b'\n')) {
+        let Some(mut value) = line.strip_prefix(b"event:") else {
+            continue;
+        };
+        if let Some(stripped) = value.strip_prefix(b" ") {
+            value = stripped;
+        }
+        return Some(value);
+    }
+    None
+}
+
+fn frame_has_data(raw: &[u8]) -> bool {
+    raw.split(|byte| matches!(*byte, b'\r' | b'\n'))
+        .any(|line| line == b"data" || line.starts_with(b"data:"))
+}
+
+fn frame_is_comment_only(raw: &[u8]) -> bool {
+    let mut saw_comment = false;
+    for line in raw.split(|byte| matches!(*byte, b'\r' | b'\n')) {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(b":") {
+            saw_comment = true;
+        } else {
+            return false;
+        }
+    }
+    saw_comment
+}
+
+fn is_terminal_event_type(event_type: &[u8]) -> bool {
+    matches!(
+        event_type,
+        b"error" | b"response.completed" | b"response.failed" | b"response.incomplete"
+    )
+}
+
+fn terminal_candidate(frame: &SseFrame) -> bool {
+    if declared_event_bytes(frame.raw()).is_some_and(is_terminal_event_type) {
+        return true;
+    }
+    [
+        b"response.completed".as_slice(),
+        b"response.failed".as_slice(),
+        b"response.incomplete".as_slice(),
+        b"\"type\":\"error\"".as_slice(),
+    ]
+    .iter()
+    .any(|needle| memmem::find(frame.raw(), needle).is_some())
+}
+
+fn selective_rewrite_candidate(frame: &SseFrame) -> bool {
+    let raw = frame.raw();
+    terminal_candidate(frame)
+        || declared_event_bytes(raw).is_none()
+        || !frame_has_data(raw)
+        || memmem::find(raw, b"custom_tool_call").is_some()
+        || contains_json_string_value_prefix(raw, b"item_")
+        || contains_json_string_value_prefix(raw, b"ctc_")
+}
+
+fn contains_json_string_value_prefix(raw: &[u8], prefix: &[u8]) -> bool {
+    let mut offset = 0;
+    while let Some(relative) = memchr::memchr(b':', &raw[offset..]) {
+        let colon = offset + relative;
+        let value = raw[colon + 1..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|leading| &raw[colon + 1 + leading..])
+            .unwrap_or_default();
+        if value
+            .strip_prefix(b"\"")
+            .is_some_and(|value| value.starts_with(prefix))
+        {
+            return true;
+        }
+        offset = colon.saturating_add(1);
+    }
+    false
+}
+
+fn observe_light_frame(stats: &mut StreamStats, frame: &SseFrame) {
+    stats.event_count = stats.event_count.saturating_add(1);
+    if declared_event_bytes(frame.raw()).is_some_and(|event_type| event_type.ends_with(b".delta")) {
+        stats.delta_events = stats.delta_events.saturating_add(1);
+    }
+}
+
+fn inspect_terminal_frame(
+    frame: &SseFrame,
+    stats: &mut StreamStats,
+) -> Result<Option<Terminal>, String> {
+    observe_light_frame(stats, frame);
+    if !terminal_candidate(frame) {
+        return Ok(None);
+    }
+    let parsed = parse_sse_frame(frame)?;
+    let Some(data) = parsed.data else {
+        return Ok(None);
+    };
+    if data.trim() == "[DONE]" {
+        return Err("Responses upstream emitted [DONE] without a terminal response event".into());
+    }
+    let payload: Value = serde_json::from_str(&data)
+        .map_err(|error| format!("Responses upstream terminal JSON is invalid: {error}"))?;
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Responses upstream terminal payload is missing a string type".to_owned())?;
+    if !is_terminal_event_type(event_type.as_bytes()) {
+        return Ok(None);
+    }
+    if let Some(declared) = parsed.declared_event.as_deref() {
+        if declared != event_type {
+            return Err(format!(
+                "Responses event field {declared:?} does not match payload type {event_type:?}"
+            ));
+        }
+    }
+    validate_terminal(event_type, &payload)?;
+    if let Some(usage) = extract_usage(&payload) {
+        stats.usage = Some(usage.clone());
+    }
+    if semantic_failure(event_type, &payload) {
+        return Ok(Some(Terminal::SemanticFailure {
+            event_type: event_type.to_owned(),
+            payload,
+        }));
+    }
+    Ok(match event_type {
+        "response.completed" => Some(Terminal::Completed),
+        "response.incomplete" => Some(Terminal::Incomplete),
+        _ => None,
+    })
 }
 
 fn validate_terminal(event_type: &str, payload: &Value) -> Result<(), String> {
@@ -2122,6 +2760,29 @@ fn collect_item_ids(root: &Map<String, Value>) -> HashSet<String> {
 
 #[derive(Debug)]
 struct SseFrame {
+    wire: Bytes,
+    raw_len: usize,
+    terminated: bool,
+}
+
+impl SseFrame {
+    fn raw(&self) -> &[u8] {
+        &self.wire[..self.raw_len]
+    }
+
+    fn canonical_wire(&self) -> Bytes {
+        if self.terminated {
+            self.wire.clone()
+        } else {
+            let mut wire = BytesMut::with_capacity(self.wire.len().saturating_add(2));
+            wire.extend_from_slice(&self.wire);
+            wire.extend_from_slice(b"\n\n");
+            wire.freeze()
+        }
+    }
+}
+
+struct ParsedSseFrame {
     raw: String,
     declared_event: Option<String>,
     data: Option<String>,
@@ -2129,14 +2790,16 @@ struct SseFrame {
 }
 
 struct SseDecoder {
-    buffer: Vec<u8>,
+    buffer: BytesMut,
+    scan_from: usize,
     max_event_bytes: usize,
 }
 
 impl SseDecoder {
     fn new(max_event_bytes: usize) -> Self {
         Self {
-            buffer: Vec::new(),
+            buffer: BytesMut::new(),
+            scan_from: 0,
             max_event_bytes: max_event_bytes.max(1),
         }
     }
@@ -2144,17 +2807,24 @@ impl SseDecoder {
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, String> {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        while let Some((end, delimiter_len)) = find_event_delimiter(&self.buffer) {
+        while let Some((end, delimiter_len)) =
+            find_event_delimiter_from(&self.buffer, self.scan_from)
+        {
             if end > self.max_event_bytes {
                 return Err("Responses upstream SSE event exceeds the configured limit".into());
             }
-            let raw = self.buffer[..end].to_vec();
-            self.buffer.drain(..end + delimiter_len);
-            if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            let wire = self.buffer.split_to(end + delimiter_len).freeze();
+            self.scan_from = 0;
+            if wire[..end].iter().all(|byte| byte.is_ascii_whitespace()) {
                 continue;
             }
-            frames.push(parse_sse_frame(&raw)?);
+            frames.push(SseFrame {
+                wire,
+                raw_len: end,
+                terminated: true,
+            });
         }
+        self.scan_from = self.buffer.len().saturating_sub(3);
         if self.buffer.len() > self.max_event_bytes.saturating_add(64 * 1024) {
             return Err("Responses upstream SSE pending frame exceeds the configured limit".into());
         }
@@ -2167,17 +2837,28 @@ impl SseDecoder {
             if self.buffer.len() > self.max_event_bytes {
                 return Err("Responses upstream SSE event exceeds the configured limit".into());
             }
-            let raw = std::mem::take(&mut self.buffer);
-            frames.push(parse_sse_frame(&raw)?);
+            let raw_len = self.buffer.len();
+            frames.push(SseFrame {
+                wire: self.buffer.split().freeze(),
+                raw_len,
+                terminated: false,
+            });
         }
         self.buffer.clear();
+        self.scan_from = 0;
         Ok(frames)
+    }
+
+    fn pending_copy(&self) -> Option<Bytes> {
+        (!self.buffer.is_empty()).then(|| Bytes::copy_from_slice(&self.buffer))
     }
 }
 
-fn find_event_delimiter(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut index = 0;
+fn find_event_delimiter_from(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut index = start.min(bytes.len());
     while index < bytes.len() {
+        let relative = memchr2(b'\r', b'\n', &bytes[index..])?;
+        index += relative;
         if bytes[index..].starts_with(b"\r\n\r\n") {
             return Some((index, 4));
         }
@@ -2189,10 +2870,14 @@ fn find_event_delimiter(bytes: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn parse_sse_frame(raw: &[u8]) -> Result<SseFrame, String> {
-    let text = std::str::from_utf8(raw)
+fn parse_sse_frame(frame: &SseFrame) -> Result<ParsedSseFrame, String> {
+    let text = std::str::from_utf8(frame.raw())
         .map_err(|_| "Responses upstream SSE event is not valid UTF-8".to_owned())?;
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = if text.as_bytes().contains(&b'\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_owned()
+    };
     let mut declared_event = None;
     let mut data_lines = Vec::new();
     let mut saw_field = false;
@@ -2216,7 +2901,7 @@ fn parse_sse_frame(raw: &[u8]) -> Result<SseFrame, String> {
             _ => {}
         }
     }
-    Ok(SseFrame {
+    Ok(ParsedSseFrame {
         raw: normalized,
         declared_event,
         data: (!data_lines.is_empty()).then(|| data_lines.join("\n")),
@@ -2456,9 +3141,11 @@ mod tests {
             max_precommit_items: 128,
             max_precommit_bytes: 64 * 1024,
         };
+        let mode = StreamMode::for_plan(&plan);
         ActiveAttempt {
             decoder: SseDecoder::new(plan.max_event_bytes),
             processor: ResponsesProcessor::new("real_output".into(), false),
+            mode,
             plan,
             status: StatusCode::OK,
             headers: HeaderMap::new(),
@@ -2471,6 +3158,7 @@ mod tests {
             commit_reason: "real_output",
             precommit_keepalive_sent: false,
             business_committed: false,
+            raw_pending_forwarded: false,
         }
     }
 
@@ -2485,9 +3173,66 @@ mod tests {
             .unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(
-            frames[0].declared_event.as_deref(),
-            Some("response.output_text.delta")
+            declared_event_bytes(frames[0].raw()),
+            Some(b"response.output_text.delta".as_slice())
         );
+    }
+
+    #[test]
+    fn stream_modes_match_engine_and_normalization_contract() {
+        let gpt = test_active("gpt");
+        assert_eq!(gpt.mode, StreamMode::OpaqueRaw);
+
+        let codex = test_active("codex");
+        assert_eq!(codex.mode, StreamMode::GuardedThenRaw);
+
+        let mut normalized_plan = test_active("gpt").plan;
+        normalized_plan.normalize_custom_tool_call_ids = true;
+        assert_eq!(
+            StreamMode::for_plan(&normalized_plan),
+            StreamMode::SelectiveRewrite
+        );
+    }
+
+    #[test]
+    fn raw_mode_ignores_nonterminal_json_and_parses_terminal_once() {
+        let mut decoder = SseDecoder::new(4096);
+        let frames = decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: this-is-not-json\n\n\
+                  event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+            )
+            .unwrap();
+        let mut stats = StreamStats::new("raw-terminal-test");
+        let terminal = inspect_raw_frames(frames, &mut stats).unwrap();
+        assert!(matches!(terminal, Some(Terminal::Completed)));
+        assert_eq!(stats.event_count, 2);
+        assert_eq!(stats.delta_events, 1);
+        assert_eq!(stats.usage.as_ref().unwrap()["total_tokens"], 3);
+    }
+
+    #[test]
+    fn decoder_preserves_crlf_wire_without_rebuilding() {
+        let wire = Bytes::from_static(
+            b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\r\n\r\n",
+        );
+        let mut decoder = SseDecoder::new(4096);
+        let frame = decoder.feed(&wire).unwrap().pop().unwrap();
+        assert_eq!(frame.canonical_wire(), wire);
+    }
+
+    #[test]
+    fn selective_mode_only_materializes_rewrite_candidates() {
+        let mut decoder = SseDecoder::new(4096);
+        let mut ordinary = decoder
+            .feed(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_abc\",\"delta\":\"x\"}\n\n")
+            .unwrap();
+        assert!(!selective_rewrite_candidate(&ordinary.remove(0)));
+
+        let mut custom = decoder
+            .feed(b"event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"item_abc\",\"delta\":\"{}\"}\n\n")
+            .unwrap();
+        assert!(selective_rewrite_candidate(&custom.remove(0)));
     }
 
     #[test]
