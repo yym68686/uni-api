@@ -3530,7 +3530,7 @@ def test_responses_stream_closes_upstream_when_downstream_closes_after_commit(mo
         )
         chunks = []
         body_iterator = response.body_iterator
-        for _ in range(3):
+        for _ in range(2):
             chunk = await anext(body_iterator)
             chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk))
         await asyncio.sleep(0)
@@ -3578,7 +3578,7 @@ def test_responses_stream_retry_closes_failed_upstream_response(monkeypatch):
         ]
 
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
-    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
 
     upstream_a = DummyStreamingUpstreamResponse(
         chunks=[
@@ -3896,7 +3896,7 @@ def test_responses_stream_retries_when_structural_events_end_without_output(monk
         ]
 
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
-    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
 
     main.app.state.config = {
         "api_keys": [
@@ -3994,7 +3994,7 @@ def test_responses_stream_retries_next_provider_on_semantic_failure(monkeypatch)
         ]
 
     monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
-    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
 
     main.app.state.config = {
         "api_keys": [
