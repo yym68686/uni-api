@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::idempotency;
 use crate::proxy::{filtered_response_headers, json_error, AppState};
 
 const CONTROL_HEADER: &str = "x-uni-api-rust-control-token";
@@ -134,6 +135,7 @@ pub async fn serve_session(
     state: AppState,
     session_id: String,
     control_response: reqwest::Response,
+    mut idempotency_owner: Option<idempotency::Owner>,
 ) -> Response<Body> {
     let public_control_headers = public_control_headers(control_response.headers());
     let mut control_response = Some(control_response);
@@ -141,21 +143,28 @@ pub async fn serve_session(
     let mut message = match control_get_plan(&state, &session_id).await {
         Ok(message) => message,
         Err(error) => {
+            release_owner(&mut idempotency_owner).await;
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("Rust Responses control plan failed: {error}"),
-            )
+            );
         }
     };
 
     loop {
         if message.get("kind").and_then(Value::as_str) == Some("final") {
-            return response_from_final(&message, &public_control_headers);
+            return response_from_final(
+                &message,
+                &public_control_headers,
+                idempotency_owner.take(),
+            )
+            .await;
         }
         let plan = match serde_json::from_value::<Plan>(message.clone()) {
             Ok(plan) if message.get("kind").and_then(Value::as_str) == Some("plan") => plan,
             Ok(_) | Err(_) => {
-                return json_error(StatusCode::BAD_GATEWAY, "Invalid Rust Responses plan")
+                release_owner(&mut idempotency_owner).await;
+                return json_error(StatusCode::BAD_GATEWAY, "Invalid Rust Responses plan");
             }
         };
         match preflight_attempt(&state, plan, false).await {
@@ -170,10 +179,11 @@ pub async fn serve_session(
                 message = match control_advance(&state, &session_id, &outcome).await {
                     Ok(next) => next,
                     Err(error) => {
+                        release_owner(&mut idempotency_owner).await;
                         return json_error(
                             StatusCode::BAD_GATEWAY,
                             &format!("Rust Responses retry coordination failed: {error}"),
-                        )
+                        );
                     }
                 };
             }
@@ -187,6 +197,7 @@ pub async fn serve_session(
                     "precommit_bytes": active.buffered.iter().map(|item| item.len() as u64).sum::<u64>(),
                 });
                 if let Err(error) = control_commit(&state, &session_id, &observation).await {
+                    release_owner(&mut idempotency_owner).await;
                     return json_error(
                         StatusCode::BAD_GATEWAY,
                         &format!("Rust Responses commit coordination failed: {error}"),
@@ -208,6 +219,7 @@ pub async fn serve_session(
                     active,
                     public_control_headers,
                     control_drain,
+                    idempotency_owner.take(),
                 );
             }
             Err(error) => {
@@ -221,10 +233,11 @@ pub async fn serve_session(
                 message = match control_advance(&state, &session_id, &outcome).await {
                     Ok(next) => next,
                     Err(control_error) => {
+                        release_owner(&mut idempotency_owner).await;
                         return json_error(
                             StatusCode::BAD_GATEWAY,
                             &format!("Rust Responses preflight failed: {control_error}"),
-                        )
+                        );
                     }
                 };
             }
@@ -477,6 +490,7 @@ fn start_public_stream(
     active: ActiveAttempt,
     control_headers: HeaderMap,
     control_drain: Option<tokio::task::JoinHandle<()>>,
+    idempotency_owner: Option<idempotency::Owner>,
 ) -> Response<Body> {
     let status = active.status;
     let mut headers = active.headers.clone();
@@ -488,6 +502,20 @@ fn start_public_stream(
         .or_insert(HeaderValue::from_static("text/event-stream"));
     headers.insert("x-uni-api-data-plane", HeaderValue::from_static("rust-v1"));
 
+    let capture_headers = headers.clone();
+    let capture = idempotency_owner.map(|owner| IdempotencyCapture {
+        max_bytes: owner.max_response_bytes(),
+        owner,
+        status,
+        headers: capture_headers,
+        chunks: Vec::new(),
+        bytes: 0,
+        overflowed: false,
+    });
+    if capture.is_some() {
+        idempotency::executed_header(&mut headers);
+    }
+
     let (sender, receiver) = mpsc::channel(DOWNSTREAM_CHANNEL_SEGMENTS);
     let cancellation = CancellationToken::new();
     let finished = Arc::new(AtomicBool::new(false));
@@ -496,15 +524,12 @@ fn start_public_stream(
         cancellation: cancellation.clone(),
         finished: finished.clone(),
     };
-    tokio::spawn(run_active_attempt(
-        state,
-        session_id,
-        active,
-        sender,
-        cancellation,
+    let runtime = ActiveRuntime {
+        output: OutputSink::new(sender, cancellation.clone(), capture),
         finished,
         control_drain,
-    ));
+    };
+    tokio::spawn(run_active_attempt(state, session_id, active, runtime));
 
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = status;
@@ -512,17 +537,121 @@ fn start_public_stream(
     response
 }
 
+struct IdempotencyCapture {
+    owner: idempotency::Owner,
+    status: StatusCode,
+    headers: HeaderMap,
+    chunks: Vec<Bytes>,
+    bytes: usize,
+    max_bytes: usize,
+    overflowed: bool,
+}
+
+struct OutputSink {
+    sender: mpsc::Sender<Result<Bytes, io::Error>>,
+    cancellation: CancellationToken,
+    downstream_open: bool,
+    capture: Option<IdempotencyCapture>,
+}
+
+struct ActiveRuntime {
+    output: OutputSink,
+    finished: Arc<AtomicBool>,
+    control_drain: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OutputSink {
+    fn new(
+        sender: mpsc::Sender<Result<Bytes, io::Error>>,
+        cancellation: CancellationToken,
+        capture: Option<IdempotencyCapture>,
+    ) -> Self {
+        Self {
+            sender,
+            cancellation,
+            downstream_open: true,
+            capture,
+        }
+    }
+
+    async fn send_wire(&mut self, wire: Bytes) -> Result<(), ()> {
+        for offset in (0..wire.len()).step_by(DOWNSTREAM_SEGMENT_BYTES) {
+            let end = (offset + DOWNSTREAM_SEGMENT_BYTES).min(wire.len());
+            let segment = wire.slice(offset..end);
+            if let Some(capture) = self.capture.as_mut() {
+                if !capture.overflowed {
+                    let next_bytes = capture.bytes.saturating_add(segment.len());
+                    if next_bytes > capture.max_bytes
+                        || !capture.owner.try_reserve_inflight_response(segment.len())
+                    {
+                        capture.owner.release_inflight_response(capture.bytes);
+                        capture.overflowed = true;
+                        capture.chunks.clear();
+                        capture.bytes = 0;
+                    } else {
+                        capture.bytes = next_bytes;
+                        capture.chunks.push(segment.clone());
+                    }
+                }
+            }
+            if !self.downstream_open {
+                continue;
+            }
+            let result = tokio::select! {
+                _ = self.cancellation.cancelled() => None,
+                result = tokio::time::timeout(
+                    downstream_write_timeout(),
+                    self.sender.send(Ok(segment)),
+                ) => Some(result),
+            };
+            if !matches!(result, Some(Ok(Ok(())))) {
+                if self.capture.is_some() {
+                    self.downstream_open = false;
+                    continue;
+                }
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self, cacheable: bool) {
+        let Some(capture) = self.capture.take() else {
+            return;
+        };
+        capture.owner.release_inflight_response(capture.bytes);
+        if !cacheable {
+            capture.owner.release().await;
+        } else if capture.overflowed {
+            capture.owner.nonreplayable("response_too_large").await;
+        } else {
+            capture
+                .owner
+                .complete(
+                    capture.status,
+                    capture.headers,
+                    capture.chunks,
+                    capture.bytes,
+                )
+                .await;
+        }
+    }
+}
+
 async fn run_active_attempt(
     state: AppState,
     session_id: String,
     mut active: ActiveAttempt,
-    sender: mpsc::Sender<Result<Bytes, io::Error>>,
-    cancellation: CancellationToken,
-    finished: Arc<AtomicBool>,
-    mut control_drain: Option<tokio::task::JoinHandle<()>>,
+    runtime: ActiveRuntime,
 ) {
-    'request: loop {
-        if flush_initial_output(&mut active, &sender, &cancellation)
+    let ActiveRuntime {
+        mut output,
+        finished,
+        mut control_drain,
+    } = runtime;
+    let cancellation = output.cancellation.clone();
+    let cacheable = 'request: loop {
+        if flush_initial_output(&mut active, &mut output)
             .await
             .is_err()
         {
@@ -534,7 +663,7 @@ async fn run_active_attempt(
                 &mut active.stats,
             )
             .await;
-            break;
+            break 'request false;
         }
 
         if let Some(terminal) = active.terminal.take() {
@@ -546,11 +675,10 @@ async fn run_active_attempt(
                         continue 'request;
                     }
                     Ok(RetryResolution::Final(message)) => {
-                        let _ = send_final_inband(&sender, &cancellation, &message).await;
+                        break 'request send_final_inband(&mut output, &message).await.is_ok();
                     }
-                    Err(_) => {}
+                    Err(_) => break 'request false,
                 }
-                break;
             }
             finish_terminal(
                 &state,
@@ -561,7 +689,7 @@ async fn run_active_attempt(
                 terminal,
             )
             .await;
-            break;
+            break 'request true;
         }
 
         loop {
@@ -571,7 +699,7 @@ async fn run_active_attempt(
             );
             let next_deadline = earlier_deadline(idle_deadline, active.total_deadline);
             let next = tokio::select! {
-                _ = cancellation.cancelled() => {
+                _ = cancellation.cancelled(), if output.capture.is_none() => {
                     complete_disconnect(
                         &state,
                         &session_id,
@@ -580,11 +708,7 @@ async fn run_active_attempt(
                         &mut active.stats,
                     )
                     .await;
-                    finished.store(true, Ordering::Release);
-                    if let Some(task) = control_drain.take() {
-                        task.abort();
-                    }
-                    return;
+                    break 'request false;
                 }
                 result = await_deadline(active.stream.next(), next_deadline) => result,
             };
@@ -610,10 +734,11 @@ async fn run_active_attempt(
                                         continue 'request;
                                     }
                                     Ok(RetryResolution::Final(message)) => {
-                                        let _ = send_final_inband(&sender, &cancellation, &message)
-                                            .await;
+                                        break 'request send_final_inband(&mut output, &message)
+                                            .await
+                                            .is_ok();
                                     }
-                                    Err(_) => {}
+                                    Err(_) => break 'request false,
                                 }
                             } else {
                                 complete_failure(
@@ -627,7 +752,7 @@ async fn run_active_attempt(
                                 )
                                 .await;
                             }
-                            break 'request;
+                            break 'request false;
                         }
                     }
                 }
@@ -648,10 +773,11 @@ async fn run_active_attempt(
                                     continue 'request;
                                 }
                                 Ok(RetryResolution::Final(message)) => {
-                                    let _ =
-                                        send_final_inband(&sender, &cancellation, &message).await;
+                                    break 'request send_final_inband(&mut output, &message)
+                                        .await
+                                        .is_ok();
                                 }
-                                Err(_) => {}
+                                Err(_) => break 'request false,
                             }
                         } else {
                             complete_failure(
@@ -665,7 +791,7 @@ async fn run_active_attempt(
                             )
                             .await;
                         }
-                        break 'request;
+                        break 'request false;
                     }
                     Err(error) => {
                         if !active.business_committed {
@@ -681,10 +807,11 @@ async fn run_active_attempt(
                                     continue 'request;
                                 }
                                 Ok(RetryResolution::Final(message)) => {
-                                    let _ =
-                                        send_final_inband(&sender, &cancellation, &message).await;
+                                    break 'request send_final_inband(&mut output, &message)
+                                        .await
+                                        .is_ok();
                                 }
-                                Err(_) => {}
+                                Err(_) => break 'request false,
                             }
                         } else {
                             complete_failure(
@@ -698,7 +825,7 @@ async fn run_active_attempt(
                             )
                             .await;
                         }
-                        break 'request;
+                        break 'request false;
                     }
                 },
                 Ok(Some(Err(error))) => {
@@ -716,9 +843,11 @@ async fn run_active_attempt(
                                 continue 'request;
                             }
                             Ok(RetryResolution::Final(message)) => {
-                                let _ = send_final_inband(&sender, &cancellation, &message).await;
+                                break 'request send_final_inband(&mut output, &message)
+                                    .await
+                                    .is_ok();
                             }
-                            Err(_) => {}
+                            Err(_) => break 'request false,
                         }
                     } else {
                         complete_failure(
@@ -732,7 +861,7 @@ async fn run_active_attempt(
                         )
                         .await;
                     }
-                    break 'request;
+                    break 'request false;
                 }
                 Err(error) => {
                     if !active.business_committed {
@@ -748,9 +877,11 @@ async fn run_active_attempt(
                                 continue 'request;
                             }
                             Ok(RetryResolution::Final(message)) => {
-                                let _ = send_final_inband(&sender, &cancellation, &message).await;
+                                break 'request send_final_inband(&mut output, &message)
+                                    .await
+                                    .is_ok();
                             }
-                            Err(_) => {}
+                            Err(_) => break 'request false,
                         }
                     } else {
                         complete_failure(
@@ -764,22 +895,14 @@ async fn run_active_attempt(
                         )
                         .await;
                     }
-                    break 'request;
+                    break 'request false;
                 }
             };
 
-            match process_active_frames(
-                &state,
-                &session_id,
-                &mut active,
-                &sender,
-                &cancellation,
-                frames,
-            )
-            .await
+            match process_active_frames(&state, &session_id, &mut active, &mut output, frames).await
             {
                 ActiveFrameResult::Continue => {}
-                ActiveFrameResult::Done => break 'request,
+                ActiveFrameResult::Done(cacheable) => break 'request cacheable,
                 ActiveFrameResult::Retry(outcome) => {
                     match retry_after_public_start(&state, &session_id, outcome).await {
                         Ok(RetryResolution::Active(next)) => {
@@ -787,33 +910,32 @@ async fn run_active_attempt(
                             continue 'request;
                         }
                         Ok(RetryResolution::Final(message)) => {
-                            let _ = send_final_inband(&sender, &cancellation, &message).await;
+                            break 'request send_final_inband(&mut output, &message).await.is_ok();
                         }
-                        Err(_) => {}
+                        Err(_) => break 'request false,
                     }
-                    break 'request;
                 }
             }
         }
-    }
+    };
     finished.store(true, Ordering::Release);
     if let Some(task) = control_drain.take() {
         task.abort();
     }
+    output.finish(cacheable).await;
 }
 
 async fn flush_initial_output(
     active: &mut ActiveAttempt,
-    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
-    cancellation: &CancellationToken,
+    output: &mut OutputSink,
 ) -> Result<(), ()> {
-    let mut output = std::mem::take(&mut active.early_output);
+    let mut wires = std::mem::take(&mut active.early_output);
     if active.business_committed {
-        output.extend(std::mem::take(&mut active.buffered));
+        wires.extend(std::mem::take(&mut active.buffered));
     }
-    for wire in output {
+    for wire in wires {
         active.stats.observe_wire(&wire);
-        send_wire(sender, cancellation, wire).await?;
+        output.send_wire(wire).await?;
     }
     Ok(())
 }
@@ -904,17 +1026,13 @@ async fn retry_after_public_start(
     }
 }
 
-async fn send_final_inband(
-    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
-    cancellation: &CancellationToken,
-    message: &Value,
-) -> Result<(), ()> {
+async fn send_final_inband(output: &mut OutputSink, message: &Value) -> Result<(), ()> {
     if let Some(encoded) = message
         .get("stream_failure_terminal_b64")
         .and_then(Value::as_str)
     {
         if let Ok(wire) = BASE64.decode(encoded) {
-            return send_wire(sender, cancellation, Bytes::from(wire)).await;
+            return output.send_wire(Bytes::from(wire)).await;
         }
     }
     let status = message
@@ -932,18 +1050,15 @@ async fn send_final_inband(
         "error": {"message": detail, "status_code": status},
     });
     let wire = encode_event("error", &error).map_err(|_| ())?;
-    send_wire(sender, cancellation, wire).await?;
-    send_wire(
-        sender,
-        cancellation,
-        Bytes::from_static(b"data: [DONE]\n\n"),
-    )
-    .await
+    output.send_wire(wire).await?;
+    output
+        .send_wire(Bytes::from_static(b"data: [DONE]\n\n"))
+        .await
 }
 
 enum ActiveFrameResult {
     Continue,
-    Done,
+    Done(bool),
     Retry(Value),
 }
 
@@ -951,8 +1066,7 @@ async fn process_active_frames(
     state: &AppState,
     session_id: &str,
     active: &mut ActiveAttempt,
-    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
-    cancellation: &CancellationToken,
+    output: &mut OutputSink,
     frames: Vec<SseFrame>,
 ) -> ActiveFrameResult {
     for frame in frames {
@@ -976,7 +1090,7 @@ async fn process_active_frames(
                     &error,
                 )
                 .await;
-                return ActiveFrameResult::Done;
+                return ActiveFrameResult::Done(false);
             }
         };
         if let Some(Terminal::SemanticFailure {
@@ -1003,16 +1117,17 @@ async fn process_active_frames(
             outcome["event_type"] = Value::String(event_type.clone());
             outcome["payload"] = payload.clone();
             outcome["committed"] = Value::Bool(true);
+            let mut terminal_sent = false;
             if let Ok(reply) = control_complete(state, session_id, &outcome).await {
                 if let Some(encoded) = reply.get("terminal_b64").and_then(Value::as_str) {
                     if let Ok(terminal) = BASE64.decode(encoded) {
                         let wire = Bytes::from(terminal);
                         active.stats.observe_wire(&wire);
-                        let _ = send_wire(sender, cancellation, wire).await;
+                        terminal_sent = output.send_wire(wire).await.is_ok();
                     }
                 }
             }
-            return ActiveFrameResult::Done;
+            return ActiveFrameResult::Done(terminal_sent);
         }
 
         let suppress_repeated_keepalive = !active.business_committed
@@ -1021,7 +1136,7 @@ async fn process_active_frames(
         if let Some(wire) = processed.wire.filter(|_| !suppress_repeated_keepalive) {
             if active.business_committed {
                 active.stats.observe_wire(&wire);
-                if send_wire(sender, cancellation, wire).await.is_err() {
+                if output.send_wire(wire).await.is_err() {
                     complete_disconnect(
                         state,
                         session_id,
@@ -1030,7 +1145,7 @@ async fn process_active_frames(
                         &mut active.stats,
                     )
                     .await;
-                    return ActiveFrameResult::Done;
+                    return ActiveFrameResult::Done(false);
                 }
             } else {
                 active.buffered.push(wire);
@@ -1044,11 +1159,11 @@ async fn process_active_frames(
                 .await
                 .is_err()
             {
-                return ActiveFrameResult::Done;
+                return ActiveFrameResult::Done(false);
             }
             for wire in std::mem::take(&mut active.buffered) {
                 active.stats.observe_wire(&wire);
-                if send_wire(sender, cancellation, wire).await.is_err() {
+                if output.send_wire(wire).await.is_err() {
                     complete_disconnect(
                         state,
                         session_id,
@@ -1057,7 +1172,7 @@ async fn process_active_frames(
                         &mut active.stats,
                     )
                     .await;
-                    return ActiveFrameResult::Done;
+                    return ActiveFrameResult::Done(false);
                 }
             }
         }
@@ -1071,7 +1186,7 @@ async fn process_active_frames(
                 terminal,
             )
             .await;
-            return ActiveFrameResult::Done;
+            return ActiveFrameResult::Done(true);
         }
     }
     ActiveFrameResult::Continue
@@ -1131,26 +1246,6 @@ async fn complete_failure(
     outcome["detail"] = Value::String(detail.chars().take(4096).collect());
     outcome["committed"] = Value::Bool(true);
     let _ = control_complete(state, session_id, &outcome).await;
-}
-
-async fn send_wire(
-    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
-    cancellation: &CancellationToken,
-    wire: Bytes,
-) -> Result<(), ()> {
-    for offset in (0..wire.len()).step_by(DOWNSTREAM_SEGMENT_BYTES) {
-        let end = (offset + DOWNSTREAM_SEGMENT_BYTES).min(wire.len());
-        let segment = wire.slice(offset..end);
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(()),
-            result = tokio::time::timeout(downstream_write_timeout(), sender.send(Ok(segment))) => {
-                if !matches!(result, Ok(Ok(()))) {
-                    return Err(());
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn downstream_write_timeout() -> Duration {
@@ -1765,17 +1860,23 @@ async fn control_request(
         .map_err(|error| format!("control response JSON is invalid: {error}"))
 }
 
-fn response_from_final(message: &Value, control_headers: &HeaderMap) -> Response<Body> {
+async fn response_from_final(
+    message: &Value,
+    control_headers: &HeaderMap,
+    owner: Option<idempotency::Owner>,
+) -> Response<Body> {
     let status = message
         .get("status_code")
         .and_then(Value::as_u64)
         .and_then(|value| StatusCode::from_u16(value as u16).ok())
         .unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = message
-        .get("body_b64")
-        .and_then(Value::as_str)
-        .and_then(|value| BASE64.decode(value).ok())
-        .unwrap_or_default();
+    let body = Bytes::from(
+        message
+            .get("body_b64")
+            .and_then(Value::as_str)
+            .and_then(|value| BASE64.decode(value).ok())
+            .unwrap_or_default(),
+    );
     let mut headers = HeaderMap::new();
     if let Some(values) = message.get("headers").and_then(Value::as_object) {
         for (name, value) in values {
@@ -1796,10 +1897,26 @@ fn response_from_final(message: &Value, control_headers: &HeaderMap) -> Response
     for (name, value) in control_headers {
         headers.insert(name.clone(), value.clone());
     }
+    if let Some(owner) = owner {
+        if body.len() > owner.max_response_bytes() {
+            owner.nonreplayable("response_too_large").await;
+        } else {
+            owner
+                .complete(status, headers.clone(), vec![body.clone()], body.len())
+                .await;
+        }
+        return idempotency::response_from_bytes(status, headers, body);
+    }
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+async fn release_owner(owner: &mut Option<idempotency::Owner>) {
+    if let Some(owner) = owner.take() {
+        owner.release().await;
+    }
 }
 
 fn public_control_headers(headers: &HeaderMap) -> HeaderMap {

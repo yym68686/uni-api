@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import signal
@@ -45,6 +46,8 @@ class FixtureServer(ThreadingHTTPServer):
         self.event_count = event_count
         self.retry_probe_failed = False
         self.retry_probe_lock = threading.Lock()
+        self.request_counts: dict[str, int] = {}
+        self.request_counts_lock = threading.Lock()
 
     def config(self) -> dict[str, Any]:
         port = self.server_address[1]
@@ -103,9 +106,16 @@ class FixtureHandler(BaseHTTPRequestHandler):
             if payload.get("input") == "warmup"
             else self.server.event_count  # type: ignore[attr-defined]
         )
+        input_value = str(payload.get("input") or "")
+        with self.server.request_counts_lock:  # type: ignore[attr-defined]
+            request_number = self.server.request_counts.get(input_value, 0) + 1  # type: ignore[attr-defined]
+            self.server.request_counts[input_value] = request_number  # type: ignore[attr-defined]
+        if input_value == "idempotency-wait-probe":
+            time.sleep(0.2)
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
+        self.send_header("x-fixture-request-number", str(request_number))
         self.end_headers()
         try:
             if payload.get("input") == "retry-after-keepalive":
@@ -178,7 +188,12 @@ def _wait_healthy(port: int, process: subprocess.Popen[bytes]) -> None:
     raise RuntimeError("service did not become healthy")
 
 
-def _post_stream(port: int, input_value: str) -> tuple[bytes, dict[str, str], float]:
+def _post_stream(
+    port: int,
+    input_value: str,
+    *,
+    idempotency_key: str | None = None,
+) -> tuple[bytes, dict[str, str], float]:
     body = json.dumps(
         {
             "model": "gpt-benchmark",
@@ -186,13 +201,16 @@ def _post_stream(port: int, input_value: str) -> tuple[bytes, dict[str, str], fl
             "stream": True,
         }
     ).encode()
+    headers = {
+        "authorization": "Bearer sk-benchmark",
+        "content-type": "application/json",
+    }
+    if idempotency_key is not None:
+        headers["idempotency-key"] = idempotency_key
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/responses",
         data=body,
-        headers={
-            "authorization": "Bearer sk-benchmark",
-            "content-type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     started = time.perf_counter()
@@ -296,6 +314,65 @@ def _run_service(
                     raise RuntimeError("precommit provider failure leaked downstream")
                 if b"event: response.completed" not in retry_wire:
                     raise RuntimeError("retry probe did not reach the fallback provider")
+                first, first_headers, _ = _post_stream(
+                    public_port,
+                    "idempotency-probe",
+                    idempotency_key="benchmark-idempotency-1",
+                )
+                replay, replay_headers, _ = _post_stream(
+                    public_port,
+                    "idempotency-probe",
+                    idempotency_key="benchmark-idempotency-1",
+                )
+                if first != replay:
+                    raise RuntimeError("Rust idempotency replay changed the SSE wire")
+                if first_headers.get("x-uni-api-idempotency-status") != "executed":
+                    raise RuntimeError("Rust idempotency owner status is missing")
+                if replay_headers.get("x-uni-api-idempotency-status") != "replayed":
+                    raise RuntimeError("Rust idempotency replay status is missing")
+                if replay_headers.get("x-uni-api-data-plane") != "rust-v1":
+                    raise RuntimeError("Rust idempotency replay lost data-plane provenance")
+                if replay_headers.get("x-fixture-request-number") != "1":
+                    raise RuntimeError("Rust idempotency replay called the provider twice")
+                try:
+                    _post_stream(
+                        public_port,
+                        "idempotency-conflict",
+                        idempotency_key="benchmark-idempotency-1",
+                    )
+                except urllib.error.HTTPError as error:
+                    if error.code != 409:
+                        raise RuntimeError(
+                            f"Rust idempotency conflict returned {error.code}"
+                        ) from error
+                else:
+                    raise RuntimeError("Rust idempotency conflict was not rejected")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    waiting = [
+                        pool.submit(
+                            _post_stream,
+                            public_port,
+                            "idempotency-wait-probe",
+                            idempotency_key="benchmark-idempotency-wait-1",
+                        )
+                        for _ in range(2)
+                    ]
+                    waiting_results = [future.result() for future in waiting]
+                if waiting_results[0][0] != waiting_results[1][0]:
+                    raise RuntimeError("Rust idempotency waiter replay changed the SSE wire")
+                waiter_statuses = sorted(
+                    result[1].get("x-uni-api-idempotency-status")
+                    for result in waiting_results
+                )
+                if waiter_statuses != ["executed", "replayed"]:
+                    raise RuntimeError(
+                        f"Rust idempotency waiter statuses are {waiter_statuses}"
+                    )
+                if any(
+                    result[1].get("x-fixture-request-number") != "1"
+                    for result in waiting_results
+                ):
+                    raise RuntimeError("Rust idempotency waiter called the provider twice")
             warmup, warmup_headers, _ = _post_stream(public_port, "warmup")
             if warmup.count(b"response.output_text.delta") != 200:
                 raise RuntimeError(

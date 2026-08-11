@@ -256,6 +256,7 @@ from uni_api.streaming.responses_fast_path import (
 )
 from uni_api.streaming.usage import (
     StreamUsageSnapshot,
+    stream_usage_snapshot,
     stream_usage_snapshot_from_payload,
 )
 from uni_api.server import build_bounded_h11_protocol

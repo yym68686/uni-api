@@ -4,10 +4,41 @@ from types import SimpleNamespace
 import pytest
 from starlette.responses import Response
 
+from uni_api.runtime import ResponsesRequestExecution
 from uni_api.rust_responses_control import (
     RustResponsesControlError,
     RustResponsesControlPlane,
 )
+
+
+def test_rust_stream_report_records_usage_without_completion_error():
+    execution = SimpleNamespace(current_info={})
+    ResponsesRequestExecution._apply_rust_stream_report(
+        execution,
+        {
+            "upstream_bytes": 120,
+            "downstream_bytes": 90,
+            "event_count": 3,
+            "delta_events": 1,
+            "normalized_events": 2,
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+            },
+        },
+    )
+    assert execution.current_info == {
+        "rust_responses_upstream_bytes": 120,
+        "rust_responses_downstream_bytes": 90,
+        "rust_responses_sse_events": 3,
+        "rust_responses_delta_events": 1,
+        "rust_responses_normalized_events": 2,
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+        "usage_seen": True,
+    }
 
 
 class _FakeExecution:
