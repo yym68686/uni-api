@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::idempotency;
 use crate::proxy::{filtered_response_headers, json_error, AppState};
+use crate::responses_native::NativeRoute;
 
 const CONTROL_HEADER: &str = "x-uni-api-rust-control-token";
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
@@ -31,28 +32,28 @@ const DOWNSTREAM_CHANNEL_SEGMENTS: usize = 16;
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 #[derive(Clone, Debug, Deserialize)]
-struct Plan {
-    attempt_id: String,
-    url: String,
-    headers: HashMap<String, String>,
-    body: String,
-    proxy: Option<String>,
-    engine: String,
+pub(crate) struct Plan {
+    pub(crate) attempt_id: String,
+    pub(crate) url: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: String,
+    pub(crate) proxy: Option<String>,
+    pub(crate) engine: String,
     #[serde(default)]
-    http1_only: bool,
+    pub(crate) http1_only: bool,
     #[serde(default = "default_commit_policy")]
-    commit_policy: String,
+    pub(crate) commit_policy: String,
     #[serde(default)]
-    normalize_custom_tool_call_ids: bool,
-    first_byte_timeout_seconds: Option<f64>,
-    idle_timeout_seconds: Option<f64>,
-    total_timeout_seconds: Option<f64>,
+    pub(crate) normalize_custom_tool_call_ids: bool,
+    pub(crate) first_byte_timeout_seconds: Option<f64>,
+    pub(crate) idle_timeout_seconds: Option<f64>,
+    pub(crate) total_timeout_seconds: Option<f64>,
     #[serde(default = "default_max_event_bytes")]
-    max_event_bytes: usize,
+    pub(crate) max_event_bytes: usize,
     #[serde(default = "default_max_precommit_items")]
-    max_precommit_items: usize,
+    pub(crate) max_precommit_items: usize,
     #[serde(default = "default_max_precommit_bytes")]
-    max_precommit_bytes: usize,
+    pub(crate) max_precommit_bytes: usize,
 }
 
 fn default_commit_policy() -> String {
@@ -129,6 +130,313 @@ struct ActiveAttempt {
 enum PreflightResult {
     Retry(Value),
     Started(ActiveAttempt),
+}
+
+enum Coordinator {
+    Python { session_id: String },
+    Native { route: NativeRoute },
+}
+
+impl Coordinator {
+    fn is_native(&self) -> bool {
+        matches!(self, Self::Native { .. })
+    }
+
+    async fn commit(&mut self, state: &AppState, observation: &Value) -> Result<(), String> {
+        match self {
+            Self::Python { session_id } => control_commit(state, session_id, observation)
+                .await
+                .map(|_| ()),
+            Self::Native { .. } => Ok(()),
+        }
+    }
+
+    async fn complete(&mut self, state: &AppState, outcome: &Value) -> Option<Value> {
+        match self {
+            Self::Python { session_id } => control_complete(state, session_id, outcome).await.ok(),
+            Self::Native { route } => {
+                if matches!(
+                    outcome.get("kind").and_then(Value::as_str),
+                    Some("completed" | "incomplete")
+                ) {
+                    route.record_success().await;
+                }
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event_type": "rust_responses_native_complete",
+                        "request_id": route.request_id(),
+                        "model": route.request_model(),
+                        "request_body_bytes": route.request_body_bytes(),
+                        "snapshot_revision": route.snapshot_revision(),
+                        "kind": outcome.get("kind").and_then(Value::as_str),
+                        "status_code": outcome.get("status_code").and_then(Value::as_u64),
+                        "upstream_status_code": outcome.get("upstream_status_code").and_then(Value::as_u64),
+                        "upstream_bytes": outcome.get("upstream_bytes").and_then(Value::as_u64),
+                        "downstream_bytes": outcome.get("downstream_bytes").and_then(Value::as_u64),
+                        "event_count": outcome.get("event_count").and_then(Value::as_u64),
+                    })
+                );
+                None
+            }
+        }
+    }
+
+    async fn retry(
+        &mut self,
+        state: &AppState,
+        mut outcome: Value,
+    ) -> Result<RetryResolution, String> {
+        match self {
+            Self::Python { session_id } => {
+                retry_after_public_start_python(state, session_id, outcome).await
+            }
+            Self::Native { route } => loop {
+                if !route.record_failure(&outcome).await {
+                    return Ok(RetryResolution::Final(route.final_message()));
+                }
+                let Some(plan) = route.next_plan().await? else {
+                    return Ok(RetryResolution::Final(route.final_message()));
+                };
+                match preflight_attempt(state, plan, true).await {
+                    Ok(PreflightResult::Started(active)) => {
+                        return Ok(RetryResolution::Active(active));
+                    }
+                    Ok(PreflightResult::Retry(next)) => outcome = next,
+                    Err(error) => {
+                        outcome = json!({
+                            "kind": "protocol_error",
+                            "status_code": 502,
+                            "detail": error,
+                            "committed": false,
+                        });
+                    }
+                }
+            },
+        }
+    }
+}
+
+pub async fn serve_native(
+    state: AppState,
+    mut route: NativeRoute,
+    mut idempotency_owner: Option<idempotency::Owner>,
+) -> Response<Body> {
+    if !route.stream() {
+        return serve_native_nonstream(state, route, idempotency_owner).await;
+    }
+    loop {
+        let plan = match route.next_plan().await {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                let status =
+                    StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+                release_owner(&mut idempotency_owner).await;
+                return json_error(status, route.last_detail());
+            }
+            Err(error) if error == "native-codex-oauth-fallback" => {
+                release_owner(&mut idempotency_owner).await;
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Native route encountered unsupported Codex OAuth",
+                );
+            }
+            Err(error) => {
+                release_owner(&mut idempotency_owner).await;
+                return json_error(StatusCode::BAD_REQUEST, &error);
+            }
+        };
+        match preflight_attempt(&state, plan, false).await {
+            Ok(PreflightResult::Started(active)) => {
+                let mut control_headers = HeaderMap::new();
+                if let Ok(value) = HeaderValue::from_str(route.request_id()) {
+                    control_headers.insert("x-request-id", value);
+                }
+                control_headers
+                    .insert("access-control-allow-origin", HeaderValue::from_static("*"));
+                return start_public_stream(
+                    state,
+                    Coordinator::Native { route },
+                    active,
+                    control_headers,
+                    None,
+                    idempotency_owner.take(),
+                );
+            }
+            Ok(PreflightResult::Retry(outcome)) => {
+                if !route.record_failure(&outcome).await {
+                    let status = StatusCode::from_u16(route.last_status())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    release_owner(&mut idempotency_owner).await;
+                    return json_error(status, route.last_detail());
+                }
+            }
+            Err(error) => {
+                let outcome = json!({
+                    "kind": "protocol_error",
+                    "status_code": 502,
+                    "detail": error,
+                    "committed": false,
+                });
+                if !route.record_failure(&outcome).await {
+                    release_owner(&mut idempotency_owner).await;
+                    return json_error(StatusCode::BAD_GATEWAY, route.last_detail());
+                }
+            }
+        }
+    }
+}
+
+async fn serve_native_nonstream(
+    state: AppState,
+    mut route: NativeRoute,
+    mut idempotency_owner: Option<idempotency::Owner>,
+) -> Response<Body> {
+    loop {
+        let plan = match route.next_plan().await {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                let status =
+                    StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+                release_owner(&mut idempotency_owner).await;
+                return json_error(status, route.last_detail());
+            }
+            Err(error) => {
+                release_owner(&mut idempotency_owner).await;
+                return json_error(StatusCode::BAD_REQUEST, &error);
+            }
+        };
+        match send_native_nonstream_attempt(&state, &plan).await {
+            Ok((status, mut headers, mut body)) if status.is_success() => {
+                route.record_success().await;
+                if plan.normalize_custom_tool_call_ids {
+                    if let Ok(mut payload) = serde_json::from_slice::<Value>(&body) {
+                        let mut normalizer = CustomIdNormalizer::default();
+                        if normalizer.normalize(&mut payload).unwrap_or(false) {
+                            body = serde_json::to_vec(&payload).unwrap_or(body);
+                        }
+                    }
+                }
+                headers.insert(
+                    "x-uni-api-data-plane",
+                    HeaderValue::from_static("rust-native-v2"),
+                );
+                if let Ok(value) = HeaderValue::from_str(route.request_id()) {
+                    headers.insert("x-request-id", value);
+                }
+                headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+                if let Some(owner) = idempotency_owner.take() {
+                    let bytes = Bytes::from(body.clone());
+                    if body.len() <= owner.max_response_bytes()
+                        && owner.try_reserve_inflight_response(body.len())
+                    {
+                        owner.release_inflight_response(body.len());
+                        owner
+                            .complete(status, headers.clone(), vec![bytes], body.len())
+                            .await;
+                        idempotency::executed_header(&mut headers);
+                    } else {
+                        owner.nonreplayable("response_too_large").await;
+                        idempotency::executed_header(&mut headers);
+                    }
+                }
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event_type": "rust_responses_native_complete",
+                        "request_id": route.request_id(),
+                        "model": route.request_model(),
+                        "request_body_bytes": route.request_body_bytes(),
+                        "snapshot_revision": route.snapshot_revision(),
+                        "kind": "completed",
+                        "status_code": status.as_u16(),
+                        "downstream_bytes": body.len(),
+                    })
+                );
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers;
+                return response;
+            }
+            Ok((status, _headers, body)) => {
+                let detail = String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(4096)
+                    .collect::<String>();
+                let outcome = json!({
+                    "kind": "http_error",
+                    "status_code": status.as_u16(),
+                    "upstream_status_code": status.as_u16(),
+                    "body": detail,
+                    "committed": false,
+                });
+                if !route.record_failure(&outcome).await {
+                    release_owner(&mut idempotency_owner).await;
+                    return json_error(status, route.last_detail());
+                }
+            }
+            Err(error) => {
+                let outcome = json!({
+                    "kind": "transport_error",
+                    "status_code": 502,
+                    "detail": error,
+                    "committed": false,
+                });
+                if !route.record_failure(&outcome).await {
+                    release_owner(&mut idempotency_owner).await;
+                    return json_error(StatusCode::BAD_GATEWAY, route.last_detail());
+                }
+            }
+        }
+    }
+}
+
+async fn send_native_nonstream_attempt(
+    state: &AppState,
+    plan: &Plan,
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
+    let client = state
+        .upstream_client(plan.proxy.as_deref(), plan.http1_only)
+        .await?;
+    let mut headers = HeaderMap::new();
+    for (name, value) in &plan.headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "native plan contains an invalid header name".to_owned())?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| "native plan contains an invalid header value".to_owned())?;
+        headers.append(name, value);
+    }
+    headers
+        .entry("accept-encoding")
+        .or_insert(HeaderValue::from_static("identity"));
+    let timeout = plan
+        .total_timeout_seconds
+        .or(plan.first_byte_timeout_seconds)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Duration::from_secs_f64);
+    let request = client
+        .post(&plan.url)
+        .headers(headers)
+        .body(plan.body.clone());
+    let response = if let Some(timeout) = timeout {
+        tokio::time::timeout(timeout, request.send())
+            .await
+            .map_err(|_| "upstream non-streaming response timed out".to_owned())?
+            .map_err(|error| format!("upstream non-streaming request failed: {error}"))?
+    } else {
+        request
+            .send()
+            .await
+            .map_err(|error| format!("upstream non-streaming request failed: {error}"))?
+    };
+    let status = response.status();
+    let headers = filtered_response_headers(response.headers());
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("read upstream non-streaming body: {error}"))?
+        .to_vec();
+    Ok((status, headers, body))
 }
 
 pub async fn serve_session(
@@ -215,7 +523,7 @@ pub async fn serve_session(
                 });
                 return start_public_stream(
                     state,
-                    session_id,
+                    Coordinator::Python { session_id },
                     active,
                     public_control_headers,
                     control_drain,
@@ -389,14 +697,9 @@ fn process_preflight_frames(
         }) = processed.terminal.as_ref()
         {
             if !started {
-                return Ok(Some(PreflightResult::Retry(json!({
-                    "kind": "semantic_error",
-                    "status_code": 502,
-                    "upstream_status_code": active.status.as_u16(),
-                    "event_type": event_type,
-                    "payload": payload,
-                    "committed": false,
-                }))));
+                return Ok(Some(PreflightResult::Retry(semantic_failure_outcome(
+                    active, event_type, payload, false,
+                ))));
             }
             active.terminal = processed.terminal;
             return Ok(Some(PreflightResult::Started(take_active(active)?)));
@@ -486,7 +789,7 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
 
 fn start_public_stream(
     state: AppState,
-    session_id: String,
+    coordinator: Coordinator,
     active: ActiveAttempt,
     control_headers: HeaderMap,
     control_drain: Option<tokio::task::JoinHandle<()>>,
@@ -500,7 +803,13 @@ fn start_public_stream(
     headers
         .entry("content-type")
         .or_insert(HeaderValue::from_static("text/event-stream"));
-    headers.insert("x-uni-api-data-plane", HeaderValue::from_static("rust-v1"));
+    headers.insert(
+        "x-uni-api-data-plane",
+        HeaderValue::from_static(match &coordinator {
+            Coordinator::Native { .. } => "rust-native-v2",
+            Coordinator::Python { .. } => "rust-v1",
+        }),
+    );
 
     let capture_headers = headers.clone();
     let capture = idempotency_owner.map(|owner| IdempotencyCapture {
@@ -529,7 +838,7 @@ fn start_public_stream(
         finished,
         control_drain,
     };
-    tokio::spawn(run_active_attempt(state, session_id, active, runtime));
+    tokio::spawn(run_active_attempt(state, coordinator, active, runtime));
 
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = status;
@@ -640,7 +949,7 @@ impl OutputSink {
 
 async fn run_active_attempt(
     state: AppState,
-    session_id: String,
+    mut coordinator: Coordinator,
     mut active: ActiveAttempt,
     runtime: ActiveRuntime,
 ) {
@@ -657,7 +966,7 @@ async fn run_active_attempt(
         {
             complete_disconnect(
                 &state,
-                &session_id,
+                &mut coordinator,
                 active.plan.attempt_id.clone(),
                 active.status,
                 &mut active.stats,
@@ -669,7 +978,7 @@ async fn run_active_attempt(
         if let Some(terminal) = active.terminal.take() {
             if !active.business_committed {
                 let outcome = semantic_retry_outcome(&active, terminal);
-                match retry_after_public_start(&state, &session_id, outcome).await {
+                match coordinator.retry(&state, outcome).await {
                     Ok(RetryResolution::Active(next)) => {
                         active = next;
                         continue 'request;
@@ -682,7 +991,7 @@ async fn run_active_attempt(
             }
             finish_terminal(
                 &state,
-                &session_id,
+                &mut coordinator,
                 active.plan.attempt_id.clone(),
                 active.status,
                 &mut active.stats,
@@ -702,7 +1011,7 @@ async fn run_active_attempt(
                 _ = cancellation.cancelled(), if output.capture.is_none() => {
                     complete_disconnect(
                         &state,
-                        &session_id,
+                        &mut coordinator,
                         active.plan.attempt_id.clone(),
                         active.status,
                         &mut active.stats,
@@ -722,12 +1031,12 @@ async fn run_active_attempt(
                         Ok(frames) => frames,
                         Err(error) => {
                             if !active.business_committed {
-                                match retry_after_public_start(
-                                    &state,
-                                    &session_id,
-                                    failure_retry_outcome(&active, "protocol_error", &error),
-                                )
-                                .await
+                                match coordinator
+                                    .retry(
+                                        &state,
+                                        failure_retry_outcome(&active, "protocol_error", &error),
+                                    )
+                                    .await
                                 {
                                     Ok(RetryResolution::Active(next)) => {
                                         active = next;
@@ -743,7 +1052,7 @@ async fn run_active_attempt(
                             } else {
                                 complete_failure(
                                     &state,
-                                    &session_id,
+                                    &mut coordinator,
                                     active.plan.attempt_id.clone(),
                                     active.status,
                                     &mut active.stats,
@@ -761,12 +1070,12 @@ async fn run_active_attempt(
                     Ok(_) => {
                         let detail = "Responses upstream ended without a terminal response event";
                         if !active.business_committed {
-                            match retry_after_public_start(
-                                &state,
-                                &session_id,
-                                failure_retry_outcome(&active, "protocol_error", detail),
-                            )
-                            .await
+                            match coordinator
+                                .retry(
+                                    &state,
+                                    failure_retry_outcome(&active, "protocol_error", detail),
+                                )
+                                .await
                             {
                                 Ok(RetryResolution::Active(next)) => {
                                     active = next;
@@ -782,7 +1091,7 @@ async fn run_active_attempt(
                         } else {
                             complete_failure(
                                 &state,
-                                &session_id,
+                                &mut coordinator,
                                 active.plan.attempt_id.clone(),
                                 active.status,
                                 &mut active.stats,
@@ -795,12 +1104,12 @@ async fn run_active_attempt(
                     }
                     Err(error) => {
                         if !active.business_committed {
-                            match retry_after_public_start(
-                                &state,
-                                &session_id,
-                                failure_retry_outcome(&active, "protocol_error", &error),
-                            )
-                            .await
+                            match coordinator
+                                .retry(
+                                    &state,
+                                    failure_retry_outcome(&active, "protocol_error", &error),
+                                )
+                                .await
                             {
                                 Ok(RetryResolution::Active(next)) => {
                                     active = next;
@@ -816,7 +1125,7 @@ async fn run_active_attempt(
                         } else {
                             complete_failure(
                                 &state,
-                                &session_id,
+                                &mut coordinator,
                                 active.plan.attempt_id.clone(),
                                 active.status,
                                 &mut active.stats,
@@ -831,12 +1140,12 @@ async fn run_active_attempt(
                 Ok(Some(Err(error))) => {
                     let detail = format!("upstream stream read failed: {error}");
                     if !active.business_committed {
-                        match retry_after_public_start(
-                            &state,
-                            &session_id,
-                            failure_retry_outcome(&active, "transport_error", &detail),
-                        )
-                        .await
+                        match coordinator
+                            .retry(
+                                &state,
+                                failure_retry_outcome(&active, "transport_error", &detail),
+                            )
+                            .await
                         {
                             Ok(RetryResolution::Active(next)) => {
                                 active = next;
@@ -852,7 +1161,7 @@ async fn run_active_attempt(
                     } else {
                         complete_failure(
                             &state,
-                            &session_id,
+                            &mut coordinator,
                             active.plan.attempt_id.clone(),
                             active.status,
                             &mut active.stats,
@@ -865,12 +1174,12 @@ async fn run_active_attempt(
                 }
                 Err(error) => {
                     if !active.business_committed {
-                        match retry_after_public_start(
-                            &state,
-                            &session_id,
-                            failure_retry_outcome(&active, "transport_error", &error),
-                        )
-                        .await
+                        match coordinator
+                            .retry(
+                                &state,
+                                failure_retry_outcome(&active, "transport_error", &error),
+                            )
+                            .await
                         {
                             Ok(RetryResolution::Active(next)) => {
                                 active = next;
@@ -886,7 +1195,7 @@ async fn run_active_attempt(
                     } else {
                         complete_failure(
                             &state,
-                            &session_id,
+                            &mut coordinator,
                             active.plan.attempt_id.clone(),
                             active.status,
                             &mut active.stats,
@@ -899,12 +1208,13 @@ async fn run_active_attempt(
                 }
             };
 
-            match process_active_frames(&state, &session_id, &mut active, &mut output, frames).await
+            match process_active_frames(&state, &mut coordinator, &mut active, &mut output, frames)
+                .await
             {
                 ActiveFrameResult::Continue => {}
                 ActiveFrameResult::Done(cacheable) => break 'request cacheable,
                 ActiveFrameResult::Retry(outcome) => {
-                    match retry_after_public_start(&state, &session_id, outcome).await {
+                    match coordinator.retry(&state, outcome).await {
                         Ok(RetryResolution::Active(next)) => {
                             active = next;
                             continue 'request;
@@ -940,22 +1250,156 @@ async fn flush_initial_output(
     Ok(())
 }
 
+fn semantic_failure_outcome(
+    active: &ActiveAttempt,
+    event_type: &str,
+    payload: &Value,
+    committed: bool,
+) -> Value {
+    let (status, detail) = responses_semantic_error(payload, event_type);
+    let mut outcome = active.stats.report();
+    outcome["attempt_id"] = Value::String(active.plan.attempt_id.clone());
+    outcome["kind"] = Value::String(
+        if committed {
+            "semantic_failure"
+        } else {
+            "semantic_error"
+        }
+        .into(),
+    );
+    outcome["status_code"] = Value::from(status);
+    outcome["upstream_status_code"] = Value::from(active.status.as_u16());
+    outcome["event_type"] = Value::String(event_type.to_owned());
+    outcome["payload"] = payload.clone();
+    outcome["detail"] = Value::String(detail);
+    outcome["committed"] = Value::Bool(committed);
+    outcome
+}
+
+fn responses_semantic_error(payload: &Value, event_type: &str) -> (u16, String) {
+    let error = if event_type.eq_ignore_ascii_case("response.failed") {
+        payload.pointer("/response/error")
+    } else {
+        payload.get("error")
+    }
+    .or_else(|| payload.get("error"));
+    let detail = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Responses upstream returned a failure terminal")
+        .chars()
+        .take(4096)
+        .collect::<String>();
+
+    for candidate in [
+        error.and_then(|value| value.get("status_code")),
+        error.and_then(|value| value.get("status")),
+        payload.get("status_code"),
+        payload.get("status"),
+        payload.pointer("/response/status_code"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let parsed = candidate
+            .as_u64()
+            .or_else(|| candidate.as_str()?.parse::<u64>().ok());
+        if let Some(status @ 400..=599) = parsed {
+            return (status as u16, detail);
+        }
+    }
+
+    let code = error
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let status = match code.as_str() {
+        "account_deactivated"
+        | "account_disabled"
+        | "account_suspended"
+        | "deactivated_workspace"
+        | "permission_denied"
+        | "user_deactivated"
+        | "user_suspended" => Some(403),
+        "authentication_error" | "incorrect_api_key_provided" | "invalid_api_key" => Some(401),
+        "billing_hard_limit_reached" | "insufficient_quota" | "rate_limit_exceeded" => Some(429),
+        "context_length_exceeded"
+        | "invalid_request_error"
+        | "invalid_type"
+        | "model_not_priced"
+        | "model_price_not_configured"
+        | "model_pricing_not_configured"
+        | "model_price_unconfigured"
+        | "model_pricing_missing"
+        | "unsupported_parameter" => Some(400),
+        "model_not_found" | "not_found_error" => Some(404),
+        _ => None,
+    };
+    if let Some(status) = status {
+        return (status, detail);
+    }
+
+    let error_type = error
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let status = match error_type.as_str() {
+        "authentication_error" => Some(401),
+        "invalid_request_error" => Some(400),
+        "not_found_error" => Some(404),
+        "permission_error" => Some(403),
+        "rate_limit_error" | "tokens" => Some(429),
+        _ => None,
+    };
+    if let Some(status) = status {
+        return (status, detail);
+    }
+
+    let message = detail.to_ascii_lowercase();
+    let status = if message.contains("rate limit") || message.contains("too many requests") {
+        429
+    } else if [
+        "context window",
+        "context length",
+        "maximum context",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        400
+    } else if message.contains("request entity too large") || message.contains("payload too large")
+    {
+        413
+    } else if message.contains("invalid") || message.contains("unsupported") {
+        400
+    } else if message.contains("not found") {
+        404
+    } else if message.contains("permission") || message.contains("forbidden") {
+        403
+    } else if message.contains("auth")
+        || message.contains("api key")
+        || message.contains("unauthorized")
+    {
+        401
+    } else {
+        500
+    };
+    (status, detail)
+}
+
 fn semantic_retry_outcome(active: &ActiveAttempt, terminal: Terminal) -> Value {
     match terminal {
         Terminal::SemanticFailure {
             event_type,
             payload,
-        } => {
-            let mut outcome = active.stats.report();
-            outcome["attempt_id"] = Value::String(active.plan.attempt_id.clone());
-            outcome["kind"] = Value::String("semantic_error".into());
-            outcome["status_code"] = Value::from(502);
-            outcome["upstream_status_code"] = Value::from(active.status.as_u16());
-            outcome["event_type"] = Value::String(event_type);
-            outcome["payload"] = payload;
-            outcome["committed"] = Value::Bool(false);
-            outcome
-        }
+        } => semantic_failure_outcome(active, &event_type, &payload, false),
         _ => failure_retry_outcome(
             active,
             "protocol_error",
@@ -991,7 +1435,7 @@ enum RetryResolution {
     Final(Value),
 }
 
-async fn retry_after_public_start(
+async fn retry_after_public_start_python(
     state: &AppState,
     session_id: &str,
     mut outcome: Value,
@@ -1064,7 +1508,7 @@ enum ActiveFrameResult {
 
 async fn process_active_frames(
     state: &AppState,
-    session_id: &str,
+    coordinator: &mut Coordinator,
     active: &mut ActiveAttempt,
     output: &mut OutputSink,
     frames: Vec<SseFrame>,
@@ -1082,7 +1526,7 @@ async fn process_active_frames(
                 }
                 complete_failure(
                     state,
-                    session_id,
+                    coordinator,
                     active.plan.attempt_id.clone(),
                     active.status,
                     &mut active.stats,
@@ -1099,32 +1543,24 @@ async fn process_active_frames(
         }) = processed.terminal.as_ref()
         {
             if !active.business_committed {
-                let mut outcome = active.stats.report();
-                outcome["attempt_id"] = Value::String(active.plan.attempt_id.clone());
-                outcome["kind"] = Value::String("semantic_error".into());
-                outcome["status_code"] = Value::from(502);
-                outcome["upstream_status_code"] = Value::from(active.status.as_u16());
-                outcome["event_type"] = Value::String(event_type.clone());
-                outcome["payload"] = payload.clone();
-                outcome["committed"] = Value::Bool(false);
+                let outcome = semantic_failure_outcome(active, event_type, payload, false);
                 return ActiveFrameResult::Retry(outcome);
             }
-            let mut outcome = active.stats.report();
-            outcome["attempt_id"] = Value::String(active.plan.attempt_id.clone());
-            outcome["kind"] = Value::String("semantic_failure".into());
-            outcome["status_code"] = Value::from(502);
-            outcome["upstream_status_code"] = Value::from(active.status.as_u16());
-            outcome["event_type"] = Value::String(event_type.clone());
-            outcome["payload"] = payload.clone();
-            outcome["committed"] = Value::Bool(true);
+            let outcome = semantic_failure_outcome(active, event_type, payload, true);
             let mut terminal_sent = false;
-            if let Ok(reply) = control_complete(state, session_id, &outcome).await {
+            if let Some(reply) = coordinator.complete(state, &outcome).await {
                 if let Some(encoded) = reply.get("terminal_b64").and_then(Value::as_str) {
                     if let Ok(terminal) = BASE64.decode(encoded) {
                         let wire = Bytes::from(terminal);
                         active.stats.observe_wire(&wire);
                         terminal_sent = output.send_wire(wire).await.is_ok();
                     }
+                }
+            }
+            if coordinator.is_native() && !terminal_sent {
+                if let Ok(wire) = encode_event(event_type, payload) {
+                    active.stats.observe_wire(&wire);
+                    terminal_sent = output.send_wire(wire).await.is_ok();
                 }
             }
             return ActiveFrameResult::Done(terminal_sent);
@@ -1139,7 +1575,7 @@ async fn process_active_frames(
                 if output.send_wire(wire).await.is_err() {
                     complete_disconnect(
                         state,
-                        session_id,
+                        coordinator,
                         active.plan.attempt_id.clone(),
                         active.status,
                         &mut active.stats,
@@ -1155,10 +1591,7 @@ async fn process_active_frames(
         if processed.commits && !active.business_committed {
             active.business_committed = true;
             let observation = commit_observation(active, "real_output");
-            if control_commit(state, session_id, &observation)
-                .await
-                .is_err()
-            {
+            if coordinator.commit(state, &observation).await.is_err() {
                 return ActiveFrameResult::Done(false);
             }
             for wire in std::mem::take(&mut active.buffered) {
@@ -1166,7 +1599,7 @@ async fn process_active_frames(
                 if output.send_wire(wire).await.is_err() {
                     complete_disconnect(
                         state,
-                        session_id,
+                        coordinator,
                         active.plan.attempt_id.clone(),
                         active.status,
                         &mut active.stats,
@@ -1179,7 +1612,7 @@ async fn process_active_frames(
         if let Some(terminal) = processed.terminal {
             finish_terminal(
                 state,
-                session_id,
+                coordinator,
                 active.plan.attempt_id.clone(),
                 active.status,
                 &mut active.stats,
@@ -1194,7 +1627,7 @@ async fn process_active_frames(
 
 async fn finish_terminal(
     state: &AppState,
-    session_id: &str,
+    coordinator: &mut Coordinator,
     attempt_id: String,
     upstream_status: StatusCode,
     stats: &mut StreamStats,
@@ -1210,12 +1643,12 @@ async fn finish_terminal(
     outcome["kind"] = Value::String(kind.into());
     outcome["upstream_status_code"] = Value::from(upstream_status.as_u16());
     outcome["committed"] = Value::Bool(true);
-    let _ = control_complete(state, session_id, &outcome).await;
+    let _ = coordinator.complete(state, &outcome).await;
 }
 
 async fn complete_disconnect(
     state: &AppState,
-    session_id: &str,
+    coordinator: &mut Coordinator,
     attempt_id: String,
     upstream_status: StatusCode,
     stats: &mut StreamStats,
@@ -1226,12 +1659,12 @@ async fn complete_disconnect(
     outcome["status_code"] = Value::from(499);
     outcome["upstream_status_code"] = Value::from(upstream_status.as_u16());
     outcome["committed"] = Value::Bool(true);
-    let _ = control_complete(state, session_id, &outcome).await;
+    let _ = coordinator.complete(state, &outcome).await;
 }
 
 async fn complete_failure(
     state: &AppState,
-    session_id: &str,
+    coordinator: &mut Coordinator,
     attempt_id: String,
     upstream_status: StatusCode,
     stats: &mut StreamStats,
@@ -1245,7 +1678,7 @@ async fn complete_failure(
     outcome["upstream_status_code"] = Value::from(upstream_status.as_u16());
     outcome["detail"] = Value::String(detail.chars().take(4096).collect());
     outcome["committed"] = Value::Bool(true);
-    let _ = control_complete(state, session_id, &outcome).await;
+    let _ = coordinator.complete(state, &outcome).await;
 }
 
 fn downstream_write_timeout() -> Duration {
@@ -2143,5 +2576,38 @@ mod tests {
             active.terminal,
             Some(Terminal::SemanticFailure { .. })
         ));
+    }
+
+    #[test]
+    fn semantic_failures_preserve_responses_http_status_and_detail() {
+        assert_eq!(
+            responses_semantic_error(
+                &json!({
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "rate_limit_exceeded",
+                            "message": "Rate limit reached"
+                        }
+                    }
+                }),
+                "response.failed",
+            ),
+            (429, "Rate limit reached".to_owned())
+        );
+        assert_eq!(
+            responses_semantic_error(
+                &json!({
+                    "type": "error",
+                    "error": {
+                        "status_code": "413",
+                        "message": "payload too large"
+                    }
+                }),
+                "error",
+            ),
+            (413, "payload too large".to_owned())
+        );
     }
 }

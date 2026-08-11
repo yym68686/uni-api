@@ -3,6 +3,7 @@ mod proxy;
 mod request_spool;
 mod resources;
 mod responses;
+mod responses_native;
 
 use std::future::IntoFuture;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -28,6 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(backend_origin.clone(), control_token.clone())?;
     let mut child = spawn_python(backend_port, &control_token)?;
     wait_for_backend(&state, &mut child).await?;
+    let _ = state.native_responses_config.refresh().await;
+    state.native_responses_config.start_watcher();
 
     let app = Router::new()
         .fallback(any(proxy::handler))

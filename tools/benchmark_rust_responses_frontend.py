@@ -58,11 +58,15 @@ class FixtureServer(ThreadingHTTPServer):
                     "engine": "codex",
                     "base_url": f"http://127.0.0.1:{port}/v1/responses",
                     "api": f"sk-{provider}",
-                    "model": ["gpt-benchmark"],
+                    "model": [{"gpt-upstream": "gpt-benchmark"}],
                     "preferences": {
                         "model_timeout": {"default": 120},
                         "cooldown_period": 0,
                         "api_key_cooldown_period": 0,
+                        "post_body_parameter_overrides": {
+                            "store": False,
+                            "__remove__": ["temperature"],
+                        },
                     },
                 }
                 for provider in ("benchmark-a", "benchmark-b")
@@ -101,6 +105,20 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("content-length") or 0)
         payload = json.loads(self.rfile.read(length) or b"{}")
+        if (
+            payload.get("model") != "gpt-upstream"
+            or payload.get("store") is not False
+            or payload.get("instructions") != ""
+        ):
+            body = json.dumps(
+                {"error": "request-side provider payload compilation mismatch"}
+            ).encode()
+            self.send_response(422)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         count = (
             100
             if payload.get("input") == "warmup"
@@ -359,8 +377,11 @@ def _run_service(
                     public_port,
                     "retry-after-keepalive",
                 )
-                if retry_headers.get("x-uni-api-data-plane") != "rust-v1":
-                    raise RuntimeError("retry probe did not use the Rust data plane")
+                if retry_headers.get("x-uni-api-data-plane") != "rust-native-v2":
+                    raise RuntimeError(
+                        "retry probe did not use the native Rust control/data plane: "
+                        f"{retry_headers.get('x-uni-api-data-plane')}"
+                    )
                 if retry_wire.count(b"event: keepalive") != 1:
                     raise RuntimeError(
                         "retry probe duplicated or lost the precommit keepalive"
@@ -385,7 +406,7 @@ def _run_service(
                     raise RuntimeError("Rust idempotency owner status is missing")
                 if replay_headers.get("x-uni-api-idempotency-status") != "replayed":
                     raise RuntimeError("Rust idempotency replay status is missing")
-                if replay_headers.get("x-uni-api-data-plane") != "rust-v1":
+                if replay_headers.get("x-uni-api-data-plane") != "rust-native-v2":
                     raise RuntimeError("Rust idempotency replay lost data-plane provenance")
                 if replay_headers.get("x-fixture-request-number") != "1":
                     raise RuntimeError("Rust idempotency replay called the provider twice")
@@ -405,6 +426,8 @@ def _run_service(
                     )
                 if nonstream_headers.get("x-uni-api-idempotency-status") != "executed":
                     raise RuntimeError("Rust non-stream idempotency owner status is missing")
+                if nonstream_headers.get("x-uni-api-data-plane") != "rust-native-v2":
+                    raise RuntimeError("Rust non-stream request left the native control plane")
                 if nonstream_replay_headers.get("x-uni-api-idempotency-status") != "replayed":
                     raise RuntimeError("Rust non-stream idempotency replay status is missing")
                 if nonstream_replay_headers.get("x-fixture-request-number") != "1":
@@ -479,7 +502,7 @@ def _run_service(
                         raise RuntimeError(
                             "large non-idempotent Rust request lost its terminal event"
                         )
-                    if direct_large_headers.get("x-uni-api-data-plane") != "rust-v1":
+                    if direct_large_headers.get("x-uni-api-data-plane") != "rust-native-v2":
                         raise RuntimeError(
                             "large non-idempotent request left the Rust data plane"
                         )

@@ -5,6 +5,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,7 @@ struct Inner {
     port_reserve_bps: u64,
     disk_reserve_bps: u64,
     inode_reserve_bps: u64,
+    reserved_memory_bytes: AtomicU64,
 }
 
 struct CachedGlobalSample {
@@ -105,6 +107,7 @@ impl ResourceGovernor {
                 port_reserve_bps: env_basis_points("RUST_EPHEMERAL_PORT_RESERVE_BPS", 500),
                 disk_reserve_bps: env_basis_points("RUST_REQUEST_SPOOL_DISK_RESERVE_BPS", 1000),
                 inode_reserve_bps: env_basis_points("RUST_REQUEST_SPOOL_INODE_RESERVE_BPS", 500),
+                reserved_memory_bytes: AtomicU64::new(0),
             }),
         }
     }
@@ -127,6 +130,7 @@ impl ResourceGovernor {
                 port_reserve_bps: 0,
                 disk_reserve_bps: 0,
                 inode_reserve_bps: 0,
+                reserved_memory_bytes: AtomicU64::new(0),
             }),
         }
     }
@@ -184,6 +188,56 @@ impl ResourceGovernor {
         }
     }
 
+    pub async fn reserve_memory_capacity(
+        &self,
+        additional_bytes: u64,
+    ) -> Result<(ResourceWait, MemoryReservation), CapacityFailure> {
+        let started = Instant::now();
+        loop {
+            let reserved = self.inner.reserved_memory_bytes.load(Ordering::Acquire);
+            let available = cgroup_memory().is_none_or(|(current, limit)| {
+                let reserve = self
+                    .inner
+                    .memory_reserve_bytes
+                    .max(fraction(limit, self.inner.memory_reserve_bps));
+                current
+                    .saturating_add(reserve)
+                    .saturating_add(reserved)
+                    .saturating_add(additional_bytes)
+                    < limit
+            });
+            if available
+                && self
+                    .inner
+                    .reserved_memory_bytes
+                    .compare_exchange(
+                        reserved,
+                        reserved.saturating_add(additional_bytes),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                return Ok((
+                    ResourceWait {
+                        waited: started.elapsed(),
+                    },
+                    MemoryReservation {
+                        inner: self.inner.clone(),
+                        bytes: additional_bytes,
+                    },
+                ));
+            }
+            if started.elapsed() >= self.inner.wait_timeout {
+                return Err(CapacityFailure {
+                    resource: ResourceKind::Memory,
+                    waited: started.elapsed(),
+                });
+            }
+            tokio::time::sleep(self.inner.sample_interval).await;
+        }
+    }
+
     pub fn local_capacity(
         &self,
         path: &Path,
@@ -219,6 +273,19 @@ impl ResourceGovernor {
         cached.sampled_at = Instant::now();
         cached.rejection = sample_global_rejection(&self.inner);
         cached.rejection
+    }
+}
+
+pub struct MemoryReservation {
+    inner: Arc<Inner>,
+    bytes: u64,
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.inner
+            .reserved_memory_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -450,6 +517,21 @@ mod tests {
         assert_eq!(
             ResourceKind::Memory.exhausted_status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reservations_are_released_without_request_slots() {
+        let governor = ResourceGovernor::unconstrained_for_test();
+        let (_, reservation) = governor.reserve_memory_capacity(4096).await.unwrap();
+        assert_eq!(
+            governor.inner.reserved_memory_bytes.load(Ordering::Acquire),
+            4096
+        );
+        drop(reservation);
+        assert_eq!(
+            governor.inner.reserved_memory_bytes.load(Ordering::Acquire),
+            0
         );
     }
 }

@@ -133,6 +133,7 @@ from uni_api.app_state import AppRuntimeSnapshot
 import uni_api.config.legacy_loader as legacy_config_loader
 from uni_api.config.compiler import compile_runtime_config
 from uni_api.config.timeout_policy import apply_timeout_policy, init_timeout_policy
+from uni_api.rust_responses_snapshot import publish_rust_responses_snapshot
 from uni_api.http_content import is_json_media_type
 from uni_api.idempotency import apply_oaix_routing_attempt_id
 from uni_api.observability.paid_keys import compute_paid_api_key_state
@@ -2457,6 +2458,19 @@ async def refresh_runtime_state(app: FastAPI) -> None:
     app.state.model_response_cache = runtime_config.api_key_model_response_cache
     app.state.api_key_index = {api_key: index for index, api_key in enumerate(api_list)}
     app.state.runtime_config_source_id = id(config)
+
+    try:
+        app.state.rust_responses_snapshot_revision = (
+            publish_rust_responses_snapshot(
+                config,
+                list(api_list),
+                database_disabled=DISABLE_DATABASE,
+            )
+        )
+    except Exception:
+        # A missing snapshot only disables the native fast path. It must never
+        # make Python configuration refresh or serving unavailable.
+        logger.exception("Failed to publish Rust Responses config snapshot")
 
     if not DISABLE_DATABASE:
         app.state.paid_api_keys_states = {}

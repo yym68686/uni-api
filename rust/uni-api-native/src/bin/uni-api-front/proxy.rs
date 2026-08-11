@@ -13,6 +13,8 @@ use crate::idempotency::RequestHasher;
 use crate::request_spool::{RequestSpool, SpoolFailure, SpoolManager, SpoolObservation};
 use crate::resources::{CapacityFailure, ResourceGovernor};
 use crate::responses;
+use crate::responses_native::NativeConfigStore;
+use crate::responses_native::{prepare_native_request, NativePreparation};
 use crate::{idempotency, idempotency::Claim};
 
 const CONTROL_HEADER: &str = "x-uni-api-rust-control-token";
@@ -29,6 +31,7 @@ pub struct AppState {
     request_spool: SpoolManager,
     idempotency: idempotency::Coordinator,
     responses_data_plane_enabled: bool,
+    pub native_responses_config: NativeConfigStore,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -55,6 +58,7 @@ impl AppState {
             request_spool,
             idempotency: idempotency::Coordinator::new(),
             responses_data_plane_enabled: env_bool("UNI_API_RUST_RESPONSES_DATA_PLANE", true),
+            native_responses_config: NativeConfigStore::new(),
         })
     }
 
@@ -232,6 +236,46 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
             None => None,
         };
+        let native_json_memory_bytes = observation.body_bytes.saturating_mul(
+            std::env::var("RUST_RESPONSES_JSON_MEMORY_MULTIPLIER")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(3),
+        );
+        let native_memory_reservation = match state
+            .resource_governor
+            .reserve_memory_capacity(native_json_memory_bytes)
+            .await
+        {
+            Ok((_, reservation)) => reservation,
+            Err(failure) => {
+                if let Some(owner) = owner {
+                    owner.release().await;
+                }
+                return resource_capacity_response(failure);
+            }
+        };
+        match prepare_native_request(
+            &state.native_responses_config,
+            &parts,
+            &storage,
+            &observation,
+            native_memory_reservation,
+        )
+        .await
+        {
+            NativePreparation::Ready(route) => {
+                return responses::serve_native(state, route, owner).await;
+            }
+            NativePreparation::Response(response) => {
+                if let Some(owner) = owner {
+                    owner.release().await;
+                }
+                return response;
+            }
+            NativePreparation::Fallback => {}
+        }
         let body = match storage.into_body(&observation).await {
             Ok(body) => body,
             Err(failure) => {

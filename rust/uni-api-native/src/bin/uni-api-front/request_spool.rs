@@ -256,6 +256,18 @@ impl StoredBody {
             _cleanup: self.cleanup,
         }))
     }
+
+    pub async fn parse_json(&self) -> Result<serde_json::Value, String> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&path)
+                .map_err(|error| format!("open local request spool for JSON parse: {error}"))?;
+            serde_json::from_reader(std::io::BufReader::new(file))
+                .map_err(|error| format!("invalid JSON request body: {error}"))
+        })
+        .await
+        .map_err(|error| format!("request JSON parser task failed: {error}"))?
+    }
 }
 
 struct LocalWriter {
