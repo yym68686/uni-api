@@ -2007,6 +2007,46 @@ def build_uni_api_ember_request_telemetry(
                     "responses_delta_fast_path_bytes": _optional_int_text(
                         current_info.get("responses_delta_fast_path_bytes")
                     ),
+                    "rust_responses_data_plane": _bool_text(
+                        _safe_bool(
+                            current_info.get("rust_responses_data_plane")
+                        )
+                    ),
+                    "rust_responses_control_version": _optional_int_text(
+                        current_info.get("rust_responses_control_version")
+                    ),
+                    "rust_responses_external_committed": _bool_text(
+                        _safe_bool(
+                            current_info.get(
+                                "rust_responses_external_committed"
+                            )
+                        )
+                    ),
+                    "rust_responses_commit_reason": _safe_text(
+                        current_info.get("rust_responses_commit_reason"),
+                        max_len=80,
+                    ),
+                    "rust_responses_precommit_events": _optional_int_text(
+                        current_info.get("rust_responses_precommit_events")
+                    ),
+                    "rust_responses_precommit_bytes": _optional_int_text(
+                        current_info.get("rust_responses_precommit_bytes")
+                    ),
+                    "rust_responses_upstream_bytes": _optional_int_text(
+                        current_info.get("rust_responses_upstream_bytes")
+                    ),
+                    "rust_responses_downstream_bytes": _optional_int_text(
+                        current_info.get("rust_responses_downstream_bytes")
+                    ),
+                    "rust_responses_sse_events": _optional_int_text(
+                        current_info.get("rust_responses_sse_events")
+                    ),
+                    "rust_responses_delta_events": _optional_int_text(
+                        current_info.get("rust_responses_delta_events")
+                    ),
+                    "rust_responses_normalized_events": _optional_int_text(
+                        current_info.get("rust_responses_normalized_events")
+                    ),
                     "wire_status_code": _optional_int_text(
                         current_info.get("wire_status_code")
                     ),

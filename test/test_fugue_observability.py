@@ -642,6 +642,7 @@ def test_transport_failure_classification_reaches_logs_summary_and_metrics():
     assert request_summary["summary"]["transport_tcp_duration_ms"] == "80"
     assert request_summary["summary"]["transport_first_body_ms"] == "102"
 
+
     for event_type in ("routing_attempt", "upstream_attempt"):
         event = next(
             item
@@ -662,6 +663,53 @@ def test_transport_failure_classification_reaches_logs_summary_and_metrics():
     metrics = {event["metric"]: event for event in telemetry["metrics"]}
     assert metrics["uniapi_ember_transport_errors_total"]["value"] == 1
     assert metrics["uniapi_ember_local_overload_total"]["value"] == 1
+
+
+def test_request_summary_exports_bounded_rust_responses_fields():
+    telemetry = build_uni_api_ember_request_telemetry(
+        service_name="uni-api-ember",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        current_info={
+            "endpoint": "POST /v1/responses",
+            "request_kind": "/v1/responses",
+            "status_code": 200,
+            "stream": True,
+            "rust_responses_data_plane": True,
+            "rust_responses_control_version": 1,
+            "rust_responses_external_committed": True,
+            "rust_responses_commit_reason": "real_output",
+            "rust_responses_precommit_events": 2,
+            "rust_responses_precommit_bytes": 120,
+            "rust_responses_upstream_bytes": 900,
+            "rust_responses_downstream_bytes": 700,
+            "rust_responses_sse_events": 8,
+            "rust_responses_delta_events": 4,
+            "rust_responses_normalized_events": 3,
+        },
+        runtime_metrics={},
+    )
+    request_summary = next(
+        row
+        for row in telemetry["logs"]
+        if row.get("event") == "request_summary"
+    )
+    expected = {
+        "rust_responses_data_plane": "true",
+        "rust_responses_control_version": "1",
+        "rust_responses_external_committed": "true",
+        "rust_responses_commit_reason": "real_output",
+        "rust_responses_precommit_events": "2",
+        "rust_responses_precommit_bytes": "120",
+        "rust_responses_upstream_bytes": "900",
+        "rust_responses_downstream_bytes": "700",
+        "rust_responses_sse_events": "8",
+        "rust_responses_delta_events": "4",
+        "rust_responses_normalized_events": "3",
+    }
+    assert {
+        key: request_summary["summary"].get(key) for key in expected
+    } == expected
 
 
 def test_early_admission_rejection_only_emits_observed_stage_spans():
