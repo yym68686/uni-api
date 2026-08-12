@@ -146,6 +146,7 @@ struct NativeAttemptObservation {
     upstream_host: String,
     stream: bool,
     snapshot_revision: String,
+    started_at: tokio::time::Instant,
 }
 
 enum ProviderKeySelection {
@@ -204,6 +205,7 @@ pub struct NativeRoute {
     routing_attempts: usize,
     routing_skips: usize,
     upstream_attempts: usize,
+    upstream_duration_ms: u64,
     routing_ledger: Vec<Value>,
     upstream_ledger: Vec<Value>,
     started_at: tokio::time::Instant,
@@ -640,6 +642,7 @@ impl NativeRoute {
                 upstream_host: upstream_host(&provider.base_url),
                 stream: self.stream,
                 snapshot_revision: self.snapshot.revision.to_string(),
+                started_at: tokio::time::Instant::now(),
             };
             self.last_provider = Some(provider.clone());
             self.last_provider_key = Some(provider_key);
@@ -881,6 +884,12 @@ impl NativeRoute {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let error_sha256 = (!detail.is_empty()).then(|| sha256_hex(detail));
+        let duration_ms = attempt
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.upstream_duration_ms = self.upstream_duration_ms.saturating_add(duration_ms);
         let attempt_outcome = outcome
             .get("kind")
             .and_then(Value::as_str)
@@ -896,6 +905,7 @@ impl NativeRoute {
                 "success": success,
                 "outcome": attempt_outcome,
                 "error_sha256": error_sha256,
+                "duration_ms": duration_ms,
             }));
         }
         eprintln!(
@@ -927,6 +937,7 @@ impl NativeRoute {
                 "attempt_outcome": attempt_outcome,
                 "status_origin": failure_origin(outcome),
                 "error_sha256": error_sha256,
+                "duration_ms": duration_ms,
                 "upstream_host": attempt.upstream_host,
                 "streaming": attempt.stream,
                 "snapshot_revision": attempt.snapshot_revision,
@@ -945,12 +956,16 @@ impl NativeRoute {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let detail = outcome
-            .get("detail")
-            .or_else(|| outcome.get("body"))
-            .and_then(Value::as_str)
-            .unwrap_or(&self.last_detail);
         let success = matches!(kind, "completed" | "incomplete");
+        let detail = if success {
+            ""
+        } else {
+            outcome
+                .get("detail")
+                .or_else(|| outcome.get("body"))
+                .and_then(Value::as_str)
+                .unwrap_or(&self.last_detail)
+        };
         let final_provider = self
             .last_attempt
             .as_ref()
@@ -981,6 +996,7 @@ impl NativeRoute {
             "routing_attempt_count": self.routing_attempts,
             "routing_skip_count": self.routing_skips,
             "upstream_attempt_count": self.upstream_attempts,
+            "upstream_duration_ms": self.upstream_duration_ms,
             "routing_attempts": self.routing_ledger,
             "upstream_attempts": self.upstream_ledger,
             "routing_attempts_omitted_count": self.routing_attempts.saturating_sub(self.routing_ledger.len()),
@@ -1013,13 +1029,13 @@ impl NativeRoute {
                 "status_code": status,
                 "status_class": status_class(status),
                 "duration_ms": elapsed_ms,
-                "upstream_ms": elapsed_ms,
+                "upstream_ms": self.upstream_duration_ms,
                 "bytes_in": self.request_body_bytes,
                 "bytes_out": outcome.get("downstream_bytes").and_then(Value::as_u64).unwrap_or(0),
                 "streaming": self.stream,
                 "error_type": (!success || status >= 400).then_some(kind),
                 "status_origin": status_origin,
-                "error_sha256": (!detail.is_empty()).then(|| sha256_hex(detail)),
+                "error_sha256": terminal_error_sha256(success, detail),
                 "summary_json": summary.to_string(),
                 "rust_responses_data_plane": true,
             })
@@ -1367,6 +1383,7 @@ pub async fn prepare_native_request(
         routing_attempts: 0,
         routing_skips: 0,
         upstream_attempts: 0,
+        upstream_duration_ms: 0,
         routing_ledger: Vec::new(),
         upstream_ledger: Vec::new(),
         started_at: tokio::time::Instant::now(),
@@ -2059,6 +2076,10 @@ fn sha256_hex(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn terminal_error_sha256(success: bool, detail: &str) -> Option<String> {
+    (!success && !detail.is_empty()).then(|| sha256_hex(detail))
+}
+
 fn provider_api_keys(value: &Value) -> Vec<String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => vec![value.trim().to_owned()],
@@ -2421,6 +2442,7 @@ mod tests {
             routing_attempts: 0,
             routing_skips: 0,
             upstream_attempts: 0,
+            upstream_duration_ms: 0,
             routing_ledger: Vec::new(),
             upstream_ledger: Vec::new(),
             started_at: tokio::time::Instant::now(),
@@ -2513,6 +2535,8 @@ mod tests {
             retry_after_seconds("Rate limit reached. Please try again in 2500ms."),
             Some(3.0)
         );
+        assert_eq!(terminal_error_sha256(true, "earlier attempt failed"), None);
+        assert!(terminal_error_sha256(false, "terminal failure").is_some());
     }
 
     #[tokio::test]
