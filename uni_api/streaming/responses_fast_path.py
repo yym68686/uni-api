@@ -97,7 +97,9 @@ def match_canonical_responses_delta_frame(
 
     if not isinstance(wire_bytes, bytes):
         return None
-    if len(wire_bytes) < 2 or len(wire_bytes) - 2 > max_event_bytes:
+    if len(wire_bytes) < 2 or (
+        max_event_bytes and len(wire_bytes) - 2 > max_event_bytes
+    ):
         return None
     if not wire_bytes.endswith(b"\n\n"):
         return None
@@ -125,6 +127,7 @@ async def can_forward_responses_delta_without_materializing(
     frame: CanonicalResponsesDeltaFrame,
     *,
     workspace: ReusableJSONParseWorkspace,
+    max_json_estimated_bytes: int = _JSON_MAX_ESTIMATED_BYTES,
     item_id_requires_full_normalization: Callable[[str, str], bool]
     | None = None,
 ) -> bool:
@@ -145,7 +148,7 @@ async def can_forward_responses_delta_without_materializing(
                 payload_view,
                 raw_memory_multiplier=4,
                 token_memory_bytes=128,
-                max_estimated_bytes=_JSON_MAX_ESTIMATED_BYTES,
+                max_estimated_bytes=max_json_estimated_bytes,
             )
         except JSONMemoryComplexityError as exc:
             raise SSEProtocolError(

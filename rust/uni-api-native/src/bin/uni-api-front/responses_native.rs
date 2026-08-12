@@ -17,11 +17,10 @@ use url::Url;
 
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
-use crate::responses::Plan;
+use crate::responses::{Plan, UNLIMITED_SSE_EVENT_BYTES};
 use crate::responses_item_ids::normalize_response_root;
 
 const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
-const DEFAULT_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_PRECOMMIT_ITEMS: usize = 128;
 const DEFAULT_MAX_PRECOMMIT_BYTES: usize = 8 * 1024 * 1024 + 128 * 266;
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal";
@@ -671,7 +670,7 @@ impl NativeRoute {
                 first_byte_timeout_seconds: timeout.first_byte,
                 idle_timeout_seconds: timeout.idle,
                 total_timeout_seconds: timeout.total,
-                max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
+                max_event_bytes: UNLIMITED_SSE_EVENT_BYTES,
                 max_precommit_items: DEFAULT_MAX_PRECOMMIT_ITEMS,
                 max_precommit_bytes: DEFAULT_MAX_PRECOMMIT_BYTES,
             }));

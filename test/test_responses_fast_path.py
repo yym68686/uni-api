@@ -25,6 +25,7 @@ def _delta_wire(payload: bytes) -> bytes:
 def _is_transparent(
     wire: bytes,
     *,
+    max_json_estimated_bytes=64 * 1024 * 1024,
     item_id_requires_full_normalization=None,
 ) -> bool:
     async def scenario() -> bool:
@@ -35,6 +36,7 @@ def _is_transparent(
             return await can_forward_responses_delta_without_materializing(
                 frame,
                 workspace=workspace,
+                max_json_estimated_bytes=max_json_estimated_bytes,
                 item_id_requires_full_normalization=(
                     item_id_requires_full_normalization
                 ),
@@ -180,3 +182,19 @@ def test_selective_decoder_keeps_existing_json_complexity_limit():
 
     with pytest.raises(SSEProtocolError, match="nesting exceeds"):
         _is_transparent(wire)
+
+
+def test_selective_decoder_uses_caller_resource_budget_not_frame_size():
+    payload = (
+        b'{"type":"response.output_text.delta","delta":"'
+        + b"x" * (64 * 1024)
+        + b'"}'
+    )
+    wire = _delta_wire(payload)
+
+    with pytest.raises(SSEProtocolError, match="materialization exceeds"):
+        _is_transparent(wire, max_json_estimated_bytes=64 * 1024)
+    assert _is_transparent(
+        wire,
+        max_json_estimated_bytes=2 * 1024 * 1024,
+    ) is True

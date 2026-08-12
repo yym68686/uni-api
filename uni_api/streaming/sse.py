@@ -21,10 +21,14 @@ from uni_api.serialization import json
 
 
 # Image-generation Responses events can legitimately carry multi-megabyte
-# base64 payloads. Eight MiB is a per-event protocol bound; aggregate parser
-# ownership is charged to the cgroup-aware process memory governor below.
+# base64 payloads. These are conservative defaults for generic SSE consumers;
+# Responses proxy paths disable the fixed byte limits while aggregate parser
+# ownership remains charged to the cgroup-aware memory governor below.
 DEFAULT_MAX_PENDING_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_EVENT_BYTES = 8 * 1024 * 1024
+# A zero byte limit disables only that fixed limit. Retained parser bytes and
+# JSON materialization remain charged to the cgroup-aware memory governor.
+UNLIMITED_SSE_BYTES = 0
 DEFAULT_MAX_EVENTS_PER_FEED = 4096
 DEFAULT_MAX_LINES_PER_FEED = 4096
 DEFAULT_MAX_FIELDS_PER_EVENT = 4096
@@ -500,7 +504,7 @@ class SSEIncompleteEventError(SSEProtocolError):
 
 
 class IncrementalSSEParser:
-    """Incrementally split a bounded UTF-8 SSE stream into raw event frames."""
+    """Incrementally split a resource-accounted UTF-8 SSE stream into frames."""
 
     def __init__(
         self,
@@ -510,14 +514,14 @@ class IncrementalSSEParser:
         max_events_per_feed: int = DEFAULT_MAX_EVENTS_PER_FEED,
         max_feed_bytes: int = DEFAULT_MAX_FEED_BYTES,
     ) -> None:
-        if max_pending_bytes <= 0:
-            raise ValueError("max_pending_bytes must be greater than zero")
-        if max_event_bytes <= 0:
-            raise ValueError("max_event_bytes must be greater than zero")
+        if max_pending_bytes < 0:
+            raise ValueError("max_pending_bytes cannot be negative")
+        if max_event_bytes < 0:
+            raise ValueError("max_event_bytes cannot be negative")
         if max_events_per_feed <= 0:
             raise ValueError("max_events_per_feed must be greater than zero")
-        if max_feed_bytes <= 0:
-            raise ValueError("max_feed_bytes must be greater than zero")
+        if max_feed_bytes < 0:
+            raise ValueError("max_feed_bytes cannot be negative")
 
         self.max_pending_bytes = max_pending_bytes
         self.max_event_bytes = max_event_bytes
@@ -651,6 +655,8 @@ class IncrementalSSEParser:
     def _validate_feed_size(self, chunk: str | bytes | bytearray) -> None:
         if not isinstance(chunk, (str, bytes, bytearray)):
             raise TypeError("SSE chunks must be str, bytes, or bytearray")
+        if not self.max_feed_bytes:
+            return
         try:
             observed = (
                 _bounded_utf8_size(chunk, limit_bytes=self.max_feed_bytes)
@@ -662,7 +668,7 @@ class IncrementalSSEParser:
             raise SSEProtocolError(
                 "SSE text contains an invalid Unicode scalar"
             ) from exc
-        if observed > self.max_feed_bytes:
+        if self.max_feed_bytes and observed > self.max_feed_bytes:
             self._failed = True
             raise SSEBufferOverflowError(
                 buffer_name="input chunk",
@@ -796,7 +802,7 @@ class IncrementalSSEParser:
                         self._pending_budget_bytes -= segment_size
                         reserved_credit += segment_size
                         raise
-                    if len(self._event) > self.max_event_bytes:
+                    if self.max_event_bytes and len(self._event) > self.max_event_bytes:
                         self._failed = True
                         raise SSEBufferOverflowError(
                             buffer_name="event",
@@ -877,7 +883,7 @@ class IncrementalSSEParser:
         # event bound here prevents a single incomplete frame from growing
         # past the limit even within one large feed().  max_pending_bytes is a
         # retained-across-feeds limit and is checked once the feed completes.
-        if len(self._event) > self.max_event_bytes:
+        if self.max_event_bytes and len(self._event) > self.max_event_bytes:
             self._failed = True
             raise SSEBufferOverflowError(
                 buffer_name="event",
@@ -887,7 +893,7 @@ class IncrementalSSEParser:
 
     def _validate_complete_event(self) -> None:
         event_bytes = len(self._event)
-        if event_bytes > self.max_event_bytes:
+        if self.max_event_bytes and event_bytes > self.max_event_bytes:
             self._failed = True
             raise SSEBufferOverflowError(
                 buffer_name="event",
@@ -897,7 +903,7 @@ class IncrementalSSEParser:
 
     def _validate_pending_size(self) -> None:
         pending_bytes = self._pending_size_bytes()
-        if pending_bytes > self.max_pending_bytes:
+        if self.max_pending_bytes and pending_bytes > self.max_pending_bytes:
             self._failed = True
             raise SSEBufferOverflowError(
                 buffer_name="pending buffer",
@@ -905,7 +911,7 @@ class IncrementalSSEParser:
                 observed_bytes=pending_bytes,
             )
 
-        if pending_bytes > self.max_event_bytes:
+        if self.max_event_bytes and pending_bytes > self.max_event_bytes:
             self._failed = True
             raise SSEBufferOverflowError(
                 buffer_name="event",
@@ -1487,12 +1493,15 @@ async def parse_owned_sse_event(
     raw_event: str,
     *,
     max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+    max_json_estimated_bytes: int = _SSE_JSON_MAX_ESTIMATED_BYTES,
     workspace: ReusableJSONParseWorkspace | None = None,
 ) -> OwnedSSEEvent:
-    """Parse one bounded event and return explicit transferable ownership."""
+    """Parse one resource-accounted event with transferable ownership."""
 
-    if max_event_bytes <= 0:
-        raise ValueError("max_event_bytes must be greater than zero")
+    if max_event_bytes < 0:
+        raise ValueError("max_event_bytes cannot be negative")
+    if max_json_estimated_bytes <= 0:
+        raise ValueError("max_json_estimated_bytes must be greater than zero")
     request_lease = get_request_admission_lease()
     # Field splitting can temporarily retain line/value slices plus the joined
     # data string.  Reserve a conservative copy workspace before performing
@@ -1501,7 +1510,7 @@ async def parse_owned_sse_event(
     workspace_reservation = None
     json_owner: OwnedJSONValue | None = None
     try:
-        if len(raw_event) > max_event_bytes:
+        if max_event_bytes and len(raw_event) > max_event_bytes:
             raise SSEBufferOverflowError(
                 buffer_name="event",
                 limit_bytes=max_event_bytes,
@@ -1515,16 +1524,17 @@ async def parse_owned_sse_event(
                     workspace_bytes
                 )
             )
-        observed_bytes = _bounded_utf8_size(
-            raw_event,
-            limit_bytes=max_event_bytes,
-        )
-        if observed_bytes > max_event_bytes:
-            raise SSEBufferOverflowError(
-                buffer_name="event",
+        if max_event_bytes:
+            observed_bytes = _bounded_utf8_size(
+                raw_event,
                 limit_bytes=max_event_bytes,
-                observed_bytes=observed_bytes,
             )
+            if observed_bytes > max_event_bytes:
+                raise SSEBufferOverflowError(
+                    buffer_name="event",
+                    limit_bytes=max_event_bytes,
+                    observed_bytes=observed_bytes,
+                )
         if is_sse_comment_frame(raw_event):
             return OwnedSSEEvent(
                 raw_event=raw_event,
@@ -1572,7 +1582,7 @@ async def parse_owned_sse_event(
 
         json_owner = await parse_owned_json_value(
             data_str,
-            max_estimated_bytes=_SSE_JSON_MAX_ESTIMATED_BYTES,
+            max_estimated_bytes=max_json_estimated_bytes,
             allow_invalid=True,
             workspace=workspace,
             workspace_extra_bytes=workspace_bytes,

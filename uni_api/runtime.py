@@ -242,6 +242,7 @@ from uni_api.streaming.sse import (
     IncrementalSSEParser,
     SSEProtocolError,
     StreamParserRetainedLease,
+    UNLIMITED_SSE_BYTES,
     is_sse_comment_frame,
     parse_owned_sse_event,
     parse_sse_event,
@@ -418,9 +419,8 @@ RUST_RESPONSES_DATA_PLANE_ENABLED = bool(
     RUST_RESPONSES_CONTROL_TOKEN
     and _env_bool("UNI_API_RUST_RESPONSES_DATA_PLANE", True)
 )
-# Responses data-only events gain this bounded header during normalization.
-# Define the resulting event limit before middleware construction so its
-# downstream usage observer accepts exactly the frames this proxy can emit.
+# The downstream usage observer is deliberately best-effort and bounded. It
+# may disable itself for a larger Responses event without affecting proxying.
 RESPONSES_CANONICAL_EVENT_HEADER_MAX_BYTES = len(b"event: ") + 256 + len(b"\n")
 RESPONSES_CANONICAL_EVENT_MAX_BYTES = (
     DEFAULT_MAX_EVENT_BYTES + RESPONSES_CANONICAL_EVENT_HEADER_MAX_BYTES
@@ -5594,6 +5594,12 @@ RESPONSES_STREAM_GLOBAL_BUDGET_BYTES = max(
         process_memory_governor.maximum_capacity_bytes(),
     ),
 )
+# Responses frames have no fixed byte ceiling. JSON validation is instead
+# bounded by the current process/cgroup capacity and the request admission
+# lease that owns the materialization workspace.
+RESPONSES_SSE_JSON_MAX_ESTIMATED_BYTES = (
+    process_memory_governor.maximum_capacity_bytes()
+)
 RESPONSES_STREAM_GLOBAL_BUDGET_WAIT_TIMEOUT_SECONDS = max(
     0.001,
     _env_float(
@@ -5605,9 +5611,8 @@ RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS = max(
     1,
     _env_int("RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS", 128),
 )
-# A raw event may be exactly DEFAULT_MAX_EVENT_BYTES.  Canonicalizing a
-# data-only event adds ``event: `` + at most 256 event-type bytes + one LF,
-# while the buffered wire frame adds the terminating blank line.
+# Keep a bounded aggregate structural precommit buffer. A frame that commits
+# the response bypasses this fixed threshold and remains memory-accounted.
 RESPONSES_CANONICAL_EVENT_MAX_OVERHEAD_BYTES = (
     RESPONSES_CANONICAL_EVENT_HEADER_MAX_BYTES + len(b"\n\n")
 )
@@ -6189,14 +6194,25 @@ async def _prime_responses_upstream_stream(
         max_bytes=RESPONSES_STREAM_PRECOMMIT_MAX_BYTES,
         retained_byte_budget=retained_byte_budget,
     )
-    sse_parser = IncrementalSSEParser()
+    sse_parser = IncrementalSSEParser(
+        max_pending_bytes=UNLIMITED_SSE_BYTES,
+        max_event_bytes=UNLIMITED_SSE_BYTES,
+        max_feed_bytes=UNLIMITED_SSE_BYTES,
+    )
     commit_policy = (commit_policy or "real_output").strip().lower()
     if commit_policy not in {"real_output", "completed_usage"}:
         commit_policy = "real_output"
 
-    async def append_buffered(chunk: bytes) -> None:
+    async def append_buffered(
+        chunk: bytes,
+        *,
+        allow_over_limit: bool = False,
+    ) -> None:
         try:
-            await buffered_chunks.append(chunk)
+            await buffered_chunks.append(
+                chunk,
+                allow_over_limit=allow_over_limit,
+            )
         except StreamQueueItemTooLarge as exc:
             raise HTTPException(
                 status_code=502,
@@ -6386,7 +6402,13 @@ async def _prime_responses_upstream_stream(
                     else None
                 )
                 try:
-                    event_owner = await parse_owned_sse_event(raw_event)
+                    event_owner = await parse_owned_sse_event(
+                        raw_event,
+                        max_event_bytes=UNLIMITED_SSE_BYTES,
+                        max_json_estimated_bytes=(
+                            RESPONSES_SSE_JSON_MAX_ESTIMATED_BYTES
+                        ),
+                    )
                 finally:
                     if phase_diagnostics is not None:
                         phase_diagnostics.finish_phase(
@@ -6514,6 +6536,12 @@ async def _prime_responses_upstream_stream(
                             "canonicalized_data_only_event",
                             event_type,
                         )
+                    commits_response = _responses_stream_event_commits(
+                        event_type,
+                        event_payload,
+                        commit_policy,
+                        precommit_semantic_guard=precommit_semantic_guard,
+                    )
                     if (
                         precommit_semantic_guard
                         and event_type == "keepalive"
@@ -6529,14 +6557,12 @@ async def _prime_responses_upstream_stream(
                             and precommit_keepalive_callback is not None
                         ):
                             await precommit_keepalive_callback(None)
-                        await append_buffered(event_bytes)
+                        await append_buffered(
+                            event_bytes,
+                            allow_over_limit=commits_response,
+                        )
 
-                    if _responses_stream_event_commits(
-                        event_type,
-                        event_payload,
-                        commit_policy,
-                        precommit_semantic_guard=precommit_semantic_guard,
-                    ):
+                    if commits_response:
                         for remaining_index in range(
                             event_index + 1,
                             len(raw_events),
@@ -6545,9 +6571,15 @@ async def _prime_responses_upstream_stream(
                             if remaining_raw_event.strip():
                                 remaining_wire = raw_event_wires[remaining_index]
                                 assert remaining_wire is not None
-                                await append_buffered(remaining_wire)
+                                await append_buffered(
+                                    remaining_wire,
+                                    allow_over_limit=True,
+                                )
                         if sse_parser.pending_data:
-                            await append_buffered(sse_parser.pending_data)
+                            await append_buffered(
+                                sse_parser.pending_data,
+                                allow_over_limit=True,
+                            )
                         return buffered_chunks, True
                 finally:
                     # The owned parser reservation may only be returned after
@@ -7528,7 +7560,7 @@ class ResponsesRequestExecution:
             ),
             "idle_timeout_seconds": attempt.state.get("idle_timeout"),
             "total_timeout_seconds": attempt.state.get("total_timeout"),
-            "max_event_bytes": DEFAULT_MAX_EVENT_BYTES,
+            "max_event_bytes": UNLIMITED_SSE_BYTES,
             "max_precommit_items": RESPONSES_STREAM_PRECOMMIT_MAX_ITEMS,
             "max_precommit_bytes": RESPONSES_STREAM_PRECOMMIT_MAX_BYTES,
         }
@@ -8318,12 +8350,13 @@ class ResponsesRequestExecution:
         fast_path_events = 0
         fast_path_fallbacks = 0
         fast_path_bytes = 0
-        # Precommit may add one bounded event header to an otherwise maximum-
-        # sized upstream frame.  The owned parser below only uses this relaxed
-        # limit for chunks already accepted by the stricter upstream parser.
+        # Responses events have no fixed frame/feed ceiling. The parser still
+        # charges retained bytes and JSON work to the process/request memory
+        # governors before materializing them.
         proxy_sse_parser = IncrementalSSEParser(
-            max_pending_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
-            max_event_bytes=RESPONSES_CANONICAL_EVENT_MAX_BYTES,
+            max_pending_bytes=UNLIMITED_SSE_BYTES,
+            max_event_bytes=UNLIMITED_SSE_BYTES,
+            max_feed_bytes=UNLIMITED_SSE_BYTES,
         )
         custom_tool_call_id_normalizer = (
             ResponsesCustomToolCallIdNormalizer()
@@ -8460,7 +8493,8 @@ class ResponsesRequestExecution:
                         and proxy_sse_parser.can_bypass_complete_frame
                     ):
                         fast_frame = match_canonical_responses_delta_frame(
-                            chunk_bytes
+                            chunk_bytes,
+                            max_event_bytes=UNLIMITED_SSE_BYTES,
                         )
                     if fast_frame is None:
                         raw_events = proxy_sse_parser.feed(chunk_bytes)
@@ -8666,6 +8700,9 @@ class ResponsesRequestExecution:
                                 can_forward_responses_delta_without_materializing(
                                     fast_frame,
                                     workspace=parse_workspace,
+                                    max_json_estimated_bytes=(
+                                        RESPONSES_SSE_JSON_MAX_ESTIMATED_BYTES
+                                    ),
                                     item_id_requires_full_normalization=(
                                         item_id_requires_full_normalization
                                     ),
@@ -8677,10 +8714,9 @@ class ResponsesRequestExecution:
                         if not fast_transparent:
                             event_owner = await parse_owned_sse_event(
                                 raw_event,
-                                max_event_bytes=(
-                                    RESPONSES_CANONICAL_EVENT_MAX_BYTES
-                                    if from_precommit_buffer
-                                    else DEFAULT_MAX_EVENT_BYTES
+                                max_event_bytes=UNLIMITED_SSE_BYTES,
+                                max_json_estimated_bytes=(
+                                    RESPONSES_SSE_JSON_MAX_ESTIMATED_BYTES
                                 ),
                                 workspace=parse_workspace,
                             )

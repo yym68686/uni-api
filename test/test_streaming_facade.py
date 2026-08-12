@@ -3,12 +3,14 @@ import asyncio
 import pytest
 
 from uni_api.streaming.sse import (
+    DEFAULT_MAX_EVENT_BYTES,
     IncrementalLineParser,
     IncrementalSSEParser,
     SSEBufferOverflowError,
     SSEIncompleteEventError,
     SSEOutputLimitError,
     SSEProtocolError,
+    UNLIMITED_SSE_BYTES,
     is_sse_comment_frame,
     parse_owned_sse_event,
     parse_sse_event,
@@ -71,6 +73,40 @@ def test_streaming_sse_facade_enforces_pending_and_event_byte_limits():
         event_parser.feed("data: x\n\n")
     assert event_error.value.buffer_name == "event"
     assert event_error.value.observed_bytes == 7
+
+
+def test_streaming_sse_zero_limit_accepts_frame_beyond_legacy_bound():
+    parser = IncrementalSSEParser(
+        max_pending_bytes=UNLIMITED_SSE_BYTES,
+        max_event_bytes=UNLIMITED_SSE_BYTES,
+        max_feed_bytes=UNLIMITED_SSE_BYTES,
+    )
+    payload = b"x" * (DEFAULT_MAX_EVENT_BYTES + 1)
+
+    assert parser.feed(b"data: " + payload) == []
+    events = parser.feed(b"\n\n")
+
+    assert len(events) == 1
+    assert len(events[0].encode()) == len(payload) + len(b"data: ")
+
+
+def test_streaming_sse_negative_limits_remain_invalid():
+    with pytest.raises(ValueError, match="cannot be negative"):
+        IncrementalSSEParser(max_event_bytes=-1)
+
+
+def test_owned_sse_event_zero_limit_disables_only_fixed_frame_bound():
+    async def inspect():
+        owner = await parse_owned_sse_event(
+            'event: note\ndata: {"type":"note"}',
+            max_event_bytes=UNLIMITED_SSE_BYTES,
+        )
+        try:
+            return owner.event_name, owner.payload
+        finally:
+            await owner.aclose()
+
+    assert asyncio.run(inspect()) == ("note", {"type": "note"})
 
 
 def test_streaming_sse_facade_finish_accepts_complete_stream_and_rejects_incomplete_event():

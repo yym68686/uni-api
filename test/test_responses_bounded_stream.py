@@ -360,6 +360,31 @@ def test_responses_precommit_buffer_has_total_item_and_byte_limits(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_responses_committing_frame_can_exceed_precommit_byte_limit(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(runtime, "RESPONSES_STREAM_PRECOMMIT_MAX_BYTES", 64)
+        event = (
+            "event: response.output_text.delta\n"
+            'data: {"type":"response.output_text.delta",'
+            '"delta":"this frame commits the response"}\n\n'
+        ).encode()
+
+        async def upstream_chunks():
+            yield event
+
+        buffered, committed = await _prime_responses_upstream_stream(
+            upstream_chunks(),
+            precommit_semantic_guard=True,
+        )
+        try:
+            assert committed is True
+            assert b"".join(buffered) == event
+        finally:
+            await buffered.clear()
+
+    asyncio.run(scenario())
+
+
 def test_responses_precommit_rejects_incomplete_sse_eof():
     async def scenario():
         async def upstream_chunks():

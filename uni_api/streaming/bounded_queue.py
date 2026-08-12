@@ -455,11 +455,18 @@ class ReservedChunkBuffer:
     def retained_bytes(self) -> int:
         return self._bytes
 
-    async def append(self, chunk: bytes) -> None:
+    async def append(
+        self,
+        chunk: bytes,
+        *,
+        allow_over_limit: bool = False,
+    ) -> None:
         chunk = bytes(chunk)
         next_items = len(self._chunks) + 1
         next_bytes = self._bytes + len(chunk)
-        if next_items > self.max_items or next_bytes > self.max_bytes:
+        if not allow_over_limit and (
+            next_items > self.max_items or next_bytes > self.max_bytes
+        ):
             raise StreamQueueItemTooLarge(
                 "stream precommit buffer limit exceeded"
             )

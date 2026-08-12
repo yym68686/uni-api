@@ -32,6 +32,7 @@ const CONTROL_HEADER: &str = "x-uni-api-rust-control-token";
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const DOWNSTREAM_SEGMENT_BYTES: usize = 64 * 1024;
 const DOWNSTREAM_CHANNEL_SEGMENTS: usize = 16;
+pub(crate) const UNLIMITED_SSE_EVENT_BYTES: usize = 0;
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
@@ -67,7 +68,7 @@ fn default_commit_policy() -> String {
 }
 
 fn default_max_event_bytes() -> usize {
-    8 * 1024 * 1024
+    UNLIMITED_SSE_EVENT_BYTES
 }
 
 fn default_max_precommit_items() -> usize {
@@ -808,6 +809,10 @@ fn process_preflight_frames(
             !active.precommit_keepalive_sent && processed.canonical_keepalive && semantic_guard;
         let suppress_repeated_keepalive =
             active.precommit_keepalive_sent && processed.event_type.as_deref() == Some("keepalive");
+        let transparent_response_created =
+            !semantic_guard && processed.event_type.as_deref() == Some("response.created");
+        let commits_response =
+            processed.commits || transparent_response_created || processed.terminal.is_some();
         if processed.event_type.as_deref() == Some("response.created")
             && semantic_guard
             && !active.precommit_keepalive_sent
@@ -820,6 +825,7 @@ fn process_preflight_frames(
         if let Some(wire) = processed.wire.filter(|_| !suppress_repeated_keepalive) {
             let buffered_bytes: usize = active.buffered.iter().map(Bytes::len).sum();
             if !started
+                && !commits_response
                 && (active.buffered.len() >= active.plan.max_precommit_items
                     || buffered_bytes.saturating_add(wire.len()) > active.plan.max_precommit_bytes)
             {
@@ -852,8 +858,6 @@ fn process_preflight_frames(
             }
             started = true;
         }
-        let transparent_response_created =
-            !semantic_guard && processed.event_type.as_deref() == Some("response.created");
         if processed.commits || transparent_response_created {
             if !started {
                 active.commit_reason = if transparent_response_created {
@@ -2661,8 +2665,12 @@ impl SseDecoder {
         Self {
             buffer: BytesMut::new(),
             scan_from: 0,
-            max_event_bytes: max_event_bytes.max(1),
+            max_event_bytes,
         }
+    }
+
+    fn exceeds_event_limit(&self, observed_bytes: usize) -> bool {
+        self.max_event_bytes != UNLIMITED_SSE_EVENT_BYTES && observed_bytes > self.max_event_bytes
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, String> {
@@ -2671,7 +2679,7 @@ impl SseDecoder {
         while let Some((end, delimiter_len)) =
             find_event_delimiter_from(&self.buffer, self.scan_from)
         {
-            if end > self.max_event_bytes {
+            if self.exceeds_event_limit(end) {
                 return Err("Responses upstream SSE event exceeds the configured limit".into());
             }
             let wire = self.buffer.split_to(end + delimiter_len).freeze();
@@ -2686,7 +2694,9 @@ impl SseDecoder {
             });
         }
         self.scan_from = self.buffer.len().saturating_sub(3);
-        if self.buffer.len() > self.max_event_bytes.saturating_add(64 * 1024) {
+        if self.max_event_bytes != UNLIMITED_SSE_EVENT_BYTES
+            && self.buffer.len() > self.max_event_bytes.saturating_add(64 * 1024)
+        {
             return Err("Responses upstream SSE pending frame exceeds the configured limit".into());
         }
         Ok(frames)
@@ -2695,7 +2705,7 @@ impl SseDecoder {
     fn finish(&mut self) -> Result<Vec<SseFrame>, String> {
         let mut frames = self.feed(&[])?;
         if !self.buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
-            if self.buffer.len() > self.max_event_bytes {
+            if self.exceeds_event_limit(self.buffer.len()) {
                 return Err("Responses upstream SSE event exceeds the configured limit".into());
             }
             let raw_len = self.buffer.len();
@@ -3040,6 +3050,27 @@ mod tests {
     }
 
     #[test]
+    fn decoder_zero_limit_accepts_frames_beyond_the_legacy_bound() {
+        let mut decoder = SseDecoder::new(UNLIMITED_SSE_EVENT_BYTES);
+        let payload = vec![b'x'; 8 * 1024 * 1024 + 1];
+        assert!(decoder.feed(b"data: ").unwrap().is_empty());
+        assert!(decoder.feed(&payload).unwrap().is_empty());
+        let frames = decoder.feed(b"\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].raw_len, payload.len() + b"data: ".len());
+    }
+
+    #[test]
+    fn decoder_explicit_limit_remains_enforced() {
+        let mut decoder = SseDecoder::new(8);
+        let error = decoder.feed(b"data: too-large\n\n").unwrap_err();
+        assert_eq!(
+            error,
+            "Responses upstream SSE event exceeds the configured limit"
+        );
+    }
+
+    #[test]
     fn stream_modes_match_engine_and_normalization_contract() {
         let gpt = test_active("gpt");
         assert_eq!(gpt.mode, StreamMode::OpaqueRaw);
@@ -3253,6 +3284,27 @@ mod tests {
         assert_eq!(active.buffered.len(), 3);
         assert!(active.buffered[0].starts_with(b"event: keepalive\n"));
         assert!(active.buffered[1].starts_with(b"event: response.created\n"));
+    }
+
+    #[test]
+    fn committing_frame_may_exceed_structural_precommit_byte_limit() {
+        let mut active = test_active("codex");
+        active.plan.max_precommit_bytes = 64;
+        let frames = active
+            .decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"this frame commits the response\"}\n\n",
+            )
+            .unwrap();
+        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected the substantive frame to commit");
+        };
+        assert!(active.business_committed);
+        assert_eq!(active.buffered.len(), 1);
+        assert!(active.buffered[0].len() > active.plan.max_precommit_bytes);
     }
 
     #[test]
