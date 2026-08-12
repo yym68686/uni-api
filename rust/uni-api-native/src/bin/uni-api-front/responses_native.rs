@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
 use crate::responses::Plan;
+use crate::responses_item_ids::normalize_response_root;
 
 const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 const DEFAULT_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
@@ -975,7 +976,7 @@ fn compile_payload(
         strip_codex_fields(root);
     }
     if normalization_enabled(provider, request_model, original_model) {
-        normalize_custom_tool_ids(root)?;
+        normalize_response_root(root)?;
     }
     Ok(())
 }
@@ -1199,159 +1200,8 @@ fn normalization_enabled(provider: &Provider, request_model: &str, original_mode
             })
         }),
         Some(_) => false,
-        None => {
-            matches!(
-                provider.name.as_ref(),
-                "fugue-codex" | "937auth" | "937auth01"
-            ) && (request_model == "gpt-5.6-sol" || original_model == "gpt-5.6-sol")
-        }
+        None => provider.engine.as_ref() == "codex",
     }
-}
-
-fn normalize_custom_tool_ids(root: &mut Map<String, Value>) -> Result<(), String> {
-    let existing = collect_item_ids(root);
-    let mut replacements = HashMap::new();
-    if let Some(item) = root.get("item").and_then(Value::as_object) {
-        register_tool_id_replacement(item, &existing, &mut replacements)?;
-    }
-    for collection in ["input", "output"] {
-        if let Some(items) = root.get(collection).and_then(Value::as_array) {
-            for item in items.iter().filter_map(Value::as_object) {
-                register_tool_id_replacement(item, &existing, &mut replacements)?;
-            }
-        }
-    }
-    if let Some(items) = root
-        .get("response")
-        .and_then(Value::as_object)
-        .and_then(|response| response.get("output"))
-        .and_then(Value::as_array)
-    {
-        for item in items.iter().filter_map(Value::as_object) {
-            register_tool_id_replacement(item, &existing, &mut replacements)?;
-        }
-    }
-    if let Some(item) = root.get_mut("item").and_then(Value::as_object_mut) {
-        apply_tool_id_replacement(item, &replacements);
-    }
-    for collection in ["input", "output"] {
-        if let Some(items) = root.get_mut(collection).and_then(Value::as_array_mut) {
-            for item in items.iter_mut().filter_map(Value::as_object_mut) {
-                apply_tool_id_replacement(item, &replacements);
-            }
-        }
-    }
-    if let Some(items) = root
-        .get_mut("response")
-        .and_then(Value::as_object_mut)
-        .and_then(|response| response.get_mut("output"))
-        .and_then(Value::as_array_mut)
-    {
-        for item in items.iter_mut().filter_map(Value::as_object_mut) {
-            apply_tool_id_replacement(item, &replacements);
-        }
-    }
-    if let Some(current) = root
-        .get("item_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        let event_reference = matches!(
-            root.get("type").and_then(Value::as_str),
-            Some("response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done")
-        );
-        let normalized = replacements.get(&current).cloned().or_else(|| {
-            event_reference
-                .then(|| normalized_tool_id(&current))
-                .flatten()
-        });
-        if let Some(normalized) = normalized {
-            if normalized != current && existing.contains(&normalized) {
-                return Err(
-                    "custom tool call event item_id normalization would collide with an existing item ID"
-                        .into(),
-                );
-            }
-            root.insert("item_id".into(), Value::String(normalized));
-        }
-    }
-    Ok(())
-}
-
-fn register_tool_id_replacement(
-    item: &Map<String, Value>,
-    existing: &std::collections::HashSet<String>,
-    replacements: &mut HashMap<String, String>,
-) -> Result<(), String> {
-    if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
-        return Ok(());
-    }
-    let Some(item_id) = item.get("id").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    let Some(normalized) = normalized_tool_id(item_id) else {
-        return Ok(());
-    };
-    if normalized != item_id && existing.contains(&normalized) {
-        return Err(
-            "custom_tool_call ID normalization would collide with an existing item ID".into(),
-        );
-    }
-    replacements.insert(item_id.to_owned(), normalized);
-    Ok(())
-}
-
-fn apply_tool_id_replacement(
-    item: &mut Map<String, Value>,
-    replacements: &HashMap<String, String>,
-) {
-    if let Some(current) = item.get("id").and_then(Value::as_str) {
-        if let Some(normalized) = replacements.get(current) {
-            item.insert("id".into(), Value::String(normalized.clone()));
-        }
-    }
-}
-
-fn normalized_tool_id(value: &str) -> Option<String> {
-    let suffix = value.strip_prefix("item_")?;
-    (!suffix.is_empty()
-        && suffix
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric()))
-    .then(|| format!("ctc_{suffix}"))
-}
-
-fn collect_item_ids(root: &Map<String, Value>) -> std::collections::HashSet<String> {
-    let mut ids = std::collections::HashSet::new();
-    if let Some(id) = root
-        .get("item")
-        .and_then(|item| item.get("id"))
-        .and_then(Value::as_str)
-    {
-        ids.insert(id.to_owned());
-    }
-    for collection in ["input", "output"] {
-        if let Some(items) = root.get(collection).and_then(Value::as_array) {
-            ids.extend(
-                items
-                    .iter()
-                    .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned)),
-            );
-        }
-    }
-    if let Some(items) = root
-        .get("response")
-        .and_then(Value::as_object)
-        .and_then(|response| response.get("output"))
-        .and_then(Value::as_array)
-    {
-        ids.extend(
-            items
-                .iter()
-                .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned)),
-        );
-    }
-    ids
 }
 
 fn build_headers(

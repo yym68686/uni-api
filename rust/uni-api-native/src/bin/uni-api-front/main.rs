@@ -3,6 +3,7 @@ mod proxy;
 mod request_spool;
 mod resources;
 mod responses;
+mod responses_item_ids;
 mod responses_native;
 
 use std::future::IntoFuture;

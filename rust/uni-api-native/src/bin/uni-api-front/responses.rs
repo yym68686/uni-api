@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::pin::Pin;
@@ -17,7 +17,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use memchr::{memchr2, memmem};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::idempotency;
 use crate::proxy::{filtered_response_headers, json_error, AppState};
+use crate::responses_item_ids::{event_item_id_needs_normalization, ResponsesItemIdNormalizer};
 use crate::responses_native::NativeRoute;
 
 const CONTROL_HEADER: &str = "x-uni-api-rust-control-token";
@@ -411,7 +412,7 @@ async fn serve_native_nonstream(
                 route.record_success().await;
                 if plan.normalize_custom_tool_call_ids {
                     if let Ok(mut payload) = serde_json::from_slice::<Value>(&body) {
-                        let mut normalizer = CustomIdNormalizer::default();
+                        let mut normalizer = ResponsesItemIdNormalizer::default();
                         if normalizer.normalize(&mut payload).unwrap_or(false) {
                             body = serde_json::to_vec(&payload).unwrap_or(body);
                         }
@@ -2243,7 +2244,7 @@ struct ProcessedEvent {
 
 struct ResponsesProcessor {
     commit_policy: String,
-    normalizer: Option<CustomIdNormalizer>,
+    normalizer: Option<ResponsesItemIdNormalizer>,
 }
 
 impl ResponsesProcessor {
@@ -2254,7 +2255,7 @@ impl ResponsesProcessor {
         };
         Self {
             commit_policy,
-            normalizer: normalize_ids.then(CustomIdNormalizer::default),
+            normalizer: normalize_ids.then(ResponsesItemIdNormalizer::default),
         }
     }
 
@@ -2422,32 +2423,32 @@ fn terminal_candidate(frame: &SseFrame) -> bool {
 
 fn selective_rewrite_candidate(frame: &SseFrame) -> bool {
     let raw = frame.raw();
+    let declared_event = declared_event_bytes(raw);
     terminal_candidate(frame)
-        || declared_event_bytes(raw).is_none()
+        || declared_event.is_none()
         || !frame_has_data(raw)
-        || memmem::find(raw, b"custom_tool_call").is_some()
-        || contains_json_string_value_prefix(raw, b"item_")
-        || contains_json_string_value_prefix(raw, b"ctc_")
+        || declared_event.is_some_and(|event_type| {
+            matches!(
+                event_type,
+                b"response.output_item.added" | b"response.output_item.done"
+            ) || json_item_id_fields(raw)
+                .any(|item_id| event_item_id_needs_normalization(event_type, item_id))
+        })
 }
 
-fn contains_json_string_value_prefix(raw: &[u8], prefix: &[u8]) -> bool {
-    let mut offset = 0;
-    while let Some(relative) = memchr::memchr(b':', &raw[offset..]) {
-        let colon = offset + relative;
-        let value = raw[colon + 1..]
+fn json_item_id_fields(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    const ITEM_ID_KEY: &[u8] = b"\"item_id\"";
+    memmem::find_iter(raw, ITEM_ID_KEY).filter_map(|key_start| {
+        let after_field = raw.get(key_start + ITEM_ID_KEY.len()..)?;
+        let colon = after_field.iter().position(|byte| *byte == b':')?;
+        let after_colon = after_field.get(colon + 1..)?;
+        let quote = after_colon
             .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map(|leading| &raw[colon + 1 + leading..])
-            .unwrap_or_default();
-        if value
-            .strip_prefix(b"\"")
-            .is_some_and(|value| value.starts_with(prefix))
-        {
-            return true;
-        }
-        offset = colon.saturating_add(1);
-    }
-    false
+            .position(|byte| !byte.is_ascii_whitespace())?;
+        let value = after_colon.get(quote..)?.strip_prefix(b"\"")?;
+        let end = value.iter().position(|byte| *byte == b'\"')?;
+        value.get(..end)
+    })
 }
 
 fn observe_light_frame(stats: &mut StreamStats, frame: &SseFrame) {
@@ -2620,142 +2621,6 @@ fn encode_event(event_type: &str, payload: &Value) -> Result<Bytes, String> {
     Ok(Bytes::from(format!(
         "event: {event_type}\ndata: {data}\n\n"
     )))
-}
-
-#[derive(Default)]
-struct CustomIdNormalizer {
-    id_map: HashMap<String, String>,
-    seen_ids: HashSet<String>,
-}
-
-impl CustomIdNormalizer {
-    fn normalize(&mut self, payload: &mut Value) -> Result<bool, String> {
-        let Some(root) = payload.as_object_mut() else {
-            return Ok(false);
-        };
-        let existing = collect_item_ids(root);
-        let mut changed = false;
-        if let Some(item) = root.get_mut("item").and_then(Value::as_object_mut) {
-            changed |= self.normalize_item(item, &existing)?;
-        }
-        for name in ["input", "output"] {
-            if let Some(items) = root.get_mut(name).and_then(Value::as_array_mut) {
-                for item in items.iter_mut().filter_map(Value::as_object_mut) {
-                    changed |= self.normalize_item(item, &existing)?;
-                }
-            }
-        }
-        if let Some(items) = root
-            .get_mut("response")
-            .and_then(Value::as_object_mut)
-            .and_then(|response| response.get_mut("output"))
-            .and_then(Value::as_array_mut)
-        {
-            for item in items.iter_mut().filter_map(Value::as_object_mut) {
-                changed |= self.normalize_item(item, &existing)?;
-            }
-        }
-
-        let event_type = root.get("type").and_then(Value::as_str).unwrap_or_default();
-        let item_reference = root
-            .get("item_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if matches!(
-            event_type,
-            "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done"
-        ) {
-            if let Some(reference) = item_reference.as_deref() {
-                if let Some(normalized) = normalized_id(reference) {
-                    self.ensure_no_collision(reference, &normalized, &existing)?;
-                    self.id_map.insert(reference.to_owned(), normalized);
-                }
-            }
-        }
-        if let Some(reference) = item_reference {
-            if let Some(normalized) = self.id_map.get(&reference).cloned() {
-                root.insert("item_id".into(), Value::String(normalized));
-                changed = true;
-            }
-        }
-        self.seen_ids.extend(collect_item_ids(root));
-        Ok(changed)
-    }
-
-    fn normalize_item(
-        &mut self,
-        item: &mut Map<String, Value>,
-        existing: &HashSet<String>,
-    ) -> Result<bool, String> {
-        if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
-            return Ok(false);
-        }
-        let Some(item_id) = item.get("id").and_then(Value::as_str).map(str::to_owned) else {
-            return Ok(false);
-        };
-        let Some(normalized) = normalized_id(&item_id) else {
-            return Ok(false);
-        };
-        self.ensure_no_collision(&item_id, &normalized, existing)?;
-        self.id_map.insert(item_id, normalized.clone());
-        item.insert("id".into(), Value::String(normalized));
-        Ok(true)
-    }
-
-    fn ensure_no_collision(
-        &self,
-        original: &str,
-        normalized: &str,
-        existing: &HashSet<String>,
-    ) -> Result<(), String> {
-        if normalized != original
-            && (existing.contains(normalized)
-                || (self.seen_ids.contains(normalized)
-                    && self.id_map.get(original).map(String::as_str) != Some(normalized)))
-        {
-            return Err(
-                "custom_tool_call ID normalization would collide with an existing item ID".into(),
-            );
-        }
-        Ok(())
-    }
-}
-
-fn normalized_id(value: &str) -> Option<String> {
-    let suffix = value.strip_prefix("item_")?;
-    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-        .then(|| format!("ctc_{suffix}"))
-}
-
-fn collect_item_ids(root: &Map<String, Value>) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    if let Some(item) = root.get("item").and_then(Value::as_object) {
-        if let Some(id) = item.get("id").and_then(Value::as_str) {
-            ids.insert(id.to_owned());
-        }
-    }
-    for name in ["input", "output"] {
-        if let Some(items) = root.get(name).and_then(Value::as_array) {
-            for item in items.iter().filter_map(Value::as_object) {
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    ids.insert(id.to_owned());
-                }
-            }
-        }
-    }
-    if let Some(items) = root
-        .get("response")
-        .and_then(Value::as_object)
-        .and_then(|response| response.get("output"))
-        .and_then(Value::as_array)
-    {
-        for item in items.iter().filter_map(Value::as_object) {
-            if let Some(id) = item.get("id").and_then(Value::as_str) {
-                ids.insert(id.to_owned());
-            }
-        }
-    }
-    ids
 }
 
 #[derive(Debug)]
@@ -3233,6 +3098,11 @@ mod tests {
             .feed(b"event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"item_abc\",\"delta\":\"{}\"}\n\n")
             .unwrap();
         assert!(selective_rewrite_candidate(&custom.remove(0)));
+
+        let mut shadowed = decoder
+            .feed(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"metadata\":{\"item_id\":\"msg_nested\"},\"item_id\":\"item_actual\",\"delta\":\"x\"}\n\n")
+            .unwrap();
+        assert!(selective_rewrite_candidate(&shadowed.remove(0)));
     }
 
     #[test]

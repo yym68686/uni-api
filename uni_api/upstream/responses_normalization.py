@@ -1,23 +1,36 @@
 from __future__ import annotations
 
 import re
+from hashlib import sha256
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-_CUSTOM_TOOL_CALL_ITEM_ID_RE = re.compile(r"^item_([A-Za-z0-9]+)$")
-_CUSTOM_TOOL_CALL_INPUT_EVENT_TYPES = frozenset(
-    {
-        "response.custom_tool_call_input.delta",
-        "response.custom_tool_call_input.done",
-    }
-)
-_MAX_RECORDED_PATHS = 16
-_DEFAULT_NORMALIZATION_MODELS_BY_PROVIDER = {
-    "fugue-codex": frozenset({"gpt-5.6-sol"}),
-    "937auth": frozenset({"gpt-5.6-sol"}),
-    "937auth01": frozenset({"gpt-5.6-sol"}),
+_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9]+_([A-Za-z0-9]+)$")
+_MAX_ITEM_ID_LENGTH = 64
+_HASHED_ITEM_ID_HEX_LENGTH = 40
+_ITEM_ID_PREFIX_BY_TYPE = {
+    "message": "msg",
+    "reasoning": "rs",
+    "function_call": "fc",
+    "function_call_output": "fco",
+    "custom_tool_call": "ctc",
+    "custom_tool_call_output": "ctco",
 }
+_ITEM_ID_PREFIX_BY_EVENT = {
+    "response.output_text.delta": "msg",
+    "response.output_text.done": "msg",
+    "response.reasoning_summary_text.delta": "rs",
+    "response.reasoning_summary_text.done": "rs",
+    "response.reasoning_text.delta": "rs",
+    "response.reasoning_text.done": "rs",
+    "response.function_call_arguments.delta": "fc",
+    "response.function_call_arguments.done": "fc",
+    "response.custom_tool_call_input.delta": "ctc",
+    "response.custom_tool_call_input.done": "ctc",
+}
+_MAX_RECORDED_PATHS = 16
+_DEFAULT_NORMALIZATION_PROVIDERS = frozenset({"fugue-codex", "937auth", "937auth01"})
 
 
 class ResponsesCustomToolCallIdCollisionError(ValueError):
@@ -44,11 +57,11 @@ def responses_custom_tool_call_id_normalization_enabled(
     if not isinstance(preferences, dict):
         return False
     if "normalize_responses_custom_tool_call_ids" not in preferences:
-        defaults = _DEFAULT_NORMALIZATION_MODELS_BY_PROVIDER.get(
-            str(provider.get("provider") or ""),
-            frozenset(),
+        return (
+            str(provider.get("engine") or "").strip().lower() == "codex"
+            or str(provider.get("provider") or "")
+            in _DEFAULT_NORMALIZATION_PROVIDERS
         )
-        return bool(requested_models.intersection(defaults))
 
     configured = preferences["normalize_responses_custom_tool_call_ids"]
     if configured is True:
@@ -60,7 +73,7 @@ def responses_custom_tool_call_id_normalization_enabled(
 
 
 class ResponsesCustomToolCallIdNormalizer:
-    """Normalize non-canonical custom tool call item IDs without touching content."""
+    """Normalize non-canonical Responses item IDs without touching content."""
 
     def __init__(self) -> None:
         self._id_map: dict[str, str] = {}
@@ -77,27 +90,41 @@ class ResponsesCustomToolCallIdNormalizer:
             if isinstance((item_id := item.get("id")), str)
         }
         candidates: list[tuple[str, dict[str, Any], str, str]] = []
+        candidate_targets: dict[str, str] = {}
+        candidate_sources: dict[str, str] = {}
 
         for path, item in item_locations:
-            if item.get("type") != "custom_tool_call":
-                continue
             item_id = item.get("id")
-            normalized_id = self._normalized_id(item_id)
+            normalized_id = self._normalized_id(item_id, item.get("type"))
             if normalized_id is None:
                 continue
             if self._would_collide(item_id, normalized_id, existing_ids):
                 raise ResponsesCustomToolCallIdCollisionError(
-                    f"custom_tool_call ID normalization at {path}.id would collide with an existing item ID"
+                    f"Responses item ID normalization at {path}.id would collide with an existing item ID"
                 )
+            target_owner = candidate_targets.get(normalized_id)
+            if target_owner is not None and target_owner != item_id:
+                raise ResponsesCustomToolCallIdCollisionError(
+                    f"Responses item ID normalization at {path}.id would collide with another normalized item ID"
+                )
+            source_target = candidate_sources.get(item_id)
+            if source_target is not None and source_target != normalized_id:
+                raise ResponsesCustomToolCallIdCollisionError(
+                    f"Responses item ID normalization at {path}.id produced an inconsistent mapping"
+                )
+            candidate_sources[item_id] = normalized_id
+            candidate_targets[normalized_id] = item_id
             candidates.append((f"{path}.id", item, item_id, normalized_id))
 
         event_type = str(payload.get("type") or "")
         item_id_reference = payload.get("item_id")
-        if (
-            event_type in _CUSTOM_TOOL_CALL_INPUT_EVENT_TYPES
-            and isinstance(item_id_reference, str)
-        ):
-            normalized_reference = self._normalized_id(item_id_reference)
+        if isinstance(item_id_reference, str):
+            normalized_reference = self._id_map.get(item_id_reference)
+            if normalized_reference is None:
+                normalized_reference = self._normalized_id_for_prefix(
+                    item_id_reference,
+                    _ITEM_ID_PREFIX_BY_EVENT.get(event_type),
+                )
             if normalized_reference is not None:
                 if self._would_collide(
                     item_id_reference,
@@ -105,7 +132,7 @@ class ResponsesCustomToolCallIdNormalizer:
                     existing_ids,
                 ):
                     raise ResponsesCustomToolCallIdCollisionError(
-                        "custom tool call event item_id normalization would collide with an existing item ID"
+                        "Responses item_id normalization would collide with an existing item ID"
                     )
                 self._register(item_id_reference, normalized_reference)
 
@@ -146,9 +173,13 @@ class ResponsesCustomToolCallIdNormalizer:
     ) -> bool:
         """Return whether this reference must stay on the stateful full path."""
 
-        return (
-            event_type in _CUSTOM_TOOL_CALL_INPUT_EVENT_TYPES
-            or item_id in self._id_map
+        return item_id in self._id_map or (
+            isinstance(item_id, str)
+            and self._normalized_id_for_prefix(
+                item_id,
+                _ITEM_ID_PREFIX_BY_EVENT.get(event_type),
+            )
+            is not None
         )
 
     def _would_collide(
@@ -170,18 +201,42 @@ class ResponsesCustomToolCallIdNormalizer:
         existing = self._id_map.get(item_id)
         if existing is not None and existing != normalized_id:
             raise ResponsesCustomToolCallIdCollisionError(
-                "custom_tool_call ID normalization produced an inconsistent mapping"
+                "Responses item ID normalization produced an inconsistent mapping"
             )
         self._id_map[item_id] = normalized_id
 
     @staticmethod
-    def _normalized_id(item_id: Any) -> str | None:
-        if not isinstance(item_id, str):
+    def _normalized_id(item_id: Any, item_type: Any = None) -> str | None:
+        prefix = _ITEM_ID_PREFIX_BY_TYPE.get(str(item_type))
+        return ResponsesCustomToolCallIdNormalizer._normalized_id_for_prefix(
+            item_id,
+            prefix,
+        )
+
+    @staticmethod
+    def _normalized_id_for_prefix(item_id: Any, prefix: str | None) -> str | None:
+        if not isinstance(item_id, str) or not prefix:
             return None
-        match = _CUSTOM_TOOL_CALL_ITEM_ID_RE.fullmatch(item_id)
-        if match is None:
+        canonical_prefix = f"{prefix}_"
+        canonical_suffix = item_id.removeprefix(canonical_prefix)
+        if (
+            item_id.startswith(canonical_prefix)
+            and canonical_suffix
+            and canonical_suffix.isascii()
+            and canonical_suffix.isalnum()
+            and len(item_id) <= _MAX_ITEM_ID_LENGTH
+        ):
             return None
-        return f"ctc_{match.group(1)}"
+
+        match = _ITEM_ID_RE.fullmatch(item_id)
+        if match is not None:
+            candidate = f"{prefix}_{match.group(1)}"
+            if len(candidate) <= _MAX_ITEM_ID_LENGTH:
+                return candidate if candidate != item_id else None
+
+        digest = sha256(item_id.encode("utf-8")).hexdigest()[:_HASHED_ITEM_ID_HEX_LENGTH]
+        candidate = f"{prefix}_{digest}"
+        return candidate if candidate != item_id else None
 
     @staticmethod
     def _item_locations(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:

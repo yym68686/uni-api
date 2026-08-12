@@ -2153,15 +2153,25 @@ def test_postcommit_delta_fast_path_coexists_with_custom_tool_id_normalizer(
     )
 
     assert response.status_code == 200
-    assert body.encode("utf-8").endswith(
-        created + first_delta + transparent_delta + completed
-    )
+    events = [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in body.strip().split("\n\n")
+        if frame.startswith("event: response.")
+    ]
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[1]["item_id"] == "msg_message"
+    assert events[2]["item_id"] == "msg_message"
+    assert events[1]["delta"] == "commit"
+    assert events[2]["delta"] == "normalizer-compatible"
     assert current_info["responses_delta_fast_path_candidates"] == 1
-    assert current_info["responses_delta_fast_path_events"] == 1
-    assert current_info["responses_delta_fast_path_fallbacks"] == 0
-    assert current_info["responses_delta_fast_path_bytes"] == len(
-        transparent_delta
-    )
+    assert current_info["responses_delta_fast_path_events"] == 0
+    assert current_info["responses_delta_fast_path_fallbacks"] == 1
+    assert current_info["responses_delta_fast_path_bytes"] == 0
 
 
 def test_responses_stream_consumes_exact_oaix_terminal_flush_marker(monkeypatch):

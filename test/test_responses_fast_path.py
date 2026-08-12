@@ -102,7 +102,7 @@ def test_selective_decoder_accepts_utf8_and_ignores_nested_diagnostic_keys():
     assert _is_transparent(wire) is True
 
 
-def test_custom_tool_normalizer_allows_unmapped_reference_and_rejects_mapped_one():
+def test_item_normalizer_materializes_noncanonical_or_mapped_references():
     normalizer = ResponsesCustomToolCallIdNormalizer()
     requires_full_normalization = (
         normalizer.requires_item_id_full_normalization
@@ -115,7 +115,7 @@ def test_custom_tool_normalizer_allows_unmapped_reference_and_rejects_mapped_one
     assert _is_transparent(
         unmapped,
         item_id_requires_full_normalization=requires_full_normalization,
-    ) is True
+    ) is False
 
     result = normalizer.normalize(
         {

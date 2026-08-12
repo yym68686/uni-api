@@ -166,7 +166,7 @@ async def can_forward_responses_delta_without_materializing(
             if metadata.type != frame.event_type:
                 return False
         if item_id_requires_full_normalization is not None:
-            # A configured custom-tool normalizer can mutate embedded items or
+            # A configured Responses item normalizer can mutate embedded items or
             # a previously mapped item_id. Keep those frames on the full path;
             # ordinary deltas with an unmapped reference remain byte-transparent.
             if any(

@@ -9,7 +9,7 @@ from uni_api.upstream.responses_normalization import (
 )
 
 
-def test_normalizes_only_top_level_custom_tool_call_input_items():
+def test_normalizes_supported_top_level_response_items_by_type():
     payload = {
         "input": [
             {
@@ -37,13 +37,24 @@ def test_normalizes_only_top_level_custom_tool_call_input_items():
                 "id": "ctco_output123",
                 "call_id": "call_foCUR1DBzdZeYyOccLpOmwUF",
             },
+            {
+                "type": "message",
+                "id": "item_message123",
+                "role": "assistant",
+                "content": [],
+            },
+            {
+                "type": "function_call",
+                "id": "item_function123",
+                "call_id": "call_function123",
+            },
         ]
     }
 
     normalizer = ResponsesCustomToolCallIdNormalizer()
     result = normalizer.normalize(payload)
 
-    assert payload["input"][0]["id"] == "item_reasoning123"
+    assert payload["input"][0]["id"] == "rs_reasoning123"
     assert payload["input"][0]["content"][0]["id"] == "item_nested123"
     assert payload["input"][1]["id"] == "ctc_alreadycanonical123"
     assert payload["input"][2] == {
@@ -52,29 +63,77 @@ def test_normalizes_only_top_level_custom_tool_call_input_items():
         "call_id": "call_foCUR1DBzdZeYyOccLpOmwUF",
     }
     assert payload["input"][3]["call_id"] == "call_foCUR1DBzdZeYyOccLpOmwUF"
-    assert result.normalized_ids == 1
+    assert payload["input"][4]["id"] == "msg_message123"
+    assert payload["input"][5]["id"] == "fc_function123"
+    assert result.normalized_ids == 4
     assert result.rewritten_references == 0
-    assert result.paths == ("input[2].id",)
+    assert result.paths == (
+        "input[0].id",
+        "input[2].id",
+        "input[4].id",
+        "input[5].id",
+    )
 
     second_result = normalizer.normalize(payload)
     assert not second_result.changed
 
 
-def test_non_alphanumeric_item_suffix_is_not_normalized():
+def test_invalid_or_long_item_ids_are_deterministically_shortened():
     payload = {
         "input": [
             {
                 "type": "custom_tool_call",
-                "id": "item_not-canonical",
+                "id": "ctc_not-canonical",
                 "call_id": "call_1",
-            }
+            },
+            {
+                "type": "message",
+                "id": "resp_" + "a" * 76 + "_msg",
+                "content": [],
+            },
         ]
     }
 
     result = ResponsesCustomToolCallIdNormalizer().normalize(payload)
 
+    assert result.normalized_ids == 2
+    assert payload["input"][0]["id"].startswith("ctc_")
+    assert payload["input"][1]["id"].startswith("msg_")
+    assert len(payload["input"][0]["id"]) <= 64
+    assert len(payload["input"][1]["id"]) <= 64
+    repeated = copy.deepcopy(payload)
+    assert not ResponsesCustomToolCallIdNormalizer().normalize(repeated).changed
+
+
+def test_wrong_canonical_prefix_is_rewritten_for_actual_item_type():
+    payload = {
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "id": "fc_417ee9f223f346fc97f3c3de2bd18bdb",
+            },
+            {
+                "type": "message",
+                "id": "rs_message123",
+                "content": [],
+            },
+        ]
+    }
+
+    result = ResponsesCustomToolCallIdNormalizer().normalize(payload)
+
+    assert result.normalized_ids == 2
+    assert payload["input"][0]["id"] == "ctc_417ee9f223f346fc97f3c3de2bd18bdb"
+    assert payload["input"][1]["id"] == "msg_message123"
+
+
+def test_unknown_item_type_is_not_guessed_or_mutated():
+    payload = {"input": [{"type": "future_item", "id": "item_future123"}]}
+
+    result = ResponsesCustomToolCallIdNormalizer().normalize(payload)
+
     assert not result.changed
-    assert payload["input"][0]["id"] == "item_not-canonical"
+    assert payload["input"][0]["id"] == "item_future123"
 
 
 def test_collision_is_rejected_before_payload_mutation():
@@ -136,6 +195,24 @@ def test_collision_with_item_from_previous_stream_event_is_rejected():
     assert payload == original
 
 
+def test_one_original_id_cannot_map_to_two_item_types():
+    payload = {
+        "input": [
+            {"type": "message", "id": "item_shared123", "content": []},
+            {"type": "function_call", "id": "item_shared123", "arguments": "{}"},
+        ]
+    }
+    original = copy.deepcopy(payload)
+
+    with pytest.raises(
+        ResponsesCustomToolCallIdCollisionError,
+        match="inconsistent mapping",
+    ):
+        ResponsesCustomToolCallIdNormalizer().normalize(payload)
+
+    assert payload == original
+
+
 def test_stream_event_sequence_uses_one_consistent_id_mapping():
     normalizer = ResponsesCustomToolCallIdNormalizer()
     item = {
@@ -189,6 +266,29 @@ def test_stream_event_sequence_uses_one_consistent_id_mapping():
 
 
 @pytest.mark.parametrize(
+    ("event_type", "original_id", "expected_id"),
+    [
+        ("response.output_text.delta", "item_message123", "msg_message123"),
+        ("response.reasoning_text.delta", "item_reasoning123", "rs_reasoning123"),
+        ("response.function_call_arguments.delta", "item_function123", "fc_function123"),
+        ("response.custom_tool_call_input.delta", "fc_custom123", "ctc_custom123"),
+    ],
+)
+def test_stream_reference_can_be_normalized_from_event_type(
+    event_type,
+    original_id,
+    expected_id,
+):
+    event = {"type": event_type, "item_id": original_id, "delta": "x"}
+
+    result = ResponsesCustomToolCallIdNormalizer().normalize(event)
+
+    assert result.normalized_ids == 0
+    assert result.rewritten_references == 1
+    assert event["item_id"] == expected_id
+
+
+@pytest.mark.parametrize(
     ("configured", "models", "expected"),
     [
         (True, ("gpt-5.6-sol",), True),
@@ -216,9 +316,10 @@ def test_provider_model_feature_flag(configured, models, expected):
     ("provider_name", "model", "expected"),
     [
         ("fugue-codex", "gpt-5.6-sol", True),
+        ("fugue-codex", "gpt-5.6-terra", True),
+        ("fugue-codex", "gpt-5.4", True),
         ("937auth", "gpt-5.6-sol", True),
         ("937auth01", "gpt-5.6-sol", True),
-        ("fugue-codex", "gpt-5.6-terra", False),
         ("unrelated", "gpt-5.6-sol", False),
     ],
 )
@@ -242,4 +343,17 @@ def test_provider_setting_can_disable_default_compatibility_matrix():
     assert not responses_custom_tool_call_id_normalization_enabled(
         provider,
         ("gpt-5.6-sol",),
+    )
+
+
+def test_codex_engine_enables_normalization_for_new_provider_names():
+    provider = {
+        "provider": "new-codex-provider",
+        "engine": "codex",
+        "preferences": {},
+    }
+
+    assert responses_custom_tool_call_id_normalization_enabled(
+        provider,
+        ("future-codex-model",),
     )

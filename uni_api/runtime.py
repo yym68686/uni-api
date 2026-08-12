@@ -7797,14 +7797,21 @@ class ResponsesRequestExecution:
         if not result.changed:
             return
         self.current_info["custom_tool_call_id_normalized"] = True
+        self.current_info["responses_item_id_normalized"] = True
         self.current_info["custom_tool_call_id_normalization_count"] = int(
             self.current_info.get("custom_tool_call_id_normalization_count") or 0
         ) + int(result.normalized_ids)
         self.current_info["custom_tool_call_id_reference_rewrite_count"] = int(
             self.current_info.get("custom_tool_call_id_reference_rewrite_count") or 0
         ) + int(result.rewritten_references)
+        self.current_info["responses_item_id_normalization_count"] = int(
+            self.current_info.get("responses_item_id_normalization_count") or 0
+        ) + int(result.normalized_ids)
+        self.current_info["responses_item_id_reference_rewrite_count"] = int(
+            self.current_info.get("responses_item_id_reference_rewrite_count") or 0
+        ) + int(result.rewritten_references)
         trace_logger.info(
-            "%s custom_tool_call ID normalized request_id=%s provider=%s direction=%s event_type=%s normalized_ids=%s rewritten_references=%s paths=%s",
+            "%s Responses item ID normalized request_id=%s provider=%s direction=%s event_type=%s normalized_ids=%s rewritten_references=%s paths=%s",
             self.endpoint,
             self.request_id,
             attempt.provider_name,
