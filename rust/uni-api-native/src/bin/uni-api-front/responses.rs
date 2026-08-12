@@ -252,32 +252,7 @@ impl Coordinator {
         match self {
             Self::Python { session_id } => control_complete(state, session_id, outcome).await.ok(),
             Self::Native { route } => {
-                if matches!(
-                    outcome.get("kind").and_then(Value::as_str),
-                    Some("completed" | "incomplete")
-                ) {
-                    route.record_success().await;
-                }
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event_type": "rust_responses_native_complete",
-                        "request_id": route.request_id(),
-                        "model": route.request_model(),
-                        "request_body_bytes": route.request_body_bytes(),
-                        "snapshot_revision": route.snapshot_revision(),
-                        "kind": outcome.get("kind").and_then(Value::as_str),
-                        "status_code": outcome.get("status_code").and_then(Value::as_u64),
-                        "upstream_status_code": outcome.get("upstream_status_code").and_then(Value::as_u64),
-                        "upstream_bytes": outcome.get("upstream_bytes").and_then(Value::as_u64),
-                        "upstream_chunks": outcome.get("upstream_chunks").and_then(Value::as_u64),
-                        "downstream_bytes": outcome.get("downstream_bytes").and_then(Value::as_u64),
-                        "downstream_chunks": outcome.get("downstream_chunks").and_then(Value::as_u64),
-                        "event_count": outcome.get("event_count").and_then(Value::as_u64),
-                        "stream_mode": outcome.get("stream_mode").and_then(Value::as_str),
-                        "wire_hash_sampled": outcome.get("wire_hash_sampled").and_then(Value::as_bool),
-                    })
-                );
+                route.complete_native(outcome).await;
                 None
             }
         }
@@ -296,8 +271,13 @@ impl Coordinator {
                 if !route.record_failure(&outcome).await {
                     return Ok(RetryResolution::Final(route.final_message()));
                 }
-                let Some(plan) = route.next_plan().await? else {
-                    return Ok(RetryResolution::Final(route.final_message()));
+                let plan = match route.next_plan().await {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => return Ok(RetryResolution::Final(route.final_message())),
+                    Err(error) => {
+                        route.emit_internal_failure(502, "native_retry_plan_error", &error);
+                        return Err(error);
+                    }
                 };
                 match preflight_attempt(state, plan, true).await {
                     Ok(PreflightResult::Started(active)) => {
@@ -332,10 +312,12 @@ pub async fn serve_native(
             Ok(None) => {
                 let status =
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+                route.emit_final_response(status.as_u16(), "native_route_exhausted");
                 release_owner(&mut idempotency_owner).await;
                 return json_error(status, route.last_detail());
             }
             Err(error) if error == "native-codex-oauth-fallback" => {
+                route.emit_internal_failure(502, "native_codex_oauth_fallback", &error);
                 release_owner(&mut idempotency_owner).await;
                 return json_error(
                     StatusCode::BAD_GATEWAY,
@@ -343,6 +325,7 @@ pub async fn serve_native(
                 );
             }
             Err(error) => {
+                route.emit_internal_failure(400, "native_plan_error", &error);
                 release_owner(&mut idempotency_owner).await;
                 return json_error(StatusCode::BAD_REQUEST, &error);
             }
@@ -368,6 +351,7 @@ pub async fn serve_native(
                 if !route.record_failure(&outcome).await {
                     let status = StatusCode::from_u16(route.last_status())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
+                    route.emit_final_response(status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
                     return json_error(status, route.last_detail());
                 }
@@ -380,6 +364,7 @@ pub async fn serve_native(
                     "committed": false,
                 });
                 if !route.record_failure(&outcome).await {
+                    route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
                     return json_error(StatusCode::BAD_GATEWAY, route.last_detail());
                 }
@@ -399,17 +384,18 @@ async fn serve_native_nonstream(
             Ok(None) => {
                 let status =
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+                route.emit_final_response(status.as_u16(), "native_route_exhausted");
                 release_owner(&mut idempotency_owner).await;
                 return json_error(status, route.last_detail());
             }
             Err(error) => {
+                route.emit_internal_failure(400, "native_plan_error", &error);
                 release_owner(&mut idempotency_owner).await;
                 return json_error(StatusCode::BAD_REQUEST, &error);
             }
         };
         match send_native_nonstream_attempt(&state, &plan).await {
             Ok((status, mut headers, mut body)) if status.is_success() => {
-                route.record_success().await;
                 if plan.normalize_custom_tool_call_ids {
                     if let Ok(mut payload) = serde_json::from_slice::<Value>(&body) {
                         let mut normalizer = ResponsesItemIdNormalizer::default();
@@ -441,19 +427,14 @@ async fn serve_native_nonstream(
                         idempotency::executed_header(&mut headers);
                     }
                 }
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event_type": "rust_responses_native_complete",
-                        "request_id": route.request_id(),
-                        "model": route.request_model(),
-                        "request_body_bytes": route.request_body_bytes(),
-                        "snapshot_revision": route.snapshot_revision(),
+                route
+                    .complete_native(&json!({
                         "kind": "completed",
                         "status_code": status.as_u16(),
+                        "upstream_status_code": status.as_u16(),
                         "downstream_bytes": body.len(),
-                    })
-                );
+                    }))
+                    .await;
                 let mut response = Response::new(Body::from(body));
                 *response.status_mut() = status;
                 *response.headers_mut() = headers;
@@ -472,8 +453,11 @@ async fn serve_native_nonstream(
                     "committed": false,
                 });
                 if !route.record_failure(&outcome).await {
+                    let final_status = StatusCode::from_u16(route.last_status())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    route.emit_final_response(final_status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(status, route.last_detail());
+                    return json_error(final_status, route.last_detail());
                 }
             }
             Err(error) => {
@@ -484,6 +468,7 @@ async fn serve_native_nonstream(
                     "committed": false,
                 });
                 if !route.record_failure(&outcome).await {
+                    route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
                     return json_error(StatusCode::BAD_GATEWAY, route.last_detail());
                 }
@@ -2151,16 +2136,27 @@ async fn finish_terminal(
     stats: &mut StreamStats,
     terminal: Terminal,
 ) {
-    let kind = match terminal {
-        Terminal::Completed => "completed",
-        Terminal::Incomplete => "incomplete",
-        Terminal::SemanticFailure { .. } => "semantic_failure",
+    let (kind, semantic_failure) = match terminal {
+        Terminal::Completed => ("completed", None),
+        Terminal::Incomplete => ("incomplete", None),
+        Terminal::SemanticFailure {
+            event_type,
+            payload,
+        } => {
+            let (status, detail) = responses_semantic_error(&payload, &event_type);
+            ("semantic_failure", Some((status, detail, event_type)))
+        }
     };
     let mut outcome = stats.report();
     outcome["attempt_id"] = Value::String(attempt_id);
     outcome["kind"] = Value::String(kind.into());
     outcome["upstream_status_code"] = Value::from(upstream_status.as_u16());
     outcome["committed"] = Value::Bool(true);
+    if let Some((status, detail, event_type)) = semantic_failure {
+        outcome["status_code"] = Value::from(status);
+        outcome["detail"] = Value::String(detail);
+        outcome["event_type"] = Value::String(event_type);
+    }
     let _ = coordinator.complete(state, &outcome).await;
 }
 

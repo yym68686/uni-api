@@ -11,7 +11,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
+use url::Url;
 
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
@@ -133,6 +135,45 @@ struct FailedRoute<'a> {
     force_quota_cooldown: bool,
 }
 
+#[derive(Clone, Debug)]
+struct NativeAttemptObservation {
+    request_id: String,
+    attempt_id: String,
+    attempt_index: usize,
+    provider: String,
+    request_model: String,
+    actual_model: String,
+    upstream_host: String,
+    stream: bool,
+    snapshot_revision: String,
+}
+
+enum ProviderKeySelection {
+    Selected(String),
+    NoProviderKey,
+    ChannelCooling,
+    AllKeysCooling,
+}
+
+struct RoutingAttemptEvent<'a> {
+    attempt_number: usize,
+    provider: &'a Provider,
+    original_model: &'a str,
+    outcome: &'a str,
+    attempt_id: Option<&'a str>,
+    skip_reason: Option<&'a str>,
+    status: Option<u16>,
+}
+
+struct NativeRejectionObservation<'a> {
+    request_id: &'a str,
+    request_model: Option<&'a str>,
+    stream: Option<bool>,
+    request_body_bytes: u64,
+    snapshot_revision: &'a str,
+    reason: &'a str,
+}
+
 pub enum NativePreparation {
     Ready(NativeRoute),
     Fallback,
@@ -155,8 +196,18 @@ pub struct NativeRoute {
     last_provider: Option<Arc<Provider>>,
     last_provider_key: Option<String>,
     last_original_model: Option<String>,
+    last_attempt: Option<NativeAttemptObservation>,
     last_status: u16,
     last_detail: String,
+    has_attempt_failure: bool,
+    last_failure_origin: String,
+    routing_attempts: usize,
+    routing_skips: usize,
+    upstream_attempts: usize,
+    routing_ledger: Vec<Value>,
+    upstream_ledger: Vec<Value>,
+    started_at: tokio::time::Instant,
+    final_emitted: bool,
     _memory_reservation: MemoryReservation,
 }
 
@@ -324,9 +375,9 @@ impl NativeConfigStore {
         &self,
         provider: &Provider,
         original_model: &str,
-    ) -> Option<String> {
+    ) -> ProviderKeySelection {
         if provider.api_keys.is_empty() {
-            return None;
+            return ProviderKeySelection::NoProviderKey;
         }
         let now = tokio::time::Instant::now();
         if self
@@ -336,7 +387,7 @@ impl NativeConfigStore {
             .get(&(provider.name.to_string(), original_model.to_owned()))
             .is_some_and(|until| *until > now)
         {
-            return None;
+            return ProviderKeySelection::ChannelCooling;
         }
         let cooldowns = self.key_cooldowns.lock().await;
         for _ in 0..provider.api_keys.len() {
@@ -346,10 +397,10 @@ impl NativeConfigStore {
                 .get(&(provider.name.to_string(), key.clone()))
                 .is_none_or(|until| *until <= now)
             {
-                return Some(key);
+                return ProviderKeySelection::Selected(key);
             }
         }
-        None
+        ProviderKeySelection::AllKeysCooling
     }
 
     async fn cool_failed_route(&self, failure: FailedRoute<'_>) {
@@ -478,18 +529,6 @@ impl NativeRoute {
         &self.request_id
     }
 
-    pub fn request_model(&self) -> &str {
-        &self.request_model
-    }
-
-    pub fn request_body_bytes(&self) -> u64 {
-        self.request_body_bytes
-    }
-
-    pub fn snapshot_revision(&self) -> &str {
-        self.snapshot.revision.as_ref()
-    }
-
     pub fn last_status(&self) -> u16 {
         self.last_status
     }
@@ -507,22 +546,55 @@ impl NativeRoute {
             let attempt_number = self.cursor;
             let provider = self.providers[attempt_number % self.providers.len()].clone();
             self.cursor += 1;
+            self.routing_attempts = self.routing_attempts.saturating_add(1);
             let original_model = provider
                 .models
                 .get(&self.request_model)
                 .ok_or_else(|| "native provider model mapping disappeared".to_owned())?
                 .clone();
-            let Some(provider_key) = self
+            let provider_key = match self
                 .store
                 .select_provider_key(&provider, &original_model)
                 .await
-            else {
-                self.last_status = 429;
-                self.last_detail = "All API keys are rate limited and stop auto retry!".into();
-                continue;
+            {
+                ProviderKeySelection::Selected(key) => key,
+                selection => {
+                    self.routing_skips = self.routing_skips.saturating_add(1);
+                    let reason = match selection {
+                        ProviderKeySelection::NoProviderKey => "provider_has_no_api_keys",
+                        ProviderKeySelection::ChannelCooling => "provider_channel_cooldown",
+                        ProviderKeySelection::AllKeysCooling => "provider_keys_cooldown",
+                        ProviderKeySelection::Selected(_) => unreachable!(),
+                    };
+                    self.emit_routing_attempt(RoutingAttemptEvent {
+                        attempt_number,
+                        provider: &provider,
+                        original_model: &original_model,
+                        outcome: "skipped",
+                        attempt_id: None,
+                        skip_reason: Some(reason),
+                        status: None,
+                    });
+                    if !self.has_attempt_failure {
+                        self.last_status = 429;
+                        self.last_detail =
+                            "All API keys are rate limited and stop auto retry!".into();
+                    }
+                    continue;
+                }
             };
             let engine = provider.engine.to_ascii_lowercase();
             if engine != "gpt" && engine != "codex" {
+                self.routing_skips = self.routing_skips.saturating_add(1);
+                self.emit_routing_attempt(RoutingAttemptEvent {
+                    attempt_number,
+                    provider: &provider,
+                    original_model: &original_model,
+                    outcome: "skipped",
+                    attempt_id: None,
+                    skip_reason: Some("unsupported_native_engine"),
+                    status: None,
+                });
                 continue;
             }
             if engine == "codex" && provider_key.contains(',') {
@@ -557,9 +629,22 @@ impl NativeRoute {
                 self.stream,
                 self.api_key.role.as_ref(),
             );
+            self.upstream_attempts = self.upstream_attempts.saturating_add(1);
+            let observation = NativeAttemptObservation {
+                request_id: self.request_id.clone(),
+                attempt_id: attempt_id.clone(),
+                attempt_index: attempt_number.saturating_add(1),
+                provider: provider.name.to_string(),
+                request_model: self.request_model.clone(),
+                actual_model: original_model.clone(),
+                upstream_host: upstream_host(&provider.base_url),
+                stream: self.stream,
+                snapshot_revision: self.snapshot.revision.to_string(),
+            };
             self.last_provider = Some(provider.clone());
             self.last_provider_key = Some(provider_key);
             self.last_original_model = Some(original_model.clone());
+            self.last_attempt = Some(observation.clone());
             return Ok(Some(Plan {
                 attempt_id,
                 url: normalize_upstream_url(&provider.base_url, &engine),
@@ -615,6 +700,27 @@ impl NativeRoute {
         let request_scoped = matches!(status, 400 | 413) || missing_persisted_item;
         self.last_status = status;
         self.last_detail = detail.chars().take(4096).collect();
+        self.has_attempt_failure = true;
+        self.last_failure_origin = failure_origin(outcome).to_owned();
+        let upstream_status = outcome_status_from(outcome, "upstream_status_code", original_status);
+        self.emit_upstream_attempt(outcome, upstream_status, false);
+        if let (Some(provider), Some(original_model)) =
+            (self.last_provider.clone(), self.last_original_model.clone())
+        {
+            let attempt_id = self
+                .last_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.clone());
+            self.emit_routing_attempt(RoutingAttemptEvent {
+                attempt_number: self.cursor.saturating_sub(1),
+                provider: &provider,
+                original_model: &original_model,
+                outcome: "failed",
+                attempt_id: attempt_id.as_deref(),
+                skip_reason: None,
+                status: Some(status),
+            });
+        }
         if !request_scoped || codex_model_unsupported {
             if let (Some(provider), Some(key), Some(original_model)) = (
                 self.last_provider.as_ref(),
@@ -650,17 +756,274 @@ impl NativeRoute {
         }
     }
 
-    pub fn final_message(&self) -> Value {
+    pub async fn complete_native(&mut self, outcome: &Value) {
+        let kind = outcome
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        let success = matches!(kind, "completed" | "incomplete");
+        let status = outcome_status(outcome, if success { 200 } else { 502 });
+        let upstream_status = outcome_status_from(outcome, "upstream_status_code", status);
+        if success {
+            self.record_success().await;
+        } else {
+            self.has_attempt_failure = true;
+            self.last_failure_origin = failure_origin(outcome).to_owned();
+        }
+        self.emit_upstream_attempt(outcome, upstream_status, success);
+        if let (Some(provider), Some(original_model)) =
+            (self.last_provider.clone(), self.last_original_model.clone())
+        {
+            let attempt_id = self
+                .last_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.clone());
+            self.emit_routing_attempt(RoutingAttemptEvent {
+                attempt_number: self.cursor.saturating_sub(1),
+                provider: &provider,
+                original_model: &original_model,
+                outcome: if success {
+                    "succeeded"
+                } else {
+                    "completed_with_error"
+                },
+                attempt_id: attempt_id.as_deref(),
+                skip_reason: None,
+                status: Some(status),
+            });
+        }
+        self.emit_final_event(status, kind, outcome);
+    }
+
+    pub fn emit_final_response(&mut self, status: u16, kind: &str) {
+        self.emit_final_event(status, kind, &Value::Null);
+    }
+
+    pub fn emit_internal_failure(&mut self, status: u16, kind: &str, detail: &str) {
+        self.last_status = status;
+        self.last_detail = detail.chars().take(4096).collect();
+        self.has_attempt_failure = true;
+        self.last_failure_origin = "ember_native".into();
+        self.emit_final_event(status, kind, &json!({"detail": detail}));
+    }
+
+    pub fn final_message(&mut self) -> Value {
         let detail = if self.last_detail.is_empty() {
             format!("All {} providers failed", self.request_model)
         } else {
             self.last_detail.clone()
         };
+        let status = if self.last_status == 0 {
+            502
+        } else {
+            self.last_status
+        };
+        self.emit_final_response(status, "failed_before_commit");
         json!({
             "kind": "final",
-            "status_code": if self.last_status == 0 { 502 } else { self.last_status },
+            "status_code": status,
             "body_b64": BASE64.encode(detail.as_bytes()),
         })
+    }
+
+    fn emit_routing_attempt(&mut self, event: RoutingAttemptEvent<'_>) {
+        let status = event.status.unwrap_or_default();
+        if self.routing_ledger.len() < 64 {
+            self.routing_ledger.push(json!({
+                "attempt_id": event.attempt_id,
+                "attempt_index": event.attempt_number.saturating_add(1),
+                "provider": event.provider.name.to_string(),
+                "actual_model": event.original_model,
+                "outcome": event.outcome,
+                "status_code": event.status,
+                "skip_reason": event.skip_reason,
+            }));
+        }
+        eprintln!(
+            "{}",
+            json!({
+                "kind": "log",
+                "fugue_table": "app_events",
+                "event": "routing_attempt",
+                "event_type": "routing_attempt",
+                "severity": event_severity(status, event.outcome),
+                "source": "uni-api-ember",
+                "message": "uni-api-ember native routing attempt",
+                "request_id": self.request_id,
+                "trace_id": self.request_id,
+                "path": "/v1/responses",
+                "path_template": "/v1/responses",
+                "route": "POST /v1/responses",
+                "method": "POST",
+                "model": self.request_model,
+                "provider": event.provider.name.to_string(),
+                "channel": event.provider.name.to_string(),
+                "actual_model": event.original_model,
+                "attempt_id": event.attempt_id,
+                "attempt_index": event.attempt_number.saturating_add(1),
+                "attempt_outcome": event.outcome,
+                "attempt_status_code": if status == 0 { None } else { Some(status) },
+                "skip_reason": event.skip_reason,
+                "streaming": self.stream,
+                "snapshot_revision": self.snapshot.revision.to_string(),
+                "rust_responses_data_plane": true,
+            })
+        );
+    }
+
+    fn emit_upstream_attempt(&mut self, outcome: &Value, status: u16, success: bool) {
+        let Some(attempt) = self.last_attempt.clone() else {
+            return;
+        };
+        let detail = outcome
+            .get("detail")
+            .or_else(|| outcome.get("body"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let error_sha256 = (!detail.is_empty()).then(|| sha256_hex(detail));
+        let attempt_outcome = outcome
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or(if success { "completed" } else { "failed" });
+        if self.upstream_ledger.len() < 64 {
+            self.upstream_ledger.push(json!({
+                "attempt_id": attempt.attempt_id,
+                "attempt_index": attempt.attempt_index,
+                "provider": attempt.provider,
+                "actual_model": attempt.actual_model,
+                "upstream_host": attempt.upstream_host,
+                "status_code": status,
+                "success": success,
+                "outcome": attempt_outcome,
+                "error_sha256": error_sha256,
+            }));
+        }
+        eprintln!(
+            "{}",
+            json!({
+                "kind": "log",
+                "fugue_table": "app_events",
+                "event": "upstream_attempt",
+                "event_type": "upstream_attempt",
+                "severity": event_severity(status, if success { "succeeded" } else { "failed" }),
+                "source": "uni-api-ember",
+                "message": "uni-api-ember native upstream attempt",
+                "request_id": attempt.request_id,
+                "trace_id": attempt.request_id,
+                "path": "/v1/responses",
+                "path_template": "/v1/responses",
+                "route": "POST /v1/responses",
+                "method": "POST",
+                "model": attempt.request_model,
+                "provider": attempt.provider,
+                "channel": attempt.provider,
+                "actual_model": attempt.actual_model,
+                "attempt_id": attempt.attempt_id,
+                "attempt_index": attempt.attempt_index,
+                "attempt_status_code": status,
+                "attempt_status_class": status_class(status),
+                "semantic_status_code": outcome.get("status_code").and_then(Value::as_u64),
+                "attempt_success": success,
+                "attempt_outcome": attempt_outcome,
+                "status_origin": failure_origin(outcome),
+                "error_sha256": error_sha256,
+                "upstream_host": attempt.upstream_host,
+                "streaming": attempt.stream,
+                "snapshot_revision": attempt.snapshot_revision,
+                "rust_responses_data_plane": true,
+            })
+        );
+    }
+
+    fn emit_final_event(&mut self, status: u16, kind: &str, outcome: &Value) {
+        if self.final_emitted {
+            return;
+        }
+        self.final_emitted = true;
+        let elapsed_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let detail = outcome
+            .get("detail")
+            .or_else(|| outcome.get("body"))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.last_detail);
+        let success = matches!(kind, "completed" | "incomplete");
+        let final_provider = self
+            .last_attempt
+            .as_ref()
+            .map(|attempt| attempt.provider.as_str());
+        let final_actual_model = self
+            .last_attempt
+            .as_ref()
+            .map(|attempt| attempt.actual_model.as_str());
+        let status_origin = if success {
+            "upstream_success"
+        } else if self.last_failure_origin.is_empty() {
+            "native_route_selection"
+        } else {
+            self.last_failure_origin.as_str()
+        };
+        let summary = json!({
+            "request_kind": "responses",
+            "terminal_kind": kind,
+            "model": self.request_model,
+            "provider": final_provider,
+            "channel": final_provider,
+            "actual_model": final_actual_model,
+            "stream": self.stream,
+            "status_code": status,
+            "status_class": status_class(status),
+            "status_origin": status_origin,
+            "error_type": (!success || status >= 400).then_some(kind),
+            "routing_attempt_count": self.routing_attempts,
+            "routing_skip_count": self.routing_skips,
+            "upstream_attempt_count": self.upstream_attempts,
+            "routing_attempts": self.routing_ledger,
+            "upstream_attempts": self.upstream_ledger,
+            "routing_attempts_omitted_count": self.routing_attempts.saturating_sub(self.routing_ledger.len()),
+            "upstream_attempts_omitted_count": self.upstream_attempts.saturating_sub(self.upstream_ledger.len()),
+            "last_failure_origin": self.last_failure_origin,
+            "snapshot_revision": self.snapshot.revision.to_string(),
+            "rust_responses_data_plane": true,
+        });
+        eprintln!(
+            "{}",
+            json!({
+                "kind": "log",
+                "fugue_table": "request_facts",
+                "event": "request_summary",
+                "event_type": "request_summary",
+                "severity": event_severity(status, kind),
+                "source": "uni-api-ember",
+                "message": "uni-api-ember native Responses request finished",
+                "request_id": self.request_id,
+                "trace_id": self.request_id,
+                "path": "/v1/responses",
+                "path_template": "/v1/responses",
+                "route": "POST /v1/responses",
+                "route_id": "POST /v1/responses",
+                "method": "POST",
+                "model": self.request_model,
+                "provider": final_provider,
+                "channel": final_provider,
+                "actual_model": final_actual_model,
+                "status_code": status,
+                "status_class": status_class(status),
+                "duration_ms": elapsed_ms,
+                "upstream_ms": elapsed_ms,
+                "bytes_in": self.request_body_bytes,
+                "bytes_out": outcome.get("downstream_bytes").and_then(Value::as_u64).unwrap_or(0),
+                "streaming": self.stream,
+                "error_type": (!success || status >= 400).then_some(kind),
+                "status_origin": status_origin,
+                "error_sha256": (!detail.is_empty()).then(|| sha256_hex(detail)),
+                "summary_json": summary.to_string(),
+                "rust_responses_data_plane": true,
+            })
+        );
     }
 
     fn auto_retry(&self) -> bool {
@@ -670,6 +1033,57 @@ impl NativeRoute {
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
+}
+
+fn emit_native_rejection(status: u16, observation: NativeRejectionObservation<'_>) {
+    let status_origin = native_rejection_origin(observation.reason);
+    let summary = json!({
+        "request_kind": "responses",
+        "terminal_kind": "native_rejection",
+        "rejection_reason": observation.reason,
+        "model": observation.request_model,
+        "stream": observation.stream,
+        "status_code": status,
+        "status_class": status_class(status),
+        "status_origin": status_origin,
+        "error_type": observation.reason,
+        "routing_attempt_count": 0,
+        "routing_skip_count": 0,
+        "upstream_attempt_count": 0,
+        "snapshot_revision": observation.snapshot_revision,
+        "rust_responses_data_plane": true,
+    });
+    eprintln!(
+        "{}",
+        json!({
+            "kind": "log",
+            "fugue_table": "request_facts",
+            "event": "request_summary",
+            "event_type": "request_summary",
+            "severity": event_severity(status, "native_rejection"),
+            "source": "uni-api-ember",
+            "message": "uni-api-ember native Responses request rejected",
+            "request_id": observation.request_id,
+            "trace_id": observation.request_id,
+            "path": "/v1/responses",
+            "path_template": "/v1/responses",
+            "route": "POST /v1/responses",
+            "route_id": "POST /v1/responses",
+            "method": "POST",
+            "model": observation.request_model,
+            "status_code": status,
+            "status_class": status_class(status),
+            "duration_ms": 0,
+            "upstream_ms": 0,
+            "bytes_in": observation.request_body_bytes,
+            "bytes_out": 0,
+            "streaming": observation.stream,
+            "error_type": observation.reason,
+            "status_origin": status_origin,
+            "summary_json": summary.to_string(),
+            "rust_responses_data_plane": true,
+        })
+    );
 }
 
 pub async fn prepare_native_request(
@@ -685,13 +1099,36 @@ pub async fn prepare_native_request(
     if !is_identity_json_request(&parts.headers) {
         return NativePreparation::Fallback;
     }
+    let request_id = request_id(&parts.headers);
     let Some(token) = extract_api_key(&parts.headers) else {
+        emit_native_rejection(
+            403,
+            NativeRejectionObservation {
+                request_id: &request_id,
+                request_model: None,
+                stream: None,
+                request_body_bytes: observation.body_bytes,
+                snapshot_revision: snapshot.revision.as_ref(),
+                reason: "invalid_api_key",
+            },
+        );
         return NativePreparation::Response(json_response(
             StatusCode::FORBIDDEN,
             json!({"error": "Invalid or missing API Key"}),
         ));
     };
     let Some(api_key) = snapshot.api_keys.get(&token).cloned() else {
+        emit_native_rejection(
+            403,
+            NativeRejectionObservation {
+                request_id: &request_id,
+                request_model: None,
+                stream: None,
+                request_body_bytes: observation.body_bytes,
+                snapshot_revision: snapshot.revision.as_ref(),
+                reason: "invalid_api_key",
+            },
+        );
         return NativePreparation::Response(json_response(
             StatusCode::FORBIDDEN,
             json!({"error": "Invalid or missing API Key"}),
@@ -716,16 +1153,38 @@ pub async fn prepare_native_request(
     let mut payload = match storage.parse_json().await {
         Ok(Value::Object(payload)) => Value::Object(payload),
         Ok(_) => {
+            emit_native_rejection(
+                422,
+                NativeRejectionObservation {
+                    request_id: &request_id,
+                    request_model: None,
+                    stream: None,
+                    request_body_bytes: observation.body_bytes,
+                    snapshot_revision: snapshot.revision.as_ref(),
+                    reason: "request_body_not_object",
+                },
+            );
             return NativePreparation::Response(json_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 json!({"detail": "Request body must be a JSON object"}),
-            ))
+            ));
         }
         Err(error) => {
+            emit_native_rejection(
+                422,
+                NativeRejectionObservation {
+                    request_id: &request_id,
+                    request_model: None,
+                    stream: None,
+                    request_body_bytes: observation.body_bytes,
+                    snapshot_revision: snapshot.revision.as_ref(),
+                    reason: "request_body_invalid_json",
+                },
+            );
             return NativePreparation::Response(json_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 json!({"detail": error}),
-            ))
+            ));
         }
     };
     let object = payload.as_object().expect("checked JSON object");
@@ -736,12 +1195,34 @@ pub async fn prepare_native_request(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
     else {
+        emit_native_rejection(
+            422,
+            NativeRejectionObservation {
+                request_id: &request_id,
+                request_model: None,
+                stream: None,
+                request_body_bytes: observation.body_bytes,
+                snapshot_revision: snapshot.revision.as_ref(),
+                reason: "request_model_missing",
+            },
+        );
         return NativePreparation::Response(json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"detail": "Request body requires a model"}),
         ));
     };
     if !object.contains_key("input") {
+        emit_native_rejection(
+            422,
+            NativeRejectionObservation {
+                request_id: &request_id,
+                request_model: Some(&request_model),
+                stream: None,
+                request_body_bytes: observation.body_bytes,
+                snapshot_revision: snapshot.revision.as_ref(),
+                reason: "request_input_missing",
+            },
+        );
         return NativePreparation::Response(json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"detail": "Request body requires input"}),
@@ -753,10 +1234,21 @@ pub async fn prepare_native_request(
         Some(value) => match pydantic_bool(value) {
             Some(value) => value,
             None => {
+                emit_native_rejection(
+                    422,
+                    NativeRejectionObservation {
+                        request_id: &request_id,
+                        request_model: Some(&request_model),
+                        stream: None,
+                        request_body_bytes: observation.body_bytes,
+                        snapshot_revision: snapshot.revision.as_ref(),
+                        reason: "request_stream_invalid",
+                    },
+                );
                 return NativePreparation::Response(json_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     json!({"detail": "stream must be a boolean"}),
-                ))
+                ));
             }
         },
     };
@@ -774,10 +1266,21 @@ pub async fn prepare_native_request(
     ) {
         Ok(providers) if !providers.is_empty() => providers,
         Ok(_) => {
+            emit_native_rejection(
+                404,
+                NativeRejectionObservation {
+                    request_id: &request_id,
+                    request_model: Some(&request_model),
+                    stream: Some(stream),
+                    request_body_bytes: observation.body_bytes,
+                    snapshot_revision: snapshot.revision.as_ref(),
+                    reason: "no_matching_provider",
+                },
+            );
             return NativePreparation::Response(json_response(
                 StatusCode::NOT_FOUND,
                 json!({"message": format!("No available providers at the moment: {request_model}")}),
-            ))
+            ));
         }
         Err(()) => return NativePreparation::Fallback,
     };
@@ -802,18 +1305,44 @@ pub async fn prepare_native_request(
     };
     // Admit only after the request is proven native-safe. A compatibility
     // fallback must not consume both the Rust and Python rate-limit buckets.
-    if !store.admit_rate("__global__", &global_rate_rules).await
-        || !store
-            .admit_rate(&format!("client:{}", api_key.token), &client_rate_rules)
-            .await
+    if !store.admit_rate("__global__", &global_rate_rules).await {
+        emit_native_rejection(
+            429,
+            NativeRejectionObservation {
+                request_id: &request_id,
+                request_model: Some(&request_model),
+                stream: Some(stream),
+                request_body_bytes: observation.body_bytes,
+                snapshot_revision: snapshot.revision.as_ref(),
+                reason: "native_global_rate_limit",
+            },
+        );
+        return NativePreparation::Response(json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "Too many requests"}),
+        ));
+    }
+    if !store
+        .admit_rate(&format!("client:{}", api_key.token), &client_rate_rules)
+        .await
     {
+        emit_native_rejection(
+            429,
+            NativeRejectionObservation {
+                request_id: &request_id,
+                request_model: Some(&request_model),
+                stream: Some(stream),
+                request_body_bytes: observation.body_bytes,
+                snapshot_revision: snapshot.revision.as_ref(),
+                reason: "native_client_rate_limit",
+            },
+        );
         return NativePreparation::Response(json_response(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error": "Too many requests"}),
         ));
     }
     let retry_count = compute_retry_count(&providers);
-    let request_id = request_id(&parts.headers);
     NativePreparation::Ready(NativeRoute {
         store: store.clone(),
         snapshot,
@@ -830,8 +1359,18 @@ pub async fn prepare_native_request(
         last_provider: None,
         last_provider_key: None,
         last_original_model: None,
+        last_attempt: None,
         last_status: 502,
         last_detail: String::new(),
+        has_attempt_failure: false,
+        last_failure_origin: String::new(),
+        routing_attempts: 0,
+        routing_skips: 0,
+        upstream_attempts: 0,
+        routing_ledger: Vec::new(),
+        upstream_ledger: Vec::new(),
+        started_at: tokio::time::Instant::now(),
+        final_emitted: false,
         _memory_reservation: memory_reservation,
     })
 }
@@ -1447,6 +1986,79 @@ fn normalize_upstream_url(base_url: &str, engine: &str) -> String {
     }
 }
 
+fn upstream_host(base_url: &str) -> String {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn outcome_status(outcome: &Value, fallback: u16) -> u16 {
+    outcome_status_from(
+        outcome,
+        "status_code",
+        outcome_status_from(outcome, "upstream_status_code", fallback),
+    )
+}
+
+fn outcome_status_from(outcome: &Value, key: &str, fallback: u16) -> u16 {
+    outcome
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|status| *status > 0)
+        .unwrap_or(u64::from(fallback))
+        .min(u64::from(u16::MAX)) as u16
+}
+
+fn failure_origin(outcome: &Value) -> &'static str {
+    match outcome.get("kind").and_then(Value::as_str) {
+        Some("http_error") => "upstream_http",
+        Some("transport_error") => "ember_transport",
+        Some("protocol_error") => "ember_protocol",
+        Some("semantic_failure" | "semantic_error") => "upstream_semantic",
+        Some("downstream_disconnected") => "downstream_client",
+        Some("completed" | "incomplete") => "upstream_success",
+        _ => "ember_native",
+    }
+}
+
+fn native_rejection_origin(reason: &str) -> &'static str {
+    match reason {
+        "native_global_rate_limit" => "native_global_rate_limit",
+        "native_client_rate_limit" => "native_client_rate_limit",
+        "no_matching_provider" => "native_route_selection",
+        "invalid_api_key" => "native_authentication",
+        _ => "native_request_validation",
+    }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
+    }
+}
+
+fn event_severity(status: u16, outcome: &str) -> &'static str {
+    if status >= 500 {
+        "error"
+    } else if status >= 400 || matches!(outcome, "skipped" | "failed" | "completed_with_error") {
+        "warning"
+    } else {
+        "info"
+    }
+}
+
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn provider_api_keys(value: &Value) -> Vec<String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => vec![value.trim().to_owned()],
@@ -1739,6 +2351,7 @@ fn json_response(status: StatusCode, payload: Value) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::ResourceGovernor;
 
     fn provider() -> Provider {
         Provider {
@@ -1756,6 +2369,63 @@ mod tests {
             )])),
             excluded_endpoints: Arc::new(Vec::new()),
             cursor: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> NativeRoute {
+        let store = NativeConfigStore::new();
+        let snapshot = Arc::new(Snapshot {
+            revision: Arc::from("0".repeat(64)),
+            database_disabled: true,
+            preferences: Arc::new(Map::new()),
+            api_keys: Arc::new(HashMap::new()),
+            providers: Arc::new(vec![provider.clone()]),
+            providers_by_name: Arc::new(HashMap::from([(
+                provider.name.to_string(),
+                provider.clone(),
+            )])),
+        });
+        let api_key = Arc::new(ApiKey {
+            token: Arc::from("client-key"),
+            model_rules: Arc::new(Vec::new()),
+            role: Arc::from("user"),
+            preferences: Arc::new(Map::from_iter([("AUTO_RETRY".into(), json!(true))])),
+            native_paid_state_safe: true,
+            native_supported: true,
+        });
+        let (_, memory_reservation) = ResourceGovernor::unconstrained_for_test()
+            .reserve_memory_capacity(0)
+            .await
+            .unwrap();
+        NativeRoute {
+            store,
+            snapshot,
+            api_key,
+            providers: vec![provider.clone(), provider],
+            base_payload: json!({"model":"gpt-public","input":"hello","stream":true}),
+            request_headers: HeaderMap::new(),
+            request_model: "gpt-public".into(),
+            stream: true,
+            request_id: "request-test".into(),
+            request_body_bytes: 64,
+            cursor: 0,
+            max_attempts,
+            last_provider: None,
+            last_provider_key: None,
+            last_original_model: None,
+            last_attempt: None,
+            last_status: 502,
+            last_detail: String::new(),
+            has_attempt_failure: false,
+            last_failure_origin: String::new(),
+            routing_attempts: 0,
+            routing_skips: 0,
+            upstream_attempts: 0,
+            routing_ledger: Vec::new(),
+            upstream_ledger: Vec::new(),
+            started_at: tokio::time::Instant::now(),
+            final_emitted: false,
+            _memory_reservation: memory_reservation,
         }
     }
 
@@ -1843,5 +2513,33 @@ mod tests {
             retry_after_seconds("Rate limit reached. Please try again in 2500ms."),
             Some(3.0)
         );
+    }
+
+    #[tokio::test]
+    async fn local_cooldown_skip_does_not_overwrite_last_upstream_failure() {
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(provider), 2).await;
+
+        assert!(route.next_plan().await.unwrap().is_some());
+        assert!(
+            route
+                .record_failure(&json!({
+                    "kind": "http_error",
+                    "status_code": 503,
+                    "body": "no available token",
+                }))
+                .await
+        );
+        assert!(route.next_plan().await.unwrap().is_none());
+
+        assert_eq!(route.last_status(), 503);
+        assert_eq!(route.last_detail(), "no available token");
+        assert_eq!(route.routing_attempts, 2);
+        assert_eq!(route.routing_skips, 1);
+        assert_eq!(route.upstream_attempts, 1);
+        let final_message = route.final_message();
+        assert_eq!(final_message["status_code"], 503);
+        assert!(route.final_emitted);
     }
 }
