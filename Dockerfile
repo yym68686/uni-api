@@ -1,16 +1,25 @@
-FROM rust:1.84-bullseye AS rust-toolchain
+FROM lukemathwalker/cargo-chef:0.1.71-rust-1.84-bullseye@sha256:e372d5aae4166598a5e4ce08c0eb75af0e7ec909d7e19188ebf669d79fa62355 AS rust-chef
 
-FROM python:3.11-bullseye AS native-builder
+FROM python:3.11-bullseye AS native-dependencies
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:${PATH}
-COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
-COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+COPY --from=rust-chef /usr/local/cargo /usr/local/cargo
+COPY --from=rust-chef /usr/local/rustup /usr/local/rustup
 WORKDIR /build
 COPY rust/uni-api-native/Cargo.toml rust/uni-api-native/Cargo.lock ./
 COPY rust/uni-api-native/.cargo ./.cargo
-COPY rust/uni-api-native/src ./src
-RUN cargo build --release --locked
+RUN mkdir -p src/bin/uni-api-front && \
+    printf 'fn main() {}\n' > src/bin/uni-api-front/main.rs && \
+    printf '' > src/lib.rs && \
+    cargo chef prepare --recipe-path recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+
+FROM native-dependencies AS native-builder
+COPY rust/uni-api-native ./
+RUN cargo build --release --locked && \
+    cp target/release/lib_uni_api_native.so /tmp/lib_uni_api_native.so && \
+    cp target/release/uni-api-front /tmp/uni-api-front
 
 FROM python:3.11 AS builder
 
@@ -26,6 +35,6 @@ EXPOSE 8000
 WORKDIR /home
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY . .
-COPY --from=native-builder /build/target/release/lib_uni_api_native.so /home/uni_api/_uni_api_native.so
-COPY --from=native-builder /build/target/release/uni-api-front /usr/local/bin/uni-api-front
+COPY --from=native-builder /tmp/lib_uni_api_native.so /home/uni_api/_uni_api_native.so
+COPY --from=native-builder /tmp/uni-api-front /usr/local/bin/uni-api-front
 ENTRYPOINT ["/usr/local/bin/uni-api-front"]

@@ -27,91 +27,229 @@ on:
       - .gitmodules
   workflow_dispatch:
 
+# A version-bump push carries [skip ci], so only one release workflow can update
+# main at a time. The prepare job explicitly checks out the latest main head.
+concurrency:
+  group: docker-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_IMAGE: yym68686/uni-api
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+  prepare:
+    name: Prepare release version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_sha: ${{ steps.release.outputs.release_sha }}
+      version: ${{ steps.release.outputs.version }}
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
-      with:
-        submodules: recursive
-        token: ${{ secrets.PACK_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.PACK_TOKEN }}
 
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v1
+      - name: Bump version and publish release commit
+        id: release
+        run: |
+          # Serialize releases against the current remote head. A queued run may
+          # have been dispatched before the preceding version bump was pushed.
+          git fetch origin main
+          git rebase origin/main
+          git submodule update --init --recursive
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v1.6.0
+          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
+          PATCH=$((VERSION_PARTS[2] + 1))
+          NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
+          sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
+          NEW_VERSION="$NEW_VERSION" python - <<'PY'
+          from pathlib import Path
+          import os
 
-    - name: Login to Docker Hub
-      uses: docker/login-action@v3.0.0
-      with:
-        username: ${{ secrets.DOCKER_HUB_USERNAME }}
-        password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          lock_path = Path("uv.lock")
+          lines = lock_path.read_text().splitlines()
+          in_uni_api_package = False
+          for index, line in enumerate(lines):
+              if line == "[[package]]":
+                  in_uni_api_package = False
+                  continue
+              if line == 'name = "uni-api"':
+                  in_uni_api_package = True
+                  continue
+              if in_uni_api_package and line.startswith("version = "):
+                  lines[index] = f'version = "{os.environ["NEW_VERSION"]}"'
+                  break
+          else:
+              raise SystemExit("uni-api package version not found in uv.lock")
 
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v2
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.PACK_TOKEN }}
+          lock_path.write_text("\n".join(lines) + "\n")
+          PY
 
-    - name: Get and Bump Version
-      id: bump_version
-      run: |
-        VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
-        echo "Current version: $VERSION"
-        IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
-        PATCH=$((VERSION_PARTS[2] + 1))
-        NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
-        echo "New version: $NEW_VERSION"
-        sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
-        NEW_VERSION="$NEW_VERSION" python - <<'PY'
-        from pathlib import Path
-        import os
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add pyproject.toml uv.lock
+          git commit -m "📖 Bump version to $NEW_VERSION [skip ci]"
+          git push origin HEAD:main
 
-        lock_path = Path("uv.lock")
-        lines = lock_path.read_text().splitlines()
-        in_uni_api_package = False
-        for index, line in enumerate(lines):
-            if line == "[[package]]":
-                in_uni_api_package = False
-                continue
-            if line == 'name = "uni-api"':
-                in_uni_api_package = True
-                continue
-            if in_uni_api_package and line.startswith("version = "):
-                lines[index] = f'version = "{os.environ["NEW_VERSION"]}"'
-                break
-        else:
-            raise SystemExit("uni-api package version not found in uv.lock")
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-        lock_path.write_text("\n".join(lines) + "\n")
-        PY
-        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform_pair: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            platform_pair: linux-arm64
+            runner: ubuntu-24.04-arm
 
-    - name: Commit version bump
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-      run: |
-        git config --global user.name 'github-actions[bot]'
-        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add pyproject.toml uv.lock
-        git commit -m "📖 Bump version to ${{ steps.bump_version.outputs.new_version }} [skip ci]"
-        git push
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          submodules: recursive
+          token: ${{ secrets.PACK_TOKEN }}
 
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v2.7.0
-      with:
-        context: .
-        file: Dockerfile
-        build-args: |
-          SOURCE_COMMIT=${{ github.sha }}
-        platforms: linux/amd64,linux/arm64
-        push: true
-        tags: |
-          yym68686/uni-api:latest
-          yym68686/uni-api:${{ steps.bump_version.outputs.new_version }}
-          ghcr.io/${{ github.repository }}:latest
-          ghcr.io/${{ github.repository }}:${{ steps.bump_version.outputs.new_version }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.PACK_TOKEN }}
+
+      - name: Build and push platform image by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            SOURCE_COMMIT=${{ needs.prepare.outputs.release_sha }}
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=uni-api-${{ matrix.platform_pair }}
+          cache-to: type=gha,mode=max,scope=uni-api-${{ matrix.platform_pair }},ignore-error=true
+
+      - name: Export platform digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${IMAGE_DIGEST#sha256:}"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.platform_pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-platform manifest
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.PACK_TOKEN }}
+
+      - name: Publish manifests to both registries
+        working-directory: /tmp/digests
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          SOURCES=()
+          for digest_file in *; do
+            SOURCES+=("${DOCKERHUB_IMAGE}@sha256:${digest_file}")
+          done
+
+          docker buildx imagetools create \
+            --tag "${DOCKERHUB_IMAGE}:latest" \
+            --tag "${DOCKERHUB_IMAGE}:${VERSION}" \
+            "${SOURCES[@]}"
+
+          GHCR_SOURCES=()
+          for digest_file in *; do
+            GHCR_SOURCES+=("${GHCR_IMAGE}@sha256:${digest_file}")
+          done
+
+          docker buildx imagetools create \
+            --tag "${GHCR_IMAGE}:latest" \
+            --tag "${GHCR_IMAGE}:${VERSION}" \
+            "${GHCR_SOURCES[@]}"
+
+      - name: Verify published platforms
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          verify_platforms() {
+            local image="$1"
+            local platforms
+            platforms=$(docker buildx imagetools inspect "$image" --raw | \
+              jq -r '.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"' | \
+              sort -u)
+            diff -u <(printf '%s\n' linux/amd64 linux/arm64) <(printf '%s\n' "$platforms")
+          }
+
+          verify_platforms "${DOCKERHUB_IMAGE}:${VERSION}"
+          verify_platforms "${DOCKERHUB_IMAGE}:latest"
+          verify_platforms "${GHCR_IMAGE}:${VERSION}"
+          verify_platforms "${GHCR_IMAGE}:latest"
