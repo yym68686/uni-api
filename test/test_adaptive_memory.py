@@ -6,7 +6,50 @@ from uni_api.admission.memory import (
     AdaptiveMemoryGovernor,
     CgroupMemorySource,
     ProcessMemorySample,
+    SharedMemoryReservationLedger,
 )
+
+
+def test_shared_ledger_makes_cross_process_reservations_visible(tmp_path):
+    path = tmp_path / "shared-memory-reservations"
+    first_ledger = SharedMemoryReservationLedger(path, reset=True)
+    second_ledger = SharedMemoryReservationLedger(path)
+    memory = FakeMemory(current=100, limit=1000)
+    first = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=0,
+        shared_ledger=first_ledger,
+    )
+    second = AdaptiveMemoryGovernor(
+        source=memory.sample,
+        guard_bytes=100,
+        guard_ratio=0,
+        sample_cache_seconds=0,
+        shared_ledger=second_ledger,
+    )
+
+    assert first.reserve_nowait("request_body", 500)
+    assert second.snapshot().reserved_bytes == 500
+    assert second.snapshot().available_bytes == 300
+    assert first_ledger.categories()["parsed_body"] == 500
+    assert not second.reserve_nowait("upstream_serialized_body", 301)
+    assert second.reserve_nowait("upstream_serialized_body", 300)
+    assert first.snapshot().reserved_bytes == 800
+    assert first_ledger.categories()["serialized_body"] == 300
+
+    second.release("upstream_serialized_body", 300)
+    first.release("request_body", 500)
+    assert first_ledger.total() == 0
+    assert first_ledger.categories() == {
+        "total": 0,
+        "parsed_body": 0,
+        "serialized_body": 0,
+        "transport_buffer": 0,
+        "response_buffer": 0,
+        "other": 0,
+    }
 
 
 class FakeMemory:

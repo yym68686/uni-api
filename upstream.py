@@ -4,6 +4,7 @@ import inspect
 import json
 import re
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -43,6 +44,40 @@ _ROUTING_ATTEMPT_TAIL = 16
 _ROUTING_ATTEMPT_LIMIT = _ROUTING_ATTEMPT_HEAD + _ROUTING_ATTEMPT_TAIL
 _ROUTING_ERROR_HASH_TEXT_LIMIT = 4096
 _ROUTING_ERROR_HASH_SCOPE = "unicode_text_prefix_4096_chars_utf8_v1"
+
+
+def _clear_exception_traceback_chain(exc: BaseException) -> None:
+    """Release completed failure frames after routing has consumed the error.
+
+    A finished ``asyncio.Task`` retains its exception, and the exception retains
+    every traceback frame.  When one of those frames also references the Task,
+    large request payloads survive until cyclic GC happens.  Routing has already
+    classified, logged, and made its retry decision before this helper is called,
+    so the traceback is no longer part of the request contract.
+    """
+
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        cause = current.__cause__
+        context = current.__context__
+        if isinstance(cause, BaseException):
+            pending.append(cause)
+        if isinstance(context, BaseException):
+            pending.append(context)
+
+        tb = current.__traceback__
+        if tb is not None:
+            traceback.clear_frames(tb)
+        current.__traceback__ = None
+        current.__cause__ = None
+        current.__context__ = None
 
 
 def _routing_error_sha256(value: Any) -> str:
@@ -981,18 +1016,21 @@ class UpstreamRunner:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return await self._handle_failure(
-                        attempt,
-                        exc,
-                        after_failure=after_failure,
-                        exclude_error_substrings=exclude_error_substrings,
-                        rollback_rate_limit_errors=rollback_rate_limit_errors,
-                        should_cool_down=should_cool_down,
-                        retry_decider=retry_decider,
-                        on_retry=on_retry,
-                        on_cooldown=on_cooldown,
-                        prepare_failure=True,
-                    )
+                    try:
+                        return await self._handle_failure(
+                            attempt,
+                            exc,
+                            after_failure=after_failure,
+                            exclude_error_substrings=exclude_error_substrings,
+                            rollback_rate_limit_errors=rollback_rate_limit_errors,
+                            should_cool_down=should_cool_down,
+                            retry_decider=retry_decider,
+                            on_retry=on_retry,
+                            on_cooldown=on_cooldown,
+                            prepare_failure=True,
+                        )
+                    finally:
+                        _clear_exception_traceback_chain(exc)
             response = await execute_attempt(attempt)
             if isinstance(response, UpstreamAttemptResult):
                 return response
@@ -1000,20 +1038,23 @@ class UpstreamRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return await self._handle_failure(
-                attempt,
-                exc,
-                after_failure=after_failure,
-                build_error_response=build_error_response,
-                exclude_error_substrings=exclude_error_substrings,
-                rollback_rate_limit_errors=rollback_rate_limit_errors,
-                allow_channel_exclusion=allow_channel_exclusion,
-                should_cool_down=should_cool_down,
-                retry_decider=retry_decider,
-                on_retry=on_retry,
-                on_cooldown=on_cooldown,
-                prepare_failure=False,
-            )
+            try:
+                return await self._handle_failure(
+                    attempt,
+                    exc,
+                    after_failure=after_failure,
+                    build_error_response=build_error_response,
+                    exclude_error_substrings=exclude_error_substrings,
+                    rollback_rate_limit_errors=rollback_rate_limit_errors,
+                    allow_channel_exclusion=allow_channel_exclusion,
+                    should_cool_down=should_cool_down,
+                    retry_decider=retry_decider,
+                    on_retry=on_retry,
+                    on_cooldown=on_cooldown,
+                    prepare_failure=False,
+                )
+            finally:
+                _clear_exception_traceback_chain(exc)
 
     async def _handle_failure(
         self,

@@ -1,7 +1,9 @@
 use memchr::memchr2;
-use pyo3::exceptions::PyOverflowError;
+use pyo3::exceptions::{PyIOError, PyOverflowError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 
 const ERROR_NONE: u8 = 0;
 const ERROR_MAX_DEPTH: u8 = 1;
@@ -280,10 +282,126 @@ fn scan_json_memory_chunk(
     })
 }
 
+fn write_all_json(writer: &mut impl Write, bytes: &[u8]) -> PyResult<()> {
+    writer
+        .write_all(bytes)
+        .map_err(|error| PyIOError::new_err(error.to_string()))
+}
+
+fn write_json_scalar<T: serde::Serialize + ?Sized>(
+    writer: &mut impl Write,
+    value: &T,
+) -> PyResult<()> {
+    serde_json::to_writer(writer, value).map_err(|error| PyIOError::new_err(error.to_string()))
+}
+
+fn write_python_json_value(writer: &mut impl Write, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    if value.is_none() {
+        return write_all_json(writer, b"null");
+    }
+    if value.is_instance_of::<PyBool>() {
+        return if value.extract::<bool>()? {
+            write_all_json(writer, b"true")
+        } else {
+            write_all_json(writer, b"false")
+        };
+    }
+    if let Ok(text) = value.cast::<PyString>() {
+        return write_json_scalar(writer, text.to_str()?);
+    }
+    if value.is_instance_of::<PyInt>() {
+        let rendered = value.str()?;
+        return write_all_json(writer, rendered.to_str()?.as_bytes());
+    }
+    if value.is_instance_of::<PyFloat>() {
+        let number = value.extract::<f64>()?;
+        if number.is_nan() {
+            return write_all_json(writer, b"NaN");
+        }
+        if number == f64::INFINITY {
+            return write_all_json(writer, b"Infinity");
+        }
+        if number == f64::NEG_INFINITY {
+            return write_all_json(writer, b"-Infinity");
+        }
+        return write_json_scalar(writer, &number);
+    }
+    if let Ok(mapping) = value.cast::<PyDict>() {
+        write_all_json(writer, b"{")?;
+        let mut first = true;
+        for (key, item) in mapping.iter() {
+            let key = key
+                .cast::<PyString>()
+                .map_err(|_| PyTypeError::new_err("native JSON object keys must be strings"))?;
+            if !first {
+                write_all_json(writer, b",")?;
+            }
+            first = false;
+            write_json_scalar(writer, key.to_str()?)?;
+            write_all_json(writer, b":")?;
+            write_python_json_value(writer, &item)?;
+        }
+        return write_all_json(writer, b"}");
+    }
+    if let Ok(sequence) = value.cast::<PyList>() {
+        write_all_json(writer, b"[")?;
+        let mut first = true;
+        for item in sequence.iter() {
+            if !first {
+                write_all_json(writer, b",")?;
+            }
+            first = false;
+            write_python_json_value(writer, &item)?;
+        }
+        return write_all_json(writer, b"]");
+    }
+    if let Ok(sequence) = value.cast::<PyTuple>() {
+        write_all_json(writer, b"[")?;
+        let mut first = true;
+        for item in sequence.iter() {
+            if !first {
+                write_all_json(writer, b",")?;
+            }
+            first = false;
+            write_python_json_value(writer, &item)?;
+        }
+        return write_all_json(writer, b"]");
+    }
+    Err(PyTypeError::new_err(format!(
+        "native JSON serializer does not support {}",
+        value.get_type().name()?
+    )))
+}
+
+/// Serialize a Python JSON graph directly into a bounded Rust file buffer.
+///
+/// Unlike ``json.dumps(...).encode()``, this never materializes a whole-document
+/// string or bytes object.  It is intentionally limited to the JSON-native
+/// values produced by FastAPI's parser and provider overrides.
+#[pyfunction]
+fn write_json_file(payload: &Bound<'_, PyAny>, path: &str) -> PyResult<u64> {
+    let file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| PyIOError::new_err(error.to_string()))?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    write_python_json_value(&mut writer, payload)?;
+    writer
+        .flush()
+        .map_err(|error| PyIOError::new_err(error.to_string()))?;
+    writer
+        .get_ref()
+        .metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| PyIOError::new_err(error.to_string()))
+}
+
 #[pymodule]
 fn _uni_api_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("IMPLEMENTATION_VERSION", 1u8)?;
+    module.add("IMPLEMENTATION_VERSION", 2u8)?;
     module.add_function(wrap_pyfunction!(scan_json_memory_chunk, module)?)?;
+    module.add_function(wrap_pyfunction!(write_json_file, module)?)?;
     Ok(())
 }
 

@@ -268,6 +268,7 @@ from uni_api.rust_responses_control import (
     RustResponsesResolvedOutcome,
 )
 from uni_api.upstream.client_pool import ClientPool
+from uni_api.upstream.request_replay import MessagesRequestReplayStore
 from uni_api.upstream.response_limits import (
     UPSTREAM_RESPONSE_CPU_WORKERS,
     read_limited_response_body,
@@ -1259,6 +1260,9 @@ class RuntimeGauges:
             ),
             "memory_parent_reservations": getattr(
                 memory_parent, "reservations", {}
+            ),
+            "memory_parent_shared_reservations": getattr(
+                memory_parent, "shared_reservations", {}
             ),
             "memory_parent_rejected": getattr(memory_parent, "rejected", {}),
             "memory_parent_blocked_reservations": getattr(
@@ -9686,6 +9690,7 @@ class MessagesPassthroughHandler:
             debug=is_debug,
             observability_context=current_info,
         )
+        replay_store = MessagesRequestReplayStore(request_body_bytes)
         ctx = {
             "http_request": http_request,
             "request_body": request_body,
@@ -9699,29 +9704,33 @@ class MessagesPassthroughHandler:
             "runner": runner,
             "background_tasks": background_tasks,
             "last_error_response": {},
+            "request_replay_store": replay_store,
         }
 
-        return await runner.run(
-            lambda attempt: self._messages_execute_attempt(attempt, ctx),
-            prepare_attempt=lambda attempt: self._messages_prepare_attempt(attempt, ctx),
-            before_next_attempt=lambda: self._messages_before_next_attempt(ctx),
-            after_failure=lambda attempt, exc, status_code, error_message: self._messages_after_failure(
-                attempt,
-                exc,
-                status_code,
-                error_message,
-                ctx,
-            ),
-            build_error_response=lambda status_code, error_message: self._messages_build_error_response(
-                status_code,
-                error_message,
-                ctx,
-            ),
-            build_final_response=lambda completed_plan: self._messages_build_final_response(completed_plan, ctx),
-            should_cool_down=self._messages_should_cool_down,
-            on_retry=_record_retry_observability,
-            on_cooldown=_record_cooldown_observability,
-        )
+        try:
+            return await runner.run(
+                lambda attempt: self._messages_execute_attempt(attempt, ctx),
+                prepare_attempt=lambda attempt: self._messages_prepare_attempt(attempt, ctx),
+                before_next_attempt=lambda: self._messages_before_next_attempt(ctx),
+                after_failure=lambda attempt, exc, status_code, error_message: self._messages_after_failure(
+                    attempt,
+                    exc,
+                    status_code,
+                    error_message,
+                    ctx,
+                ),
+                build_error_response=lambda status_code, error_message: self._messages_build_error_response(
+                    status_code,
+                    error_message,
+                    ctx,
+                ),
+                build_final_response=lambda completed_plan: self._messages_build_final_response(completed_plan, ctx),
+                should_cool_down=self._messages_should_cool_down,
+                on_retry=_record_retry_observability,
+                on_cooldown=_record_cooldown_observability,
+            )
+        finally:
+            await replay_store.aclose()
 
     async def _messages_before_next_attempt(self, ctx: dict[str, Any]):
         disconnect_event = ctx["disconnect_event"]
@@ -9810,12 +9819,40 @@ class MessagesPassthroughHandler:
             routing_attempt_id=attempt.routing_attempt_id,
         )
         self._messages_log_attempt(ctx, attempt, payload, headers)
-        json_payload = await run_json_cpu(json.dumps, payload)
+        replay_store = ctx["request_replay_store"]
+        prepared_body = await replay_store.prepare(
+            (
+                attempt.provider_name,
+                original_model,
+                bool(payload.get("stream")),
+                upstream_url,
+                id(provider),
+            ),
+            payload,
+        )
+        headers["Content-Length"] = str(prepared_body.content_length)
+        attempt.state["request_body_storage"] = prepared_body.storage
+        attempt.state["request_body_wire_bytes"] = prepared_body.content_length
 
-        async with app.state.client_manager.get_client(upstream_url, proxy) as client:
-            if payload.get("stream"):
-                return await self._messages_stream_response(client, attempt, ctx, headers, json_payload)
-            return await self._messages_non_stream_response(client, attempt, ctx, headers, json_payload)
+        try:
+            async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+                if payload.get("stream"):
+                    return await self._messages_stream_response(
+                        client,
+                        attempt,
+                        ctx,
+                        headers,
+                        prepared_body.content,
+                    )
+                return await self._messages_non_stream_response(
+                    client,
+                    attempt,
+                    ctx,
+                    headers,
+                    prepared_body.content,
+                )
+        finally:
+            await prepared_body.aclose()
 
     def _messages_headers(self, http_request: Request, provider: dict[str, Any], api_key: Any) -> dict[str, str]:
         headers = {
@@ -9866,7 +9903,7 @@ class MessagesPassthroughHandler:
             actual_model=attempt.original_model,
         )
 
-    async def _messages_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: str):
+    async def _messages_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: Any):
         upstream_url = attempt.state["upstream_url"]
         stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=attempt.state["timeout_value"])
 
@@ -10148,7 +10185,7 @@ class MessagesPassthroughHandler:
         )
         return True
 
-    async def _messages_non_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: str):
+    async def _messages_non_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: Any):
         async def cleanup_cancelled_response(response: Any) -> None:
             close = getattr(response, "aclose", None)
             if callable(close):

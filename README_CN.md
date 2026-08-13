@@ -414,6 +414,8 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_ENABLED: 可选人类可读 stdout 请求摘要日志开关，默认 `true`。
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: 可选人类可读 stdout 请求摘要日志采样率，默认 `1.0`。高并发压测时可以调低或关闭。
 - UNI_API_RUST_RESPONSES_DATA_PLANE: 是否为流式 `/v1/responses` 启用 Rust 的 socket→SSE→下游数据路径，默认 `true`。带 `Idempotency-Key` 的请求也保留在 Rust 数据面：Rust 负责凭证作用域请求哈希、owner/wait/replay/conflict 协调和有界零拷贝响应缓存；`IDEMPOTENCY_*` 的 TTL、条目数、总缓存和单响应限制继续生效，未完成请求/响应字节另由 `RUST_IDEMPOTENCY_MAX_INFLIGHT_REQUEST_BYTES` 与 `RUST_IDEMPOTENCY_MAX_INFLIGHT_RESPONSE_BYTES` 限制（均默认 128 MiB）。设为 `false` 并重启进程即可在不更换镜像的情况下立即回退到 Python 数据路径。
+- Rust 与 Python 现在共用 `MEMORY_SOFT_LIMIT_BYTES`、`MEMORY_GUARD_BYTES`、`MEMORY_GUARD_RATIO`、`MEMORY_FALLBACK_BUDGET_BYTES` 的 cgroup 策略，并通过同一共享账本核算 parsed body、serialized body、transport buffer 和 response buffer。
+- `MESSAGES_REQUEST_SPOOL_THRESHOLD_BYTES`、`MESSAGES_REQUEST_SPOOL_MAX_VARIANTS`、`MESSAGES_REQUEST_TRANSPORT_CHUNK_BYTES`、`MESSAGES_REQUEST_SPOOL_DIRECTORY` 控制 `/v1/messages` 上游请求磁盘重放。默认 1 MiB 及以上由 Rust 直接序列化到请求级临时文件，最多缓存 4 个 provider-specific 版本，每次重试重新打开并以 256 KiB 分块发送；provider 顺序和重试次数不变。
 
 ### 加权资源接入
 

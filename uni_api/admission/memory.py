@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
+import struct
 import threading
 from collections import Counter
 from dataclasses import dataclass
@@ -21,6 +23,16 @@ _DEFAULT_GUARD_BYTES = 512 * _MIB
 _DEFAULT_GUARD_RATIO = 0.25
 _DEFAULT_SAMPLE_CACHE_SECONDS = 0.05
 _CGROUP_FILE_READ_LIMIT_BYTES = 64 * 1024
+_SHARED_RESERVATION_CATEGORIES = (
+    "total",
+    "parsed_body",
+    "serialized_body",
+    "transport_buffer",
+    "response_buffer",
+    "other",
+)
+_SHARED_RESERVATION_BYTES = 8 * len(_SHARED_RESERVATION_CATEGORIES)
+_DEFAULT_SHARED_RESERVATION_PATH = "/tmp/uni-api-shared-memory-reservation-v1"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -204,6 +216,128 @@ class CgroupMemorySource:
         self._reader.close()
 
 
+class SharedMemoryReservationLedger:
+    """A flock-protected byte counter shared by the Rust and Python processes."""
+
+    def __init__(self, path: str | Path, *, reset: bool = False) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._descriptor = os.open(
+            self.path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        with self._locked():
+            if reset or os.fstat(self._descriptor).st_size < _SHARED_RESERVATION_BYTES:
+                self._write_locked([0] * len(_SHARED_RESERVATION_CATEGORIES))
+
+    @staticmethod
+    def _category_index(category: str) -> int:
+        normalized = str(category or "other")
+        if normalized in {
+            "request_body",
+            "pending_request_body",
+            "parsed_body",
+            "rust_parsed_body",
+        }:
+            return 1
+        if normalized in {"upstream_serialized_body", "serialized_body"}:
+            return 2
+        if normalized in {"upstream_transport_buffer", "transport_buffer"}:
+            return 3
+        if normalized in {"buffered_response", "response_buffer"}:
+            return 4
+        return 5
+
+    def _locked(self):
+        ledger = self
+
+        class _Lock:
+            def __enter__(self):
+                fcntl.flock(ledger._descriptor, fcntl.LOCK_EX)
+                return ledger
+
+            def __exit__(self, *_exc_info: object) -> None:
+                fcntl.flock(ledger._descriptor, fcntl.LOCK_UN)
+
+        return _Lock()
+
+    def _read_locked(self) -> list[int]:
+        payload = os.pread(
+            self._descriptor,
+            _SHARED_RESERVATION_BYTES,
+            0,
+        )
+        if len(payload) != _SHARED_RESERVATION_BYTES:
+            raise OSError("shared memory reservation ledger is truncated")
+        return [
+            int(value)
+            for value in struct.unpack(
+                f"<{len(_SHARED_RESERVATION_CATEGORIES)}Q",
+                payload,
+            )
+        ]
+
+    def _write_locked(self, values: list[int]) -> None:
+        payload = struct.pack(
+            f"<{len(_SHARED_RESERVATION_CATEGORIES)}Q",
+            *(max(0, int(value)) for value in values),
+        )
+        if os.pwrite(self._descriptor, payload, 0) != len(payload):
+            raise OSError("short write to shared memory reservation ledger")
+        os.ftruncate(self._descriptor, _SHARED_RESERVATION_BYTES)
+
+    def total(self) -> int:
+        with self._locked():
+            return self._read_locked()[0]
+
+    def categories(self) -> dict[str, int]:
+        with self._locked():
+            values = self._read_locked()
+        return dict(zip(_SHARED_RESERVATION_CATEGORIES, values, strict=True))
+
+    def try_reserve(
+        self,
+        category: str,
+        size: int,
+        *,
+        maximum_total: int,
+    ) -> tuple[bool, int, int]:
+        with self._locked():
+            values = self._read_locked()
+            before = values[0]
+            after = before + int(size)
+            if after > int(maximum_total):
+                return False, before, before
+            values[0] = after
+            values[self._category_index(category)] += int(size)
+            self._write_locked(values)
+            return True, before, after
+
+    def release(self, category: str, size: int) -> None:
+        with self._locked():
+            values = self._read_locked()
+            category_index = self._category_index(category)
+            if int(size) > values[0] or int(size) > values[category_index]:
+                raise RuntimeError("shared memory reservation ledger underflow")
+            values[0] -= int(size)
+            values[category_index] -= int(size)
+            self._write_locked(values)
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_descriptor", None)
+        if descriptor is None:
+            return
+        self._descriptor = None
+        os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 @dataclass(frozen=True, slots=True)
 class AdaptiveMemorySnapshot:
     source: str
@@ -217,6 +351,7 @@ class AdaptiveMemorySnapshot:
     reserved_bytes: int
     peak_reserved_bytes: int
     reservations: dict[str, int]
+    shared_reservations: dict[str, int]
     rejected: dict[str, int]
     blocked_reservations: int
     waiting_reservations: int
@@ -273,6 +408,7 @@ class AdaptiveMemoryGovernor:
         fallback_budget_bytes: int = _DEFAULT_FALLBACK_BUDGET_BYTES,
         sample_cache_seconds: float = _DEFAULT_SAMPLE_CACHE_SECONDS,
         clock: Callable[[], float] = monotonic,
+        shared_ledger: SharedMemoryReservationLedger | None = None,
     ) -> None:
         if soft_limit_bytes is not None and soft_limit_bytes <= 0:
             raise ValueError("soft_limit_bytes must be positive when provided")
@@ -291,6 +427,8 @@ class AdaptiveMemoryGovernor:
         self.fallback_budget_bytes = int(fallback_budget_bytes)
         self.sample_cache_seconds = float(sample_cache_seconds)
         self._clock = clock
+        self._shared_ledger = shared_ledger
+        self._shared_ledger_error: str | None = None
 
         self._lock = threading.RLock()
         self._sample: ProcessMemorySample | None = None
@@ -309,6 +447,10 @@ class AdaptiveMemoryGovernor:
     @classmethod
     def from_environment(cls) -> AdaptiveMemoryGovernor:
         configured_soft_limit = _env_int("MEMORY_SOFT_LIMIT_BYTES", 0)
+        shared_path = os.getenv(
+            "UNI_API_SHARED_MEMORY_RESERVATION_PATH",
+            _DEFAULT_SHARED_RESERVATION_PATH,
+        )
         return cls(
             soft_limit_bytes=(
                 configured_soft_limit if configured_soft_limit > 0 else None
@@ -332,7 +474,30 @@ class AdaptiveMemoryGovernor:
                     _DEFAULT_SAMPLE_CACHE_SECONDS,
                 ),
             ),
+            shared_ledger=SharedMemoryReservationLedger(shared_path),
         )
+
+    def _reserved_total_locked(self) -> int:
+        if self._shared_ledger is None:
+            return sum(self._reserved.values())
+        try:
+            total = self._shared_ledger.total()
+            self._shared_ledger_error = None
+            return total
+        except Exception as exc:
+            self._shared_ledger_error = f"{type(exc).__name__}: {exc}"[:512]
+            return sum(self._reserved.values())
+
+    def _shared_categories_locked(self) -> dict[str, int]:
+        if self._shared_ledger is None:
+            return {}
+        try:
+            categories = self._shared_ledger.categories()
+            self._shared_ledger_error = None
+            return categories
+        except Exception as exc:
+            self._shared_ledger_error = f"{type(exc).__name__}: {exc}"[:512]
+            return {}
 
     def _refresh_sample_locked(self, *, force: bool = False) -> ProcessMemorySample:
         now = self._clock()
@@ -381,7 +546,7 @@ class AdaptiveMemoryGovernor:
             guard = self.guard_bytes
             soft_limit = None
 
-        reserved = sum(self._reserved.values())
+        reserved = self._reserved_total_locked()
         if soft_limit is None or sample.current_bytes is None:
             capacity = max(reserved, self.fallback_budget_bytes)
         else:
@@ -391,7 +556,11 @@ class AdaptiveMemoryGovernor:
             # Preserve existing ownership, but contract all new allocations to
             # the portable finite fallback until sampling recovers.
             capacity = max(reserved, min(capacity, self.fallback_budget_bytes))
-        available = max(0, capacity - reserved)
+        available = (
+            0
+            if self._shared_ledger_error is not None
+            else max(0, capacity - reserved)
+        )
         return soft_limit, guard, capacity, available
 
     def maximum_capacity_bytes(self) -> int:
@@ -419,13 +588,29 @@ class AdaptiveMemoryGovernor:
             soft_limit, guard, capacity, available_before = self._limits_locked(
                 sample
             )
-            reserved_before = sum(self._reserved.values())
+            reserved_before = self._reserved_total_locked()
             allowed = size <= available_before
+            reserved_after = reserved_before
+            if allowed and size and self._shared_ledger is not None:
+                try:
+                    allowed, reserved_before, reserved_after = (
+                        self._shared_ledger.try_reserve(
+                            normalized,
+                            size,
+                            maximum_total=capacity,
+                        )
+                    )
+                    self._shared_ledger_error = None
+                except Exception as exc:
+                    self._shared_ledger_error = (
+                        f"{type(exc).__name__}: {exc}"[:512]
+                    )
+                    allowed = False
             if allowed and size:
                 self._reserved[normalized] += size
                 self._peak_reserved_bytes = max(
                     self._peak_reserved_bytes,
-                    reserved_before + size,
+                    reserved_after if self._shared_ledger is not None else reserved_before + size,
                 )
             elif not allowed:
                 self._rejected[normalized] += 1
@@ -443,7 +628,8 @@ class AdaptiveMemoryGovernor:
                 if sampled_at is not None
                 else None
             )
-            reserved_after = reserved_before + size if allowed else reserved_before
+            if self._shared_ledger is None:
+                reserved_after = reserved_before + size if allowed else reserved_before
             return AdaptiveMemoryReservationDecision(
                 allowed=allowed,
                 category=normalized,
@@ -463,7 +649,7 @@ class AdaptiveMemoryGovernor:
                     0,
                     available_before - size if allowed else available_before,
                 ),
-                sample_error=self._sample_error,
+                sample_error=self._sample_error or self._shared_ledger_error,
                 sample_sequence=self._sample_sequence,
                 sampled_at_monotonic=sampled_at,
                 sample_age_ms=sample_age_ms,
@@ -477,15 +663,33 @@ class AdaptiveMemoryGovernor:
         record_rejection: bool,
     ) -> bool:
         sample = self._refresh_sample_locked()
-        _soft_limit, _guard, _capacity, available = self._limits_locked(sample)
+        _soft_limit, _guard, capacity, available = self._limits_locked(sample)
         if size > available:
             if record_rejection:
                 self._rejected[category] += 1
             return False
+        if self._shared_ledger is not None:
+            try:
+                allowed, _before, after = self._shared_ledger.try_reserve(
+                    category,
+                    size,
+                    maximum_total=capacity,
+                )
+                self._shared_ledger_error = None
+            except Exception as exc:
+                self._shared_ledger_error = f"{type(exc).__name__}: {exc}"[:512]
+                allowed = False
+                after = self._reserved_total_locked()
+            if not allowed:
+                if record_rejection:
+                    self._rejected[category] += 1
+                return False
+        else:
+            after = sum(self._reserved.values()) + size
         self._reserved[category] += size
         self._peak_reserved_bytes = max(
             self._peak_reserved_bytes,
-            sum(self._reserved.values()),
+            after,
         )
         return True
 
@@ -560,6 +764,8 @@ class AdaptiveMemoryGovernor:
         with self._lock:
             if size > self._reserved[normalized]:
                 raise RuntimeError("adaptive memory reservation underflow")
+            if self._shared_ledger is not None:
+                self._shared_ledger.release(normalized, size)
             self._reserved[normalized] -= size
             if self._reserved[normalized] == 0:
                 del self._reserved[normalized]
@@ -594,15 +800,16 @@ class AdaptiveMemoryGovernor:
             guard_bytes=guard,
             capacity_bytes=capacity,
             available_bytes=available,
-            reserved_bytes=sum(self._reserved.values()),
+            reserved_bytes=self._reserved_total_locked(),
             peak_reserved_bytes=self._peak_reserved_bytes,
             reservations=dict(self._reserved),
+            shared_reservations=self._shared_categories_locked(),
             rejected=dict(self._rejected),
             blocked_reservations=self._blocked_reservations,
             waiting_reservations=self._waiting_reservations,
             wait_timeouts=self._wait_timeouts,
             events=dict(sample.events or {}),
-            sample_error=self._sample_error,
+            sample_error=self._sample_error or self._shared_ledger_error,
             sample_sequence=self._sample_sequence,
             sampled_at_monotonic=sampled_at,
             sample_age_ms=sample_age_ms,

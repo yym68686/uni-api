@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import pathlib
+import weakref
 from collections import defaultdict
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -594,6 +596,73 @@ def test_upstream_runner_stops_after_success_at_exact_attempt_boundary(
         assert current_info["routing_attempts"][-1]["outcome"] == "succeeded"
 
     asyncio.run(run())
+
+
+def test_upstream_runner_releases_failed_task_tracebacks_with_gc_disabled(
+    monkeypatch,
+):
+    class RetainedPayload:
+        def __init__(self):
+            self.data = bytearray(1024 * 1024)
+
+    async def run():
+        attempts = [
+            SimpleNamespace(
+                provider={"preferences": {}},
+                provider_name=f"provider-{index}",
+                original_model="gpt-4.1",
+            )
+            for index in range(6)
+        ]
+
+        class Plan:
+            auto_retry = True
+            api_list = ()
+            request_model_name = "gpt-4.1"
+            status_code = 500
+            error_message = "failed"
+
+            async def next_provider(self):
+                return attempts.pop(0) if attempts else None
+
+            def record_failure(self, status_code, error_message):
+                self.status_code = status_code
+                self.error_message = error_message
+
+        retained = []
+        calls = []
+
+        async def fail_after_task_boundary(payload):
+            await asyncio.sleep(0)
+            raise RuntimeError(f"failed with {len(payload.data)} bytes")
+
+        async def execute_attempt(attempt):
+            calls.append(attempt.provider_name)
+            payload = RetainedPayload()
+            retained.append(weakref.ref(payload))
+            task = asyncio.create_task(fail_after_task_boundary(payload))
+            await asyncio.wait({task})
+            return task.result()
+
+        monkeypatch.setattr(
+            "upstream.should_retry_provider",
+            lambda *_args, **_kwargs: True,
+        )
+        response = await UpstreamRunner(Plan()).run(execute_attempt)
+
+        assert response.status_code == 500
+        assert calls == [f"provider-{index}" for index in range(6)]
+        assert all(reference() is None for reference in retained)
+
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        asyncio.run(run())
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 def test_upstream_runner_treats_precollected_stream_response_as_terminal(
