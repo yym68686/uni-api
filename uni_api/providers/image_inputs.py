@@ -19,10 +19,8 @@ from uni_api.providers.normalization import (
 from uni_api.upstream.response_limits import read_limited_response_body
 
 
-IMAGE_INPUT_MAX_BYTES = 8 * 1024 * 1024
 IMAGE_FETCH_TIMEOUT_SECONDS = 30.0
 _MAX_DATA_URL_HEADER_BYTES = 128
-_MAX_BASE64_BYTES = ((IMAGE_INPUT_MAX_BYTES + 2) // 3) * 4
 _FETCH_MEMORY_MULTIPLIER = 8
 _SUPPORTED_IMAGE_MEDIA_TYPES = {
     "image/jpeg",
@@ -64,8 +62,8 @@ def _data_url_metadata(value: str) -> tuple[str, int, int]:
             detail="Unsupported image media type",
         )
     encoded_bytes = len(value) - comma - 1
-    if encoded_bytes <= 0 or encoded_bytes > _MAX_BASE64_BYTES:
-        raise HTTPException(status_code=413, detail="Image input is too large")
+    if encoded_bytes <= 0:
+        raise HTTPException(status_code=400, detail="Invalid image base64")
     if encoded_bytes % 4 == 1:
         raise HTTPException(status_code=400, detail="Invalid image base64")
     return media_type, comma + 1, encoded_bytes
@@ -84,19 +82,13 @@ async def _extract_and_validate_image_base64_payload(
         inspection = await inspect_base64_chunks(
             data_url,
             start_index=encoded_start,
-            max_encoded_chars=_MAX_BASE64_BYTES,
-            max_decoded_bytes=IMAGE_INPUT_MAX_BYTES,
+            max_encoded_chars=None,
+            max_decoded_bytes=None,
             prefix_bytes=16,
             collect_encoded_payload=collect_encoded_payload,
         )
     except ChunkedBase64Error as exc:
-        status_code = 413 if "too large" in str(exc) else 400
-        detail = (
-            "Image input is too large"
-            if status_code == 413
-            else "Invalid image base64"
-        )
-        raise HTTPException(status_code=status_code, detail=detail) from exc
+        raise HTTPException(status_code=400, detail="Invalid image base64") from exc
     detected = _detect_image_media_type(inspection.prefix)
     if detected is None or detected != media_type:
         raise HTTPException(
@@ -129,26 +121,15 @@ async def _fetch_image_data_url(
                             status_code=400,
                             detail="Unable to fetch image URL",
                         )
-                    content_length = response.headers.get("content-length")
-                    if content_length:
-                        try:
-                            declared_length = int(content_length)
-                        except (TypeError, ValueError):
-                            declared_length = 0
-                        if declared_length > IMAGE_INPUT_MAX_BYTES:
-                            raise HTTPException(
-                                status_code=413,
-                                detail="Image input is too large",
-                            )
                     limited = await read_limited_response_body(
                         response,
-                        max_bytes=IMAGE_INPUT_MAX_BYTES,
                         reserve_bytes=(
                             reservation.reserve
                             if reservation is not None
                             else None
                         ),
                         reservation_multiplier=_FETCH_MEMORY_MULTIPLIER,
+                        resource_governed=True,
                     )
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=408, detail="Image fetch timed out") from exc
@@ -160,8 +141,8 @@ async def _fetch_image_data_url(
             detail="Unable to fetch image URL",
         ) from exc
 
-    if limited.truncated or not limited.body:
-        raise HTTPException(status_code=413, detail="Image input is too large")
+    if not limited.body:
+        raise HTTPException(status_code=400, detail="Unable to fetch image URL")
     body = limited.body
     media_type = _detect_image_media_type(body[:16])
     if media_type is None:
@@ -218,7 +199,7 @@ async def build_image_message(
     image_url: str,
     engine: str | None = None,
 ) -> dict[str, Any]:
-    """Build a provider image part without unbounded download/PIL expansion."""
+    """Build a provider image part under request resource admission."""
 
     if not isinstance(image_url, str) or not image_url:
         raise HTTPException(status_code=400, detail="Image URL is required")

@@ -121,15 +121,31 @@ async def read_limited_response_body(
     max_bytes: int | None = None,
     reserve_bytes: Callable[[int], Awaitable[Any]] | None = None,
     reservation_multiplier: int = 1,
+    resource_governed: bool = False,
 ) -> LimitedResponseBody:
     """Incrementally read a response body without an unbounded ``aread``.
 
-    This is intended for diagnostics/error bodies, not successful payloads.
-    Once the limit is crossed the upstream response is closed immediately.
+    By default this is intended for diagnostics/error bodies and closes the
+    response when the configured limit is crossed.  ``resource_governed``
+    removes the static byte ceiling; callers can instead use ``reserve_bytes``
+    to admit every retained chunk against current runtime resources.
     """
 
-    limit = upstream_error_body_max_bytes() if max_bytes is None else int(max_bytes)
-    if limit <= 0:
+    if resource_governed and max_bytes is not None:
+        raise ValueError(
+            "max_bytes cannot be combined with resource_governed"
+        )
+    if resource_governed and reserve_bytes is None:
+        raise ValueError(
+            "resource_governed requires a reserve_bytes callback"
+        )
+    if resource_governed:
+        limit = None
+    elif max_bytes is None:
+        limit = upstream_error_body_max_bytes()
+    else:
+        limit = int(max_bytes)
+    if limit is not None and limit <= 0:
         raise ValueError("max_bytes must be positive")
     if reservation_multiplier <= 0:
         raise ValueError("reservation_multiplier must be positive")
@@ -139,8 +155,8 @@ async def read_limited_response_body(
     ):
         content = bytes(getattr(response, "content", b""))
         return LimitedResponseBody(
-            body=content[:limit],
-            truncated=len(content) > limit,
+            body=content if limit is None else content[:limit],
+            truncated=limit is not None and len(content) > limit,
             observed_bytes_at_least=len(content),
         )
     headers = getattr(response, "headers", None)
@@ -199,13 +215,17 @@ async def read_limited_response_body(
     async def retain(decoded: bytes) -> bool:
         nonlocal observed, truncated
         observed += len(decoded)
-        remaining = limit - len(body)
-        retained = decoded[: max(0, remaining)]
+        remaining = None if limit is None else limit - len(body)
+        retained = (
+            decoded
+            if remaining is None
+            else decoded[: max(0, remaining)]
+        )
         if retained and reserve_bytes is not None:
             await reserve_bytes(len(retained) * reservation_multiplier)
         if retained:
             body.extend(retained)
-        if len(decoded) > remaining:
+        if remaining is not None and len(decoded) > remaining:
             truncated = True
             return False
         return True
@@ -219,6 +239,7 @@ async def read_limited_response_body(
             raw_observed += len(raw)
             if (
                 decompressor is not None
+                and limit is not None
                 and raw_observed
                 > limit + _ENCODED_OVERHEAD_ALLOWANCE_BYTES
             ):
@@ -242,7 +263,9 @@ async def read_limited_response_body(
                     while pending and not truncated:
                         max_output = min(
                             _DECODE_CHUNK_BYTES,
-                            max(1, limit - len(body) + 1),
+                            max(1, limit - len(body) + 1)
+                            if limit is not None
+                            else _DECODE_CHUNK_BYTES,
                         )
                         previous_pending = len(pending)
                         # zlib work is CPU-bound.  More importantly, max_output
@@ -282,7 +305,9 @@ async def read_limited_response_body(
                 while True:
                     max_output = min(
                         _DECODE_CHUNK_BYTES,
-                        max(1, limit - len(body) + 1),
+                        max(1, limit - len(body) + 1)
+                        if limit is not None
+                        else _DECODE_CHUNK_BYTES,
                     )
                     tail = await _run_response_cpu(
                         decompressor.flush,
@@ -302,7 +327,7 @@ async def read_limited_response_body(
         await close_response()
         raise
 
-    if truncated and observed <= limit:
+    if truncated and limit is not None and observed <= limit:
         # We may stop because encoded input itself crossed the hard cap before
         # the decoder produced another byte.
         observed = limit + 1

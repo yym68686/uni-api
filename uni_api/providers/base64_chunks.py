@@ -56,18 +56,21 @@ def predicted_decoded_base64_bytes(value: str) -> int:
 async def iter_strict_base64_decoded_chunks(
     value: str,
     *,
-    max_encoded_chars: int,
-    max_decoded_bytes: int,
+    max_encoded_chars: int | None,
+    max_decoded_bytes: int | None,
     start_index: int = 0,
 ) -> AsyncIterator[bytes]:
-    """Strictly decode bounded base64 without one long GIL-holding call."""
+    """Strictly decode base64 in bounded work chunks."""
 
     payload_length = len(value) - start_index if isinstance(value, str) else -1
     if (
         not isinstance(value, str)
         or start_index < 0
         or payload_length <= 0
-        or payload_length > max_encoded_chars
+        or (
+            max_encoded_chars is not None
+            and payload_length > max_encoded_chars
+        )
         or payload_length % 4 == 1
     ):
         raise ChunkedBase64Error("invalid or oversized base64 payload")
@@ -89,7 +92,10 @@ async def iter_strict_base64_decoded_chunks(
             decode_chunk += "=" * ((-len(decode_chunk)) % 4)
         decoded_chunk = await run_json_cpu(_strict_decode_chunk, decode_chunk)
         total_decoded += len(decoded_chunk)
-        if total_decoded > max_decoded_bytes:
+        if (
+            max_decoded_bytes is not None
+            and total_decoded > max_decoded_bytes
+        ):
             decoded_chunk = None
             raise ChunkedBase64Error("decoded base64 payload is too large")
         yield decoded_chunk
@@ -99,8 +105,8 @@ async def iter_strict_base64_decoded_chunks(
 async def inspect_base64_chunks(
     value: str,
     *,
-    max_encoded_chars: int,
-    max_decoded_bytes: int,
+    max_encoded_chars: int | None,
+    max_decoded_bytes: int | None,
     prefix_bytes: int = 0,
     collect_encoded_payload: bool = False,
     start_index: int = 0,

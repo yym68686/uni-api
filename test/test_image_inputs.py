@@ -8,15 +8,13 @@ from fastapi import HTTPException
 
 from uni_api.admission import (
     RequestAdmissionController,
+    UpstreamResponseBudgetExhausted,
     bind_request_admission_lease,
     reset_request_admission_lease,
 )
 import uni_api.providers.image_inputs as image_inputs
 from core.utils import gemini_audio_inline_data_to_wav_base64
-from uni_api.providers.image_inputs import (
-    IMAGE_INPUT_MAX_BYTES,
-    build_image_message,
-)
+from uni_api.providers.image_inputs import build_image_message
 from uni_api.providers.normalization import (
     GEMINI_THOUGHT_SIGNATURE_MAX_BYTES,
     GeminiThoughtSignatureTooLarge,
@@ -25,6 +23,9 @@ from uni_api.providers.normalization import (
     gemini_thought_signature_cache_snapshot,
     normalize_gemini_parts,
 )
+
+
+_FORMER_FIXED_IMAGE_LIMIT_BYTES = 8 * 1024 * 1024
 
 
 def _data_url(media_type: str, content: bytes) -> str:
@@ -42,7 +43,7 @@ def test_webp_is_validated_and_forwarded_without_pillow_transcoding():
     assert base64.b64decode(message["source"]["data"]) == webp
 
 
-def test_data_url_rejects_declared_type_mismatch_and_encoded_oversize():
+def test_data_url_rejects_declared_type_mismatch():
     png = b"\x89PNG\r\n\x1a\n" + b"payload"
 
     async def mismatch():
@@ -52,36 +53,18 @@ def test_data_url_rejects_declared_type_mismatch_and_encoded_oversize():
         asyncio.run(mismatch())
     assert rejected_type.value.status_code == 400
 
-    oversized = "data:image/png;base64," + "A" * (
-        ((IMAGE_INPUT_MAX_BYTES + 2) // 3) * 4 + 1
-    )
 
-    async def too_large():
-        await build_image_message(oversized, "gpt")
-
-    with pytest.raises(HTTPException) as rejected_size:
-        asyncio.run(too_large())
-    assert rejected_size.value.status_code == 413
-
-
-def test_data_url_strictly_validates_full_base64_and_exact_decoded_limit():
-    exact = b"\x89PNG\r\n\x1a\n" + b"x" * (IMAGE_INPUT_MAX_BYTES - 8)
-    exact_url = _data_url("image/png", exact)
+def test_data_url_accepts_image_above_former_fixed_limit():
+    image = b"\x89PNG\r\n\x1a\n" + b"x" * _FORMER_FIXED_IMAGE_LIMIT_BYTES
+    image_url = _data_url("image/png", image)
 
     async def accepted():
-        return await build_image_message(exact_url, "gpt")
+        return await build_image_message(image_url, "gpt")
 
-    assert asyncio.run(accepted())["image_url"]["url"] is exact_url
+    assert asyncio.run(accepted())["image_url"]["url"] is image_url
 
-    one_too_many = exact + b"x"
 
-    async def rejected_decoded_size():
-        await build_image_message(_data_url("image/png", one_too_many), "gpt")
-
-    with pytest.raises(HTTPException) as rejected_size:
-        asyncio.run(rejected_decoded_size())
-    assert rejected_size.value.status_code == 413
-
+def test_data_url_strictly_validates_full_base64():
     valid_small = _data_url("image/png", b"\x89PNG\r\n\x1a\n" + b"payload")
     comma = valid_small.index(",")
     corrupted = valid_small[: comma + 12] + "!!!!" + valid_small[comma + 16 :]
@@ -139,7 +122,24 @@ def test_remote_image_fetch_uses_explicit_30_second_httpx_timeout(monkeypatch):
     monkeypatch.setattr(image_inputs.httpx, "AsyncClient", client_factory)
 
     async def run():
-        return await build_image_message("https://image.example/small.png", "gpt")
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024 * 1024,
+            body_budget_bytes=1024 * 1024,
+            max_response_bytes=1024 * 1024,
+        )
+        lease = await controller.acquire()
+        token = bind_request_admission_lease(lease)
+        try:
+            return await build_image_message(
+                "https://image.example/small.png",
+                "gpt",
+            )
+        finally:
+            reset_request_admission_lease(token)
+            await lease.release()
 
     message = asyncio.run(run())
 
@@ -174,7 +174,24 @@ def test_remote_image_fetch_total_deadline_still_maps_to_408(monkeypatch):
     monkeypatch.setattr(image_inputs, "IMAGE_FETCH_TIMEOUT_SECONDS", 0.01)
 
     async def run():
-        await build_image_message("https://image.example/slow.png", "gpt")
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024 * 1024,
+            body_budget_bytes=1024 * 1024,
+            max_response_bytes=1024 * 1024,
+        )
+        lease = await controller.acquire()
+        token = bind_request_admission_lease(lease)
+        try:
+            await build_image_message(
+                "https://image.example/slow.png",
+                "gpt",
+            )
+        finally:
+            reset_request_admission_lease(token)
+            await lease.release()
 
     with pytest.raises(HTTPException) as rejected:
         asyncio.run(run())
@@ -182,8 +199,10 @@ def test_remote_image_fetch_total_deadline_still_maps_to_408(monkeypatch):
     assert rejected.value.status_code == 408
 
 
-def test_remote_compression_expansion_is_stopped_at_decoded_limit(monkeypatch):
-    decoded = b"\x89PNG\r\n\x1a\n" + b"x" * IMAGE_INPUT_MAX_BYTES
+def test_remote_image_above_former_limit_is_governed_by_admission(monkeypatch):
+    decoded = (
+        b"\x89PNG\r\n\x1a\n" + b"x" * _FORMER_FIXED_IMAGE_LIMIT_BYTES
+    )
     compressed = gzip.compress(decoded)
 
     class CompressedStream(httpx.AsyncByteStream):
@@ -209,11 +228,84 @@ def test_remote_compression_expansion_is_stopped_at_decoded_limit(monkeypatch):
     monkeypatch.setattr(image_inputs.httpx, "AsyncClient", client_factory)
 
     async def run():
-        await build_image_message("https://image.example/large.png", "gpt")
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=1024 * 1024,
+            body_budget_bytes=96 * 1024 * 1024,
+            max_response_bytes=96 * 1024 * 1024,
+        )
+        lease = await controller.acquire()
+        token = bind_request_admission_lease(lease)
+        try:
+            message = await build_image_message(
+                "https://image.example/large.png",
+                "gpt",
+            )
+            assert base64.b64decode(
+                message["image_url"]["url"].partition(",")[2]
+            ) == decoded
+            assert controller.snapshot()["reserved_response_bytes"] > 0
+        finally:
+            reset_request_admission_lease(token)
+            await lease.release()
+        assert controller.snapshot()["reserved_response_bytes"] == 0
 
-    with pytest.raises(HTTPException) as rejected:
-        asyncio.run(run())
-    assert rejected.value.status_code == 413
+    asyncio.run(run())
+
+
+def test_remote_image_stops_when_dynamic_admission_rejects(monkeypatch):
+    decoded = b"\x89PNG\r\n\x1a\n" + b"x" * (128 * 1024)
+    compressed = gzip.compress(decoded)
+
+    class CompressedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield compressed
+
+        async def aclose(self):
+            return None
+
+    async def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=CompressedStream(),
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(**kwargs)
+
+    monkeypatch.setattr(image_inputs.httpx, "AsyncClient", client_factory)
+
+    async def run():
+        controller = RequestAdmissionController(
+            capacity=1,
+            waiter_limit=0,
+            wait_timeout_seconds=1,
+            max_body_bytes=64 * 1024,
+            body_budget_bytes=256 * 1024,
+            max_response_bytes=256 * 1024,
+        )
+        lease = await controller.acquire()
+        token = bind_request_admission_lease(lease)
+        try:
+            with pytest.raises(UpstreamResponseBudgetExhausted) as rejected:
+                await build_image_message(
+                    "https://image.example/resource-pressure.png",
+                    "gpt",
+                )
+            assert rejected.value.status_code == 503
+            assert rejected.value.local_admission_rejection is True
+        finally:
+            reset_request_admission_lease(token)
+            await lease.release()
+        assert controller.snapshot()["reserved_response_bytes"] == 0
+
+    asyncio.run(run())
 
 
 def test_gemini_signature_cache_is_bounded_by_entry_and_total_bytes():
@@ -295,8 +387,8 @@ def test_attacker_sized_audio_mime_rate_is_ignored_without_generic_failure():
     asyncio.run(run())
 
 
-def test_four_maximum_image_validations_do_not_monopolize_event_loop():
-    image = b"\x89PNG\r\n\x1a\n" + b"x" * (IMAGE_INPUT_MAX_BYTES - 8)
+def test_four_large_image_validations_do_not_monopolize_event_loop():
+    image = b"\x89PNG\r\n\x1a\n" + b"x" * (8 * 1024 * 1024 - 8)
     url = _data_url("image/png", image)
 
     async def run():

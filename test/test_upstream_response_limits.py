@@ -98,6 +98,50 @@ def test_gzip_body_is_decoded_in_bounded_reserved_chunks():
     asyncio.run(scenario())
 
 
+def test_resource_governed_body_has_no_static_byte_ceiling():
+    async def scenario():
+        payload = b"a" * (300 * 1024)
+        compressed = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+        encoded = compressed.compress(payload) + compressed.flush()
+        response = _RawChunkedResponse(
+            [encoded],
+            content_encoding="gzip",
+        )
+        reservations = []
+
+        async def reserve(size):
+            reservations.append(size)
+
+        result = await read_limited_response_body(
+            response,
+            reserve_bytes=reserve,
+            resource_governed=True,
+        )
+
+        assert result.body == payload
+        assert result.truncated is False
+        assert sum(reservations) == len(payload)
+        assert max(reservations) <= 64 * 1024
+        assert response.closed == 0
+
+    asyncio.run(scenario())
+
+
+def test_resource_governed_body_requires_admission_callback():
+    async def scenario():
+        response = _ChunkedResponse([b"payload"])
+        with pytest.raises(
+            ValueError,
+            match="requires a reserve_bytes callback",
+        ):
+            await read_limited_response_body(
+                response,
+                resource_governed=True,
+            )
+
+    asyncio.run(scenario())
+
+
 def test_incompressible_gzip_at_exact_decoded_limit_is_not_false_truncated():
     async def scenario():
         payload = random.Random(7).randbytes(100_000)
