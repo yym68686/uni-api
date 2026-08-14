@@ -9,7 +9,10 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
+use crate::codex_oauth::CodexOAuthManager;
+use crate::config::RuntimeConfigPublisher;
 use crate::idempotency::RequestHasher;
+use crate::persistence::Persistence;
 use crate::request_spool::{RequestSpool, SpoolFailure, SpoolManager, SpoolObservation};
 use crate::resources::{CapacityFailure, ResourceGovernor};
 use crate::responses;
@@ -28,10 +31,14 @@ pub struct AppState {
     pub backend_client: reqwest::Client,
     upstream_clients: Arc<Mutex<HashMap<ClientKey, reqwest::Client>>>,
     resource_governor: ResourceGovernor,
-    request_spool: SpoolManager,
+    pub(crate) request_spool: SpoolManager,
     idempotency: idempotency::Coordinator,
     responses_data_plane_enabled: bool,
+    pub python_compat_enabled: bool,
+    pub persistence: Persistence,
+    pub config_publisher: RuntimeConfigPublisher,
     pub native_responses_config: NativeConfigStore,
+    pub codex_oauth: CodexOAuthManager,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -41,7 +48,13 @@ struct ClientKey {
 }
 
 impl AppState {
-    pub fn new(backend_origin: String, control_token: String) -> Result<Self, String> {
+    pub fn new(
+        backend_origin: String,
+        control_token: String,
+        python_compat_enabled: bool,
+        persistence: Persistence,
+        config_publisher: RuntimeConfigPublisher,
+    ) -> Result<Self, String> {
         let backend_client = reqwest::Client::builder()
             .http1_only()
             .pool_max_idle_per_host(256)
@@ -58,7 +71,11 @@ impl AppState {
             request_spool,
             idempotency: idempotency::Coordinator::new(),
             responses_data_plane_enabled: env_bool("UNI_API_RUST_RESPONSES_DATA_PLANE", true),
+            python_compat_enabled,
+            persistence,
+            config_publisher,
             native_responses_config: NativeConfigStore::new(),
+            codex_oauth: CodexOAuthManager::new(),
         })
     }
 
@@ -102,13 +119,32 @@ impl AppState {
 }
 
 pub async fn handler(State(state): State<AppState>, request: Request) -> Response<Body> {
+    let request = match crate::request_decompression::decode(request).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let path = request.uri().path().to_owned();
     if path.starts_with(INTERNAL_PREFIX) {
         return json_error(StatusCode::NOT_FOUND, "Not found");
     }
+    let native_method = request.method().clone();
+    let native_path = path.clone();
+    let native_uri = request.uri().clone();
+    let native_headers = request.headers().clone();
+    if let Some(response) = crate::native_api::handle(
+        &state,
+        &native_method,
+        &native_uri,
+        &native_path,
+        &native_headers,
+    )
+    .await
+    {
+        return response;
+    }
     let use_rust_responses = state.responses_data_plane_enabled
         && request.method() == Method::POST
-        && path == "/v1/responses";
+        && matches!(path.as_str(), "/v1/responses" | "/v1/responses/compact");
     let resource_wait = if path == "/healthz" {
         Duration::ZERO
     } else {
@@ -236,6 +272,26 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
             None => None,
         };
+        if state
+            .native_responses_config
+            .moderation_enabled(&parts.headers)
+            .await
+            .unwrap_or(false)
+        {
+            if let Ok(payload) = storage.parse_json().await {
+                if let Some(text) = crate::generic_api::moderation_text(&payload) {
+                    if let Err(response) =
+                        crate::generic_api::run_moderation_preflight(&state, &parts.headers, &text)
+                            .await
+                    {
+                        if let Some(owner) = owner {
+                            owner.release().await;
+                        }
+                        return response;
+                    }
+                }
+            }
+        }
         let native_json_memory_bytes = observation.body_bytes.saturating_mul(
             std::env::var("RUST_RESPONSES_JSON_MEMORY_MULTIPLIER")
                 .ok()
@@ -258,10 +314,13 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
         };
         match prepare_native_request(
             &state.native_responses_config,
+            state.codex_oauth.clone(),
+            state.persistence.clone(),
             &parts,
             &storage,
             &observation,
             native_memory_reservation,
+            &path,
         )
         .await
         {
@@ -275,6 +334,15 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
                 return response;
             }
             NativePreparation::Fallback => {}
+        }
+        if !state.python_compat_enabled {
+            if let Some(owner) = owner {
+                owner.release().await;
+            }
+            return json_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "Request is not supported by the Rust runtime",
+            );
         }
         let body = match storage.into_body(&observation).await {
             Ok(body) => body,
@@ -313,6 +381,18 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
                 &format!("Python control plane unavailable: {error}"),
             ),
         };
+    }
+    if crate::generic_api::supports(request.method(), &path) {
+        return crate::generic_api::handle(state, request, resource_wait).await;
+    }
+    if crate::native_api::supports_mutation(request.method(), &path) {
+        return crate::native_api::handle_mutation(&state, request).await;
+    }
+    if !state.python_compat_enabled {
+        return json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Route is not supported by the Rust runtime",
+        );
     }
     match proxy_to_backend(&state, request, use_rust_responses, false, None).await {
         Ok((response, session_id)) => {
@@ -431,13 +511,13 @@ fn idempotency_error(
     response
 }
 
-enum RequestBodySpoolError {
+pub(crate) enum RequestBodySpoolError {
     Timeout,
     Read,
     Spool(SpoolFailure),
 }
 
-async fn read_spooled_body(
+pub(crate) async fn read_spooled_body(
     body: Body,
     manager: &SpoolManager,
     request_hasher: Option<RequestHasher>,

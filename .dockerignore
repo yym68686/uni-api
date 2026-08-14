@@ -12,6 +12,9 @@ uni_api/_uni_api_native*.so
 *.jpg
 *.json
 !vercel.json
+!uni_api/
+!uni_api/api/
+!uni_api/api/codex_models_pro_0_144_0.json
 # *.png
 *.db
 .aider*
@@ -33,6 +36,7 @@ docker-compose.yml
 Dockerfile
 Dockerfile.debug
 *.md
+!README.md
 *.toml
 !pyproject.toml
 !rust/

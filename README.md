@@ -570,6 +570,12 @@ https://linux.do/t/topic/218738
 
 ## Docker local deployment
 
+The default image runs the complete API in the Rust runtime and does not start
+a Python worker. Mount `api.yaml` (or set `CONFIG_URL`) as before. To build the
+temporary Python compatibility image during migration or rollback, use
+`docker build --target legacy-runtime ...`; that target sets
+`UNI_API_RUNTIME=hybrid`.
+
 Start the container
 
 ```bash

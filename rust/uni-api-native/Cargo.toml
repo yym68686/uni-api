@@ -14,19 +14,26 @@ crate-type = ["cdylib"]
 axum = "=0.8.4"
 base64 = "=0.22.1"
 bytes = "=1.10.1"
+crc32fast = "=1.5.0"
 futures-util = "=0.3.31"
+hmac = "=0.12.1"
 hyper-rustls = { version = "=0.27.7", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
 libc = "=0.2.189"
 memchr = "2.7.4"
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 reqwest = { version = "=0.12.22", default-features = false, features = ["json", "rustls-tls-webpki-roots", "socks", "stream"] }
+ring = "=0.17.14"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
 serde = { version = "=1.0.219", features = ["derive"] }
 serde_json = "=1.0.142"
+serde_yaml = { package = "serde_yaml", version = "=0.9.34-deprecated" }
 sha2 = "=0.10.9"
 tokio = { version = "=1.47.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = "=0.7.13"
 tokio-stream = "=0.1.17"
 tokio-util = { version = "=0.7.16", features = ["io"] }
 url = "=2.5.4"
+zstd = "=0.13.3"
 
 [profile.release]
 codegen-units = 1

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +16,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
+use crate::codex_oauth::CodexOAuthManager;
+use crate::persistence::{ChannelStat, Persistence, RequestStat};
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
 use crate::responses::{Plan, UNLIMITED_SSE_EVENT_BYTES};
@@ -26,6 +29,7 @@ const DEFAULT_MAX_PRECOMMIT_BYTES: usize = 8 * 1024 * 1024 + 128 * 266;
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal";
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static SCHEDULING_NONCE: AtomicU64 = AtomicU64::new(1);
 
 type RouteKey = (String, String);
 type RouteFailureHistory = HashMap<RouteKey, VecDeque<tokio::time::Instant>>;
@@ -47,6 +51,7 @@ pub struct NativeConfigStore {
     channel_cooldowns: Arc<Mutex<HashMap<(String, String), tokio::time::Instant>>>,
     route_failures: Arc<Mutex<RouteFailureHistory>>,
     client_windows: Arc<Mutex<RateWindows>>,
+    routing_cursors: Arc<Mutex<HashMap<(String, String), usize>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,13 +59,13 @@ struct RawSnapshot {
     schema_version: u64,
     revision: String,
     #[serde(default)]
-    database_disabled: bool,
-    #[serde(default)]
     preferences: Map<String, Value>,
     #[serde(default)]
     api_keys: Vec<RawApiKey>,
     #[serde(default)]
     providers: Vec<RawProvider>,
+    #[serde(default)]
+    api_config: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,8 +79,6 @@ struct RawApiKey {
     weights: Map<String, Value>,
     #[serde(default)]
     preferences: Map<String, Value>,
-    #[serde(default)]
-    native_paid_state_safe: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +87,22 @@ struct RawProvider {
     base_url: String,
     engine: Option<String>,
     api: Value,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    private_key: Option<String>,
+    #[serde(default)]
+    client_email: Option<String>,
+    #[serde(default)]
+    aws_access_key: Option<String>,
+    #[serde(default)]
+    aws_secret_key: Option<String>,
+    #[serde(default)]
+    aws_session_token: Option<String>,
+    #[serde(default)]
+    cf_account_id: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
     #[serde(default)]
     models: HashMap<String, String>,
     #[serde(default)]
@@ -97,47 +116,55 @@ struct RawProvider {
 }
 
 #[derive(Clone)]
-struct Snapshot {
-    revision: Arc<str>,
-    database_disabled: bool,
-    preferences: Arc<Map<String, Value>>,
-    api_keys: Arc<HashMap<String, Arc<ApiKey>>>,
-    providers: Arc<Vec<Arc<Provider>>>,
-    providers_by_name: Arc<HashMap<String, Arc<Provider>>>,
+pub(crate) struct Snapshot {
+    pub(crate) revision: Arc<str>,
+    pub(crate) preferences: Arc<Map<String, Value>>,
+    pub(crate) api_keys: Arc<HashMap<String, Arc<ApiKey>>>,
+    pub(crate) providers: Arc<Vec<Arc<Provider>>>,
+    pub(crate) providers_by_name: Arc<HashMap<String, Arc<Provider>>>,
+    pub(crate) api_config: Arc<Value>,
 }
 
 #[derive(Clone)]
-struct ApiKey {
-    token: Arc<str>,
-    model_rules: Arc<Vec<String>>,
-    role: Arc<str>,
-    preferences: Arc<Map<String, Value>>,
-    native_paid_state_safe: bool,
-    native_supported: bool,
+pub(crate) struct ApiKey {
+    pub(crate) token: Arc<str>,
+    pub(crate) model_rules: Arc<Vec<String>>,
+    pub(crate) role: Arc<str>,
+    pub(crate) preferences: Arc<Map<String, Value>>,
+    pub(crate) weights: Arc<Map<String, Value>>,
+    pub(crate) native_supported: bool,
 }
 
 #[derive(Clone)]
-struct Provider {
-    name: Arc<str>,
-    base_url: Arc<str>,
-    engine: Arc<str>,
-    api_keys: Arc<Vec<String>>,
-    models: Arc<HashMap<String, String>>,
-    preferences: Arc<Map<String, Value>>,
-    excluded_endpoints: Arc<Vec<String>>,
-    only_request_types: Arc<Vec<String>>,
-    excluded_request_types: Arc<Vec<String>>,
-    cursor: Arc<AtomicUsize>,
+pub(crate) struct Provider {
+    pub(crate) name: Arc<str>,
+    pub(crate) base_url: Arc<str>,
+    pub(crate) engine: Arc<str>,
+    pub(crate) api_keys: Arc<Vec<String>>,
+    pub(crate) project_id: Option<Arc<str>>,
+    pub(crate) private_key: Option<Arc<str>>,
+    pub(crate) client_email: Option<Arc<str>>,
+    pub(crate) aws_access_key: Option<Arc<str>>,
+    pub(crate) aws_secret_key: Option<Arc<str>>,
+    pub(crate) aws_session_token: Option<Arc<str>>,
+    pub(crate) cf_account_id: Option<Arc<str>>,
+    pub(crate) region: Arc<str>,
+    pub(crate) models: Arc<HashMap<String, String>>,
+    pub(crate) preferences: Arc<Map<String, Value>>,
+    pub(crate) excluded_endpoints: Arc<Vec<String>>,
+    pub(crate) only_request_types: Arc<Vec<String>>,
+    pub(crate) excluded_request_types: Arc<Vec<String>>,
+    pub(crate) cursor: Arc<AtomicUsize>,
 }
 
-struct FailedRoute<'a> {
-    provider: &'a Provider,
-    key: &'a str,
-    original_model: &'a str,
-    has_alternative: bool,
-    status: u16,
-    detail: &'a str,
-    force_quota_cooldown: bool,
+pub(crate) struct FailedRoute<'a> {
+    pub(crate) provider: &'a Provider,
+    pub(crate) key: &'a str,
+    pub(crate) original_model: &'a str,
+    pub(crate) has_alternative: bool,
+    pub(crate) status: u16,
+    pub(crate) detail: &'a str,
+    pub(crate) force_quota_cooldown: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -154,11 +181,26 @@ struct NativeAttemptObservation {
     started_at: tokio::time::Instant,
 }
 
-enum ProviderKeySelection {
+pub(crate) enum ProviderKeySelection {
     Selected(String),
     NoProviderKey,
     ChannelCooling,
     AllKeysCooling,
+}
+
+pub(crate) struct ResolvedRoute {
+    pub(crate) providers: Vec<Arc<Provider>>,
+}
+
+pub(crate) struct RouteResolutionError {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthContext {
+    pub(crate) api_key: Arc<ApiKey>,
+    pub(crate) api_key_count: usize,
 }
 
 struct RoutingAttemptEvent<'a> {
@@ -188,12 +230,16 @@ pub enum NativePreparation {
 
 pub struct NativeRoute {
     store: NativeConfigStore,
+    codex_oauth: CodexOAuthManager,
+    persistence: Persistence,
     snapshot: Arc<Snapshot>,
     api_key: Arc<ApiKey>,
     providers: Vec<Arc<Provider>>,
     base_payload: Value,
     request_headers: HeaderMap,
     request_model: String,
+    endpoint: String,
+    wants_compact: bool,
     stream: bool,
     request_id: String,
     request_body_bytes: u64,
@@ -231,6 +277,7 @@ impl NativeConfigStore {
             channel_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             route_failures: Arc::new(Mutex::new(HashMap::new())),
             client_windows: Arc::new(Mutex::new(HashMap::new())),
+            routing_cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -315,6 +362,39 @@ impl NativeConfigStore {
                 base_url: item.base_url.trim().to_owned().into(),
                 engine: item.engine.unwrap_or_else(|| "gpt".into()).into(),
                 api_keys: Arc::new(provider_api_keys(&item.api)),
+                project_id: item
+                    .project_id
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                private_key: item
+                    .private_key
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                client_email: item
+                    .client_email
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                aws_access_key: item
+                    .aws_access_key
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                aws_secret_key: item
+                    .aws_secret_key
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                aws_session_token: item
+                    .aws_session_token
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                cf_account_id: item
+                    .cf_account_id
+                    .filter(|value| !value.trim().is_empty())
+                    .map(Into::into),
+                region: item
+                    .region
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "global".into())
+                    .into(),
                 models: Arc::new(item.models),
                 preferences: Arc::new(item.preferences),
                 excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
@@ -335,8 +415,7 @@ impl NativeConfigStore {
                 if token.is_empty() {
                     return None;
                 }
-                let native_supported =
-                    item.weights.is_empty() && item.model_rules.iter().all(Value::is_string);
+                let native_supported = item.model_rules.iter().all(Value::is_string);
                 let rules = item
                     .model_rules
                     .into_iter()
@@ -349,7 +428,7 @@ impl NativeConfigStore {
                         model_rules: Arc::new(rules),
                         role: item.role.into(),
                         preferences: Arc::new(item.preferences),
-                        native_paid_state_safe: item.native_paid_state_safe,
+                        weights: Arc::new(item.weights),
                         native_supported,
                     }),
                 ))
@@ -357,11 +436,11 @@ impl NativeConfigStore {
             .collect::<HashMap<_, _>>();
         let snapshot = Arc::new(Snapshot {
             revision: raw.revision.into(),
-            database_disabled: raw.database_disabled,
             preferences: Arc::new(raw.preferences),
             api_keys: Arc::new(api_keys),
             providers: Arc::new(providers),
             providers_by_name: Arc::new(providers_by_name),
+            api_config: Arc::new(raw.api_config),
         });
         *self.current.write().await = Some(snapshot.clone());
         eprintln!(
@@ -376,15 +455,349 @@ impl NativeConfigStore {
         Ok(true)
     }
 
-    async fn snapshot(&self) -> Option<Arc<Snapshot>> {
+    pub(crate) async fn snapshot(&self) -> Option<Arc<Snapshot>> {
         self.current.read().await.clone()
     }
 
-    async fn select_provider_key(
+    pub async fn is_ready(&self) -> bool {
+        self.current.read().await.is_some()
+    }
+
+    pub async fn models_for_headers(&self, headers: &HeaderMap) -> Result<Vec<String>, u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let mut models = BTreeSet::new();
+        for rule in api_key.model_rules.iter() {
+            if rule == "all" {
+                for provider in snapshot.providers.iter() {
+                    models.extend(provider.models.keys().cloned());
+                }
+                continue;
+            }
+            if rule.starts_with('<') && rule.ends_with('>') {
+                let model = rule[1..rule.len() - 1].to_owned();
+                if snapshot
+                    .providers
+                    .iter()
+                    .any(|provider| provider.models.contains_key(&model))
+                {
+                    models.insert(model);
+                }
+                continue;
+            }
+            if let Some((provider_name, model_rule)) = rule.split_once('/') {
+                if let Some(provider) = snapshot.providers_by_name.get(provider_name) {
+                    if model_rule == "*" {
+                        models.extend(provider.models.keys().cloned());
+                    } else if provider.models.contains_key(model_rule) {
+                        models.insert(model_rule.to_owned());
+                    }
+                }
+                continue;
+            }
+            if snapshot
+                .providers
+                .iter()
+                .any(|provider| provider.models.contains_key(rule))
+            {
+                models.insert(rule.clone());
+            }
+        }
+        Ok(models.into_iter().collect())
+    }
+
+    pub(crate) async fn authorize(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthContext, RouteResolutionError> {
+        let token = extract_api_key(headers).ok_or_else(|| RouteResolutionError {
+            status: StatusCode::FORBIDDEN,
+            message: "Invalid or missing API Key".into(),
+        })?;
+        let snapshot = self.snapshot().await.ok_or_else(|| RouteResolutionError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Runtime configuration is not ready".into(),
+        })?;
+        let api_key =
+            snapshot
+                .api_keys
+                .get(&token)
+                .cloned()
+                .ok_or_else(|| RouteResolutionError {
+                    status: StatusCode::FORBIDDEN,
+                    message: "Invalid or missing API Key".into(),
+                })?;
+        Ok(AuthContext {
+            api_key,
+            api_key_count: snapshot.api_keys.len(),
+        })
+    }
+
+    pub(crate) async fn moderation_enabled(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<bool, RouteResolutionError> {
+        Ok(self
+            .authorize(headers)
+            .await?
+            .api_key
+            .preferences
+            .get("ENABLE_MODERATION")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    pub async fn runtime_counts(&self) -> (usize, usize, usize) {
+        let Some(snapshot) = self.snapshot().await else {
+            return (0, 0, 0);
+        };
+        let model_count = snapshot
+            .providers
+            .iter()
+            .flat_map(|provider| provider.models.keys())
+            .collect::<BTreeSet<_>>()
+            .len();
+        (
+            snapshot.api_keys.len(),
+            snapshot.providers.len(),
+            model_count,
+        )
+    }
+
+    pub(crate) async fn prices_for_model(&self, model: &str) -> (f64, f64) {
+        self.snapshot()
+            .await
+            .map(|snapshot| model_prices(&snapshot.preferences, model))
+            .unwrap_or((0.3, 1.0))
+    }
+
+    pub async fn api_config(&self) -> Option<Value> {
+        self.snapshot()
+            .await
+            .map(|snapshot| (*snapshot.api_config).clone())
+    }
+
+    pub async fn paid_api_key_states(&self, persistence: &Persistence) -> Value {
+        let Some(snapshot) = self.snapshot().await else {
+            return json!({});
+        };
+        let mut states = Map::new();
+        for item in snapshot
+            .api_config
+            .get("api_keys")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(token) = item.get("api").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(credits) = item.pointer("/preferences/credits").and_then(Value::as_f64) else {
+                continue;
+            };
+            let created_at = item
+                .pointer("/preferences/created_at")
+                .and_then(Value::as_str)
+                .and_then(parse_config_datetime)
+                .unwrap_or_else(|| unix_seconds_i64().saturating_sub(30 * 86_400));
+            let total_cost = persistence
+                .total_cost(token, created_at)
+                .await
+                .unwrap_or(0.0);
+            let all_tokens_info = persistence
+                .token_usage(Some(token), None, Some(created_at), None)
+                .await
+                .ok()
+                .and_then(|value| value.get("usage").cloned())
+                .unwrap_or_else(|| json!([]));
+            states.insert(
+                token.to_owned(),
+                json!({
+                    "credits": credits,
+                    "created_at": created_at,
+                    "all_tokens_info": all_tokens_info,
+                    "total_cost": total_cost,
+                    "enabled": credits == -1.0 || total_cost <= credits,
+                }),
+            );
+        }
+        Value::Object(states)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resolve_route(
+        &self,
+        persistence: &Persistence,
+        headers: &HeaderMap,
+        request_model: &str,
+        endpoint: &str,
+        request_body_bytes: u64,
+        request_type: Option<&str>,
+        admit_rate: bool,
+    ) -> Result<ResolvedRoute, RouteResolutionError> {
+        let snapshot = self.snapshot().await.ok_or_else(|| RouteResolutionError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Runtime configuration is not ready".into(),
+        })?;
+        let token = extract_api_key(headers).ok_or_else(|| RouteResolutionError {
+            status: StatusCode::FORBIDDEN,
+            message: "Invalid or missing API Key".into(),
+        })?;
+        let api_key =
+            snapshot
+                .api_keys
+                .get(&token)
+                .cloned()
+                .ok_or_else(|| RouteResolutionError {
+                    status: StatusCode::FORBIDDEN,
+                    message: "Invalid or missing API Key".into(),
+                })?;
+        if !api_key.native_supported {
+            return Err(RouteResolutionError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "API key contains an unsupported model rule".into(),
+            });
+        }
+        self.ensure_paid_balance(persistence, &api_key).await?;
+        let global_rules = parse_rate_limits(snapshot.preferences.get("rate_limit"), None)
+            .ok_or_else(|| RouteResolutionError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "Invalid global rate-limit configuration".into(),
+            })?;
+        let client_rules =
+            parse_rate_limits(api_key.preferences.get("rate_limit"), Some(request_model))
+                .ok_or_else(|| RouteResolutionError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Invalid client rate-limit configuration".into(),
+                })?;
+        if admit_rate
+            && (!self.admit_rate("__global__", &global_rules).await
+                || !self
+                    .admit_rate(&format!("client:{}", api_key.token), &client_rules)
+                    .await)
+        {
+            return Err(RouteResolutionError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "Too many requests".into(),
+            });
+        }
+        let providers = matching_providers(
+            &snapshot,
+            &api_key,
+            request_model,
+            request_body_bytes,
+            request_type,
+            endpoint.trim_end_matches('/'),
+        )
+        .map_err(|_| RouteResolutionError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: "Nested runtime provider is not available".into(),
+        })?;
+        if providers.is_empty() {
+            return Err(RouteResolutionError {
+                status: StatusCode::NOT_FOUND,
+                message: format!("No available providers at the moment: {request_model}"),
+            });
+        }
+        let providers = self
+            .schedule_providers(&api_key, request_model, providers)
+            .await;
+        Ok(ResolvedRoute { providers })
+    }
+
+    pub(crate) async fn ensure_paid_balance(
+        &self,
+        persistence: &Persistence,
+        api_key: &ApiKey,
+    ) -> Result<(), RouteResolutionError> {
+        if persistence.disabled() {
+            return Ok(());
+        }
+        let Some(credits) = api_key.preferences.get("credits").and_then(Value::as_f64) else {
+            return Ok(());
+        };
+        if credits == -1.0 {
+            return Ok(());
+        }
+        let created_at = api_key
+            .preferences
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_config_datetime)
+            .unwrap_or_else(|| unix_seconds_i64().saturating_sub(30 * 86_400));
+        let total_cost = persistence
+            .total_cost(api_key.token.as_ref(), created_at)
+            .await
+            .map_err(|error| RouteResolutionError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("Unable to verify API-key balance: {error}"),
+            })?;
+        if total_cost > credits {
+            return Err(RouteResolutionError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "Balance is insufficient, please check your account.".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn schedule_providers(
+        &self,
+        api_key: &ApiKey,
+        request_model: &str,
+        providers: Vec<Arc<Provider>>,
+    ) -> Vec<Arc<Provider>> {
+        if providers.len() <= 1 {
+            return providers;
+        }
+        let algorithm = api_key
+            .preferences
+            .get("SCHEDULING_ALGORITHM")
+            .and_then(Value::as_str)
+            .unwrap_or("fixed_priority")
+            .trim()
+            .to_ascii_lowercase();
+        let mut scheduled = weighted_provider_sequence(
+            &providers,
+            request_model,
+            api_key.weights.as_ref(),
+            &algorithm,
+        );
+        if scheduled.is_empty() {
+            scheduled = providers;
+        }
+        if algorithm == "random" {
+            shuffle_providers(
+                &mut scheduled,
+                scheduling_seed(&api_key.token, request_model),
+            );
+            return scheduled;
+        }
+        if algorithm == "fixed_priority" || scheduled.len() <= 1 {
+            return scheduled;
+        }
+        let mut cursors = self.routing_cursors.lock().await;
+        let cursor = cursors
+            .entry((api_key.token.to_string(), request_model.to_owned()))
+            .or_insert(0);
+        let start = *cursor % scheduled.len();
+        *cursor = (start + 1) % scheduled.len();
+        scheduled.rotate_left(start);
+        scheduled
+    }
+
+    pub(crate) async fn select_provider_key(
         &self,
         provider: &Provider,
         original_model: &str,
     ) -> ProviderKeySelection {
+        if provider.api_keys.is_empty()
+            && provider.client_email.is_some()
+            && provider.private_key.is_some()
+        {
+            return ProviderKeySelection::Selected(String::new());
+        }
         if provider.api_keys.is_empty() {
             return ProviderKeySelection::NoProviderKey;
         }
@@ -412,7 +825,7 @@ impl NativeConfigStore {
         ProviderKeySelection::AllKeysCooling
     }
 
-    async fn cool_failed_route(&self, failure: FailedRoute<'_>) {
+    pub(crate) async fn cool_failed_route(&self, failure: FailedRoute<'_>) {
         let FailedRoute {
             provider,
             key,
@@ -496,14 +909,14 @@ impl NativeConfigStore {
         }
     }
 
-    async fn reset_route_failure(&self, provider: &Provider, original_model: &str) {
+    pub(crate) async fn reset_route_failure(&self, provider: &Provider, original_model: &str) {
         self.route_failures
             .lock()
             .await
             .remove(&(provider.name.to_string(), original_model.to_owned()));
     }
 
-    async fn admit_rate(&self, bucket: &str, rules: &[(usize, u64)]) -> bool {
+    pub(crate) async fn admit_rate(&self, bucket: &str, rules: &[(usize, u64)]) -> bool {
         let now = tokio::time::Instant::now();
         let mut buckets = self.client_windows.lock().await;
         for (limit, seconds) in rules {
@@ -561,7 +974,7 @@ impl NativeRoute {
                 .get(&self.request_model)
                 .ok_or_else(|| "native provider model mapping disappeared".to_owned())?
                 .clone();
-            let provider_key = match self
+            let provider_key_raw = match self
                 .store
                 .select_provider_key(&provider, &original_model)
                 .await
@@ -606,8 +1019,18 @@ impl NativeRoute {
                 });
                 continue;
             }
-            if engine == "codex" && provider_key.contains(',') {
-                return Err("native-codex-oauth-fallback".into());
+            let mut provider_key = provider_key_raw.clone();
+            let mut codex_account_id = None;
+            if engine == "codex" && provider_key_raw.contains(',') {
+                let auth = self
+                    .codex_oauth
+                    .resolve(
+                        &provider_key_raw,
+                        preference_string(&provider.preferences, "proxy").as_deref(),
+                    )
+                    .await?;
+                provider_key = auth.bearer;
+                codex_account_id = auth.account_id;
             }
             let mut payload = self.base_payload.clone();
             compile_payload(
@@ -616,11 +1039,12 @@ impl NativeRoute {
                 &self.request_model,
                 &original_model,
                 &engine,
+                self.wants_compact,
             )?;
             let body = serde_json::to_string(&payload)
                 .map_err(|error| format!("encode native upstream payload: {error}"))?;
             let attempt_id = native_attempt_id(&self.request_id, attempt_number);
-            let headers = build_headers(
+            let mut headers = build_headers(
                 &self.request_headers,
                 &provider,
                 &provider_key,
@@ -629,6 +1053,11 @@ impl NativeRoute {
                 &self.request_id,
                 &attempt_id,
             )?;
+            if let Some(account_id) = codex_account_id {
+                HeaderValue::from_str(&account_id)
+                    .map_err(|_| "Codex account ID is not a valid header".to_owned())?;
+                headers.insert("chatgpt-account-id".into(), account_id);
+            }
             let timeout = resolve_timeouts(
                 &self.snapshot,
                 &provider,
@@ -637,6 +1066,7 @@ impl NativeRoute {
                 &engine,
                 self.stream,
                 self.api_key.role.as_ref(),
+                &self.endpoint,
             );
             self.upstream_attempts = self.upstream_attempts.saturating_add(1);
             let observation = NativeAttemptObservation {
@@ -652,12 +1082,12 @@ impl NativeRoute {
                 started_at: tokio::time::Instant::now(),
             };
             self.last_provider = Some(provider.clone());
-            self.last_provider_key = Some(provider_key);
+            self.last_provider_key = Some(provider_key_raw);
             self.last_original_model = Some(original_model.clone());
             self.last_attempt = Some(observation.clone());
             return Ok(Some(Plan {
                 attempt_id,
-                url: normalize_upstream_url(&provider.base_url, &engine),
+                url: normalize_upstream_url(&provider.base_url, &engine, self.wants_compact),
                 headers,
                 body,
                 proxy: preference_string(&provider.preferences, "proxy")
@@ -714,6 +1144,7 @@ impl NativeRoute {
         self.last_failure_origin = failure_origin(outcome).to_owned();
         let upstream_status = outcome_status_from(outcome, "upstream_status_code", original_status);
         self.emit_upstream_attempt(outcome, upstream_status, false);
+        self.record_current_channel(false);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
@@ -781,6 +1212,7 @@ impl NativeRoute {
             self.last_failure_origin = failure_origin(outcome).to_owned();
         }
         self.emit_upstream_attempt(outcome, upstream_status, success);
+        self.record_current_channel(success);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
@@ -1012,6 +1444,28 @@ impl NativeRoute {
             "snapshot_revision": self.snapshot.revision.to_string(),
             "rust_responses_data_plane": true,
         });
+        let (prompt_tokens, completion_tokens, total_tokens) = usage_tokens(outcome);
+        let (prompt_price, completion_price) =
+            model_prices(&self.snapshot.preferences, &self.request_model);
+        self.persistence.record_request(RequestStat {
+            request_id: self.request_id.clone(),
+            trace_id: trace_id(&self.request_headers, &self.request_id),
+            endpoint: self.endpoint.clone(),
+            client_ip: client_ip(&self.request_headers),
+            process_time: elapsed_ms as f64 / 1000.0,
+            first_response_time: 0.0,
+            provider: final_provider.unwrap_or_default().to_owned(),
+            model: self.request_model.clone(),
+            api_key: self.api_key.token.to_string(),
+            is_flagged: !success || status >= 400,
+            text: detail.chars().take(4096).collect(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            prompt_price,
+            completion_price,
+            timing_spans: summary.to_string(),
+        });
         eprintln!(
             "{}",
             json!({
@@ -1056,6 +1510,95 @@ impl NativeRoute {
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
+
+    fn record_current_channel(&self, success: bool) {
+        let (Some(provider), Some(provider_key)) =
+            (self.last_provider.as_ref(), self.last_provider_key.as_ref())
+        else {
+            return;
+        };
+        self.persistence.record_channel(ChannelStat {
+            request_id: self.request_id.clone(),
+            provider: provider.name.to_string(),
+            model: self.request_model.clone(),
+            api_key: self.api_key.token.to_string(),
+            provider_api_key: provider_key.clone(),
+            success,
+        });
+    }
+}
+
+fn usage_tokens(outcome: &Value) -> (i64, i64, i64) {
+    let usage = outcome.get("usage").filter(|value| value.is_object());
+    let read = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| {
+                usage
+                    .and_then(|value| value.get(*name))
+                    .and_then(Value::as_i64)
+            })
+            .unwrap_or_default()
+    };
+    let prompt = read(&["input_tokens", "prompt_tokens"]);
+    let completion = read(&["output_tokens", "completion_tokens"]);
+    let total = read(&["total_tokens"]);
+    (
+        prompt,
+        completion,
+        total.max(prompt.saturating_add(completion)),
+    )
+}
+
+fn model_prices(preferences: &Map<String, Value>, model: &str) -> (f64, f64) {
+    let prices = preferences.get("model_price").and_then(Value::as_object);
+    let encoded = prices
+        .and_then(|prices| {
+            prices
+                .iter()
+                .find(|(prefix, _)| {
+                    prefix.as_str() != "default" && model.starts_with(prefix.as_str())
+                })
+                .map(|(_, value)| value)
+                .or_else(|| prices.get("default"))
+        })
+        .and_then(|value| value.as_str())
+        .unwrap_or("0.3,1");
+    let mut parts = encoded.split(',').map(str::trim);
+    let prompt = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.3);
+    let completion = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1.0);
+    (prompt, completion)
+}
+
+fn trace_id(headers: &HeaderMap, fallback: &str) -> String {
+    headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split('-').nth(1))
+        .filter(|value| value.len() == 32)
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 fn emit_native_rejection(status: u16, observation: NativeRejectionObservation<'_>) {
@@ -1109,12 +1652,16 @@ fn emit_native_rejection(status: u16, observation: NativeRejectionObservation<'_
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_native_request(
     store: &NativeConfigStore,
+    codex_oauth: CodexOAuthManager,
+    persistence: Persistence,
     parts: &Parts,
     storage: &StoredBody,
     observation: &SpoolObservation,
     memory_reservation: MemoryReservation,
+    endpoint: &str,
 ) -> NativePreparation {
     let Some(snapshot) = store.snapshot().await else {
         return NativePreparation::Fallback;
@@ -1157,21 +1704,14 @@ pub async fn prepare_native_request(
             json!({"error": "Invalid or missing API Key"}),
         ));
     };
-    if !snapshot.database_disabled
-        || !api_key.native_supported
-        || !api_key.native_paid_state_safe
-        || api_key
-            .preferences
-            .get("ENABLE_MODERATION")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || api_key
-            .preferences
-            .get("SCHEDULING_ALGORITHM")
-            .and_then(Value::as_str)
-            .is_some_and(|algorithm| algorithm != "fixed_priority")
-    {
+    if !api_key.native_supported {
         return NativePreparation::Fallback;
+    }
+    if let Err(error) = store.ensure_paid_balance(&persistence, &api_key).await {
+        return NativePreparation::Response(json_response(
+            error.status,
+            json!({"error": error.message}),
+        ));
     }
     let mut payload = match storage.parse_json().await {
         Ok(Value::Object(payload)) => Value::Object(payload),
@@ -1252,6 +1792,8 @@ pub async fn prepare_native_request(
         ));
     }
     let request_type = detect_request_type(object);
+    let normalized_endpoint = endpoint.trim_end_matches('/');
+    let wants_compact = normalized_endpoint == "/v1/responses/compact";
     let stream_value = object.get("stream").cloned();
     let stream = match stream_value.as_ref() {
         None | Some(Value::Null) => false,
@@ -1288,6 +1830,7 @@ pub async fn prepare_native_request(
         &request_model,
         observation.body_bytes,
         request_type,
+        normalized_endpoint,
     ) {
         Ok(providers) if !providers.is_empty() => providers,
         Ok(_) => {
@@ -1309,11 +1852,12 @@ pub async fn prepare_native_request(
         }
         Err(()) => return NativePreparation::Fallback,
     };
+    let providers = store
+        .schedule_providers(&api_key, &request_model, providers)
+        .await;
     if providers.iter().any(|provider| {
         !matches!(provider.engine.as_ref(), "gpt" | "codex")
             || provider.api_keys.is_empty()
-            || (provider.engine.as_ref() == "codex"
-                && provider.api_keys.iter().any(|key| key.contains(',')))
             || (provider.engine.as_ref() == "gpt" && !provider.base_url.contains("v1/responses"))
             || provider_stream_override(provider).is_some_and(|value| value != stream)
     }) {
@@ -1370,12 +1914,16 @@ pub async fn prepare_native_request(
     let retry_count = compute_retry_count(&providers);
     NativePreparation::Ready(NativeRoute {
         store: store.clone(),
+        codex_oauth,
+        persistence,
         snapshot,
         api_key,
         providers,
         base_payload: payload,
         request_headers: parts.headers.clone(),
         request_model,
+        endpoint: normalized_endpoint.to_owned(),
+        wants_compact,
         stream,
         request_id,
         request_body_bytes: observation.body_bytes,
@@ -1407,6 +1955,7 @@ fn matching_providers(
     request_model: &str,
     request_body_bytes: u64,
     request_type: Option<&str>,
+    endpoint: &str,
 ) -> Result<Vec<Arc<Provider>>, ()> {
     let mut matches = Vec::new();
     for rule in api_key.model_rules.iter() {
@@ -1458,17 +2007,201 @@ fn matching_providers(
         }
     }
     matches.retain(|provider| {
-        !provider
-            .excluded_endpoints
-            .iter()
-            .any(|endpoint| endpoint.trim_end_matches('/') == "/v1/responses")
-            && provider_accepts_body(provider, request_body_bytes)
+        !provider.excluded_endpoints.iter().any(|excluded| {
+            excluded
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(endpoint)
+        }) && provider_accepts_body(provider, request_body_bytes)
             && provider_accepts_request_type(provider, request_type)
     });
     Ok(matches)
 }
 
-fn compute_retry_count(providers: &[Arc<Provider>]) -> usize {
+fn weighted_provider_sequence(
+    providers: &[Arc<Provider>],
+    request_model: &str,
+    weights: &Map<String, Value>,
+    algorithm: &str,
+) -> Vec<Arc<Provider>> {
+    let weighted = providers
+        .iter()
+        .filter_map(|provider| {
+            let exact = format!("{}/{request_model}", provider.name);
+            let wildcard = format!("{}/*", provider.name);
+            let weight = weights
+                .get(&exact)
+                .or_else(|| weights.get(&wildcard))
+                .and_then(positive_weight)?;
+            Some((provider.clone(), weight))
+        })
+        .collect::<Vec<_>>();
+    if weighted.len() <= 1 {
+        return providers.to_vec();
+    }
+    match algorithm {
+        "weighted_round_robin" | "smart_round_robin" => smooth_weighted_sequence(&weighted),
+        "lottery" => lottery_sequence(&weighted, scheduling_seed("lottery", request_model)),
+        _ => weighted.into_iter().map(|(provider, _)| provider).collect(),
+    }
+}
+
+fn positive_weight(value: &Value) -> Option<usize> {
+    let weight = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))?;
+    usize::try_from(weight).ok().filter(|value| *value > 0)
+}
+
+fn smooth_weighted_sequence(weighted: &[(Arc<Provider>, usize)]) -> Vec<Arc<Provider>> {
+    let total = weighted
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<usize>()
+        .min(16_384);
+    let mut current = vec![0i64; weighted.len()];
+    let total_weight = weighted
+        .iter()
+        .map(|(_, weight)| i64::try_from(*weight).unwrap_or(i64::MAX / 4))
+        .sum::<i64>()
+        .max(1);
+    let mut sequence = Vec::with_capacity(total);
+    for _ in 0..total {
+        let mut selected = 0usize;
+        let mut selected_current = i64::MIN;
+        let mut selected_configured = 1i64;
+        for (index, (_, weight)) in weighted.iter().enumerate() {
+            let configured = i64::try_from(*weight).unwrap_or(i64::MAX / 4);
+            current[index] = current[index].saturating_add(configured);
+            if selected_current == i64::MIN
+                || current[index].saturating_mul(selected_configured)
+                    > selected_current.saturating_mul(configured)
+            {
+                selected = index;
+                selected_current = current[index];
+                selected_configured = configured;
+            }
+        }
+        sequence.push(weighted[selected].0.clone());
+        current[selected] = current[selected].saturating_sub(total_weight);
+    }
+    sequence
+}
+
+fn lottery_sequence(weighted: &[(Arc<Provider>, usize)], mut seed: u64) -> Vec<Arc<Provider>> {
+    let total = weighted
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<usize>()
+        .min(16_384);
+    let total_weight = weighted
+        .iter()
+        .map(|(_, weight)| *weight as u64)
+        .sum::<u64>()
+        .max(1);
+    let mut sequence = Vec::with_capacity(total);
+    for _ in 0..total {
+        seed = xorshift(seed);
+        let ticket = seed % total_weight;
+        let mut cumulative = 0u64;
+        let selected = weighted
+            .iter()
+            .find(|(_, weight)| {
+                cumulative = cumulative.saturating_add(*weight as u64);
+                ticket < cumulative
+            })
+            .map(|(provider, _)| provider)
+            .unwrap_or(&weighted[0].0);
+        sequence.push(selected.clone());
+    }
+    sequence
+}
+
+fn shuffle_providers(providers: &mut [Arc<Provider>], mut seed: u64) {
+    for index in (1..providers.len()).rev() {
+        seed = xorshift(seed);
+        providers.swap(index, seed as usize % (index + 1));
+    }
+}
+
+fn scheduling_seed(scope: &str, request_model: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(request_model.as_bytes());
+    hasher.update(
+        SCHEDULING_NONCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
+}
+
+fn xorshift(mut value: u64) -> u64 {
+    if value == 0 {
+        value = 0x9e37_79b9_7f4a_7c15;
+    }
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^ (value << 17)
+}
+
+fn unix_seconds_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn parse_config_datetime(value: &str) -> Option<i64> {
+    if let Ok(value) = value.parse::<f64>() {
+        return value.is_finite().then_some(value as i64);
+    }
+    let value = value.trim();
+    let (date, raw_time) = value.split_once('T').or_else(|| value.split_once(' '))?;
+    let (time, offset_seconds) = if let Some(time) = raw_time.strip_suffix('Z') {
+        (time, 0i64)
+    } else if let Some(index) = raw_time
+        .char_indices()
+        .skip(1)
+        .filter(|(_, value)| matches!(value, '+' | '-'))
+        .map(|(index, _)| index)
+        .fold(None, |_, index| Some(index))
+    {
+        let (time, offset) = raw_time.split_at(index);
+        let sign = if offset.starts_with('-') { -1 } else { 1 };
+        let mut parts = offset[1..].split(':');
+        let hours = parts.next()?.parse::<i64>().ok()?;
+        let minutes = parts.next().unwrap_or("0").parse::<i64>().ok()?;
+        (time, sign * (hours * 3600 + minutes * 60))
+    } else {
+        (raw_time, 0i64)
+    };
+    let mut date = date.split('-').map(|value| value.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let mut time = time.split(':');
+    let hour = time.next()?.parse::<i64>().ok()?;
+    let minute = time.next()?.parse::<i64>().ok()?;
+    let second = time.next()?.split('.').next()?.parse::<i64>().ok()?;
+    Some(
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
+            - offset_seconds,
+    )
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_prime + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+pub(crate) fn compute_retry_count(providers: &[Arc<Provider>]) -> usize {
     if providers.is_empty() {
         return 0;
     }
@@ -1553,6 +2286,7 @@ fn compile_payload(
     request_model: &str,
     original_model: &str,
     engine: &str,
+    wants_compact: bool,
 ) -> Result<(), String> {
     let root = payload
         .as_object_mut()
@@ -1572,6 +2306,9 @@ fn compile_payload(
     apply_overrides(root, provider, request_model);
     if engine == "codex" {
         strip_codex_fields(root);
+        if wants_compact {
+            root.remove("store");
+        }
     }
     if normalization_enabled(provider, request_model, original_model) {
         normalize_response_root(root)?;
@@ -1579,7 +2316,11 @@ fn compile_payload(
     Ok(())
 }
 
-fn apply_overrides(root: &mut Map<String, Value>, provider: &Provider, request_model: &str) {
+pub(crate) fn apply_overrides(
+    root: &mut Map<String, Value>,
+    provider: &Provider,
+    request_model: &str,
+) {
     let Some(overrides) = provider
         .preferences
         .get("post_body_parameter_overrides")
@@ -1897,6 +2638,7 @@ struct Timeouts {
     total: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_timeouts(
     snapshot: &Snapshot,
     provider: &Provider,
@@ -1905,6 +2647,7 @@ fn resolve_timeouts(
     engine: &str,
     stream: bool,
     role: &str,
+    endpoint: &str,
 ) -> Timeouts {
     let base = model_timeout(
         provider,
@@ -1914,7 +2657,7 @@ fn resolve_timeouts(
     );
     let context = HashMap::from([
         ("provider", provider.name.as_ref()),
-        ("endpoint", "/v1/responses"),
+        ("endpoint", endpoint),
         ("method", "POST"),
         ("engine", engine),
         ("model", request_model),
@@ -2036,8 +2779,15 @@ fn timeout_value_matches(expected: &Value, actual: &str) -> bool {
         })
 }
 
-fn normalize_upstream_url(base_url: &str, engine: &str) -> String {
+fn normalize_upstream_url(base_url: &str, engine: &str, wants_compact: bool) -> String {
     let base = base_url.trim().trim_end_matches('/');
+    if wants_compact {
+        if base.ends_with("/v1/responses/compact") || base.ends_with("/responses/compact") {
+            return base.to_owned();
+        }
+        let response_url = normalize_upstream_url(base, engine, false);
+        return format!("{response_url}/compact");
+    }
     if engine != "codex" || base.ends_with("/v1/responses") || base.ends_with("/responses") {
         base.to_owned()
     } else {
@@ -2350,7 +3100,7 @@ fn pydantic_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn extract_api_key(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     if let Some(token) = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
@@ -2383,7 +3133,7 @@ fn is_identity_json_request(headers: &HeaderMap) -> bool {
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn request_id(headers: &HeaderMap) -> String {
+pub(crate) fn request_id(headers: &HeaderMap) -> String {
     for name in ["x-request-id", "x-caller-request-id"] {
         if let Some(value) = headers
             .get(name)
@@ -2430,6 +3180,14 @@ mod tests {
             base_url: Arc::from("https://example.com/v1/responses"),
             engine: Arc::from("codex"),
             api_keys: Arc::new(vec!["provider-key".into()]),
+            project_id: None,
+            private_key: None,
+            client_email: None,
+            aws_access_key: None,
+            aws_secret_key: None,
+            aws_session_token: None,
+            cf_account_id: None,
+            region: Arc::from("global"),
             models: Arc::new(HashMap::from([(
                 "gpt-public".into(),
                 "gpt-upstream".into(),
@@ -2445,11 +3203,16 @@ mod tests {
         }
     }
 
+    fn named_provider(name: &str) -> Arc<Provider> {
+        let mut value = provider();
+        value.name = name.to_owned().into();
+        Arc::new(value)
+    }
+
     async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> NativeRoute {
         let store = NativeConfigStore::new();
         let snapshot = Arc::new(Snapshot {
             revision: Arc::from("0".repeat(64)),
-            database_disabled: true,
             preferences: Arc::new(Map::new()),
             api_keys: Arc::new(HashMap::new()),
             providers: Arc::new(vec![provider.clone()]),
@@ -2457,13 +3220,14 @@ mod tests {
                 provider.name.to_string(),
                 provider.clone(),
             )])),
+            api_config: Arc::new(json!({})),
         });
         let api_key = Arc::new(ApiKey {
             token: Arc::from("client-key"),
             model_rules: Arc::new(Vec::new()),
             role: Arc::from("user"),
             preferences: Arc::new(Map::from_iter([("AUTO_RETRY".into(), json!(true))])),
-            native_paid_state_safe: true,
+            weights: Arc::new(Map::new()),
             native_supported: true,
         });
         let (_, memory_reservation) = ResourceGovernor::unconstrained_for_test()
@@ -2472,12 +3236,16 @@ mod tests {
             .unwrap();
         NativeRoute {
             store,
+            codex_oauth: CodexOAuthManager::new(),
+            persistence: Persistence::initialize(true).await.unwrap(),
             snapshot,
             api_key,
             providers: vec![provider.clone(), provider],
             base_payload: json!({"model":"gpt-public","input":"hello","stream":true}),
             request_headers: HeaderMap::new(),
             request_model: "gpt-public".into(),
+            endpoint: "/v1/responses".into(),
+            wants_compact: false,
             stream: true,
             request_id: "request-test".into(),
             request_body_bytes: 64,
@@ -2520,6 +3288,7 @@ mod tests {
             "gpt-public",
             "gpt-upstream",
             "codex",
+            false,
         )
         .unwrap();
         assert_eq!(payload["model"], "gpt-upstream");
@@ -2569,6 +3338,45 @@ mod tests {
             ),
             Some(vec![(5, 1)])
         );
+    }
+
+    #[tokio::test]
+    async fn weighted_round_robin_matches_legacy_sequence_and_rotates_requests() {
+        let providers = vec![named_provider("a"), named_provider("b")];
+        let weights = Map::from_iter([
+            ("a/gpt-public".into(), json!(3)),
+            ("b/gpt-public".into(), json!(1)),
+        ]);
+        let sequence =
+            weighted_provider_sequence(&providers, "gpt-public", &weights, "weighted_round_robin");
+        assert_eq!(
+            sequence
+                .iter()
+                .map(|provider| provider.name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "a", "a"]
+        );
+
+        let api_key = ApiKey {
+            token: "client".into(),
+            model_rules: Arc::new(vec!["all".into()]),
+            role: "client".into(),
+            preferences: Arc::new(Map::from_iter([(
+                "SCHEDULING_ALGORITHM".into(),
+                json!("weighted_round_robin"),
+            )])),
+            weights: Arc::new(weights),
+            native_supported: true,
+        };
+        let store = NativeConfigStore::new();
+        let first = store
+            .schedule_providers(&api_key, "gpt-public", providers.clone())
+            .await;
+        let second = store
+            .schedule_providers(&api_key, "gpt-public", providers)
+            .await;
+        assert_eq!(first[0].name.as_ref(), "a");
+        assert_eq!(second[0].name.as_ref(), "b");
     }
 
     #[test]

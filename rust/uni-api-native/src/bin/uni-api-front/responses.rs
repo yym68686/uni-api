@@ -397,6 +397,14 @@ async fn serve_native_nonstream(
         };
         match send_native_nonstream_attempt(&state, &plan).await {
             Ok((status, mut headers, mut body)) if status.is_success() => {
+                let usage = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("usage")
+                            .filter(|value| value.is_object())
+                            .cloned()
+                    });
                 if plan.normalize_custom_tool_call_ids {
                     if let Ok(mut payload) = serde_json::from_slice::<Value>(&body) {
                         let mut normalizer = ResponsesItemIdNormalizer::default();
@@ -428,14 +436,16 @@ async fn serve_native_nonstream(
                         idempotency::executed_header(&mut headers);
                     }
                 }
-                route
-                    .complete_native(&json!({
-                        "kind": "completed",
-                        "status_code": status.as_u16(),
-                        "upstream_status_code": status.as_u16(),
-                        "downstream_bytes": body.len(),
-                    }))
-                    .await;
+                let mut outcome = json!({
+                    "kind": "completed",
+                    "status_code": status.as_u16(),
+                    "upstream_status_code": status.as_u16(),
+                    "downstream_bytes": body.len(),
+                });
+                if let Some(usage) = usage {
+                    outcome["usage"] = usage;
+                }
+                route.complete_native(&outcome).await;
                 let mut response = Response::new(Body::from(body));
                 *response.status_mut() = status;
                 *response.headers_mut() = headers;

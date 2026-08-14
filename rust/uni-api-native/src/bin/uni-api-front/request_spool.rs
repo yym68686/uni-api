@@ -231,6 +231,7 @@ pub struct RequestSpool {
     pub storage: StoredBody,
 }
 
+#[derive(Clone)]
 pub struct StoredBody {
     path: PathBuf,
     cleanup: Arc<LocalCleanup>,
@@ -268,6 +269,92 @@ impl StoredBody {
         .await
         .map_err(|error| format!("request JSON parser task failed: {error}"))?
     }
+
+    pub fn clone_for_replay(&self) -> Self {
+        self.clone()
+    }
+
+    pub async fn multipart_text_field(
+        &self,
+        content_type: &str,
+        field_name: &str,
+        max_value_bytes: usize,
+    ) -> Result<Option<String>, String> {
+        let boundary = content_type
+            .split(';')
+            .map(str::trim)
+            .find_map(|item| item.strip_prefix("boundary="))
+            .map(|value| value.trim_matches('"').to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "multipart request is missing a boundary".to_owned())?;
+        let path = self.path.clone();
+        let field_name = field_name.to_owned();
+        let marker = format!("name=\"{field_name}\"").into_bytes();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+
+            let mut file = std::fs::File::open(&path)
+                .map_err(|error| format!("open multipart request spool: {error}"))?;
+            let boundary_marker = format!("\r\n--{boundary}").into_bytes();
+            let mut buffer = Vec::with_capacity(16 * 1024);
+            let mut chunk = [0u8; 16 * 1024];
+            let mut field_start = None;
+            loop {
+                let read = file
+                    .read(&mut chunk)
+                    .map_err(|error| format!("read multipart request spool: {error}"))?;
+                if read > 0 {
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                if field_start.is_none() {
+                    if let Some(marker_index) = find_bytes(&buffer, &marker) {
+                        if let Some(relative) = find_bytes(&buffer[marker_index..], b"\r\n\r\n") {
+                            field_start = Some(marker_index + relative + 4);
+                        }
+                    }
+                    if field_start.is_none() && buffer.len() > 128 * 1024 {
+                        let keep = marker.len().saturating_add(8).min(buffer.len());
+                        buffer.drain(..buffer.len() - keep);
+                    }
+                }
+                if let Some(start) = field_start {
+                    if let Some(relative_end) = find_bytes(&buffer[start..], &boundary_marker) {
+                        let value = &buffer[start..start + relative_end];
+                        if value.len() > max_value_bytes {
+                            return Err(format!(
+                                "multipart field {field_name} exceeds {max_value_bytes} bytes"
+                            ));
+                        }
+                        return std::str::from_utf8(value)
+                            .map(|value| Some(value.trim().to_owned()))
+                            .map_err(|error| {
+                                format!("multipart field {field_name} is not UTF-8: {error}")
+                            });
+                    }
+                    if buffer.len().saturating_sub(start) > max_value_bytes + boundary_marker.len()
+                    {
+                        return Err(format!(
+                            "multipart field {field_name} exceeds {max_value_bytes} bytes"
+                        ));
+                    }
+                }
+                if read == 0 {
+                    return Ok(None);
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("join multipart field parser: {error}"))?
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 struct LocalWriter {

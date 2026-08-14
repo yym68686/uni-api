@@ -1,0 +1,2726 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum::body::{to_bytes, Body};
+use axum::extract::Request;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use ring::rand::SystemRandom;
+use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use url::Url;
+
+use crate::persistence::{ChannelStat, RequestStat};
+use crate::provider_stream::{self, Protocol as StreamProtocol};
+use crate::proxy::{
+    filtered_response_headers, json_error, read_spooled_body, AppState, RequestBodySpoolError,
+};
+use crate::request_spool::{SpoolObservation, StoredBody};
+use crate::responses_native::{
+    apply_overrides, compute_retry_count, extract_api_key, request_id, FailedRoute, Provider,
+    ProviderKeySelection,
+};
+
+const PUBLIC_JSON_ROUTES: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/images/generations",
+    "/v1/embeddings",
+    "/v1/audio/speech",
+    "/v1/moderations",
+    "/v1/video/tasks",
+    "/v1/asset-groups",
+    "/v1/assets",
+    "/v1/alpha/search",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseAdapter {
+    Passthrough,
+    ResponsesToChat,
+    GeminiToChat,
+    ClaudeToChat,
+    CohereToChat,
+    CloudflareToChat,
+    AwsToChat,
+}
+
+struct PreparedAttempt {
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: AttemptBody,
+    adapter: ResponseAdapter,
+    downstream_stream: bool,
+    upstream_stream: bool,
+    original_model: String,
+}
+
+#[derive(Clone)]
+struct CachedVertexToken {
+    value: String,
+    expires_at: Instant,
+}
+
+static VERTEX_TOKEN_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, CachedVertexToken>>> =
+    OnceLock::new();
+
+enum AttemptBody {
+    Json(Vec<u8>),
+    Replay(StoredBody, SpoolObservation),
+    Empty,
+}
+
+pub fn supports(method: &Method, path: &str) -> bool {
+    if *method == Method::POST
+        && (PUBLIC_JSON_ROUTES.contains(&path)
+            || matches!(path, "/v1/images/edits" | "/v1/audio/transcriptions"))
+    {
+        return true;
+    }
+    if *method == Method::GET
+        && (matches!(path, "/search" | "/v1/search")
+            || path.starts_with("/v1/video/tasks/")
+            || path.starts_with("/v1/asset-groups/")
+            || path.starts_with("/v1/assets/"))
+    {
+        return true;
+    }
+    false
+}
+
+pub async fn handle(state: AppState, request: Request, resource_wait: Duration) -> Response<Body> {
+    let started = Instant::now();
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let path = uri.path().trim_end_matches('/').to_owned();
+    let path = if path.is_empty() { "/".into() } else { path };
+    let headers = request.headers().clone();
+    let request_id = request_id(&headers);
+    let trace_id = trace_id(&headers, &request_id);
+    let client_ip = client_ip(&headers);
+    let api_key = extract_api_key(&headers).unwrap_or_default();
+
+    let input = match prepare_input(&state, request, &method, &uri, &path, resource_wait).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    let query_model = query_value(&uri, "model");
+    let mut request_model = input
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("model"))
+        .and_then(Value::as_str)
+        .or(query_model.as_deref())
+        .unwrap_or(input.default_model.as_str())
+        .trim()
+        .to_owned();
+    if request_model.is_empty() {
+        request_model = default_model_for_path(&state, &headers, &path).await;
+    }
+    if request_model.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "Request model is required");
+    }
+    if path != "/v1/moderations"
+        && state
+            .native_responses_config
+            .moderation_enabled(&headers)
+            .await
+            .unwrap_or(false)
+    {
+        if let Some(text) = input.payload.as_ref().and_then(moderation_text) {
+            if let Err(response) = run_moderation_preflight(&state, &headers, &text).await {
+                return response;
+            }
+        }
+    }
+    let body_bytes = input.observation.body_bytes;
+    let resolved = match state
+        .native_responses_config
+        .resolve_route(
+            &state.persistence,
+            &headers,
+            &request_model,
+            &path,
+            body_bytes,
+            None,
+            true,
+        )
+        .await
+    {
+        Ok(route) => route,
+        Err(error) => return json_error(error.status, &error.message),
+    };
+    let max_attempts = compute_retry_count(&resolved.providers)
+        .max(resolved.providers.len())
+        .min(10);
+    let (prompt_price, completion_price) = state
+        .native_responses_config
+        .prices_for_model(&request_model)
+        .await;
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    let mut last_detail = String::from("No upstream attempt succeeded");
+
+    for attempt_index in 0..max_attempts {
+        let provider = resolved.providers[attempt_index % resolved.providers.len()].clone();
+        let Some(original_model) = provider.models.get(&request_model).cloned() else {
+            continue;
+        };
+        let provider_key_raw = match state
+            .native_responses_config
+            .select_provider_key(&provider, &original_model)
+            .await
+        {
+            ProviderKeySelection::Selected(key) => key,
+            ProviderKeySelection::NoProviderKey => {
+                last_status = StatusCode::BAD_GATEWAY;
+                last_detail = format!("Provider {} has no API key", provider.name);
+                continue;
+            }
+            ProviderKeySelection::ChannelCooling | ProviderKeySelection::AllKeysCooling => {
+                last_status = StatusCode::TOO_MANY_REQUESTS;
+                last_detail = "All matching provider routes are cooling down".into();
+                continue;
+            }
+        };
+        let mut provider_key = provider_key_raw.clone();
+        let mut codex_account_id = None;
+        if provider.engine.eq_ignore_ascii_case("codex") && provider_key_raw.contains(',') {
+            match state
+                .codex_oauth
+                .resolve(
+                    &provider_key_raw,
+                    provider.preferences.get("proxy").and_then(Value::as_str),
+                )
+                .await
+            {
+                Ok(auth) => {
+                    provider_key = auth.bearer;
+                    codex_account_id = auth.account_id;
+                }
+                Err(error) => {
+                    last_status = StatusCode::UNAUTHORIZED;
+                    last_detail = error;
+                    continue;
+                }
+            }
+        }
+        let mut prepared = match build_attempt(
+            &provider,
+            &provider_key,
+            &request_model,
+            &original_model,
+            &method,
+            &uri,
+            &path,
+            &headers,
+            &input,
+            &request_id,
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                last_status = StatusCode::BAD_REQUEST;
+                last_detail = error;
+                continue;
+            }
+        };
+        if let Some(account_id) = codex_account_id {
+            if let Ok(value) = HeaderValue::from_str(&account_id) {
+                prepared.headers.insert("chatgpt-account-id", value);
+            }
+        }
+        let attempt_started = Instant::now();
+        emit_attempt(
+            &request_id,
+            &trace_id,
+            attempt_index,
+            &provider,
+            &request_model,
+            &original_model,
+            &prepared.url,
+            "started",
+            None,
+        );
+        match send_attempt(&state, &provider, prepared).await {
+            Ok(success) => {
+                state.persistence.record_channel(ChannelStat {
+                    request_id: request_id.clone(),
+                    provider: provider.name.to_string(),
+                    model: request_model.clone(),
+                    api_key: api_key.clone(),
+                    provider_api_key: provider_key_raw.clone(),
+                    success: true,
+                });
+                state
+                    .native_responses_config
+                    .reset_route_failure(&provider, &original_model)
+                    .await;
+                let mut request_stat = RequestStat {
+                    request_id: request_id.clone(),
+                    trace_id: trace_id.clone(),
+                    endpoint: path.clone(),
+                    client_ip: client_ip.clone(),
+                    process_time: started.elapsed().as_secs_f64(),
+                    first_response_time: attempt_started.elapsed().as_secs_f64(),
+                    provider: provider.name.to_string(),
+                    model: request_model.clone(),
+                    api_key: api_key.clone(),
+                    prompt_tokens: success.usage.0,
+                    completion_tokens: success.usage.1,
+                    total_tokens: success.usage.2,
+                    prompt_price,
+                    completion_price,
+                    timing_spans: json!({
+                        "runtime": "rust",
+                        "attempt_count": attempt_index + 1,
+                        "upstream_ms": attempt_started.elapsed().as_millis(),
+                    })
+                    .to_string(),
+                    ..RequestStat::default()
+                };
+                if let Some(usage_completion) = success.usage_completion {
+                    let persistence = state.persistence.clone();
+                    tokio::spawn(async move {
+                        if let Ok(usage) = usage_completion.await {
+                            request_stat.prompt_tokens = usage.0;
+                            request_stat.completion_tokens = usage.1;
+                            request_stat.total_tokens = usage.2;
+                        }
+                        persistence.record_request(request_stat);
+                    });
+                } else {
+                    state.persistence.record_request(request_stat);
+                }
+                emit_attempt(
+                    &request_id,
+                    &trace_id,
+                    attempt_index,
+                    &provider,
+                    &request_model,
+                    &original_model,
+                    &success.upstream_url,
+                    "completed",
+                    Some(success.status.as_u16()),
+                );
+                return success.response;
+            }
+            Err(failure) => {
+                last_status = failure.status;
+                last_detail = failure.detail.clone();
+                state.persistence.record_channel(ChannelStat {
+                    request_id: request_id.clone(),
+                    provider: provider.name.to_string(),
+                    model: request_model.clone(),
+                    api_key: api_key.clone(),
+                    provider_api_key: provider_key_raw.clone(),
+                    success: false,
+                });
+                state
+                    .native_responses_config
+                    .cool_failed_route(FailedRoute {
+                        provider: &provider,
+                        key: &provider_key_raw,
+                        original_model: &original_model,
+                        has_alternative: resolved.providers.len() > 1,
+                        status: failure.status.as_u16(),
+                        detail: &failure.detail,
+                        force_quota_cooldown: false,
+                    })
+                    .await;
+                if provider.engine.eq_ignore_ascii_case("codex")
+                    && provider_key_raw.contains(',')
+                    && matches!(failure.status.as_u16(), 401..=403)
+                {
+                    state.codex_oauth.clear(&provider_key_raw).await;
+                }
+                emit_attempt(
+                    &request_id,
+                    &trace_id,
+                    attempt_index,
+                    &provider,
+                    &request_model,
+                    &original_model,
+                    &failure.upstream_url,
+                    "failed",
+                    Some(failure.status.as_u16()),
+                );
+                if failure.status.is_client_error()
+                    && failure.status != StatusCode::TOO_MANY_REQUESTS
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    state.persistence.record_request(RequestStat {
+        request_id,
+        trace_id,
+        endpoint: path,
+        client_ip,
+        process_time: started.elapsed().as_secs_f64(),
+        model: request_model,
+        api_key,
+        timing_spans: json!({"runtime":"rust","terminal":"route_exhausted"}).to_string(),
+        ..RequestStat::default()
+    });
+    json_error(last_status, &last_detail)
+}
+
+pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
+    let root = payload.as_object()?;
+    if let Some(messages) = root.get("messages").and_then(Value::as_array) {
+        for message in messages.iter().rev() {
+            if let Some(text) = moderation_content_text(message.get("content")) {
+                return Some(text);
+            }
+        }
+    }
+    if let Some(input) = root.get("input") {
+        if let Some(text) = input
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.to_owned());
+        }
+        if let Some(items) = input.as_array() {
+            if items.iter().all(Value::is_string) {
+                let text = items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+            for item in items.iter().rev() {
+                if item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role.eq_ignore_ascii_case("user"))
+                {
+                    if let Some(text) = moderation_content_text(item.get("content")) {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+    }
+    root.get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn moderation_content_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_owned());
+    }
+    value
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|part| {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("text" | "input_text")
+            )
+            .then(|| part.get("text").and_then(Value::as_str))
+            .flatten()
+        })
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn content_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_owned());
+    }
+    let parts = value.as_array()?;
+    let mut output = String::new();
+    for part in parts {
+        let text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(text);
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+pub(crate) async fn run_moderation_preflight(
+    state: &AppState,
+    headers: &HeaderMap,
+    text: &str,
+) -> Result<(), Response<Body>> {
+    let model = "omni-moderation-latest";
+    let payload = json!({"model": model, "input": text, "stream": false});
+    let resolved = state
+        .native_responses_config
+        .resolve_route(
+            &state.persistence,
+            headers,
+            model,
+            "/v1/moderations",
+            serde_json::to_vec(&payload)
+                .map(|body| body.len() as u64)
+                .unwrap_or(0),
+            Some("moderation"),
+            false,
+        )
+        .await
+        .map_err(|error| json_error(error.status, &error.message))?;
+    let input = PreparedInput {
+        payload: Some(payload),
+        replay: None,
+        observation: SpoolObservation::default(),
+        default_model: model.into(),
+        content_type: "application/json".into(),
+    };
+    let uri = Uri::from_static("/v1/moderations");
+    let mut last_error = json_error(
+        StatusCode::BAD_GATEWAY,
+        "Moderation preflight did not reach an upstream provider",
+    );
+    for provider in resolved.providers {
+        let Some(original_model) = provider.models.get(model).cloned() else {
+            continue;
+        };
+        let provider_key = match state
+            .native_responses_config
+            .select_provider_key(&provider, &original_model)
+            .await
+        {
+            ProviderKeySelection::Selected(key) => key,
+            _ => continue,
+        };
+        let prepared = build_attempt(
+            &provider,
+            &provider_key,
+            model,
+            &original_model,
+            &Method::POST,
+            &uri,
+            "/v1/moderations",
+            headers,
+            &input,
+            &request_id(headers),
+        )
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?;
+        match send_attempt(state, &provider, prepared).await {
+            Ok(success) => {
+                let bytes = to_bytes(success.response.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .map_err(|error| {
+                        json_error(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("Read moderation response failed: {error}"),
+                        )
+                    })?;
+                let response = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+                    json_error(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("Decode moderation response failed: {error}"),
+                    )
+                })?;
+                let flagged = response
+                    .pointer("/results/0/flagged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if flagged {
+                    return Err(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "Content did not pass the moral check, please modify and try again.",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(failure) => {
+                last_error = json_error(failure.status, &failure.detail);
+            }
+        }
+    }
+    Err(last_error)
+}
+
+struct PreparedInput {
+    payload: Option<Value>,
+    replay: Option<(StoredBody, SpoolObservation)>,
+    observation: SpoolObservation,
+    default_model: String,
+    content_type: String,
+}
+
+async fn prepare_input(
+    state: &AppState,
+    request: Request,
+    method: &Method,
+    uri: &Uri,
+    path: &str,
+    resource_wait: Duration,
+) -> Result<PreparedInput, Response<Body>> {
+    if *method == Method::GET {
+        let payload = if matches!(path, "/search" | "/v1/search") {
+            let query = query_value(uri, "q").unwrap_or_else(|| "Jina+AI".into());
+            Some(json!({
+                "model": "search",
+                "messages": [{"role":"user","content":query}],
+                "stream": false,
+            }))
+        } else {
+            let model = query_value(uri, "model").unwrap_or_else(|| "video".into());
+            Some(json!({"model": model}))
+        };
+        return Ok(PreparedInput {
+            payload,
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: if matches!(path, "/search" | "/v1/search") {
+                "search".into()
+            } else {
+                String::new()
+            },
+            content_type: String::new(),
+        });
+    }
+
+    let content_length = request
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let content_type = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_ascii_lowercase();
+    let (_, body) = request.into_parts();
+    let spool = read_spooled_body(
+        body,
+        &state.request_spool,
+        None,
+        content_length,
+        resource_wait,
+    )
+    .await
+    .map_err(|error| match error {
+        RequestBodySpoolError::Timeout => {
+            json_error(StatusCode::REQUEST_TIMEOUT, "Request body upload timed out")
+        }
+        RequestBodySpoolError::Read => {
+            json_error(StatusCode::BAD_REQUEST, "Request body upload failed")
+        }
+        RequestBodySpoolError::Spool(failure) => json_error(failure.status, &failure.message),
+    })?;
+    if content_type.starts_with("application/json") {
+        let payload = spool
+            .storage
+            .parse_json()
+            .await
+            .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?;
+        if !payload.is_object() {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "JSON request body must be an object",
+            ));
+        }
+        return Ok(PreparedInput {
+            payload: Some(payload),
+            replay: None,
+            observation: spool.observation,
+            default_model: String::new(),
+            content_type,
+        });
+    }
+    let model = match query_value(uri, "model") {
+        Some(model) => model,
+        None if content_type.starts_with("multipart/form-data") => spool
+            .storage
+            .multipart_text_field(&content_type, "model", 4096)
+            .await
+            .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    Ok(PreparedInput {
+        payload: Some(json!({"model": model})),
+        replay: Some((spool.storage, spool.observation.clone())),
+        observation: spool.observation,
+        default_model: String::new(),
+        content_type,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_attempt(
+    provider: &Provider,
+    provider_key: &str,
+    request_model: &str,
+    original_model: &str,
+    method: &Method,
+    uri: &Uri,
+    path: &str,
+    incoming_headers: &HeaderMap,
+    input: &PreparedInput,
+    request_id: &str,
+) -> Result<PreparedAttempt, String> {
+    let downstream_stream = input
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let engine = provider.engine.trim().to_ascii_lowercase();
+    let proxy = provider
+        .preferences
+        .get("proxy")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let _ = proxy;
+
+    if let Some((storage, observation)) = &input.replay {
+        let url = endpoint_url(provider.base_url.as_ref(), path, method, uri)?;
+        let mut headers = provider_headers(
+            provider,
+            provider_key,
+            incoming_headers,
+            request_id,
+            &engine,
+            false,
+            Some(&input.content_type),
+        )?;
+        headers.remove("content-length");
+        return Ok(PreparedAttempt {
+            method: method.clone(),
+            url,
+            headers,
+            body: AttemptBody::Replay(storage.clone_for_replay(), observation.clone()),
+            adapter: ResponseAdapter::Passthrough,
+            downstream_stream: false,
+            upstream_stream: false,
+            original_model: original_model.to_owned(),
+        });
+    }
+
+    let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
+    let (url, adapter, upstream_stream) = match engine.as_str() {
+        "codex" if path == "/v1/chat/completions" => {
+            payload = chat_to_responses(&payload, original_model)?;
+            (
+                responses_url(provider.base_url.as_ref()),
+                ResponseAdapter::ResponsesToChat,
+                downstream_stream,
+            )
+        }
+        "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
+            if path == "/v1/chat/completions"
+                && provider
+                    .base_url
+                    .to_ascii_lowercase()
+                    .contains("/responses") =>
+        {
+            payload = chat_to_responses(&payload, original_model)?;
+            (
+                responses_url(provider.base_url.as_ref()),
+                ResponseAdapter::ResponsesToChat,
+                downstream_stream,
+            )
+        }
+        "gemini" | "vertex" | "vertex-gemini" if path == "/v1/chat/completions" => {
+            payload = chat_to_gemini(&payload, original_model)?;
+            (
+                if matches!(engine.as_str(), "vertex" | "vertex-gemini") {
+                    vertex_gemini_url(provider, original_model, provider_key, downstream_stream)?
+                } else {
+                    gemini_url(
+                        provider.base_url.as_ref(),
+                        original_model,
+                        provider_key,
+                        downstream_stream,
+                    )?
+                },
+                ResponseAdapter::GeminiToChat,
+                downstream_stream,
+            )
+        }
+        "vertex-claude" if path == "/v1/chat/completions" => {
+            payload = chat_to_claude(&payload, original_model)?;
+            (
+                vertex_claude_url(provider, original_model)?,
+                ResponseAdapter::ClaudeToChat,
+                downstream_stream,
+            )
+        }
+        "claude" if path == "/v1/chat/completions" => {
+            payload = chat_to_claude(&payload, original_model)?;
+            (
+                messages_url(provider.base_url.as_ref()),
+                ResponseAdapter::ClaudeToChat,
+                downstream_stream,
+            )
+        }
+        "aws" if path == "/v1/chat/completions" => {
+            payload = chat_to_claude(&payload, original_model)?;
+            if let Some(root) = payload.as_object_mut() {
+                root.remove("model");
+                root.remove("stream");
+                root.insert(
+                    "anthropic_version".into(),
+                    Value::String("bedrock-2023-05-31".into()),
+                );
+            }
+            (
+                aws_bedrock_url(provider, original_model, downstream_stream)?,
+                ResponseAdapter::AwsToChat,
+                downstream_stream,
+            )
+        }
+        "cohere" if path == "/v1/chat/completions" => {
+            payload = chat_to_cohere(&payload, original_model)?;
+            (
+                provider.base_url.to_string(),
+                ResponseAdapter::CohereToChat,
+                downstream_stream,
+            )
+        }
+        "azure" if path == "/v1/chat/completions" => {
+            set_model(&mut payload, original_model)?;
+            normalize_azure_token_limit(&mut payload, original_model);
+            (
+                azure_chat_url(provider.base_url.as_ref(), original_model)?,
+                ResponseAdapter::Passthrough,
+                downstream_stream,
+            )
+        }
+        "azure-databricks" if path == "/v1/chat/completions" => {
+            set_model(&mut payload, original_model)?;
+            (
+                databricks_chat_url(provider.base_url.as_ref(), original_model)?,
+                ResponseAdapter::Passthrough,
+                downstream_stream,
+            )
+        }
+        "cloudflare" if path == "/v1/chat/completions" => {
+            payload = chat_to_cloudflare(&payload)?;
+            (
+                cloudflare_url(provider, original_model)?,
+                ResponseAdapter::CloudflareToChat,
+                downstream_stream,
+            )
+        }
+        "claude" if path == "/v1/messages" => {
+            set_model(&mut payload, original_model)?;
+            (
+                messages_url(provider.base_url.as_ref()),
+                ResponseAdapter::Passthrough,
+                downstream_stream,
+            )
+        }
+        _ => {
+            set_model(&mut payload, original_model)?;
+            (
+                endpoint_url(provider.base_url.as_ref(), path, method, uri)?,
+                ResponseAdapter::Passthrough,
+                downstream_stream,
+            )
+        }
+    };
+    if !matches!(
+        adapter,
+        ResponseAdapter::GeminiToChat | ResponseAdapter::AwsToChat
+    ) && engine != "vertex-claude"
+    {
+        if let Some(root) = payload.as_object_mut() {
+            root.insert("stream".into(), Value::Bool(upstream_stream));
+        }
+    }
+    if let Some(root) = payload.as_object_mut() {
+        apply_overrides(root, provider, request_model);
+    }
+    let mut headers = provider_headers(
+        provider,
+        provider_key,
+        incoming_headers,
+        request_id,
+        &engine,
+        upstream_stream,
+        None,
+    )?;
+    let outgoing_method = if matches!(path, "/search" | "/v1/search") {
+        Method::POST
+    } else {
+        method.clone()
+    };
+    let body = if outgoing_method == Method::GET {
+        AttemptBody::Empty
+    } else {
+        let body = serde_json::to_vec(&payload)
+            .map_err(|error| format!("encode upstream request body: {error}"))?;
+        if engine == "aws" {
+            sign_aws_request(provider, &url, &body, &mut headers)?;
+        }
+        AttemptBody::Json(body)
+    };
+    Ok(PreparedAttempt {
+        method: outgoing_method,
+        url,
+        headers,
+        body,
+        adapter,
+        downstream_stream,
+        upstream_stream,
+        original_model: original_model.to_owned(),
+    })
+}
+
+struct AttemptSuccess {
+    response: Response<Body>,
+    status: StatusCode,
+    usage: (i64, i64, i64),
+    usage_completion: Option<tokio::sync::oneshot::Receiver<(i64, i64, i64)>>,
+    upstream_url: String,
+}
+
+struct AttemptFailure {
+    status: StatusCode,
+    detail: String,
+    upstream_url: String,
+}
+
+async fn send_attempt(
+    state: &AppState,
+    provider: &Provider,
+    mut prepared: PreparedAttempt,
+) -> Result<AttemptSuccess, AttemptFailure> {
+    let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
+    let http1_only = provider.engine.eq_ignore_ascii_case("codex");
+    let client = state
+        .upstream_client(proxy, http1_only)
+        .await
+        .map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: error,
+            upstream_url: prepared.url.clone(),
+        })?;
+    let timeout = provider_timeout(provider, &prepared.original_model);
+    if matches!(
+        provider.engine.to_ascii_lowercase().as_str(),
+        "vertex" | "vertex-gemini" | "vertex-claude"
+    ) && provider.client_email.is_some()
+        && provider.private_key.is_some()
+    {
+        let token = vertex_access_token(state, provider)
+            .await
+            .map_err(|error| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail: error,
+                upstream_url: prepared.url.clone(),
+            })?;
+        prepared.headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail: "Vertex OAuth token is not a valid header value".into(),
+                upstream_url: prepared.url.clone(),
+            })?,
+        );
+    }
+    let mut request = client
+        .request(prepared.method.clone(), &prepared.url)
+        .headers(prepared.headers.clone())
+        .timeout(timeout);
+    request = match prepared.body {
+        AttemptBody::Json(body) => request.body(body),
+        AttemptBody::Replay(storage, observation) => {
+            let body = storage
+                .into_body(&observation)
+                .await
+                .map_err(|error| AttemptFailure {
+                    status: error.status,
+                    detail: error.message,
+                    upstream_url: prepared.url.clone(),
+                })?;
+            request.body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        }
+        AttemptBody::Empty => request,
+    };
+    let response = request.send().await.map_err(|error| AttemptFailure {
+        status: StatusCode::BAD_GATEWAY,
+        detail: format!("Upstream transport error: {error}"),
+        upstream_url: prepared.url.clone(),
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("read upstream error response: {error}"));
+        return Err(AttemptFailure {
+            status,
+            detail: truncate_detail(&detail),
+            upstream_url: prepared.url,
+        });
+    }
+    if prepared.adapter == ResponseAdapter::Passthrough && prepared.upstream_stream {
+        let headers = filtered_response_headers(response.headers());
+        let mut output = Response::new(Body::from_stream(response.bytes_stream()));
+        *output.status_mut() = status;
+        *output.headers_mut() = headers;
+        output
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            response: output,
+            status,
+            usage: (0, 0, 0),
+            usage_completion: None,
+            upstream_url: prepared.url,
+        });
+    }
+    if prepared.upstream_stream {
+        let protocol = match prepared.adapter {
+            ResponseAdapter::ResponsesToChat => StreamProtocol::Responses,
+            ResponseAdapter::GeminiToChat => StreamProtocol::Gemini,
+            ResponseAdapter::ClaudeToChat
+                if provider.engine.eq_ignore_ascii_case("vertex-claude") =>
+            {
+                StreamProtocol::VertexClaude
+            }
+            ResponseAdapter::ClaudeToChat => StreamProtocol::Claude,
+            ResponseAdapter::CohereToChat => StreamProtocol::Cohere,
+            ResponseAdapter::CloudflareToChat => StreamProtocol::Cloudflare,
+            ResponseAdapter::AwsToChat => StreamProtocol::AwsBedrock,
+            ResponseAdapter::Passthrough => unreachable!(),
+        };
+        let mut translation =
+            provider_stream::translate(response, protocol, prepared.original_model.clone());
+        translation
+            .response
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            response: translation.response,
+            status,
+            usage: (0, 0, 0),
+            usage_completion: Some(translation.usage),
+            upstream_url: prepared.url,
+        });
+    }
+    if prepared.adapter == ResponseAdapter::Passthrough {
+        let headers = filtered_response_headers(response.headers());
+        let body = response.bytes().await.map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Read upstream response failed: {error}"),
+            upstream_url: prepared.url.clone(),
+        })?;
+        let usage = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .map(|value| usage(&value))
+            .unwrap_or((0, 0, 0));
+        let mut output = Response::new(Body::from(body));
+        *output.status_mut() = status;
+        *output.headers_mut() = headers;
+        output
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            response: output,
+            status,
+            usage,
+            usage_completion: None,
+            upstream_url: prepared.url,
+        });
+    }
+    let upstream = response
+        .json::<Value>()
+        .await
+        .map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Decode upstream response failed: {error}"),
+            upstream_url: prepared.url.clone(),
+        })?;
+    let normalized = match prepared.adapter {
+        ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::GeminiToChat => gemini_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::ClaudeToChat => claude_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::CohereToChat => cohere_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::CloudflareToChat => {
+            cloudflare_to_chat(&upstream, &prepared.original_model)
+        }
+        ResponseAdapter::AwsToChat => claude_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::Passthrough => unreachable!(),
+    };
+    let usage = usage(&normalized);
+    let mut output = if prepared.downstream_stream {
+        synthetic_chat_stream(normalized)
+    } else {
+        json_response(StatusCode::OK, normalized)
+    };
+    output
+        .headers_mut()
+        .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+    Ok(AttemptSuccess {
+        response: output,
+        status: StatusCode::OK,
+        usage,
+        usage_completion: None,
+        upstream_url: prepared.url,
+    })
+}
+
+fn provider_headers(
+    provider: &Provider,
+    provider_key: &str,
+    incoming: &HeaderMap,
+    request_id: &str,
+    engine: &str,
+    stream: bool,
+    content_type: Option<&str>,
+) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    if let Some(content_type) = content_type.filter(|value| !value.is_empty()) {
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(content_type)
+                .map_err(|_| "request Content-Type is not a valid header".to_owned())?,
+        );
+    }
+    if engine == "claude" {
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(provider_key)
+                .map_err(|_| "provider API key is not a valid header".to_owned())?,
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("tools-2024-05-16"),
+        );
+    } else if engine == "azure" {
+        headers.insert(
+            "api-key",
+            HeaderValue::from_str(provider_key)
+                .map_err(|_| "provider API key is not a valid header".to_owned())?,
+        );
+    } else if engine == "azure-databricks" {
+        let encoded = BASE64.encode(format!("token:{provider_key}"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Basic {encoded}"))
+                .map_err(|_| "provider API key is not a valid header".to_owned())?,
+        );
+    } else if !matches!(
+        engine,
+        "gemini" | "vertex" | "vertex-gemini" | "vertex-claude" | "aws"
+    ) {
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {provider_key}"))
+                .map_err(|_| "provider API key is not a valid header".to_owned())?,
+        );
+    }
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert("x-request-id", value.clone());
+        headers.insert("x-caller-request-id", value);
+    }
+    if stream {
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+    }
+    if engine == "openrouter" && provider.base_url.contains("openrouter.ai") {
+        headers.insert(
+            "http-referer",
+            HeaderValue::from_static("https://github.com/yym68686/uni-api"),
+        );
+        headers.insert("x-title", HeaderValue::from_static("Uni API"));
+    }
+    if let Some(extra) = provider
+        .preferences
+        .get("headers")
+        .and_then(Value::as_object)
+    {
+        for (name, value) in extra {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| format!("provider {} has an invalid header", provider.name))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|_| format!("provider {} has an invalid header value", provider.name))?;
+            headers.insert(name, value);
+        }
+    }
+    let passthrough = provider
+        .preferences
+        .get("passthrough_request_headers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    for name in passthrough {
+        if let (Ok(header_name), Some(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            incoming.get(name).cloned(),
+        ) {
+            headers.insert(header_name, value);
+        }
+    }
+    Ok(headers)
+}
+
+fn set_model(payload: &mut Value, model: &str) -> Result<(), String> {
+    payload
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_owned())?
+        .insert("model".into(), Value::String(model.to_owned()));
+    Ok(())
+}
+
+fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "chat request body must be an object".to_owned())?;
+    let mut items = Vec::new();
+    for message in root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if role == "tool" {
+            items.push(json!({
+                "type":"function_call_output",
+                "call_id": message.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                "output": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+            }));
+            continue;
+        }
+        if let Some(content) = message.get("content") {
+            items.push(json!({"role":role,"content":responses_content(content, role)}));
+        }
+        for tool in message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            items.push(json!({
+                "type":"function_call",
+                "call_id":tool.get("id").cloned().unwrap_or(Value::Null),
+                "name":tool.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                "arguments":tool.pointer("/function/arguments").cloned().unwrap_or(Value::String("{}".into())),
+            }));
+        }
+    }
+    let mut output = Map::new();
+    output.insert("model".into(), Value::String(original_model.to_owned()));
+    output.insert("input".into(), Value::Array(items));
+    output.insert("stream".into(), Value::Bool(false));
+    output.insert("store".into(), Value::Bool(false));
+    if let Some(max_tokens) = root.get("max_tokens") {
+        output.insert("max_output_tokens".into(), max_tokens.clone());
+    }
+    for name in [
+        "temperature",
+        "top_p",
+        "reasoning",
+        "parallel_tool_calls",
+        "service_tier",
+    ] {
+        if let Some(value) = root.get(name) {
+            output.insert(name.into(), value.clone());
+        }
+    }
+    if let Some(tools) = root.get("tools").and_then(Value::as_array) {
+        output.insert(
+            "tools".into(),
+            Value::Array(
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let function = tool.get("function")?;
+                        Some(json!({
+                            "type":"function",
+                            "name":function.get("name").cloned().unwrap_or(Value::Null),
+                            "description":function.get("description").cloned().unwrap_or(Value::Null),
+                            "parameters":function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                        }))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Ok(Value::Object(output))
+}
+
+fn responses_content(content: &Value, role: &str) -> Value {
+    if let Some(text) = content.as_str() {
+        return Value::Array(vec![json!({
+            "type": if role == "assistant" { "output_text" } else { "input_text" },
+            "text": text,
+        })]);
+    }
+    let mut parts = Vec::new();
+    for item in content.as_array().into_iter().flatten() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => parts.push(json!({
+                "type": if role == "assistant" { "output_text" } else { "input_text" },
+                "text": item.get("text").cloned().unwrap_or(Value::String(String::new())),
+            })),
+            Some("image_url") => parts.push(json!({
+                "type":"input_image",
+                "image_url":item.pointer("/image_url/url").cloned().unwrap_or(Value::Null),
+            })),
+            _ => parts.push(item.clone()),
+        }
+    }
+    Value::Array(parts)
+}
+
+fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "chat request body must be an object".to_owned())?;
+    let mut contents = Vec::new();
+    let mut system_parts = Vec::new();
+    for message in root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let parts = gemini_parts(message.get("content").unwrap_or(&Value::Null));
+        if role == "system" {
+            system_parts.extend(parts);
+        } else if !parts.is_empty() {
+            contents.push(json!({
+                "role": if role == "assistant" { "model" } else { "user" },
+                "parts": parts,
+            }));
+        }
+    }
+    if contents.is_empty() {
+        contents.push(json!({"role":"user","parts":[{"text":"No messages"}]}));
+    }
+    let mut generation = Map::new();
+    if let Some(value) = root.get("temperature") {
+        generation.insert("temperature".into(), value.clone());
+    }
+    if let Some(value) = root.get("top_p") {
+        generation.insert("topP".into(), value.clone());
+    }
+    generation.insert(
+        "maxOutputTokens".into(),
+        root.get("max_tokens").cloned().unwrap_or(json!(8192)),
+    );
+    let mut output = json!({
+        "contents": contents,
+        "generationConfig": generation,
+        "safetySettings": [
+            {"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_NONE"},
+            {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"},
+            {"category":"HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold":"BLOCK_NONE"},
+            {"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":"BLOCK_NONE"}
+        ],
+        "_uni_api_model": original_model,
+    });
+    output
+        .as_object_mut()
+        .expect("Gemini payload object")
+        .remove("_uni_api_model");
+    if !system_parts.is_empty() {
+        output
+            .as_object_mut()
+            .expect("Gemini payload object")
+            .insert("systemInstruction".into(), json!({"parts":system_parts}));
+    }
+    if let Some(tools) = root.get("tools").and_then(Value::as_array) {
+        let declarations = tools
+            .iter()
+            .filter_map(|tool| tool.get("function").cloned())
+            .collect::<Vec<_>>();
+        if !declarations.is_empty() {
+            output
+                .as_object_mut()
+                .expect("Gemini payload object")
+                .insert(
+                    "tools".into(),
+                    json!([{"functionDeclarations":declarations}]),
+                );
+        }
+    }
+    Ok(output)
+}
+
+fn gemini_parts(content: &Value) -> Vec<Value> {
+    if let Some(text) = content.as_str() {
+        return vec![json!({"text":text})];
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("text") => Some(
+                json!({"text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
+            ),
+            Some("image_url") => item
+                .pointer("/image_url/url")
+                .and_then(Value::as_str)
+                .and_then(data_url_part),
+            _ => None,
+        })
+        .collect()
+}
+
+fn data_url_part(value: &str) -> Option<Value> {
+    let data = value.strip_prefix("data:")?;
+    let (metadata, body) = data.split_once(',')?;
+    let mime = metadata
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream");
+    Some(json!({"inlineData":{"mimeType":mime,"data":body}}))
+}
+
+fn chat_to_claude(input: &Value, original_model: &str) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "chat request body must be an object".to_owned())?;
+    let mut messages = Vec::new();
+    let mut system = Vec::new();
+    for message in root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        if role == "system" {
+            if let Some(text) = content.as_str() {
+                system.push(text.to_owned());
+            }
+            continue;
+        }
+        if role == "tool" {
+            messages.push(json!({
+                "role":"user",
+                "content":[{"type":"tool_result","tool_use_id":message.get("tool_call_id").cloned().unwrap_or(Value::Null),"content":content}],
+            }));
+            continue;
+        }
+        let mut blocks = claude_content(&content);
+        for tool in message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let arguments = tool
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or_else(|| json!({}));
+            blocks.push(json!({
+                "type":"tool_use",
+                "id":tool.get("id").cloned().unwrap_or(Value::Null),
+                "name":tool.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                "input":arguments,
+            }));
+        }
+        messages.push(json!({
+            "role": if role == "assistant" { "assistant" } else { "user" },
+            "content": blocks,
+        }));
+    }
+    let mut output = json!({
+        "model": original_model,
+        "messages": messages,
+        "max_tokens": root.get("max_tokens").cloned().unwrap_or(json!(4096)),
+        "stream": false,
+    });
+    if !system.is_empty() {
+        output
+            .as_object_mut()
+            .expect("Claude payload object")
+            .insert("system".into(), Value::String(system.join("\n")));
+    }
+    if let Some(tools) = root.get("tools").and_then(Value::as_array) {
+        let tools = tools
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                Some(json!({
+                    "name":function.get("name").cloned().unwrap_or(Value::Null),
+                    "description":function.get("description").cloned().unwrap_or(Value::Null),
+                    "input_schema":function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                }))
+            })
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            output
+                .as_object_mut()
+                .expect("Claude payload object")
+                .insert("tools".into(), Value::Array(tools));
+        }
+    }
+    Ok(output)
+}
+
+fn chat_to_cohere(input: &Value, original_model: &str) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "chat request body must be an object".to_owned())?;
+    let mut messages = Vec::new();
+    for message in root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = match message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+        {
+            "assistant" => "CHATBOT",
+            "system" => "SYSTEM",
+            _ => "USER",
+        };
+        if let Some(text) = content_text(message.get("content")) {
+            messages.push(json!({"role":role,"message":text}));
+        }
+    }
+    let last = messages
+        .pop()
+        .ok_or_else(|| "Cohere chat request requires at least one message".to_owned())?;
+    let mut output = json!({
+        "model":original_model,
+        "message":last.get("message").cloned().unwrap_or(Value::String(String::new())),
+    });
+    if !messages.is_empty() {
+        output
+            .as_object_mut()
+            .expect("Cohere payload object")
+            .insert("chat_history".into(), Value::Array(messages));
+    }
+    Ok(output)
+}
+
+fn chat_to_cloudflare(input: &Value) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "chat request body must be an object".to_owned())?;
+    let prompt = root
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .and_then(|message| content_text(message.get("content")))
+        .ok_or_else(|| "Cloudflare chat request requires a text message".to_owned())?;
+    let mut output = json!({"prompt":prompt});
+    if let Some(root) = output.as_object_mut() {
+        for name in ["temperature", "top_p", "max_tokens", "seed"] {
+            if let Some(value) = input.get(name) {
+                root.insert(name.into(), value.clone());
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn claude_content(content: &Value) -> Vec<Value> {
+    if let Some(text) = content.as_str() {
+        return vec![json!({"type":"text","text":text})];
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("text") => Some(json!({"type":"text","text":item.get("text").cloned().unwrap_or(Value::String(String::new()))})),
+            Some("image_url") => item
+                .pointer("/image_url/url")
+                .and_then(Value::as_str)
+                .and_then(|value| {
+                    let data = value.strip_prefix("data:")?;
+                    let (metadata, body) = data.split_once(',')?;
+                    Some(json!({
+                        "type":"image",
+                        "source":{"type":"base64","media_type":metadata.split(';').next().unwrap_or("image/png"),"data":body},
+                    }))
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn responses_to_chat(value: &Value, model: &str) -> Value {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for item in value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for content in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(delta) = content
+                        .get("text")
+                        .or_else(|| content.get("output_text"))
+                        .and_then(Value::as_str)
+                    {
+                        text.push_str(delta);
+                    }
+                }
+            }
+            Some("function_call") => tool_calls.push(json!({
+                "id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
+                "type":"function",
+                "function":{"name":item.get("name").cloned().unwrap_or(Value::Null),"arguments":item.get("arguments").cloned().unwrap_or(Value::String("{}".into()))},
+            })),
+            _ => {}
+        }
+    }
+    let mut message = json!({"role":"assistant","content":text});
+    if !tool_calls.is_empty() {
+        message
+            .as_object_mut()
+            .expect("chat message")
+            .insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    json!({
+        "id":value.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl-{}", unix_seconds()))),
+        "object":"chat.completion",
+        "created":unix_seconds(),
+        "model":model,
+        "choices":[{"index":0,"message":message,"finish_reason":"stop"}],
+        "usage":value.get("usage").cloned().unwrap_or_else(|| json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0})),
+    })
+}
+
+fn gemini_to_chat(value: &Value, model: &str) -> Value {
+    let candidate = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first());
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for part in candidate
+        .and_then(|candidate| candidate.pointer("/content/parts"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(value) = part.get("text").and_then(Value::as_str) {
+            text.push_str(value);
+        }
+        if let Some(call) = part.get("functionCall") {
+            tool_calls.push(json!({
+                "id":format!("call_{}", tool_calls.len() + 1),
+                "type":"function",
+                "function":{
+                    "name":call.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments":serde_json::to_string(call.get("args").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into()),
+                }
+            }));
+        }
+    }
+    let usage = value
+        .get("usageMetadata")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut message = json!({"role":"assistant","content":text});
+    if !tool_calls.is_empty() {
+        message
+            .as_object_mut()
+            .expect("chat message")
+            .insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    json!({
+        "id":format!("chatcmpl-{}",unix_seconds()),
+        "object":"chat.completion",
+        "created":unix_seconds(),
+        "model":model,
+        "choices":[{"index":0,"message":message,"finish_reason":"stop"}],
+        "usage":{
+            "prompt_tokens":usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
+            "completion_tokens":usage.get("candidatesTokenCount").cloned().unwrap_or(json!(0)),
+            "total_tokens":usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
+        },
+    })
+}
+
+fn claude_to_chat(value: &Value, model: &str) -> Value {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for item in value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => text.push_str(item.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("tool_use") => tool_calls.push(json!({
+                "id":item.get("id").cloned().unwrap_or(Value::Null),
+                "type":"function",
+                "function":{
+                    "name":item.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments":serde_json::to_string(item.get("input").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into()),
+                }
+            })),
+            _ => {}
+        }
+    }
+    let mut message = json!({"role":"assistant","content":text});
+    if !tool_calls.is_empty() {
+        message
+            .as_object_mut()
+            .expect("chat message")
+            .insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    let usage = value.get("usage").cloned().unwrap_or_else(|| json!({}));
+    json!({
+        "id":value.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl-{}",unix_seconds()))),
+        "object":"chat.completion",
+        "created":unix_seconds(),
+        "model":model,
+        "choices":[{"index":0,"message":message,"finish_reason":"stop"}],
+        "usage":{
+            "prompt_tokens":usage.get("input_tokens").cloned().unwrap_or(json!(0)),
+            "completion_tokens":usage.get("output_tokens").cloned().unwrap_or(json!(0)),
+            "total_tokens":usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0) + usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
+        },
+    })
+}
+
+fn cohere_to_chat(value: &Value, model: &str) -> Value {
+    let prompt_tokens = value
+        .pointer("/meta/billed_units/input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion_tokens = value
+        .pointer("/meta/billed_units/output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    json!({
+        "id":value.get("generation_id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl-{}",unix_seconds()))),
+        "object":"chat.completion",
+        "created":unix_seconds(),
+        "model":model,
+        "choices":[{"index":0,"message":{"role":"assistant","content":value.get("text").cloned().unwrap_or(Value::String(String::new()))},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens,"total_tokens":prompt_tokens + completion_tokens},
+    })
+}
+
+fn cloudflare_to_chat(value: &Value, model: &str) -> Value {
+    let text = value
+        .pointer("/result/response")
+        .or_else(|| value.get("response"))
+        .cloned()
+        .unwrap_or(Value::String(String::new()));
+    json!({
+        "id":format!("chatcmpl-{}",unix_seconds()),
+        "object":"chat.completion",
+        "created":unix_seconds(),
+        "model":model,
+        "choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},
+    })
+}
+
+fn synthetic_chat_stream(value: Value) -> Response<Body> {
+    let message = value
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_else(|| json!({"role":"assistant","content":""}));
+    let chunk = json!({
+        "id":value.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl-{}",unix_seconds()))),
+        "object":"chat.completion.chunk",
+        "created":value.get("created").cloned().unwrap_or_else(|| json!(unix_seconds())),
+        "model":value.get("model").cloned().unwrap_or(Value::Null),
+        "choices":[{"index":0,"delta":message,"finish_reason":"stop"}],
+        "usage":value.get("usage").cloned().unwrap_or(Value::Null),
+    });
+    let wire = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
+    let mut response = Response::new(Body::from(wire));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+fn azure_chat_url(base: &str, deployment: &str) -> Result<String, String> {
+    let mut url = Url::parse(base).map_err(|error| format!("invalid Azure base URL: {error}"))?;
+    let path = url.path().trim_end_matches('/');
+    if !path.contains("/models/chat/completions")
+        && !path.contains("/openai/deployments/")
+        && !path.ends_with("/chat/completions")
+    {
+        url.set_path(&format!(
+            "/openai/deployments/{deployment}/chat/completions"
+        ));
+    }
+    let has_version = url.query_pairs().any(|(name, _)| name == "api-version");
+    if !has_version {
+        url.query_pairs_mut()
+            .append_pair("api-version", "2025-01-01-preview");
+    }
+    Ok(url.to_string())
+}
+
+fn databricks_chat_url(base: &str, deployment: &str) -> Result<String, String> {
+    let mut url =
+        Url::parse(base).map_err(|error| format!("invalid Databricks base URL: {error}"))?;
+    url.set_path(&format!("/serving-endpoints/{deployment}/invocations"));
+    url.set_query(None);
+    Ok(url.to_string())
+}
+
+fn cloudflare_url(provider: &Provider, model: &str) -> Result<String, String> {
+    let account = provider.cf_account_id.as_deref().ok_or_else(|| {
+        format!(
+            "Cloudflare provider {} is missing cf_account_id",
+            provider.name
+        )
+    })?;
+    let mut url = Url::parse(provider.base_url.as_ref())
+        .map_err(|error| format!("invalid Cloudflare base URL: {error}"))?;
+    url.set_path(&format!("/client/v4/accounts/{account}/ai/run/{model}"));
+    url.set_query(None);
+    Ok(url.to_string())
+}
+
+fn vertex_claude_url(provider: &Provider, model: &str) -> Result<String, String> {
+    let project = provider
+        .project_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("Vertex provider {} is missing project_id", provider.name))?;
+    let region = provider.region.trim();
+    let origin = if provider.base_url.contains("google-vertex-ai") {
+        provider.base_url.trim_end_matches('/').to_owned()
+    } else if region == "global" {
+        "https://aiplatform.googleapis.com".into()
+    } else {
+        format!("https://{region}-aiplatform.googleapis.com")
+    };
+    Ok(format!(
+        "{origin}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict"
+    ))
+}
+
+fn aws_bedrock_url(provider: &Provider, model: &str, stream: bool) -> Result<String, String> {
+    let mut url = Url::parse(provider.base_url.as_ref())
+        .map_err(|error| format!("invalid AWS Bedrock base URL: {error}"))?;
+    url.set_path(&format!(
+        "/model/{model}/{}",
+        if stream {
+            "invoke-with-response-stream"
+        } else {
+            "invoke"
+        }
+    ));
+    url.set_query(None);
+    Ok(url.to_string())
+}
+
+fn normalize_azure_token_limit(payload: &mut Value, model: &str) {
+    if !model.to_ascii_lowercase().contains("gpt-5") {
+        return;
+    }
+    let Some(root) = payload.as_object_mut() else {
+        return;
+    };
+    if let Some(value) = root.remove("max_tokens") {
+        root.insert("max_completion_tokens".into(), value);
+    }
+}
+
+fn sign_aws_request(
+    provider: &Provider,
+    url: &str,
+    body: &[u8],
+    headers: &mut HeaderMap,
+) -> Result<(), String> {
+    sign_aws_request_at(provider, url, body, headers, SystemTime::now())
+}
+
+fn sign_aws_request_at(
+    provider: &Provider,
+    url: &str,
+    body: &[u8],
+    headers: &mut HeaderMap,
+    now: SystemTime,
+) -> Result<(), String> {
+    type HmacSha256 = Hmac<Sha256>;
+
+    let access_key = provider
+        .aws_access_key
+        .as_deref()
+        .ok_or_else(|| format!("AWS provider {} is missing aws_access_key", provider.name))?;
+    let secret_key = provider
+        .aws_secret_key
+        .as_deref()
+        .ok_or_else(|| format!("AWS provider {} is missing aws_secret_key", provider.name))?;
+    let parsed = Url::parse(url).map_err(|error| format!("invalid AWS URL: {error}"))?;
+    let host = match parsed.port() {
+        Some(port) => format!("{}:{port}", parsed.host_str().unwrap_or_default()),
+        None => parsed.host_str().unwrap_or_default().to_owned(),
+    };
+    let region = aws_region(provider, &host)?;
+    let (amz_date, date_stamp) = aws_timestamp(now);
+    let payload_hash = format!("{:x}", Sha256::digest(body));
+    let accept = if parsed.path().ends_with("invoke-with-response-stream") {
+        "application/vnd.amazon.bedrock.payload+json"
+    } else {
+        "application/json"
+    };
+    let mut canonical_headers = format!(
+        "accept:{accept}\ncontent-type:application/json\nhost:{host}\nx-amz-bedrock-accept:{accept}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+    );
+    let mut signed_headers =
+        "accept;content-type;host;x-amz-bedrock-accept;x-amz-content-sha256;x-amz-date".to_owned();
+    if let Some(token) = provider.aws_session_token.as_deref() {
+        canonical_headers.push_str(&format!("x-amz-security-token:{token}\n"));
+        signed_headers.push_str(";x-amz-security-token");
+    }
+    let canonical_query = parsed.query().unwrap_or_default();
+    let canonical_request = format!(
+        "POST\n{}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        aws_uri_encode(parsed.path())
+    );
+    let scope = format!("{date_stamp}/{region}/bedrock/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{:x}",
+        Sha256::digest(canonical_request.as_bytes())
+    );
+    let k_date = hmac_bytes::<HmacSha256>(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    )?;
+    let k_region = hmac_bytes::<HmacSha256>(&k_date, region.as_bytes())?;
+    let k_service = hmac_bytes::<HmacSha256>(&k_region, b"bedrock")?;
+    let k_signing = hmac_bytes::<HmacSha256>(&k_service, b"aws4_request")?;
+    let signature = hex_bytes(&hmac_bytes::<HmacSha256>(
+        &k_signing,
+        string_to_sign.as_bytes(),
+    )?);
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    for (name, value) in [
+        ("accept", accept),
+        ("content-type", "application/json"),
+        ("host", host.as_str()),
+        ("x-amz-bedrock-accept", accept),
+        ("x-amz-content-sha256", payload_hash.as_str()),
+        ("x-amz-date", amz_date.as_str()),
+        ("authorization", authorization.as_str()),
+    ] {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).expect("static AWS header name"),
+            HeaderValue::from_str(value)
+                .map_err(|_| format!("AWS provider {} has an invalid header", provider.name))?,
+        );
+    }
+    if let Some(token) = provider.aws_session_token.as_deref() {
+        headers.insert(
+            "x-amz-security-token",
+            HeaderValue::from_str(token)
+                .map_err(|_| "AWS session token is not a valid header value".to_owned())?,
+        );
+    }
+    Ok(())
+}
+
+fn hmac_bytes<M>(key: &[u8], message: &[u8]) -> Result<Vec<u8>, String>
+where
+    M: Mac + hmac::digest::KeyInit,
+{
+    let mut mac = <M as Mac>::new_from_slice(key).map_err(|_| "invalid HMAC key".to_owned())?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn aws_region(provider: &Provider, host: &str) -> Result<String, String> {
+    if provider.region.as_ref() != "global" && !provider.region.trim().is_empty() {
+        return Ok(provider.region.to_string());
+    }
+    let parts = host.split('.').collect::<Vec<_>>();
+    if parts.len() >= 3 && parts[0].starts_with("bedrock-runtime") {
+        return Ok(parts[1].to_owned());
+    }
+    Err(format!(
+        "AWS provider {} has no usable Bedrock region",
+        provider.name
+    ))
+}
+
+fn aws_timestamp(now: SystemTime) -> (String, String) {
+    let total = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let days = total.div_euclid(86_400);
+    let seconds = total.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3600;
+    let minute = seconds % 3600 / 60;
+    let second = seconds % 60;
+    (
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+        format!("{year:04}{month:02}{day:02}"),
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn aws_uri_encode(path: &str) -> String {
+    let mut output = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            output.push(byte as char);
+        } else {
+            output.push('%');
+            output.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+            output.push(char::from(b"0123456789ABCDEF"[(byte & 0x0f) as usize]));
+        }
+    }
+    output
+}
+
+fn hex_bytes(value: &[u8]) -> String {
+    let mut output = String::with_capacity(value.len() * 2);
+    for byte in value {
+        output.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+        output.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+    }
+    output
+}
+
+fn endpoint_url(base: &str, endpoint: &str, method: &Method, uri: &Uri) -> Result<String, String> {
+    if endpoint.starts_with("/v1/video/tasks/") {
+        let task = endpoint.trim_start_matches("/v1/video/tasks/");
+        return Ok(format!(
+            "{}/{}",
+            video_tasks_url(base),
+            url::form_urlencoded::byte_serialize(task.as_bytes()).collect::<String>()
+        ));
+    }
+    if endpoint == "/v1/video/tasks" {
+        return Ok(video_tasks_url(base));
+    }
+    if endpoint.starts_with("/v1/asset-groups/") {
+        return lingjing_url(
+            base,
+            &format!(
+                "/material/asset-groups/{}",
+                endpoint.trim_start_matches("/v1/asset-groups/")
+            ),
+            uri.query(),
+        );
+    }
+    if endpoint == "/v1/asset-groups" {
+        return lingjing_url(base, "/material/asset-groups", uri.query());
+    }
+    if endpoint.starts_with("/v1/assets/") {
+        return lingjing_url(
+            base,
+            &format!(
+                "/material/assets/{}",
+                endpoint.trim_start_matches("/v1/assets/")
+            ),
+            uri.query(),
+        );
+    }
+    if endpoint == "/v1/assets" {
+        return lingjing_url(base, "/material/assets/create", uri.query());
+    }
+    if matches!(endpoint, "/search" | "/v1/search") && *method == Method::GET {
+        return Ok(base.to_owned());
+    }
+    replace_known_endpoint(base, endpoint)
+}
+
+fn replace_known_endpoint(base: &str, endpoint: &str) -> Result<String, String> {
+    let mut url =
+        Url::parse(base).map_err(|error| format!("invalid provider base URL: {error}"))?;
+    let known = [
+        "/chat/completions",
+        "/images/generations",
+        "/images/edits",
+        "/audio/transcriptions",
+        "/audio/speech",
+        "/moderations",
+        "/embeddings",
+        "/responses/compact",
+        "/responses",
+        "/messages",
+    ];
+    let mut path = url.path().trim_end_matches('/').to_owned();
+    for suffix in known {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    let endpoint = endpoint.trim_start_matches("/v1/");
+    url.set_path(&format!("{}/{}", path.trim_end_matches('/'), endpoint));
+    Ok(url.to_string())
+}
+
+fn responses_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/responses") {
+        base.to_owned()
+    } else {
+        format!("{base}/responses")
+    }
+}
+
+fn messages_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/messages") {
+        base.to_owned()
+    } else {
+        format!("{base}/messages")
+    }
+}
+
+fn gemini_url(base: &str, model: &str, key: &str, stream: bool) -> Result<String, String> {
+    let mut url = Url::parse(base).map_err(|error| format!("invalid Gemini base URL: {error}"))?;
+    let path = url
+        .path()
+        .split("/models/")
+        .next()
+        .unwrap_or(url.path())
+        .trim_end_matches('/');
+    url.set_path(&format!(
+        "{path}/models/{model}:{}",
+        if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        }
+    ));
+    url.query_pairs_mut().clear().append_pair("key", key);
+    Ok(url.to_string())
+}
+
+fn vertex_gemini_url(
+    provider: &Provider,
+    model: &str,
+    key: &str,
+    stream: bool,
+) -> Result<String, String> {
+    let operation = if stream {
+        "streamGenerateContent"
+    } else {
+        "generateContent"
+    };
+    if key.as_bytes().get(2) == Some(&b'.') {
+        let mut url = Url::parse(provider.base_url.trim_end_matches('/'))
+            .map_err(|error| format!("invalid Vertex base URL: {error}"))?;
+        let base_path = url.path().trim_end_matches('/');
+        url.set_path(&format!(
+            "{base_path}/v1/publishers/google/models/{model}:{operation}"
+        ));
+        url.query_pairs_mut().clear().append_pair("key", key);
+        return Ok(url.to_string());
+    }
+    let project = provider
+        .project_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("Vertex provider {} is missing project_id", provider.name))?;
+    let region = provider.region.trim();
+    let origin = if provider.base_url.contains("google-vertex-ai") {
+        provider.base_url.trim_end_matches('/').to_owned()
+    } else if region == "global" {
+        "https://aiplatform.googleapis.com".into()
+    } else {
+        format!("https://{region}-aiplatform.googleapis.com")
+    };
+    Ok(format!(
+        "{origin}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:{operation}"
+    ))
+}
+
+async fn vertex_access_token(state: &AppState, provider: &Provider) -> Result<String, String> {
+    let email = provider
+        .client_email
+        .as_deref()
+        .ok_or_else(|| format!("Vertex provider {} is missing client_email", provider.name))?;
+    let private_key = provider
+        .private_key
+        .as_deref()
+        .ok_or_else(|| format!("Vertex provider {} is missing private_key", provider.name))?;
+    let cache = VERTEX_TOKEN_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    if let Some(token) = cache
+        .lock()
+        .await
+        .get(email)
+        .filter(|token| token.expires_at > Instant::now() + Duration::from_secs(60))
+        .cloned()
+    {
+        return Ok(token.value);
+    }
+    let assertion = service_account_jwt(email, private_key)?;
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+        .append_pair("assertion", &assertion)
+        .finish();
+    let response = state
+        .backend_client
+        .post("https://oauth2.googleapis.com/token")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept-encoding", "identity")
+        .body(body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| format!("Vertex OAuth token request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Vertex OAuth token endpoint returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("decode Vertex OAuth token response: {error}"))?;
+    let value = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 16 * 1024)
+        .ok_or_else(|| "Vertex OAuth token response is invalid".to_owned())?
+        .to_owned();
+    let expires_in = payload
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600)
+        .clamp(120, 86_400);
+    cache.lock().await.insert(
+        email.to_owned(),
+        CachedVertexToken {
+            value: value.clone(),
+            expires_at: Instant::now() + Duration::from_secs(expires_in),
+        },
+    );
+    Ok(value)
+}
+
+fn service_account_jwt(email: &str, private_key: &str) -> Result<String, String> {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let now = unix_seconds();
+    let claims = serde_json::to_vec(&json!({
+        "iss": email,
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "aud": "https://oauth2.googleapis.com/token",
+        "exp": now.saturating_add(3600),
+        "iat": now,
+    }))
+    .map_err(|error| format!("encode Vertex OAuth claims: {error}"))?;
+    let claims = URL_SAFE_NO_PAD.encode(claims);
+    let signing_input = format!("{header}.{claims}");
+    let encoded_key = private_key
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<String>();
+    let der = BASE64
+        .decode(encoded_key)
+        .map_err(|error| format!("decode Vertex private key: {error}"))?;
+    let key = RsaKeyPair::from_pkcs8(&der)
+        .or_else(|_| RsaKeyPair::from_der(&der))
+        .map_err(|_| "parse Vertex RSA private key".to_owned())?;
+    let mut signature = vec![0; key.public().modulus_len()];
+    key.sign(
+        &RSA_PKCS1_SHA256,
+        &SystemRandom::new(),
+        signing_input.as_bytes(),
+        &mut signature,
+    )
+    .map_err(|_| "sign Vertex OAuth assertion".to_owned())?;
+    Ok(format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
+}
+
+fn video_tasks_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/contents/generations/tasks") {
+        base.to_owned()
+    } else if Url::parse(base)
+        .ok()
+        .is_some_and(|url| url.path().is_empty() || url.path() == "/")
+    {
+        format!("{base}/api/v3/contents/generations/tasks")
+    } else {
+        format!("{base}/contents/generations/tasks")
+    }
+}
+
+fn lingjing_url(base: &str, openapi_path: &str, query: Option<&str>) -> Result<String, String> {
+    let mut url =
+        Url::parse(base).map_err(|error| format!("invalid Lingjing base URL: {error}"))?;
+    let base_path = url.path().trim_end_matches('/');
+    let suffix = openapi_path.trim_start_matches('/');
+    let path = if base_path.ends_with("/api/entrance/openapi") {
+        format!("{base_path}/{suffix}")
+    } else if base_path.ends_with("/api/entrance") {
+        format!("{base_path}/openapi/{suffix}")
+    } else {
+        format!("{base_path}/api/entrance/openapi/{suffix}")
+    };
+    url.set_path(&path);
+    url.set_query(query);
+    Ok(url.to_string())
+}
+
+fn provider_timeout(provider: &Provider, model: &str) -> Duration {
+    let raw = provider.preferences.get("model_timeout");
+    let seconds = match raw {
+        Some(Value::Number(value)) => value.as_f64(),
+        Some(Value::Object(values)) => values
+            .get(model)
+            .or_else(|| values.get("default"))
+            .and_then(Value::as_f64),
+        _ => None,
+    }
+    .filter(|value| value.is_finite() && *value > 0.0)
+    .unwrap_or(200.0);
+    Duration::from_secs_f64(seconds)
+}
+
+fn usage(value: &Value) -> (i64, i64, i64) {
+    let usage = value.get("usage").unwrap_or(&Value::Null);
+    let prompt = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(prompt.saturating_add(completion));
+    (prompt, completion, total)
+}
+
+fn query_value(uri: &Uri, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+async fn default_model_for_path(state: &AppState, headers: &HeaderMap, path: &str) -> String {
+    let Ok(models) = state
+        .native_responses_config
+        .models_for_headers(headers)
+        .await
+    else {
+        return String::new();
+    };
+    let preferred = if path.contains("video")
+        || path.contains("asset-groups")
+        || path.starts_with("/v1/assets")
+    {
+        ["seedance", "sora", "video", "veo"].as_slice()
+    } else {
+        [].as_slice()
+    };
+    for token in preferred {
+        if let Some(model) = models
+            .iter()
+            .find(|model| model.to_ascii_lowercase().contains(token))
+        {
+            return model.clone();
+        }
+    }
+    models.into_iter().next().unwrap_or_default()
+}
+
+fn trace_id(headers: &HeaderMap, fallback: &str) -> String {
+    headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split('-').nth(1))
+        .filter(|value| value.len() == 32)
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+fn truncate_detail(value: &str) -> String {
+    value.chars().take(4096).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_attempt(
+    request_id: &str,
+    trace_id: &str,
+    attempt_index: usize,
+    provider: &Provider,
+    request_model: &str,
+    original_model: &str,
+    url: &str,
+    outcome: &str,
+    status: Option<u16>,
+) {
+    let upstream_host = Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    eprintln!(
+        "{}",
+        json!({
+            "event_type":"rust_native_api_attempt",
+            "request_id":request_id,
+            "trace_id":trace_id,
+            "attempt_index":attempt_index + 1,
+            "provider":provider.name.as_ref(),
+            "request_model":request_model,
+            "actual_model":original_model,
+            "upstream_host":upstream_host,
+            "outcome":outcome,
+            "status_code":status,
+        })
+    );
+}
+
+fn json_response(status: StatusCode, value: Value) -> Response<Body> {
+    let mut response = Response::new(Body::from(value.to_string()));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    response
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_provider(engine: &str, base_url: &str) -> Provider {
+        Provider {
+            name: "provider-a".into(),
+            base_url: base_url.to_owned().into(),
+            engine: engine.to_owned().into(),
+            api_keys: std::sync::Arc::new(vec!["upstream-key".into()]),
+            project_id: None,
+            private_key: None,
+            client_email: None,
+            aws_access_key: None,
+            aws_secret_key: None,
+            aws_session_token: None,
+            cf_account_id: None,
+            region: "global".into(),
+            models: std::sync::Arc::new(HashMap::new()),
+            preferences: std::sync::Arc::new(Map::new()),
+            excluded_endpoints: std::sync::Arc::new(Vec::new()),
+            only_request_types: std::sync::Arc::new(Vec::new()),
+            excluded_request_types: std::sync::Arc::new(Vec::new()),
+            cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn every_python_model_route_has_a_native_dispatch() {
+        for route in [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/embeddings",
+            "/v1/audio/speech",
+            "/v1/audio/transcriptions",
+            "/v1/moderations",
+            "/v1/video/tasks",
+            "/v1/asset-groups",
+            "/v1/assets",
+            "/v1/alpha/search",
+        ] {
+            assert!(supports(&Method::POST, route), "missing {route}");
+        }
+        assert!(supports(&Method::GET, "/v1/search"));
+        assert!(supports(&Method::GET, "/v1/video/tasks/task-1"));
+    }
+
+    #[test]
+    fn codex_chat_is_compiled_to_responses_wire() {
+        let input = json!({
+            "model":"gpt-public",
+            "messages":[
+                {"role":"system","content":"be concise"},
+                {"role":"user","content":"hello"}
+            ],
+            "max_tokens":42,
+            "stream":true
+        });
+        let output = chat_to_responses(&input, "gpt-upstream").unwrap();
+        assert_eq!(output["model"], "gpt-upstream");
+        assert_eq!(output["max_output_tokens"], 42);
+        assert_eq!(output["stream"], false);
+        assert_eq!(output["input"][1]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn gemini_and_claude_payloads_preserve_system_and_tools() {
+        let input = json!({
+            "messages":[
+                {"role":"system","content":"system"},
+                {"role":"user","content":"hello"}
+            ],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+        });
+        let gemini = chat_to_gemini(&input, "gemini-upstream").unwrap();
+        assert_eq!(gemini["systemInstruction"]["parts"][0]["text"], "system");
+        assert_eq!(
+            gemini["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        let claude = chat_to_claude(&input, "claude-upstream").unwrap();
+        assert_eq!(claude["system"], "system");
+        assert_eq!(claude["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn upstream_responses_are_normalized_to_openai_chat() {
+        let gemini = gemini_to_chat(
+            &json!({
+                "candidates":[{"content":{"parts":[{"text":"hello"}]}}],
+                "usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}
+            }),
+            "gemini-public",
+        );
+        assert_eq!(gemini["choices"][0]["message"]["content"], "hello");
+        assert_eq!(gemini["usage"]["total_tokens"], 5);
+        let claude = claude_to_chat(
+            &json!({"content":[{"type":"text","text":"world"}],"usage":{"input_tokens":1,"output_tokens":2}}),
+            "claude-public",
+        );
+        assert_eq!(claude["choices"][0]["message"]["content"], "world");
+        assert_eq!(claude["usage"]["total_tokens"], 3);
+    }
+
+    #[test]
+    fn special_provider_urls_and_payloads_match_legacy_contracts() {
+        assert_eq!(
+            azure_chat_url("https://azure.example.com", "deployment-a").unwrap(),
+            "https://azure.example.com/openai/deployments/deployment-a/chat/completions?api-version=2025-01-01-preview"
+        );
+        assert_eq!(
+            databricks_chat_url("https://dbc.example.com", "serving-a").unwrap(),
+            "https://dbc.example.com/serving-endpoints/serving-a/invocations"
+        );
+        let cohere = chat_to_cohere(
+            &json!({"messages":[{"role":"system","content":"rules"},{"role":"user","content":"hello"}]}),
+            "command-r",
+        )
+        .unwrap();
+        assert_eq!(cohere["message"], "hello");
+        assert_eq!(cohere["chat_history"][0]["role"], "SYSTEM");
+
+        let mut cloudflare = test_provider("cloudflare", "https://api.cloudflare.com");
+        cloudflare.cf_account_id = Some("account-a".into());
+        assert_eq!(
+            cloudflare_url(&cloudflare, "@cf/meta/llama").unwrap(),
+            "https://api.cloudflare.com/client/v4/accounts/account-a/ai/run/@cf/meta/llama"
+        );
+    }
+
+    #[test]
+    fn provider_headers_use_protocol_specific_authentication() {
+        let request_headers = HeaderMap::new();
+        let azure = test_provider("azure", "https://azure.example.com");
+        let headers = provider_headers(
+            &azure,
+            "azure-key",
+            &request_headers,
+            "request-a",
+            "azure",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(headers["api-key"], "azure-key");
+        assert!(headers.get("authorization").is_none());
+
+        let openrouter = test_provider(
+            "openrouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+        );
+        let headers = provider_headers(
+            &openrouter,
+            "key",
+            &request_headers,
+            "request-a",
+            "openrouter",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            headers["http-referer"],
+            "https://github.com/yym68686/uni-api"
+        );
+        assert_eq!(headers["x-title"], "Uni API");
+    }
+
+    #[test]
+    fn aws_bedrock_request_is_signed_with_sigv4() {
+        let mut provider = test_provider("aws", "https://bedrock-runtime.us-east-1.amazonaws.com");
+        provider.aws_access_key = Some("AKIA_TEST".into());
+        provider.aws_secret_key = Some("secret".into());
+        let url = aws_bedrock_url(&provider, "anthropic.claude-3-haiku:0", true).unwrap();
+        let mut headers = HeaderMap::new();
+        sign_aws_request_at(
+            &provider,
+            &url,
+            br#"{"messages":[]}"#,
+            &mut headers,
+            UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(headers["x-amz-date"], "19700101T000000Z");
+        assert!(headers["authorization"].to_str().unwrap().starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIA_TEST/19700101/us-east-1/bedrock/aws4_request"
+        ));
+        assert_eq!(
+            headers["accept"],
+            "application/vnd.amazon.bedrock.payload+json"
+        );
+    }
+
+    #[test]
+    fn vertex_claude_uses_project_and_region() {
+        let mut provider = test_provider("vertex-claude", "https://aiplatform.googleapis.com");
+        provider.project_id = Some("project-a".into());
+        provider.region = "europe-west1".into();
+        assert_eq!(
+            vertex_claude_url(&provider, "claude-sonnet-4-5@20250929").unwrap(),
+            "https://europe-west1-aiplatform.googleapis.com/v1/projects/project-a/locations/europe-west1/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict"
+        );
+    }
+
+    #[test]
+    fn moderation_extracts_the_legacy_last_text_shapes() {
+        assert_eq!(
+            moderation_text(&json!({
+                "messages":[
+                    {"role":"user","content":"earlier"},
+                    {"role":"assistant","content":[{"type":"text","text":"latest"}]}
+                ]
+            }))
+            .as_deref(),
+            Some("latest")
+        );
+        assert_eq!(
+            moderation_text(&json!({"model":"text-embedding-3-small","input":["one","two"]}))
+                .as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(
+            moderation_text(&json!({
+                "input":[{"role":"user","content":[
+                    {"type":"input_text","text":"first"},
+                    {"type":"input_text","text":"last"}
+                ]}]
+            }))
+            .as_deref(),
+            Some("last")
+        );
+    }
+}

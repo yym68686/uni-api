@@ -1,5 +1,12 @@
+mod codex_oauth;
+mod config;
+mod generic_api;
 mod idempotency;
+mod native_api;
+mod persistence;
+mod provider_stream;
 mod proxy;
+mod request_decompression;
 mod request_spool;
 mod resources;
 mod responses;
@@ -16,20 +23,44 @@ use axum::Router;
 use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 
+use config::RuntimeConfigPublisher;
 use proxy::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_port = env_u16("PORT", 8000)?;
+    // Every public route is implemented by the Rust runtime.  Compatibility
+    // mode remains opt-in for the legacy image target.
+    let runtime_mode = std::env::var("UNI_API_RUNTIME").unwrap_or_else(|_| "rust".to_owned());
+    let python_mode = runtime_mode.eq_ignore_ascii_case("hybrid")
+        || runtime_mode.eq_ignore_ascii_case("python")
+        || env_bool("UNI_API_ENABLE_PYTHON_COMPAT", false);
     let backend_port = env_u16("UNI_API_PYTHON_PORT", 18001)?;
-    if public_port == backend_port {
+    if python_mode && public_port == backend_port {
         return Err("PORT and UNI_API_PYTHON_PORT must differ".into());
     }
     let control_token = control_token();
     let backend_origin = format!("http://127.0.0.1:{backend_port}");
-    let state = AppState::new(backend_origin.clone(), control_token.clone())?;
-    let mut child = spawn_python(backend_port, &control_token)?;
-    wait_for_backend(&state, &mut child).await?;
+    let database_disabled = env_bool("DISABLE_DATABASE", false);
+    let publisher = RuntimeConfigPublisher::discover(database_disabled)?;
+    publisher.publish().await?;
+    publisher.start_watcher();
+    let persistence = persistence::Persistence::initialize(database_disabled).await?;
+    let mut child = if python_mode {
+        Some(spawn_python(backend_port, &control_token)?)
+    } else {
+        None
+    };
+    let state = AppState::new(
+        backend_origin.clone(),
+        control_token.clone(),
+        python_mode,
+        persistence,
+        publisher,
+    )?;
+    if let Some(child) = child.as_mut() {
+        wait_for_backend(&state, child).await?;
+    }
     let _ = state.native_responses_config.refresh().await;
     state.native_responses_config.start_watcher();
 
@@ -38,7 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), public_port);
     let listener = tokio::net::TcpListener::bind(address).await?;
-    eprintln!("uni-api Rust frontend listening on {address}; Python control plane on 127.0.0.1:{backend_port}");
+    if python_mode {
+        eprintln!(
+            "uni-api Rust frontend listening on {address}; Python compatibility worker on 127.0.0.1:{backend_port}"
+        );
+    } else {
+        eprintln!("uni-api Rust runtime listening on {address}; Python compatibility disabled");
+    }
 
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -48,14 +85,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut server => {
             result?;
         }
-        status = child.wait() => {
-            return Err(format!("Python control plane exited unexpectedly: {}", status?).into());
+        status = async {
+            match child.as_mut() {
+                Some(child) => Some(child.wait().await),
+                None => std::future::pending().await,
+            }
+        } => {
+            if let Some(status) = status {
+                return Err(format!("Python control plane exited unexpectedly: {}", status?).into());
+            }
         }
     }
 
-    if child.id().is_some() {
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    if let Some(child) = child.as_mut() {
+        if child.id().is_some() {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        }
     }
     Ok(())
 }
@@ -128,6 +174,18 @@ fn control_token() -> String {
     );
     hasher.update(format!("{:p}", &hasher).as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 async fn shutdown_signal() {
