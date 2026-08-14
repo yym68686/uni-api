@@ -73,6 +73,10 @@ providers:
       - dall-e-3
     exclude_endpoints: # Optional. Exact request paths this provider should skip.
       - /v1/responses/compact
+    exclude_request_types: # Optional. Semantic request types this provider should skip.
+      - compaction # /v1/responses/compact, or /v1/responses with input type compaction_trigger.
+    # only_request_types: # Optional. Restrict this provider to the listed semantic request types.
+    #   - compaction
     preferences:
       max_request_body_bytes: 20000000 # Optional. Skip this provider when the incoming JSON request body is larger than this many bytes. Numeric values and strings like "20MB" or "20MiB" are supported.
 

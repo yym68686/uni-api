@@ -73,6 +73,10 @@ providers:
       - dall-e-3
     exclude_endpoints: # 选填，该渠道要跳过的请求端点，按请求路径精确匹配。
       - /v1/responses/compact
+    exclude_request_types: # 选填，该渠道要跳过的语义请求类型。
+      - compaction # /v1/responses/compact，或 input 中包含 type: compaction_trigger 的 /v1/responses 请求。
+    # only_request_types: # 选填，该渠道只处理列出的语义请求类型。
+    #   - compaction
     preferences:
       max_request_body_bytes: 20000000 # 选填，当入站 JSON 请求体大于该字节数时跳过这个渠道。支持数字，也支持 "20MB" 或 "20MiB" 这类字符串。
 

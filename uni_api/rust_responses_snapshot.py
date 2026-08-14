@@ -11,6 +11,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from core.utils import get_model_dict
+from uni_api.routing.request_types import provider_request_type_values
 
 
 RUST_RESPONSES_SNAPSHOT_SCHEMA_VERSION = 1
@@ -83,6 +84,12 @@ def build_rust_responses_snapshot(
                 },
                 "preferences": provider_preferences,
                 "exclude_endpoints": excluded_endpoints,
+                "only_request_types": provider_request_type_values(
+                    provider, "only_request_types"
+                ),
+                "exclude_request_types": provider_request_type_values(
+                    provider, "exclude_request_types"
+                ),
             }
         )
 

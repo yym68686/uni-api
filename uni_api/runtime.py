@@ -62,6 +62,7 @@ from uni_api.routing.planner import (
     get_right_order_providers,
     select_provider_api_key_raw,
 )
+from uni_api.routing.request_types import detect_request_type
 from upstream import (
     UPSTREAM_NETWORK_ERRORS,
     UpstreamRunner,
@@ -6833,6 +6834,9 @@ class ResponsesRequestExecution:
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
         request_body_bytes = _request_body_size_bytes(http_request, request_data)
+        request_type = detect_request_type(endpoint, request_data)
+        if request_type:
+            current_info["semantic_request_type"] = request_type
         plan = await RoutingPlan.create(
             app,
             request_model_name,
@@ -6841,6 +6845,7 @@ class ResponsesRequestExecution:
             handler.locks,
             endpoint=endpoint,
             request_body_bytes=request_body_bytes,
+            request_type=request_type,
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )

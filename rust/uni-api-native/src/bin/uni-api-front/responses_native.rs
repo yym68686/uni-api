@@ -90,6 +90,10 @@ struct RawProvider {
     preferences: Map<String, Value>,
     #[serde(default)]
     exclude_endpoints: Value,
+    #[serde(default)]
+    only_request_types: Value,
+    #[serde(default)]
+    exclude_request_types: Value,
 }
 
 #[derive(Clone)]
@@ -121,6 +125,8 @@ struct Provider {
     models: Arc<HashMap<String, String>>,
     preferences: Arc<Map<String, Value>>,
     excluded_endpoints: Arc<Vec<String>>,
+    only_request_types: Arc<Vec<String>>,
+    excluded_request_types: Arc<Vec<String>>,
     cursor: Arc<AtomicUsize>,
 }
 
@@ -312,6 +318,8 @@ impl NativeConfigStore {
                 models: Arc::new(item.models),
                 preferences: Arc::new(item.preferences),
                 excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
+                only_request_types: Arc::new(request_type_values(&item.only_request_types)),
+                excluded_request_types: Arc::new(request_type_values(&item.exclude_request_types)),
                 cursor,
             });
             providers_by_name.insert(name, provider.clone());
@@ -1243,6 +1251,7 @@ pub async fn prepare_native_request(
             json!({"detail": "Request body requires input"}),
         ));
     }
+    let request_type = detect_request_type(object);
     let stream_value = object.get("stream").cloned();
     let stream = match stream_value.as_ref() {
         None | Some(Value::Null) => false,
@@ -1278,6 +1287,7 @@ pub async fn prepare_native_request(
         &api_key,
         &request_model,
         observation.body_bytes,
+        request_type,
     ) {
         Ok(providers) if !providers.is_empty() => providers,
         Ok(_) => {
@@ -1396,6 +1406,7 @@ fn matching_providers(
     api_key: &ApiKey,
     request_model: &str,
     request_body_bytes: u64,
+    request_type: Option<&str>,
 ) -> Result<Vec<Arc<Provider>>, ()> {
     let mut matches = Vec::new();
     for rule in api_key.model_rules.iter() {
@@ -1452,6 +1463,7 @@ fn matching_providers(
             .iter()
             .any(|endpoint| endpoint.trim_end_matches('/') == "/v1/responses")
             && provider_accepts_body(provider, request_body_bytes)
+            && provider_accepts_request_type(provider, request_type)
     });
     Ok(matches)
 }
@@ -1478,6 +1490,37 @@ fn provider_accepts_body(provider: &Provider, bytes: u64) -> bool {
         return true;
     };
     parse_byte_limit(raw).is_none_or(|limit| bytes <= limit)
+}
+
+fn detect_request_type(payload: &Map<String, Value>) -> Option<&'static str> {
+    let is_compaction = payload
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+        });
+    is_compaction.then_some("compaction")
+}
+
+fn provider_accepts_request_type(provider: &Provider, request_type: Option<&str>) -> bool {
+    if !provider.only_request_types.is_empty()
+        && !request_type.is_some_and(|value| {
+            provider
+                .only_request_types
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(value))
+        })
+    {
+        return false;
+    }
+    !request_type.is_some_and(|value| {
+        provider
+            .excluded_request_types
+            .iter()
+            .any(|excluded| excluded.eq_ignore_ascii_case(value))
+    })
 }
 
 fn parse_byte_limit(value: &Value) -> Option<u64> {
@@ -2105,6 +2148,14 @@ fn endpoint_values(value: &Value) -> Vec<String> {
     }
 }
 
+fn request_type_values(value: &Value) -> Vec<String> {
+    endpoint_values(value)
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn preference_string(preferences: &Map<String, Value>, key: &str) -> Option<String> {
     preferences
         .get(key)
@@ -2388,6 +2439,8 @@ mod tests {
                 json!({"store": false, "__remove__": ["temperature"]}),
             )])),
             excluded_endpoints: Arc::new(Vec::new()),
+            only_request_types: Arc::new(Vec::new()),
+            excluded_request_types: Arc::new(Vec::new()),
             cursor: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -2516,6 +2569,33 @@ mod tests {
             ),
             Some(vec![(5, 1)])
         );
+    }
+
+    #[test]
+    fn request_type_detection_and_provider_filters_match_python_semantics() {
+        let regular = json!({"input": [{"type":"message"}]});
+        let compact = json!({
+            "input": [
+                {"type":"message"},
+                {"type":"compaction_trigger"}
+            ]
+        });
+        assert_eq!(detect_request_type(regular.as_object().unwrap()), None);
+        assert_eq!(
+            detect_request_type(compact.as_object().unwrap()),
+            Some("compaction")
+        );
+
+        let mut provider = provider();
+        provider.only_request_types = Arc::new(vec!["compaction".into()]);
+        assert!(!provider_accepts_request_type(&provider, None));
+        assert!(provider_accepts_request_type(&provider, Some("compaction")));
+
+        provider.excluded_request_types = Arc::new(vec!["compaction".into()]);
+        assert!(!provider_accepts_request_type(
+            &provider,
+            Some("compaction")
+        ));
     }
 
     #[test]

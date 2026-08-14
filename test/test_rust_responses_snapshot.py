@@ -21,7 +21,9 @@ def _config():
                 "model": [{"gpt-upstream": "gpt-public"}],
                 "preferences": {
                     "post_body_parameter_overrides": {"store": False},
+                    "exclude_request_types": ["future-type"],
                 },
+                "only_request_types": ["compaction"],
             }
         ],
         "api_keys": [
@@ -54,6 +56,8 @@ def test_snapshot_contains_compiled_models_and_hot_path_configuration():
         "provider-key-1",
         "provider-key-2",
     ]
+    assert snapshot["providers"][0]["only_request_types"] == ["compaction"]
+    assert snapshot["providers"][0]["exclude_request_types"] == ["future-type"]
     assert build_rust_responses_snapshot(
         _config(),
         ["client-key"],

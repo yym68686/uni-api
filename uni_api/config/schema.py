@@ -15,6 +15,8 @@ class ProviderConfig(BaseModel):
     region: str = "global"
     preferences: dict[str, Any] = Field(default_factory=dict)
     exclude_endpoints: Any = None
+    only_request_types: Any = None
+    exclude_request_types: Any = None
 
 
 class ApiKeyConfig(BaseModel):

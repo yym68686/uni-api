@@ -952,6 +952,82 @@ def test_get_right_order_providers_combines_weights_and_endpoint_exclusion():
     asyncio.run(run())
 
 
+def test_get_right_order_providers_filters_semantic_request_types():
+    config = {
+        "providers": [
+            {
+                "provider": "provider-default",
+                "base_url": "https://default.example/v1/responses",
+                "api": "key-default",
+                "model": ["gpt-5.6-terra"],
+            },
+            {
+                "provider": "provider-compaction-only",
+                "base_url": "https://compact.example/v1/responses",
+                "api": "key-compact",
+                "model": ["gpt-5.6-terra"],
+                "only_request_types": ["compaction"],
+            },
+            {
+                "provider": "provider-no-compaction",
+                "base_url": "https://regular.example/v1/responses",
+                "api": "key-regular",
+                "model": ["gpt-5.6-terra"],
+                "exclude_request_types": ["compaction"],
+            },
+        ],
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.6-terra"],
+            }
+        ],
+    }
+
+    async def run():
+        regular = await get_right_order_providers(
+            "gpt-5.6-terra",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.6-terra"]},
+        )
+        compact = await get_right_order_providers(
+            "gpt-5.6-terra",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.6-terra"]},
+            request_type="compaction",
+        )
+        legacy_compact = await get_right_order_providers(
+            "gpt-5.6-terra",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.6-terra"]},
+            endpoint="/v1/responses/compact",
+        )
+
+        assert [provider["provider"] for provider in regular] == [
+            "provider-default",
+            "provider-no-compaction",
+        ]
+        assert [provider["provider"] for provider in compact] == [
+            "provider-default",
+            "provider-compaction-only",
+        ]
+        assert [provider["provider"] for provider in legacy_compact] == [
+            "provider-default",
+            "provider-compaction-only",
+        ]
+
+    asyncio.run(run())
+
+
 def test_get_right_order_providers_smart_round_robin_uses_weighted_provider_order():
     config = {
         "providers": [
@@ -1172,5 +1248,58 @@ def test_routing_plan_refresh_preserves_endpoint(monkeypatch):
         await plan.refresh_matching_providers()
         assert endpoints == ["/v1/alpha/search", "/v1/alpha/search"]
         assert plan.endpoint == "/v1/alpha/search"
+
+    asyncio.run(run())
+
+
+def test_routing_plan_refresh_preserves_request_type():
+    request_types = []
+
+    async def resolver(
+        request_model_name,
+        config,
+        api_index,
+        scheduling_algorithm,
+        api_list,
+        models_list,
+        *,
+        request_type=None,
+        **_kwargs,
+    ):
+        _ = config, api_index, scheduling_algorithm, api_list, models_list
+        request_types.append(request_type)
+        return [
+            {
+                "provider": "provider-a",
+                "_model_dict_cache": {request_model_name: request_model_name},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config={"api_keys": [{"api": "sk-test", "model": ["gpt-5.6-terra"]}]},
+            api_list=["sk-test"],
+            models_list={"sk-test": ["gpt-5.6-terra"]},
+            channel_manager=None,
+        )
+    )
+
+    async def run():
+        plan = await RoutingPlan.create(
+            app,
+            "gpt-5.6-terra",
+            0,
+            {},
+            {},
+            endpoint="/v1/responses",
+            request_type="compaction",
+            provider_resolver=resolver,
+        )
+        await plan.refresh_matching_providers()
+        assert request_types == ["compaction", "compaction"]
+        assert plan.request_type == "compaction"
 
     asyncio.run(run())
