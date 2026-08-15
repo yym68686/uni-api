@@ -1330,6 +1330,73 @@ def test_responses_compact_non_stream_uses_timeout_policy_and_records_attempt(mo
     assert attempt["success"] is True
 
 
+def test_responses_compaction_trigger_uses_request_type_timeout_policy(monkeypatch):
+    client_manager = _configure_responses_test(monkeypatch, engine="codex")
+    client_manager.response = DummyStreamingUpstreamResponse(
+        chunks=[
+            _responses_sse("response.created", {"type": "response.created"}),
+            _responses_sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        }
+                    },
+                },
+            ),
+            _responses_sse(None, "[DONE]"),
+        ]
+    )
+    main.app.state.provider_timeouts = {"global": {"gpt-5.4": 20, "default": 30}}
+    main.app.state.timeout_policy = main.init_timeout_policy(
+        {
+            "preferences": {
+                "timeout_policy": {
+                    "rules": [
+                        {
+                            "match": {
+                                "endpoint": "/v1/responses",
+                                "stream": True,
+                                "request_type": "compaction",
+                                "engine": "codex",
+                                "model": "gpt-5.4*",
+                            },
+                            "timeout": {"first_byte": 300, "total": 3000},
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    current_info = {
+        "request_id": "req-compaction-trigger",
+        "api_key": "sk-test",
+        "disconnect_event": None,
+        "trace": main.RequestTrace(trace_id="req-compaction-trigger"),
+    }
+
+    response, _ = _run_responses_request_with_stream_body(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"type": "compaction_trigger"}],
+            stream=True,
+        ),
+        current_info=current_info,
+    )
+
+    assert response.status_code == 200
+    assert current_info["semantic_request_type"] == "compaction"
+    assert len(client_manager.stream_calls) == 1
+    attempt = current_info["upstream_attempts"][0]
+    assert attempt["timeout_seconds"] == 300
+    assert attempt["timeout_adjusted_from_seconds"] == 20
+    assert attempt["timeout_policy_sources"] == ["global.rules[0]"]
+
+
 def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatch):
     provider_name = "provider-a"
     monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))

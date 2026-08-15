@@ -4363,6 +4363,7 @@ class ModelRequestHandler:
                     engine=engine_for_timeout,
                     original_model=original_model,
                     request_model=request_model_name,
+                    request_type=plan.request_type,
                     role=plan.role,
                 )
                 local_timeout_value = int(timeout_resolution["timeout_value"])
@@ -7462,6 +7463,7 @@ class ResponsesRequestExecution:
             engine=engine,
             original_model=original_model,
             request_model=self.request_model_name,
+            request_type=self.plan.request_type,
             role=self.plan.role,
         )
         attempt.state.update(

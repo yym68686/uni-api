@@ -206,6 +206,60 @@ def test_timeout_policy_matches_most_specific_provider_rule():
     assert idle_only["total_timeout"] is None
 
 
+def test_timeout_policy_matches_semantic_request_type_without_affecting_regular_requests():
+    policy = main.init_timeout_policy(
+        {
+            "preferences": {
+                "timeout_policy": {
+                    "rules": [
+                        {
+                            "match": {
+                                "endpoint": "/v1/responses",
+                                "stream": True,
+                                "request_type": "compaction",
+                                "engine": "codex",
+                                "model": ["gpt-5.6*", "gpt-5.5", "gpt-5.4*"],
+                            },
+                            "timeout": {"first_byte": 300, "total": 3000},
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    compaction = main.apply_timeout_policy(
+        base_timeout=20,
+        timeout_policy=policy,
+        provider_name="openai-a",
+        endpoint="/v1/responses",
+        method="POST",
+        stream=True,
+        engine="codex",
+        original_model="gpt-5.5",
+        request_model="gpt-5.5",
+        request_type="compaction",
+    )
+    regular = main.apply_timeout_policy(
+        base_timeout=20,
+        timeout_policy=policy,
+        provider_name="openai-a",
+        endpoint="/v1/responses",
+        method="POST",
+        stream=True,
+        engine="codex",
+        original_model="gpt-5.5",
+        request_model="gpt-5.5",
+    )
+
+    assert compaction["first_byte_timeout"] == 300
+    assert compaction["total_timeout"] == 3000
+    assert compaction["timeout_policy_sources"] == ["global.rules[0]"]
+    assert regular["first_byte_timeout"] == 20
+    assert regular["total_timeout"] is None
+    assert regular["timeout_policy_sources"] == []
+
+
 def test_compile_runtime_config_resolves_wildcard_and_nested_api_keys():
     config = validate_config_data(
         {

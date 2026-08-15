@@ -1142,7 +1142,7 @@ By tuning `model_timeout` and `keepalive_interval` based on this matching behavi
 
 - How should I configure different timeouts for different endpoints or streaming modes?
 
-Use `timeout_policy` when timeout depends on endpoint, stream mode, provider, engine, model, method, or role. `model_timeout` is still supported as the backward-compatible fallback; `timeout_policy` is the more precise rule system.
+Use `timeout_policy` when timeout depends on endpoint, stream mode, semantic request type, provider, engine, model, method, or role. `model_timeout` is still supported as the backward-compatible fallback; `timeout_policy` is the more precise rule system.
 
 ```yaml
 preferences:
@@ -1160,6 +1160,18 @@ preferences:
         timeout:
           first_byte: 120
           total: 300
+      - match:
+          endpoint: /v1/responses
+          stream: true
+          request_type: compaction
+          engine: codex
+          model:
+            - gpt-5.6*
+            - gpt-5.5
+            - gpt-5.4*
+        timeout:
+          first_byte: 300
+          total: 3000
       - match:
           endpoint: /v1/responses
           stream: true
@@ -1181,7 +1193,7 @@ providers:
               first_byte: 180
 ```
 
-Supported `match` keys are `endpoint`, `stream`, `method`, `engine`, `provider`, `model`, `request_model`, `upstream_model`, and `role`. `model` matches either the request model or upstream model. `*` matches any value, and a value ending in `*` is treated as a prefix match.
+Supported `match` keys are `endpoint`, `stream`, `request_type`, `method`, `engine`, `provider`, `model`, `request_model`, `upstream_model`, and `role`. `request_type: compaction` matches a Responses request whose `input` contains `{ "type": "compaction_trigger" }`. `model` matches either the request model or upstream model. `*` matches any value, and a value ending in `*` is treated as a prefix match.
 
 Supported timeout keys are `connect`, `write`, `pool`, `first_byte`, `idle`, and `total`. For `/v1/responses` streaming calls, each key has one responsibility: `first_byte` limits the time until upstream headers or the first upstream stream event; `idle` is the only field that becomes an httpx read timeout between upstream chunks; `total` limits the full upstream stream lifetime. If `first_byte` is not set, uni-api uses provider/global `model_timeout`, then `TIMEOUT`, as the first-byte fallback. uni-api does not install a default streaming idle timeout unless `idle` is explicitly configured.
 

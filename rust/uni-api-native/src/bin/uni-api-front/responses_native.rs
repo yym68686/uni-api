@@ -240,6 +240,7 @@ pub struct NativeRoute {
     request_headers: HeaderMap,
     request_model: String,
     endpoint: String,
+    request_type: Option<String>,
     wants_compact: bool,
     stream: bool,
     request_id: String,
@@ -599,6 +600,7 @@ impl NativeConfigStore {
             original_model,
             engine,
             stream,
+            None,
             &role,
             endpoint,
             method,
@@ -1098,6 +1100,7 @@ impl NativeRoute {
                 &original_model,
                 &engine,
                 self.stream,
+                self.request_type.as_deref(),
                 self.api_key.role.as_ref(),
                 &self.endpoint,
                 "POST",
@@ -1960,6 +1963,7 @@ pub async fn prepare_native_request(
         request_headers: parts.headers.clone(),
         request_model,
         endpoint: normalized_endpoint.to_owned(),
+        request_type: request_type.map(str::to_owned),
         wants_compact,
         stream,
         request_id,
@@ -2687,6 +2691,7 @@ fn resolve_timeouts(
     original_model: &str,
     engine: &str,
     stream: bool,
+    request_type: Option<&str>,
     role: &str,
     endpoint: &str,
     method: &str,
@@ -2705,6 +2710,7 @@ fn resolve_timeouts(
         ("model", request_model),
         ("request_model", request_model),
         ("upstream_model", original_model),
+        ("request_type", request_type.unwrap_or_default()),
         ("role", role),
     ]);
     let mut values = Map::new();
@@ -3290,6 +3296,7 @@ mod tests {
             request_headers: HeaderMap::new(),
             request_model: "gpt-public".into(),
             endpoint: "/v1/responses".into(),
+            request_type: None,
             wants_compact: false,
             stream: true,
             request_id: "request-test".into(),
@@ -3344,6 +3351,66 @@ mod tests {
         assert!(payload.get("previous_response_id").is_none());
         assert!(payload["input"][0].get("id").is_none());
         assert!(payload["input"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn timeout_policy_matches_compaction_request_type_without_affecting_regular_requests() {
+        let provider = provider();
+        let snapshot = Snapshot {
+            revision: Arc::from("0".repeat(64)),
+            preferences: Arc::new(Map::from_iter([
+                ("model_timeout".into(), json!({"gpt-public": 20})),
+                (
+                    "timeout_policy".into(),
+                    json!({
+                        "rules": [{
+                            "match": {
+                                "endpoint": "/v1/responses",
+                                "stream": true,
+                                "request_type": "compaction",
+                                "engine": "codex",
+                                "model": ["gpt-5.6*", "gpt-public", "gpt-5.4*"]
+                            },
+                            "timeout": {"first_byte": 300, "total": 3000}
+                        }]
+                    }),
+                ),
+            ])),
+            api_keys: Arc::new(HashMap::new()),
+            providers: Arc::new(Vec::new()),
+            providers_by_name: Arc::new(HashMap::new()),
+            api_config: Arc::new(json!({})),
+        };
+
+        let compaction = resolve_timeouts(
+            &snapshot,
+            &provider,
+            "gpt-public",
+            "gpt-upstream",
+            "codex",
+            true,
+            Some("compaction"),
+            "user",
+            "/v1/responses",
+            "POST",
+        );
+        let regular = resolve_timeouts(
+            &snapshot,
+            &provider,
+            "gpt-public",
+            "gpt-upstream",
+            "codex",
+            true,
+            None,
+            "user",
+            "/v1/responses",
+            "POST",
+        );
+
+        assert_eq!(compaction.first_byte, Some(300.0));
+        assert_eq!(compaction.total, Some(3000.0));
+        assert_eq!(regular.first_byte, Some(20.0));
+        assert_eq!(regular.total, None);
     }
 
     #[test]

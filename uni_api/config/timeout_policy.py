@@ -31,6 +31,7 @@ def resolve_timeout_policy(
     engine: str,
     original_model: str,
     request_model: str,
+    request_type: Optional[str] = None,
     role: Optional[str] = None,
 ) -> dict[str, Any]:
     context = {
@@ -42,6 +43,7 @@ def resolve_timeout_policy(
         "model": str(request_model or ""),
         "request_model": str(request_model or ""),
         "upstream_model": str(original_model or ""),
+        "request_type": str(request_type or ""),
         "role": str(role or ""),
     }
     merged: dict[str, int] = {}
@@ -79,6 +81,7 @@ def apply_timeout_policy(
     original_model: str,
     request_model: str,
     method: str = "POST",
+    request_type: Optional[str] = None,
     role: Optional[str] = None,
 ) -> dict[str, Any]:
     resolved = resolve_timeout_policy(
@@ -90,6 +93,7 @@ def apply_timeout_policy(
         engine=engine,
         original_model=original_model,
         request_model=request_model,
+        request_type=request_type,
         role=role,
     )
     timeout_values = dict(resolved.get("timeout") or {})
@@ -183,6 +187,7 @@ def _timeout_policy_rule_matches(match: dict[str, Any], context: dict[str, Any])
         "model": ("model", "request_model", "upstream_model"),
         "request_model": ("request_model",),
         "upstream_model": ("upstream_model",),
+        "request_type": ("request_type",),
         "provider": ("provider",),
         "endpoint": ("endpoint",),
         "method": ("method",),

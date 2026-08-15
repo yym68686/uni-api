@@ -1121,7 +1121,7 @@ api_keys:
 
 - 如何给不同端点、流式 / 非流式、不同模型设置不同超时？
 
-如果超时策略需要依赖端点、是否流式、provider、engine、模型、HTTP method 或 role，请使用 `timeout_policy`。`model_timeout` 仍然保留，作为向后兼容的 fallback；`timeout_policy` 是更精确的规则系统。
+如果超时策略需要依赖端点、是否流式、语义请求类型、provider、engine、模型、HTTP method 或 role，请使用 `timeout_policy`。`model_timeout` 仍然保留，作为向后兼容的 fallback；`timeout_policy` 是更精确的规则系统。
 
 ```yaml
 preferences:
@@ -1139,6 +1139,18 @@ preferences:
         timeout:
           first_byte: 120
           total: 300
+      - match:
+          endpoint: /v1/responses
+          stream: true
+          request_type: compaction
+          engine: codex
+          model:
+            - gpt-5.6*
+            - gpt-5.5
+            - gpt-5.4*
+        timeout:
+          first_byte: 300
+          total: 3000
       - match:
           endpoint: /v1/responses
           stream: true
@@ -1160,7 +1172,7 @@ providers:
               first_byte: 180
 ```
 
-支持的 `match` 字段包括：`endpoint`、`stream`、`method`、`engine`、`provider`、`model`、`request_model`、`upstream_model`、`role`。其中 `model` 会同时匹配请求模型名和真实上游模型名；`*` 匹配任意值；以 `*` 结尾的字符串表示前缀匹配。
+支持的 `match` 字段包括：`endpoint`、`stream`、`request_type`、`method`、`engine`、`provider`、`model`、`request_model`、`upstream_model`、`role`。其中 `request_type: compaction` 会匹配 `input` 中包含 `{ "type": "compaction_trigger" }` 的 Responses 请求；`model` 会同时匹配请求模型名和真实上游模型名；`*` 匹配任意值；以 `*` 结尾的字符串表示前缀匹配。
 
 支持的 timeout 字段包括：`connect`、`write`、`pool`、`first_byte`、`idle`、`total`。对于 `/v1/responses` 流式调用，每个字段只承担自己的职责：`first_byte` 限制从发起上游请求到收到上游 headers 或第一个上游 stream event 的时间；`idle` 是唯一会映射成 httpx read timeout、限制上游 chunk 间隔的字段；`total` 限制整条上游流的总生命周期。如果没有配置 `first_byte`，uni-api 会使用 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`，作为首字 fallback。除非显式配置 `idle`，uni-api 不会默认设置流式 idle timeout。
 
