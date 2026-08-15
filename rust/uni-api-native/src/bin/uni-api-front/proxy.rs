@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use axum::response::IntoResponse;
@@ -30,7 +30,7 @@ pub struct AppState {
     pub control_token: Arc<str>,
     pub backend_client: reqwest::Client,
     upstream_clients: Arc<Mutex<HashMap<ClientKey, reqwest::Client>>>,
-    resource_governor: ResourceGovernor,
+    pub(crate) resource_governor: ResourceGovernor,
     pub(crate) request_spool: SpoolManager,
     idempotency: idempotency::Coordinator,
     responses_data_plane_enabled: bool,
@@ -335,7 +335,7 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
             NativePreparation::Fallback => {}
         }
-        if !state.python_compat_enabled {
+        if path != "/v1/responses" && !state.python_compat_enabled {
             if let Some(owner) = owner {
                 owner.release().await;
             }
@@ -355,6 +355,13 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
         };
         let request = Request::from_parts(parts, body);
+        if path == "/v1/responses" {
+            let response = crate::generic_api::handle(state, request, resource_wait).await;
+            if let Some(owner) = owner {
+                return relay_idempotent_axum_response(response, owner).await;
+            }
+            return response;
+        }
         let proxied = proxy_to_backend(
             &state,
             request,
@@ -475,6 +482,50 @@ async fn relay_idempotent_response(
             .await;
     }
     idempotency::response_from_bytes(status, headers, body)
+}
+
+async fn relay_idempotent_axum_response(
+    response: Response<Body>,
+    owner: idempotency::Owner,
+) -> Response<Body> {
+    if response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        owner.nonreplayable("streaming_response").await;
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let maximum = std::env::var("RUST_GENERIC_UPSTREAM_RESPONSE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64 * 1024 * 1024);
+    let body = match to_bytes(body, maximum.saturating_add(1)).await {
+        Ok(body) => body,
+        Err(error) => {
+            owner.release().await;
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Rust compatibility response read failed: {error}"),
+            );
+        }
+    };
+    if body.len() > owner.max_response_bytes() {
+        owner.nonreplayable("response_too_large").await;
+    } else {
+        owner
+            .complete(
+                parts.status,
+                parts.headers.clone(),
+                vec![body.clone()],
+                body.len(),
+            )
+            .await;
+    }
+    Response::from_parts(parts, Body::from(body))
 }
 
 fn idempotency_error(

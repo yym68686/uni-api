@@ -12,7 +12,6 @@ from uni_api.api.alpha_search import AlphaSearchRequestHandler
 from uni_api.middleware.request_decompression import JSON_BODY_PATHS
 from uni_api.observability.middleware import StatsMiddleware
 from uni_api.rate_limit.key_pool import ProviderKeyPool
-from uni_api.routing.search_affinity import SearchAffinityStore
 
 
 class _SequenceClient:
@@ -138,7 +137,6 @@ def _make_handler(
         api_key_has_model_rules=lambda _app, _index: True,
         resolve_codex_upstream_auth=resolve_codex_upstream_auth,
         resolve_timeout=lambda **_kwargs: None,
-        affinity_store=SearchAffinityStore(pepper=b"p" * 32),
     )
     return handler, manager
 
@@ -306,7 +304,7 @@ def test_alpha_search_non_retryable_4xx_is_raw_and_single_attempt(
     assert len(manager.calls) == 1
 
 
-def test_alpha_search_retries_unbound_then_binds_successful_provider(monkeypatch):
+def test_alpha_search_retries_without_binding_subsequent_requests(monkeypatch):
     providers = [
         _provider("provider-a", key="key-a"),
         _provider("provider-b", key="key-b"),
@@ -332,33 +330,13 @@ def test_alpha_search_retries_unbound_then_binds_successful_provider(monkeypatch
     assert [call["url"] for call in manager.calls] == [
         "https://provider-a.example/v1/alpha/search",
         "https://provider-b.example/v1/alpha/search",
-        "https://provider-b.example/v1/alpha/search",
+        "https://provider-a.example/v1/alpha/search",
     ]
     assert manager.calls[1]["headers"]["Authorization"] == "Bearer key-b"
-    assert manager.calls[2]["headers"]["Authorization"] == "Bearer key-b"
+    assert manager.calls[2]["headers"]["Authorization"] == "Bearer key-a"
 
 
-def test_alpha_search_bound_credential_removal_fails_closed(monkeypatch):
-    provider = _provider("provider-a", key="key-a")
-    handler, manager = _make_handler(
-        monkeypatch,
-        [provider],
-        [_upstream_response(200, b'{"output":"bound"}')],
-    )
-    body = {"id": "session-removed-key", "model": "gpt-5.4"}
-
-    first = _run(handler, body)
-    asyncio.run(
-        provider_api_circular_list["provider-a"].reset_items(["replacement-key"])
-    )
-    second = _run(handler, body)
-
-    assert first.status_code == 200
-    assert second.status_code == 503
-    assert len(manager.calls) == 1
-
-
-def test_alpha_search_concurrent_first_requests_share_one_binding(monkeypatch):
+def test_alpha_search_concurrent_requests_rotate_credentials(monkeypatch):
     providers = [
         _provider("provider-a", key=["key-a1", "key-a2"]),
         _provider("provider-b", key="key-b"),
@@ -391,32 +369,28 @@ def test_alpha_search_concurrent_first_requests_share_one_binding(monkeypatch):
 
     assert all(response.status_code == 200 for response in responses)
     assert len(manager.calls) == 20
-    assert {
-        call["url"] for call in manager.calls
-    } == {"https://provider-a.example/v1/alpha/search"}
+    assert {call["url"] for call in manager.calls} == {
+        "https://provider-a.example/v1/alpha/search",
+    }
     selected_credentials = {
         call["headers"]["Authorization"] for call in manager.calls
     }
-    assert len(selected_credentials) == 1
-    assert selected_credentials <= {"Bearer key-a1", "Bearer key-a2"}
+    assert selected_credentials == {
+        "Bearer key-a1",
+        "Bearer key-a2",
+    }
 
 
-def test_alpha_search_invalid_success_retries_and_attempts_are_capped(monkeypatch):
+def test_alpha_search_accepts_any_success_body_without_retry(monkeypatch):
     providers = [
         _provider(f"provider-{name}", key=f"key-{name}")
         for name in ("a", "b", "c", "d")
     ]
-    timeout = httpx.ReadTimeout(
-        "timed out",
-        request=httpx.Request("POST", "https://provider.example/v1/alpha/search"),
-    )
     handler, manager = _make_handler(
         monkeypatch,
         providers,
         [
             _upstream_response(200, b'{"id":"responses-envelope"}'),
-            timeout,
-            timeout,
         ],
     )
 
@@ -425,13 +399,9 @@ def test_alpha_search_invalid_success_retries_and_attempts_are_capped(monkeypatc
         {"id": "session-cap", "model": "gpt-5.4"},
     )
 
-    assert response.status_code == 504
-    assert len(manager.calls) == 3
-    assert [call["url"] for call in manager.calls] == [
-        "https://provider-a.example/v1/alpha/search",
-        "https://provider-b.example/v1/alpha/search",
-        "https://provider-c.example/v1/alpha/search",
-    ]
+    assert response.status_code == 200
+    assert response.body == b'{"id":"responses-envelope"}'
+    assert len(manager.calls) == 1
 
 
 def test_alpha_search_accepts_non_special_engine_and_json_body_path(monkeypatch):
@@ -508,26 +478,15 @@ def test_alpha_search_body_inspection_does_not_log_unknown_request_type(
     assert errors == []
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        [],
-        {},
-        {"id": "session"},
-        {"id": "", "model": "gpt-5.4"},
-        {"id": "session", "model": ""},
-        {"id": 1, "model": "gpt-5.4"},
-    ],
-)
-def test_alpha_search_rejects_invalid_request_before_routing(monkeypatch, body):
+def test_alpha_search_does_not_require_id(monkeypatch):
     handler, manager = _make_handler(
         monkeypatch,
         [_provider("provider-a", key="key-a")],
-        [],
+        [_upstream_response(200, b'{"anything":true}')],
     )
 
-    with pytest.raises(Exception) as exc_info:
-        _run(handler, body)
+    response = _run(handler, {"model": "gpt-5.4"})
 
-    assert getattr(exc_info.value, "status_code", None) == 400
-    assert manager.calls == []
+    assert response.status_code == 200
+    assert response.body == b'{"anything":true}'
+    assert "Session_id" not in manager.calls[0]["headers"]

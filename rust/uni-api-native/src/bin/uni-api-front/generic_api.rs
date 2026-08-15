@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
@@ -7,6 +8,8 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use base64::Engine;
+use bytes::Bytes;
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
@@ -15,17 +18,24 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::persistence::{ChannelStat, RequestStat};
-use crate::provider_stream::{self, Protocol as StreamProtocol};
+use crate::provider_stream::{
+    self, OutputProtocol as StreamOutputProtocol, Protocol as StreamProtocol,
+};
 use crate::proxy::{
     filtered_response_headers, json_error, read_spooled_body, AppState, RequestBodySpoolError,
 };
 use crate::request_spool::{SpoolObservation, StoredBody};
+use crate::resources::MemoryReservation;
 use crate::responses_native::{
     apply_overrides, compute_retry_count, extract_api_key, request_id, FailedRoute, Provider,
     ProviderKeySelection, CODEX_USER_AGENT,
 };
 
 const ALPHA_SEARCH_ENDPOINT: &str = "/v1/alpha/search";
+const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
+const DEFAULT_UPSTREAM_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const UPSTREAM_ERROR_MAX_BYTES: usize = 1024 * 1024;
 
 const PUBLIC_JSON_ROUTES: &[&str] = &[
     "/v1/chat/completions",
@@ -43,12 +53,19 @@ const PUBLIC_JSON_ROUTES: &[&str] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponseAdapter {
     Passthrough,
+    Search,
     ResponsesToChat,
     GeminiToChat,
     ClaudeToChat,
     CohereToChat,
     CloudflareToChat,
     AwsToChat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownstreamProtocol {
+    Native,
+    ResponsesCompat,
 }
 
 struct PreparedAttempt {
@@ -59,7 +76,9 @@ struct PreparedAttempt {
     adapter: ResponseAdapter,
     downstream_stream: bool,
     upstream_stream: bool,
+    request_model: String,
     original_model: String,
+    downstream_protocol: DownstreamProtocol,
 }
 
 #[derive(Clone)]
@@ -71,16 +90,34 @@ struct CachedVertexToken {
 static VERTEX_TOKEN_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, CachedVertexToken>>> =
     OnceLock::new();
 
+struct ThoughtSignatureCache {
+    values: HashMap<String, String>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+static GEMINI_THOUGHT_SIGNATURES: OnceLock<Mutex<ThoughtSignatureCache>> = OnceLock::new();
+
 enum AttemptBody {
     Json(Vec<u8>),
     Replay(StoredBody, SpoolObservation),
+    MultipartRewrite {
+        storage: StoredBody,
+        observation: SpoolObservation,
+        source_content_type: String,
+        boundary: String,
+        model: String,
+    },
     Empty,
 }
 
 pub fn supports(method: &Method, path: &str) -> bool {
     if *method == Method::POST
         && (PUBLIC_JSON_ROUTES.contains(&path)
-            || matches!(path, "/v1/images/edits" | "/v1/audio/transcriptions"))
+            || matches!(
+                path,
+                "/v1/images/edits" | "/v1/audio/transcriptions" | "/v1/responses"
+            ))
     {
         return true;
     }
@@ -160,12 +197,17 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let max_attempts = compute_retry_count(&resolved.providers)
         .max(resolved.providers.len())
         .min(10);
+    let (input, _image_reservations) = match prepare_image_inputs(&state, input).await {
+        Ok(prepared) => prepared,
+        Err((status, detail)) => return json_error(status, &detail),
+    };
     let (prompt_price, completion_price) = state
         .native_responses_config
         .prices_for_model(&request_model)
         .await;
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
+    let mut last_upstream_response = None;
 
     for attempt_index in 0..max_attempts {
         let provider = resolved.providers[attempt_index % resolved.providers.len()].clone();
@@ -310,9 +352,12 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                 );
                 return success.response;
             }
-            Err(failure) => {
+            Err(mut failure) => {
                 last_status = failure.status;
                 last_detail = failure.detail.clone();
+                if let Some(response) = failure.response.take() {
+                    last_upstream_response = Some(response);
+                }
                 state.persistence.record_channel(ChannelStat {
                     request_id: request_id.clone(),
                     provider: provider.name.to_string(),
@@ -370,7 +415,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         timing_spans: json!({"runtime":"rust","terminal":"route_exhausted"}).to_string(),
         ..RequestStat::default()
     });
-    json_error(last_status, &last_detail)
+    last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
 }
 
 pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
@@ -577,6 +622,244 @@ struct PreparedInput {
     content_type: String,
 }
 
+async fn prepare_image_inputs(
+    state: &AppState,
+    mut input: PreparedInput,
+) -> Result<(PreparedInput, Vec<MemoryReservation>), (StatusCode, String)> {
+    let Some(payload) = input.payload.as_mut() else {
+        return Ok((input, Vec::new()));
+    };
+    let mut reservations = Vec::new();
+    if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                    continue;
+                }
+                let Some(url) = part
+                    .pointer("/image_url/url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let normalized = normalize_image_url(state, &url, &mut reservations).await?;
+                if let Some(root) = part.get_mut("image_url").and_then(Value::as_object_mut) {
+                    root.insert("url".into(), Value::String(normalized));
+                }
+            }
+        }
+    }
+    if let Some(items) = payload.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("input_image") {
+                    continue;
+                }
+                let Some(url) = part
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let normalized = normalize_image_url(state, &url, &mut reservations).await?;
+                part.as_object_mut()
+                    .expect("responses input image object")
+                    .insert("image_url".into(), Value::String(normalized));
+            }
+        }
+    }
+    Ok((input, reservations))
+}
+
+async fn normalize_image_url(
+    state: &AppState,
+    value: &str,
+    reservations: &mut Vec<MemoryReservation>,
+) -> Result<String, (StatusCode, String)> {
+    if value.starts_with("data:") {
+        validate_image_data_url(state, value, reservations).await?;
+        return Ok(value.to_owned());
+    }
+    let parsed =
+        Url::parse(value).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err((StatusCode::BAD_REQUEST, "Invalid image URL".into()));
+    }
+    let client = state
+        .upstream_client(None, false)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let response = tokio::time::timeout(
+        IMAGE_FETCH_TIMEOUT,
+        client
+            .get(value)
+            .header("accept-encoding", "identity")
+            .timeout(IMAGE_FETCH_TIMEOUT)
+            .send(),
+    )
+    .await
+    .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "Image fetch timed out".into()))?
+    .map_err(|_| (StatusCode::BAD_REQUEST, "Unable to fetch image URL".into()))?;
+    if !response.status().is_success() {
+        return Err((StatusCode::BAD_REQUEST, "Unable to fetch image URL".into()));
+    }
+    let maximum = image_max_bytes();
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Image input exceeds the configured size limit".into(),
+        ));
+    }
+    if let Some(length) = response.content_length() {
+        let (_, reservation) = state
+            .resource_governor
+            .reserve_memory_capacity(length.saturating_mul(3))
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Insufficient memory capacity for image input".into(),
+                )
+            })?;
+        reservations.push(reservation);
+    }
+    let known_length = response.content_length().is_some();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| (StatusCode::BAD_REQUEST, "Unable to fetch image URL".into()))?;
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Image input exceeds the configured size limit".into(),
+            ));
+        }
+        if !known_length {
+            let (_, reservation) = state
+                .resource_governor
+                .reserve_memory_capacity((chunk.len() as u64).saturating_mul(3))
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Insufficient memory capacity for image input".into(),
+                    )
+                })?;
+            reservations.push(reservation);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let media_type = detect_image_media_type(&bytes).ok_or_else(|| {
+        (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Unsupported image media type".into(),
+        )
+    })?;
+    Ok(format!(
+        "data:{media_type};base64,{}",
+        BASE64.encode(&bytes)
+    ))
+}
+
+async fn validate_image_data_url(
+    state: &AppState,
+    value: &str,
+    reservations: &mut Vec<MemoryReservation>,
+) -> Result<(), (StatusCode, String)> {
+    let (header, encoded) = value
+        .split_once(',')
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid image data URL".into()))?;
+    if header.len() > 128
+        || !header.to_ascii_lowercase().starts_with("data:")
+        || !header.to_ascii_lowercase().ends_with(";base64")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Image input must be a base64 data URL".into(),
+        ));
+    }
+    let declared = header[5..header.len().saturating_sub(7)].to_ascii_lowercase();
+    let declared = if declared == "image/jpg" {
+        "image/jpeg"
+    } else {
+        declared.as_str()
+    };
+    if !matches!(declared, "image/jpeg" | "image/png" | "image/webp") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Unsupported image media type".into(),
+        ));
+    }
+    let predicted = encoded.len().saturating_add(3) / 4 * 3;
+    if predicted > image_max_bytes() {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Image input exceeds the configured size limit".into(),
+        ));
+    }
+    let (_, reservation) = state
+        .resource_governor
+        .reserve_memory_capacity(predicted as u64)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Insufficient memory capacity for image input".into(),
+            )
+        })?;
+    reservations.push(reservation);
+    let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
+    let decoded = BASE64
+        .decode(padded.as_bytes())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image base64".into()))?;
+    let detected = detect_image_media_type(&decoded).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Image bytes do not match the declared media type".into(),
+        )
+    })?;
+    if detected != declared {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Image bytes do not match the declared media type".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn image_max_bytes() -> usize {
+    std::env::var("RUST_IMAGE_INPUT_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_IMAGE_MAX_BYTES)
+}
+
+fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
 async fn prepare_input(
     state: &AppState,
     request: Request,
@@ -620,7 +903,8 @@ async fn prepare_input(
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
-        .to_ascii_lowercase();
+        .to_owned();
+    let normalized_content_type = content_type.to_ascii_lowercase();
     let (_, body) = request.into_parts();
     let spool = read_spooled_body(
         body,
@@ -639,7 +923,7 @@ async fn prepare_input(
         }
         RequestBodySpoolError::Spool(failure) => json_error(failure.status, &failure.message),
     })?;
-    if content_type.starts_with("application/json") {
+    if normalized_content_type.starts_with("application/json") {
         let payload = spool
             .storage
             .parse_json()
@@ -661,12 +945,18 @@ async fn prepare_input(
     }
     let model = match query_value(uri, "model") {
         Some(model) => model,
-        None if content_type.starts_with("multipart/form-data") => spool
+        None if normalized_content_type.starts_with("multipart/form-data") => spool
             .storage
             .multipart_text_field(&content_type, "model", 4096)
             .await
             .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                if path == "/v1/images/edits" {
+                    "gpt-image-2".into()
+                } else {
+                    String::new()
+                }
+            }),
         None => String::new(),
     };
     Ok(PreparedInput {
@@ -692,6 +982,19 @@ fn build_attempt(
     request_id: &str,
 ) -> Result<PreparedAttempt, String> {
     let is_alpha_search = path == ALPHA_SEARCH_ENDPOINT;
+    let engine = provider.engine.trim().to_ascii_lowercase();
+    let native_responses_wire = path == "/v1/responses"
+        && (engine == "codex"
+            || (engine == "gpt"
+                && provider
+                    .base_url
+                    .to_ascii_lowercase()
+                    .contains("/responses")));
+    let downstream_protocol = if path == "/v1/responses" && !native_responses_wire {
+        DownstreamProtocol::ResponsesCompat
+    } else {
+        DownstreamProtocol::Native
+    };
     let downstream_stream = !is_alpha_search
         && input
             .payload
@@ -699,7 +1002,7 @@ fn build_attempt(
             .and_then(|payload| payload.get("stream"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let engine = provider.engine.trim().to_ascii_lowercase();
+    let provider_stream = downstream_stream;
     let proxy = provider
         .preferences
         .get("proxy")
@@ -709,6 +1012,13 @@ fn build_attempt(
 
     if let Some((storage, observation)) = &input.replay {
         let url = endpoint_url(provider.base_url.as_ref(), path, method, uri)?;
+        let multipart_boundary = input
+            .content_type
+            .starts_with("multipart/form-data")
+            .then(|| multipart_output_boundary(request_id));
+        let outgoing_content_type = multipart_boundary
+            .as_ref()
+            .map(|boundary| format!("multipart/form-data; boundary={boundary}"));
         let mut headers = provider_headers(
             provider,
             provider_key,
@@ -716,33 +1026,56 @@ fn build_attempt(
             request_id,
             &engine,
             false,
-            Some(&input.content_type),
+            outgoing_content_type
+                .as_deref()
+                .or(Some(input.content_type.as_str())),
         )?;
         headers.remove("content-length");
+        let body = if let Some(boundary) = multipart_boundary {
+            AttemptBody::MultipartRewrite {
+                storage: storage.clone_for_replay(),
+                observation: observation.clone(),
+                source_content_type: input.content_type.clone(),
+                boundary,
+                model: original_model.to_owned(),
+            }
+        } else {
+            AttemptBody::Replay(storage.clone_for_replay(), observation.clone())
+        };
         return Ok(PreparedAttempt {
             method: method.clone(),
             url,
             headers,
-            body: AttemptBody::Replay(storage.clone_for_replay(), observation.clone()),
+            body,
             adapter: ResponseAdapter::Passthrough,
             downstream_stream: false,
             upstream_stream: false,
+            request_model: request_model.to_owned(),
             original_model: original_model.to_owned(),
+            downstream_protocol,
         });
     }
 
     let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
+    if downstream_protocol == DownstreamProtocol::ResponsesCompat {
+        payload = responses_to_chat_request(&payload, original_model)?;
+    }
+    let wire_path = if downstream_protocol == DownstreamProtocol::ResponsesCompat {
+        "/v1/chat/completions"
+    } else {
+        path
+    };
     let (url, adapter, upstream_stream) = match engine.as_str() {
-        "codex" if path == "/v1/chat/completions" => {
+        "codex" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_responses(&payload, original_model)?;
             (
                 responses_url(provider.base_url.as_ref()),
                 ResponseAdapter::ResponsesToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
         "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
-            if path == "/v1/chat/completions"
+            if wire_path == "/v1/chat/completions"
                 && provider
                     .base_url
                     .to_ascii_lowercase()
@@ -752,43 +1085,43 @@ fn build_attempt(
             (
                 responses_url(provider.base_url.as_ref()),
                 ResponseAdapter::ResponsesToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "gemini" | "vertex" | "vertex-gemini" if path == "/v1/chat/completions" => {
+        "gemini" | "vertex" | "vertex-gemini" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_gemini(&payload, original_model)?;
             (
                 if matches!(engine.as_str(), "vertex" | "vertex-gemini") {
-                    vertex_gemini_url(provider, original_model, provider_key, downstream_stream)?
+                    vertex_gemini_url(provider, original_model, provider_key, provider_stream)?
                 } else {
                     gemini_url(
                         provider.base_url.as_ref(),
                         original_model,
                         provider_key,
-                        downstream_stream,
+                        provider_stream,
                     )?
                 },
                 ResponseAdapter::GeminiToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "vertex-claude" if path == "/v1/chat/completions" => {
+        "vertex-claude" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_claude(&payload, original_model)?;
             (
                 vertex_claude_url(provider, original_model)?,
                 ResponseAdapter::ClaudeToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "claude" if path == "/v1/chat/completions" => {
+        "claude" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_claude(&payload, original_model)?;
             (
                 messages_url(provider.base_url.as_ref()),
                 ResponseAdapter::ClaudeToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "aws" if path == "/v1/chat/completions" => {
+        "aws" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_claude(&payload, original_model)?;
             if let Some(root) = payload.as_object_mut() {
                 root.remove("model");
@@ -799,58 +1132,66 @@ fn build_attempt(
                 );
             }
             (
-                aws_bedrock_url(provider, original_model, downstream_stream)?,
+                aws_bedrock_url(provider, original_model, provider_stream)?,
                 ResponseAdapter::AwsToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "cohere" if path == "/v1/chat/completions" => {
+        "cohere" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_cohere(&payload, original_model)?;
             (
                 provider.base_url.to_string(),
                 ResponseAdapter::CohereToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "azure" if path == "/v1/chat/completions" => {
+        "azure" if wire_path == "/v1/chat/completions" => {
             set_model(&mut payload, original_model)?;
             normalize_azure_token_limit(&mut payload, original_model);
             (
                 azure_chat_url(provider.base_url.as_ref(), original_model)?,
                 ResponseAdapter::Passthrough,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "azure-databricks" if path == "/v1/chat/completions" => {
+        "azure-databricks" if wire_path == "/v1/chat/completions" => {
             set_model(&mut payload, original_model)?;
             (
                 databricks_chat_url(provider.base_url.as_ref(), original_model)?,
                 ResponseAdapter::Passthrough,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "cloudflare" if path == "/v1/chat/completions" => {
+        "cloudflare" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_cloudflare(&payload)?;
             (
                 cloudflare_url(provider, original_model)?,
                 ResponseAdapter::CloudflareToChat,
-                downstream_stream,
+                provider_stream,
             )
         }
-        "claude" if path == "/v1/messages" => {
+        "claude" if wire_path == "/v1/messages" => {
             set_model(&mut payload, original_model)?;
             (
                 messages_url(provider.base_url.as_ref()),
                 ResponseAdapter::Passthrough,
-                downstream_stream,
+                provider_stream,
+            )
+        }
+        _ if matches!(path, "/search" | "/v1/search") => {
+            set_model(&mut payload, original_model)?;
+            (
+                endpoint_url(provider.base_url.as_ref(), wire_path, method, uri)?,
+                ResponseAdapter::Search,
+                false,
             )
         }
         _ => {
             set_model(&mut payload, original_model)?;
             (
-                endpoint_url(provider.base_url.as_ref(), path, method, uri)?,
+                endpoint_url(provider.base_url.as_ref(), wire_path, method, uri)?,
                 ResponseAdapter::Passthrough,
-                downstream_stream,
+                provider_stream,
             )
         }
     };
@@ -906,8 +1247,116 @@ fn build_attempt(
         adapter,
         downstream_stream,
         upstream_stream,
+        request_model: request_model.to_owned(),
         original_model: original_model.to_owned(),
+        downstream_protocol,
     })
+}
+
+fn multipart_output_boundary(request_id: &str) -> String {
+    let digest = Sha256::digest(request_id.as_bytes());
+    format!("uni-api-{}", hex_bytes(&digest[..12]))
+}
+
+async fn multipart_rewrite_body(
+    storage: StoredBody,
+    observation: SpoolObservation,
+    source_content_type: &str,
+    boundary: String,
+    model: String,
+) -> Result<reqwest::Body, String> {
+    Ok(reqwest::Body::wrap_stream(
+        multipart_rewrite_stream(storage, observation, source_content_type, boundary, model)
+            .await?,
+    ))
+}
+
+async fn multipart_rewrite_stream(
+    storage: StoredBody,
+    observation: SpoolObservation,
+    source_content_type: &str,
+    boundary: String,
+    model: String,
+) -> Result<tokio_stream::wrappers::ReceiverStream<Result<Bytes, io::Error>>, String> {
+    let source_boundary = multer::parse_boundary(source_content_type)
+        .map_err(|error| format!("invalid multipart boundary: {error}"))?;
+    let body = storage
+        .into_body(&observation)
+        .await
+        .map_err(|error| error.message)?;
+    let stream = body.into_data_stream();
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(8);
+    tokio::spawn(async move {
+        let mut multipart = multer::Multipart::new(stream, source_boundary);
+        let mut rewrote_model = false;
+        loop {
+            let mut field = match multipart.next_field().await {
+                Ok(Some(field)) => field,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("parse multipart request: {error}"),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let rewrite_model = field.name() == Some("model");
+            rewrote_model |= rewrite_model;
+            let mut prefix = Vec::new();
+            prefix.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            for (name, value) in field.headers() {
+                prefix.extend_from_slice(name.as_str().as_bytes());
+                prefix.extend_from_slice(b": ");
+                prefix.extend_from_slice(value.as_bytes());
+                prefix.extend_from_slice(b"\r\n");
+            }
+            prefix.extend_from_slice(b"\r\n");
+            if sender.send(Ok(Bytes::from(prefix))).await.is_err() {
+                return;
+            }
+            if rewrite_model && sender.send(Ok(Bytes::from(model.clone()))).await.is_err() {
+                return;
+            }
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) if !rewrite_model => {
+                        if sender.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("read multipart field: {error}"),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            if sender.send(Ok(Bytes::from_static(b"\r\n"))).await.is_err() {
+                return;
+            }
+        }
+        if !rewrote_model {
+            let field = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n"
+            );
+            if sender.send(Ok(Bytes::from(field))).await.is_err() {
+                return;
+            }
+        }
+        let _ = sender
+            .send(Ok(Bytes::from(format!("--{boundary}--\r\n"))))
+            .await;
+    });
+    Ok(tokio_stream::wrappers::ReceiverStream::new(receiver))
 }
 
 fn sanitize_alpha_search_payload(root: &mut Map<String, Value>) {
@@ -968,6 +1417,7 @@ struct AttemptFailure {
     status: StatusCode,
     detail: String,
     upstream_url: String,
+    response: Option<Response<Body>>,
 }
 
 async fn send_attempt(
@@ -984,6 +1434,7 @@ async fn send_attempt(
             status: StatusCode::BAD_GATEWAY,
             detail: error,
             upstream_url: prepared.url.clone(),
+            response: None,
         })?;
     let timeout = provider_timeout(provider, &prepared.original_model);
     if matches!(
@@ -998,6 +1449,7 @@ async fn send_attempt(
                 status: StatusCode::BAD_GATEWAY,
                 detail: error,
                 upstream_url: prepared.url.clone(),
+                response: None,
             })?;
         prepared.headers.insert(
             "authorization",
@@ -1005,6 +1457,7 @@ async fn send_attempt(
                 status: StatusCode::BAD_GATEWAY,
                 detail: "Vertex OAuth token is not a valid header value".into(),
                 upstream_url: prepared.url.clone(),
+                response: None,
             })?,
         );
     }
@@ -1022,29 +1475,58 @@ async fn send_attempt(
                     status: error.status,
                     detail: error.message,
                     upstream_url: prepared.url.clone(),
+                    response: None,
                 })?;
             request.body(reqwest::Body::wrap_stream(body.into_data_stream()))
         }
+        AttemptBody::MultipartRewrite {
+            storage,
+            observation,
+            source_content_type,
+            boundary,
+            model,
+        } => request.body(
+            multipart_rewrite_body(storage, observation, &source_content_type, boundary, model)
+                .await
+                .map_err(|detail| AttemptFailure {
+                    status: StatusCode::BAD_REQUEST,
+                    detail,
+                    upstream_url: prepared.url.clone(),
+                    response: None,
+                })?,
+        ),
         AttemptBody::Empty => request,
     };
     let response = request.send().await.map_err(|error| AttemptFailure {
         status: StatusCode::BAD_GATEWAY,
         detail: format!("Upstream transport error: {error}"),
         upstream_url: prepared.url.clone(),
+        response: None,
     })?;
     let status = response.status();
     if !status.is_success() {
-        let detail = response
-            .text()
+        let headers = filtered_response_headers(response.headers());
+        let body = read_limited_upstream_body(response, UPSTREAM_ERROR_MAX_BYTES)
             .await
-            .unwrap_or_else(|error| format!("read upstream error response: {error}"));
+            .unwrap_or_else(|error| Bytes::from(format!("read upstream error response: {error}")));
+        let detail = String::from_utf8_lossy(&body).into_owned();
+        let mut output = Response::new(Body::from(body));
+        *output.status_mut() = status;
+        *output.headers_mut() = headers;
+        output
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
         return Err(AttemptFailure {
             status,
             detail: truncate_detail(&detail),
             upstream_url: prepared.url,
+            response: Some(output),
         });
     }
-    if prepared.adapter == ResponseAdapter::Passthrough && prepared.upstream_stream {
+    if prepared.adapter == ResponseAdapter::Passthrough
+        && prepared.downstream_protocol == DownstreamProtocol::Native
+        && prepared.upstream_stream
+    {
         let headers = filtered_response_headers(response.headers());
         let mut output = Response::new(Body::from_stream(response.bytes_stream()));
         *output.status_mut() = status;
@@ -1073,10 +1555,21 @@ async fn send_attempt(
             ResponseAdapter::CohereToChat => StreamProtocol::Cohere,
             ResponseAdapter::CloudflareToChat => StreamProtocol::Cloudflare,
             ResponseAdapter::AwsToChat => StreamProtocol::AwsBedrock,
-            ResponseAdapter::Passthrough => unreachable!(),
+            ResponseAdapter::Passthrough => StreamProtocol::Chat,
+            ResponseAdapter::Search => unreachable!(),
         };
-        let mut translation =
-            provider_stream::translate(response, protocol, prepared.original_model.clone());
+        let output_protocol = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat
+        {
+            StreamOutputProtocol::Responses
+        } else {
+            StreamOutputProtocol::Chat
+        };
+        let mut translation = provider_stream::translate(
+            response,
+            protocol,
+            output_protocol,
+            prepared.request_model.clone(),
+        );
         translation
             .response
             .headers_mut()
@@ -1089,13 +1582,18 @@ async fn send_attempt(
             upstream_url: prepared.url,
         });
     }
-    if prepared.adapter == ResponseAdapter::Passthrough {
+    if prepared.adapter == ResponseAdapter::Passthrough
+        && prepared.downstream_protocol == DownstreamProtocol::Native
+    {
         let headers = filtered_response_headers(response.headers());
-        let body = response.bytes().await.map_err(|error| AttemptFailure {
-            status: StatusCode::BAD_GATEWAY,
-            detail: format!("Read upstream response failed: {error}"),
-            upstream_url: prepared.url.clone(),
-        })?;
+        let body = read_limited_upstream_body(response, upstream_response_max_bytes())
+            .await
+            .map_err(|error| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail: format!("Read upstream response failed: {error}"),
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
         let usage = serde_json::from_slice::<Value>(&body)
             .ok()
             .map(|value| usage(&value))
@@ -1114,15 +1612,35 @@ async fn send_attempt(
             upstream_url: prepared.url,
         });
     }
-    let upstream = response
-        .json::<Value>()
-        .await
-        .map_err(|error| AttemptFailure {
+    let upstream = if prepared.adapter == ResponseAdapter::Search {
+        let bytes = read_limited_upstream_body(response, upstream_response_max_bytes())
+            .await
+            .map_err(|error| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail: format!("Read upstream response failed: {error}"),
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+        serde_json::from_slice::<Value>(&bytes)
+            .unwrap_or_else(|_| json!({"text":String::from_utf8_lossy(&bytes)}))
+    } else {
+        let bytes = read_limited_upstream_body(response, upstream_response_max_bytes())
+            .await
+            .map_err(|error| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail: format!("Read upstream response failed: {error}"),
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|error| AttemptFailure {
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Decode upstream response failed: {error}"),
             upstream_url: prepared.url.clone(),
-        })?;
+            response: None,
+        })?
+    };
     let normalized = match prepared.adapter {
+        ResponseAdapter::Search => normalize_search_response(&prepared.url, &upstream),
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::GeminiToChat => gemini_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::ClaudeToChat => claude_to_chat(&upstream, &prepared.original_model),
@@ -1131,11 +1649,20 @@ async fn send_attempt(
             cloudflare_to_chat(&upstream, &prepared.original_model)
         }
         ResponseAdapter::AwsToChat => claude_to_chat(&upstream, &prepared.original_model),
-        ResponseAdapter::Passthrough => unreachable!(),
+        ResponseAdapter::Passthrough => upstream,
+    };
+    let normalized = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
+        chat_to_responses_response(&normalized, &prepared.request_model)
+    } else {
+        normalized
     };
     let usage = usage(&normalized);
     let mut output = if prepared.downstream_stream {
-        synthetic_chat_stream(normalized)
+        if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
+            synthetic_responses_stream(normalized)
+        } else {
+            synthetic_chat_stream(normalized)
+        }
     } else {
         json_response(StatusCode::OK, normalized)
     };
@@ -1149,6 +1676,40 @@ async fn send_attempt(
         usage_completion: None,
         upstream_url: prepared.url,
     })
+}
+
+async fn read_limited_upstream_body(
+    response: reqwest::Response,
+    maximum: usize,
+) -> Result<Bytes, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(format!(
+            "upstream response exceeds the configured {maximum} byte limit"
+        ));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if body.len().saturating_add(chunk.len()) > maximum {
+            return Err(format!(
+                "upstream response exceeds the configured {maximum} byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn upstream_response_max_bytes() -> usize {
+    std::env::var("RUST_GENERIC_UPSTREAM_RESPONSE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_UPSTREAM_RESPONSE_MAX_BYTES)
 }
 
 fn provider_headers(
@@ -1257,6 +1818,172 @@ fn set_model(payload: &mut Value, model: &str) -> Result<(), String> {
         .ok_or_else(|| "request body must be a JSON object".to_owned())?
         .insert("model".into(), Value::String(model.to_owned()));
     Ok(())
+}
+
+fn responses_to_chat_request(input: &Value, original_model: &str) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "responses request body must be an object".to_owned())?;
+    let mut messages = Vec::new();
+    if let Some(instructions) = root
+        .get("instructions")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(json!({"role":"system","content":instructions}));
+    }
+    match root.get("input") {
+        Some(Value::String(text)) => messages.push(json!({"role":"user","content":text})),
+        Some(Value::Array(items)) => {
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str);
+                match item_type {
+                    Some("function_call") => messages.push(json!({
+                        "role":"assistant",
+                        "content":Value::Null,
+                        "tool_calls":[{
+                            "id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
+                            "type":"function",
+                            "function":{
+                                "name":item.get("name").cloned().unwrap_or(Value::Null),
+                                "arguments":item.get("arguments").cloned().unwrap_or_else(|| Value::String("{}".into())),
+                            }
+                        }]
+                    })),
+                    Some("function_call_output") => messages.push(json!({
+                        "role":"tool",
+                        "tool_call_id":item.get("call_id").cloned().unwrap_or(Value::Null),
+                        "content":item.get("output").cloned().unwrap_or_else(|| Value::String(String::new())),
+                    })),
+                    Some("message") | None if item.get("role").is_some() => {
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        messages.push(json!({
+                            "role":role,
+                            "content":responses_input_to_chat_content(item.get("content")),
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(value) if !value.is_null() => {
+            messages.push(json!({"role":"user","content":value.clone()}));
+        }
+        _ => {}
+    }
+    if messages.is_empty() {
+        return Err("responses request requires input".into());
+    }
+
+    let mut output = Map::new();
+    output.insert("model".into(), Value::String(original_model.to_owned()));
+    output.insert("messages".into(), Value::Array(messages));
+    output.insert(
+        "stream".into(),
+        Value::Bool(root.get("stream").and_then(Value::as_bool).unwrap_or(false)),
+    );
+    if let Some(value) = root.get("max_output_tokens") {
+        output.insert("max_tokens".into(), value.clone());
+    }
+    for name in [
+        "temperature",
+        "top_p",
+        "parallel_tool_calls",
+        "service_tier",
+        "reasoning",
+        "reasoning_effort",
+        "modalities",
+        "audio",
+        "metadata",
+        "user",
+    ] {
+        if let Some(value) = root.get(name) {
+            output.insert(name.into(), value.clone());
+        }
+    }
+    if let Some(tools) = root.get("tools").and_then(Value::as_array) {
+        output.insert(
+            "tools".into(),
+            Value::Array(
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) != Some("function") {
+                            return None;
+                        }
+                        let function = tool.get("function").unwrap_or(tool);
+                        let mut definition = Map::new();
+                        definition.insert(
+                            "name".into(),
+                            function.get("name").cloned().unwrap_or(Value::Null),
+                        );
+                        if let Some(value) = function.get("description") {
+                            definition.insert("description".into(), value.clone());
+                        }
+                        definition.insert(
+                            "parameters".into(),
+                            function
+                                .get("parameters")
+                                .cloned()
+                                .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                        );
+                        if let Some(value) = function.get("strict") {
+                            definition.insert("strict".into(), value.clone());
+                        }
+                        Some(json!({"type":"function","function":definition}))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(choice) = root.get("tool_choice") {
+        let choice = if choice.get("type").and_then(Value::as_str) == Some("function") {
+            json!({
+                "type":"function",
+                "function":{"name":choice.get("name").cloned().unwrap_or(Value::Null)}
+            })
+        } else {
+            choice.clone()
+        };
+        output.insert("tool_choice".into(), choice);
+    }
+    Ok(Value::Object(output))
+}
+
+fn responses_input_to_chat_content(content: Option<&Value>) -> Value {
+    let Some(content) = content else {
+        return Value::String(String::new());
+    };
+    if let Some(text) = content.as_str() {
+        return Value::String(text.to_owned());
+    }
+    Value::Array(
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("input_text" | "output_text" | "text") => Some(json!({
+                    "type":"text",
+                    "text":part.get("text").cloned().unwrap_or_else(|| Value::String(String::new())),
+                })),
+                Some("input_image") => Some(json!({
+                    "type":"image_url",
+                    "image_url":{"url":part.get("image_url").cloned().unwrap_or(Value::Null)},
+                })),
+                Some("input_audio") => Some(json!({
+                    "type":"input_audio",
+                    "input_audio":part.get("input_audio").cloned().unwrap_or_else(|| {
+                        json!({
+                            "data":part.get("data").cloned().unwrap_or(Value::Null),
+                            "format":part.get("format").cloned().unwrap_or(Value::Null),
+                        })
+                    }),
+                })),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, String> {
@@ -1373,6 +2100,27 @@ fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Value, String> 
         .ok_or_else(|| "chat request body must be an object".to_owned())?;
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
+    let mut tool_names = HashMap::new();
+    for message in root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for tool in message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(id), Some(name)) = (
+                tool.get("id").and_then(Value::as_str),
+                tool.pointer("/function/name").and_then(Value::as_str),
+            ) {
+                tool_names.insert(id.to_owned(), name.to_owned());
+            }
+        }
+    }
     for message in root
         .get("messages")
         .and_then(Value::as_array)
@@ -1383,14 +2131,61 @@ fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Value, String> 
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user");
-        let parts = gemini_parts(message.get("content").unwrap_or(&Value::Null));
+        let mut parts = gemini_parts(message.get("content").unwrap_or(&Value::Null))?;
         if role == "system" {
             system_parts.extend(parts);
-        } else if !parts.is_empty() {
+        } else if role == "tool" {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = tool_names
+                .get(call_id)
+                .cloned()
+                .unwrap_or_else(|| "tool".into());
+            let response = message
+                .get("content")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()));
             contents.push(json!({
-                "role": if role == "assistant" { "model" } else { "user" },
-                "parts": parts,
+                "role":"user",
+                "parts":[{"functionResponse":{"name":name,"response":{"result":response}}}],
             }));
+        } else {
+            for tool in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let arguments = tool
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .unwrap_or_else(|| json!({}));
+                let mut part = json!({
+                    "functionCall":{
+                        "name":tool.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                        "args":arguments,
+                    }
+                });
+                if let Some(signature) = tool
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(decode_gemini_thought_signature)
+                {
+                    part.as_object_mut()
+                        .expect("Gemini function call part")
+                        .insert("thoughtSignature".into(), Value::String(signature));
+                }
+                parts.push(part);
+            }
+            if !parts.is_empty() {
+                contents.push(json!({
+                    "role": if role == "assistant" { "model" } else { "user" },
+                    "parts": parts,
+                }));
+            }
         }
     }
     if contents.is_empty() {
@@ -1431,7 +2226,16 @@ fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Value, String> 
     if let Some(tools) = root.get("tools").and_then(Value::as_array) {
         let declarations = tools
             .iter()
-            .filter_map(|tool| tool.get("function").cloned())
+            .filter_map(|tool| {
+                let mut function = tool.get("function")?.clone();
+                if let Some(function) = function.as_object_mut() {
+                    function.remove("strict");
+                    if let Some(parameters) = function.get_mut("parameters") {
+                        sanitize_gemini_schema(parameters);
+                    }
+                }
+                Some(function)
+            })
             .collect::<Vec<_>>();
         if !declarations.is_empty() {
             output
@@ -1443,28 +2247,65 @@ fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Value, String> 
                 );
         }
     }
+    apply_gemini_request_controls(&mut output, root, original_model);
     Ok(output)
 }
 
-fn gemini_parts(content: &Value) -> Vec<Value> {
-    if let Some(text) = content.as_str() {
-        return vec![json!({"text":text})];
+fn sanitize_gemini_schema(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("additionalProperties");
+            if let Some(default) = object.remove("default") {
+                let description = object
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                object.insert(
+                    "description".into(),
+                    Value::String(format!("{description}\nDefault: {default}")),
+                );
+            }
+            for value in object.values_mut() {
+                sanitize_gemini_schema(value);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                sanitize_gemini_schema(value);
+            }
+        }
+        _ => {}
     }
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
-            Some("text") => Some(
+}
+
+fn gemini_parts(content: &Value) -> Result<Vec<Value>, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(vec![json!({"text":text})]);
+    }
+    let mut parts = Vec::new();
+    for item in content.as_array().into_iter().flatten() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => parts.push(
                 json!({"text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
             ),
-            Some("image_url") => item
-                .pointer("/image_url/url")
-                .and_then(Value::as_str)
-                .and_then(data_url_part),
-            _ => None,
-        })
-        .collect()
+            Some("image_url") => {
+                if let Some(part) = item
+                    .pointer("/image_url/url")
+                    .and_then(Value::as_str)
+                    .and_then(data_url_part)
+                {
+                    parts.push(part);
+                }
+            }
+            Some("input_audio") => {
+                if let Some(part) = input_audio_part(item)? {
+                    parts.push(part);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(parts)
 }
 
 fn data_url_part(value: &str) -> Option<Value> {
@@ -1474,7 +2315,273 @@ fn data_url_part(value: &str) -> Option<Value> {
         .split(';')
         .next()
         .unwrap_or("application/octet-stream");
-    Some(json!({"inlineData":{"mimeType":mime,"data":body}}))
+    let mut part = json!({"inlineData":{"mimeType":mime,"data":body}});
+    if let Some(signature) = gemini_image_thought_signature(body) {
+        part.as_object_mut()
+            .expect("Gemini image part")
+            .insert("thoughtSignature".into(), Value::String(signature));
+    }
+    Some(part)
+}
+
+fn input_audio_part(item: &Value) -> Result<Option<Value>, String> {
+    let Some(input) = item.get("input_audio") else {
+        return Ok(None);
+    };
+    let Some(data) = input.get("data").and_then(Value::as_str) else {
+        return Err("input_audio.data must be a non-empty string".into());
+    };
+    let format = input
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("wav")
+        .to_ascii_lowercase();
+    if matches!(
+        Url::parse(data)
+            .ok()
+            .map(|url| url.scheme().to_owned())
+            .as_deref(),
+        Some("http" | "https" | "gs")
+    ) {
+        return Ok(Some(
+            json!({"fileData":{"mimeType":audio_mime_type(&format),"fileUri":data}}),
+        ));
+    }
+    let (mime, encoded) = if let Some(rest) = data.strip_prefix("data:") {
+        let (metadata, encoded) = rest
+            .split_once(',')
+            .ok_or_else(|| "input_audio data URL is invalid".to_owned())?;
+        (
+            metadata.split(';').next().unwrap_or("audio/wav").to_owned(),
+            encoded,
+        )
+    } else {
+        (audio_mime_type(&format).to_owned(), data)
+    };
+    if encoded.is_empty() || encoded.len() > 8 * 1024 * 1024 {
+        return Err("input_audio base64 exceeds the supported size limit".into());
+    }
+    let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
+    BASE64
+        .decode(padded.as_bytes())
+        .map_err(|_| "input_audio data must be valid base64".to_owned())?;
+    Ok(Some(json!({"inlineData":{"mimeType":mime,"data":encoded}})))
+}
+
+fn audio_mime_type(format: &str) -> &'static str {
+    match format {
+        "mp3" | "mpeg" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "opus" => "audio/opus",
+        "webm" => "audio/webm",
+        _ => "audio/wav",
+    }
+}
+
+fn apply_gemini_request_controls(output: &mut Value, root: &Map<String, Value>, model: &str) {
+    let output = output.as_object_mut().expect("Gemini payload object");
+    if let Some(choice) = root.get("tool_choice") {
+        let mut config = Map::new();
+        match choice.as_str() {
+            Some("none") => {
+                config.insert("mode".into(), Value::String("NONE".into()));
+            }
+            Some("required" | "any") => {
+                config.insert("mode".into(), Value::String("ANY".into()));
+            }
+            Some("auto") => {
+                config.insert("mode".into(), Value::String("AUTO".into()));
+            }
+            _ if choice.get("type").and_then(Value::as_str) == Some("function") => {
+                config.insert("mode".into(), Value::String("ANY".into()));
+                if let Some(name) = choice
+                    .pointer("/function/name")
+                    .or_else(|| choice.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    config.insert(
+                        "allowedFunctionNames".into(),
+                        Value::Array(vec![Value::String(name.to_owned())]),
+                    );
+                }
+            }
+            _ => {}
+        }
+        if !config.is_empty() {
+            output.insert("toolConfig".into(), json!({"functionCallingConfig":config}));
+        }
+    }
+    if let Some(tier) = root
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+    {
+        let tier = match tier.as_str() {
+            "default" | "standard" => "STANDARD",
+            "priority" => "PRIORITY",
+            "flex" => "FLEX",
+            value => value,
+        };
+        output.insert(
+            "serviceTier".into(),
+            Value::String(tier.to_ascii_uppercase()),
+        );
+    }
+    let effort = root
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            root.get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .map(|value| value.to_ascii_lowercase().replace('-', "_"));
+    if let Some(effort) = effort {
+        let generation = output
+            .entry("generationConfig")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("Gemini generation config");
+        if model.to_ascii_lowercase().contains("gemini-3") {
+            let level = match effort.as_str() {
+                "minimal" | "low" => "low",
+                "medium" => "medium",
+                "high" | "extra_high" | "xhigh" => "high",
+                _ => "minimal",
+            };
+            generation.insert("thinkingConfig".into(), json!({"thinkingLevel":level}));
+        } else if model.to_ascii_lowercase().contains("gemini-2.5") {
+            let maximum = if model.to_ascii_lowercase().contains("pro") {
+                32768
+            } else {
+                24576
+            };
+            let budget = match effort.as_str() {
+                "none" => 0,
+                "minimal" | "low" => maximum / 4,
+                "medium" => maximum / 2,
+                "high" => maximum * 3 / 4,
+                "extra_high" | "xhigh" => maximum,
+                _ => 0,
+            };
+            generation.insert(
+                "thinkingConfig".into(),
+                json!({"includeThoughts":budget > 0,"thinkingBudget":budget}),
+            );
+        }
+    }
+    let wants_audio = root
+        .get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("audio"))
+            })
+        })
+        || root.get("audio").is_some();
+    if wants_audio {
+        let voice = root
+            .get("audio")
+            .and_then(|value| value.get("voice"))
+            .and_then(Value::as_str)
+            .unwrap_or("Kore");
+        let generation = output
+            .entry("generationConfig")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("Gemini generation config");
+        generation.insert("responseModalities".into(), json!(["AUDIO"]));
+        generation.insert(
+            "speechConfig".into(),
+            json!({"voiceConfig":{"prebuiltVoiceConfig":{"voiceName":voice}}}),
+        );
+    }
+}
+
+fn decode_gemini_thought_signature(call_id: &str) -> Option<String> {
+    let encoded = call_id.strip_prefix("call_")?.split('.').next()?;
+    if encoded.is_empty() || encoded.len() > 90_000 {
+        return None;
+    }
+    let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes()))
+        .ok()?;
+    (decoded.len() <= 64 * 1024)
+        .then(|| String::from_utf8(decoded).ok())
+        .flatten()
+}
+
+fn gemini_image_key(encoded: &str) -> Option<String> {
+    if encoded.is_empty() || encoded.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
+    let decoded = BASE64.decode(padded.as_bytes()).ok()?;
+    Some(format!("{:x}", Sha256::digest(decoded)))
+}
+
+fn gemini_image_thought_signature(encoded: &str) -> Option<String> {
+    let key = gemini_image_key(encoded)?;
+    let cache = GEMINI_THOUGHT_SIGNATURES.get_or_init(|| {
+        Mutex::new(ThoughtSignatureCache {
+            values: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        })
+    });
+    cache.lock().ok()?.values.get(&key).cloned()
+}
+
+pub(crate) fn cache_gemini_image_thought_signature(encoded: &str, signature: &str) {
+    if signature.is_empty() || signature.len() > 64 * 1024 {
+        return;
+    }
+    let Some(key) = gemini_image_key(encoded) else {
+        return;
+    };
+    let cache = GEMINI_THOUGHT_SIGNATURES.get_or_init(|| {
+        Mutex::new(ThoughtSignatureCache {
+            values: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        })
+    });
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    if let Some(previous) = cache.values.remove(&key) {
+        cache.bytes = cache.bytes.saturating_sub(previous.len());
+        cache.order.retain(|item| item != &key);
+    }
+    cache.bytes = cache.bytes.saturating_add(signature.len());
+    cache.order.push_back(key.clone());
+    cache.values.insert(key, signature.to_owned());
+    while cache.values.len() > 100 || cache.bytes > 4 * 1024 * 1024 {
+        let Some(oldest) = cache.order.pop_front() else {
+            break;
+        };
+        if let Some(value) = cache.values.remove(&oldest) {
+            cache.bytes = cache.bytes.saturating_sub(value.len());
+        }
+    }
+}
+
+pub(crate) fn gemini_call_id(signature: Option<&str>, fallback_index: usize) -> String {
+    signature
+        .filter(|signature| !signature.is_empty() && signature.len() <= 64 * 1024)
+        .map(|signature| {
+            format!(
+                "call_{}.{}",
+                URL_SAFE_NO_PAD.encode(signature.as_bytes()),
+                fallback_index
+            )
+        })
+        .unwrap_or_else(|| format!("call_{fallback_index}"))
 }
 
 fn chat_to_claude(input: &Value, original_model: &str) -> Result<Value, String> {
@@ -1495,8 +2602,8 @@ fn chat_to_claude(input: &Value, original_model: &str) -> Result<Value, String> 
             .unwrap_or("user");
         let content = message.get("content").cloned().unwrap_or(Value::Null);
         if role == "system" {
-            if let Some(text) = content.as_str() {
-                system.push(text.to_owned());
+            if let Some(text) = content_text(Some(&content)) {
+                system.push(text);
             }
             continue;
         }
@@ -1560,6 +2667,84 @@ fn chat_to_claude(input: &Value, original_model: &str) -> Result<Value, String> 
                 .as_object_mut()
                 .expect("Claude payload object")
                 .insert("tools".into(), Value::Array(tools));
+        }
+    }
+    if let Some(output) = output.as_object_mut() {
+        for name in ["temperature", "top_p", "top_k", "stop_sequences"] {
+            if let Some(value) = root.get(name) {
+                output.insert(name.into(), value.clone());
+            }
+        }
+        if let Some(choice) = root.get("tool_choice") {
+            let choice = match choice.as_str() {
+                Some("auto") => Some(json!({"type":"auto"})),
+                Some("required" | "any") => Some(json!({"type":"any"})),
+                Some("none") => None,
+                _ if choice.get("type").and_then(Value::as_str) == Some("function") => choice
+                    .pointer("/function/name")
+                    .or_else(|| choice.get("name"))
+                    .cloned()
+                    .map(|name| json!({"type":"tool","name":name})),
+                _ => None,
+            };
+            if let Some(choice) = choice {
+                output.insert("tool_choice".into(), choice);
+            } else if root.get("tool_choice").and_then(Value::as_str) == Some("none") {
+                output.remove("tools");
+            }
+        }
+        let explicit_thinking = root.get("thinking").filter(|value| value.is_object());
+        let effort = root
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                root.get("reasoning")
+                    .and_then(|value| value.get("effort"))
+                    .and_then(Value::as_str)
+            });
+        if let Some(thinking) = explicit_thinking {
+            output.insert("thinking".into(), thinking.clone());
+            output.insert("temperature".into(), json!(1));
+            output.remove("top_p");
+            output.remove("top_k");
+            if let Some(budget) = thinking.get("budget_tokens").and_then(Value::as_i64) {
+                let max_tokens = output
+                    .get("max_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(4096)
+                    .max(budget + 1024);
+                output.insert("max_tokens".into(), json!(max_tokens));
+            }
+        } else if let Some(effort) = effort {
+            let budget = match effort.to_ascii_lowercase().as_str() {
+                "minimal" | "low" => 1024,
+                "medium" => 4096,
+                "high" => 8192,
+                "extra_high" | "xhigh" => 16384,
+                _ => 0,
+            };
+            if budget > 0 {
+                output.insert(
+                    "thinking".into(),
+                    json!({"type":"enabled","budget_tokens":budget}),
+                );
+                output.insert("temperature".into(), json!(1));
+                output.remove("top_p");
+                output.remove("top_k");
+                let max_tokens = output
+                    .get("max_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(4096)
+                    .max(budget + 1024);
+                output.insert("max_tokens".into(), json!(max_tokens));
+            }
+        }
+        if let Some(tier) = root.get("service_tier").and_then(Value::as_str) {
+            let tier = match tier.to_ascii_lowercase().as_str() {
+                "flex" | "standard" | "standard_only" => "standard_only",
+                _ => "auto",
+            };
+            output.insert("service_tier".into(), Value::String(tier.into()));
         }
     }
     Ok(output)
@@ -1709,6 +2894,7 @@ fn gemini_to_chat(value: &Value, model: &str) -> Value {
         .and_then(Value::as_array)
         .and_then(|items| items.first());
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     for part in candidate
         .and_then(|candidate| candidate.pointer("/content/parts"))
@@ -1716,12 +2902,36 @@ fn gemini_to_chat(value: &Value, model: &str) -> Value {
         .into_iter()
         .flatten()
     {
+        if let (Some(data), Some(signature)) = (
+            part.pointer("/inlineData/data")
+                .or_else(|| part.pointer("/inline_data/data"))
+                .and_then(Value::as_str),
+            part.get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(Value::as_str),
+        ) {
+            cache_gemini_image_thought_signature(data, signature);
+        }
         if let Some(value) = part.get("text").and_then(Value::as_str) {
-            text.push_str(value);
+            if part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                reasoning.push_str(value);
+            } else {
+                text.push_str(value);
+            }
         }
         if let Some(call) = part.get("functionCall") {
+            let call_id = gemini_call_id(
+                part.get("thoughtSignature")
+                    .or_else(|| part.get("thought_signature"))
+                    .and_then(Value::as_str),
+                tool_calls.len() + 1,
+            );
             tool_calls.push(json!({
-                "id":format!("call_{}", tool_calls.len() + 1),
+                "id":call_id,
                 "type":"function",
                 "function":{
                     "name":call.get("name").cloned().unwrap_or(Value::Null),
@@ -1735,6 +2945,12 @@ fn gemini_to_chat(value: &Value, model: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let mut message = json!({"role":"assistant","content":text});
+    if !reasoning.is_empty() {
+        message
+            .as_object_mut()
+            .expect("chat message")
+            .insert("reasoning_content".into(), Value::String(reasoning));
+    }
     if !tool_calls.is_empty() {
         message
             .as_object_mut()
@@ -1757,6 +2973,7 @@ fn gemini_to_chat(value: &Value, model: &str) -> Value {
 
 fn claude_to_chat(value: &Value, model: &str) -> Value {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     for item in value
         .get("content")
@@ -1766,6 +2983,12 @@ fn claude_to_chat(value: &Value, model: &str) -> Value {
     {
         match item.get("type").and_then(Value::as_str) {
             Some("text") => text.push_str(item.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("thinking") => reasoning.push_str(
+                item.get("thinking")
+                    .or_else(|| item.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
             Some("tool_use") => tool_calls.push(json!({
                 "id":item.get("id").cloned().unwrap_or(Value::Null),
                 "type":"function",
@@ -1778,6 +3001,12 @@ fn claude_to_chat(value: &Value, model: &str) -> Value {
         }
     }
     let mut message = json!({"role":"assistant","content":text});
+    if !reasoning.is_empty() {
+        message
+            .as_object_mut()
+            .expect("chat message")
+            .insert("reasoning_content".into(), Value::String(reasoning));
+    }
     if !tool_calls.is_empty() {
         message
             .as_object_mut()
@@ -1834,6 +3063,173 @@ fn cloudflare_to_chat(value: &Value, model: &str) -> Value {
     })
 }
 
+fn chat_to_responses_response(value: &Value, model: &str) -> Value {
+    let message = value
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_else(|| json!({"role":"assistant","content":""}));
+    let mut output = Vec::new();
+    let text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        output.push(json!({
+            "id":format!("rs_{}", unix_seconds()),
+            "type":"reasoning",
+            "summary":[{"type":"summary_text","text":reasoning}],
+        }));
+    }
+    if !text.is_empty() || message.get("tool_calls").is_none() {
+        output.push(json!({
+            "id":format!("msg_{}", unix_seconds()),
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":text,"annotations":[]}],
+        }));
+    }
+    for tool in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        output.push(json!({
+            "id":tool.get("id").cloned().unwrap_or_else(|| Value::String(format!("fc_{}", unix_seconds()))),
+            "type":"function_call",
+            "status":"completed",
+            "call_id":tool.get("id").cloned().unwrap_or_else(|| Value::String(format!("call_{}", unix_seconds()))),
+            "name":tool.pointer("/function/name").cloned().unwrap_or(Value::Null),
+            "arguments":tool.pointer("/function/arguments").cloned().unwrap_or_else(|| Value::String("{}".into())),
+        }));
+    }
+    let chat_usage = value.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let input_tokens = chat_usage
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = chat_usage
+        .get("completion_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    json!({
+        "id":format!("resp_{}", unix_seconds()),
+        "object":"response",
+        "created_at":unix_seconds(),
+        "status":"completed",
+        "model":model,
+        "output":output,
+        "output_text":text,
+        "usage":{
+            "input_tokens":input_tokens,
+            "output_tokens":output_tokens,
+            "total_tokens":chat_usage.get("total_tokens").cloned().unwrap_or(json!(input_tokens + output_tokens)),
+            "input_tokens_details":chat_usage.get("prompt_tokens_details").cloned().unwrap_or_else(|| json!({})),
+            "output_tokens_details":chat_usage.get("completion_tokens_details").cloned().unwrap_or_else(|| json!({})),
+        },
+        "error":Value::Null,
+        "incomplete_details":Value::Null,
+    })
+}
+
+fn normalize_search_response(url: &str, value: &Value) -> Value {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    if value.is_object() && (host.ends_with("tavily.com") || value.get("results").is_some()) {
+        let data = value
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let item = item.as_object()?;
+                let mut normalized = item.clone();
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let description = if content.chars().count() > 240 {
+                    format!("{}...", content.chars().take(237).collect::<String>())
+                } else {
+                    content.to_owned()
+                };
+                normalized.insert(
+                    "title".into(),
+                    item.get("title")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new())),
+                );
+                normalized.insert(
+                    "url".into(),
+                    item.get("url")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new())),
+                );
+                normalized.insert("description".into(), Value::String(description));
+                normalized.insert("content".into(), Value::String(content.to_owned()));
+                for name in ["usage", "score", "raw_content"] {
+                    normalized.entry(name).or_insert(Value::Null);
+                }
+                Some(Value::Object(normalized))
+            })
+            .collect::<Vec<_>>();
+        let mut meta = Map::new();
+        meta.insert("provider".into(), Value::String("tavily".into()));
+        if let Some(root) = value.as_object() {
+            for (name, value) in root {
+                if name != "results" {
+                    meta.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        return json!({"code":200,"status":20000,"data":data,"meta":meta});
+    }
+    if let Some(root) = value.as_object().filter(|root| root.contains_key("data")) {
+        let mut output = root.clone();
+        output.entry("code").or_insert(json!(200));
+        output.entry("status").or_insert(json!(20000));
+        let mut meta = output
+            .remove("meta")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        meta.entry("provider")
+            .or_insert_with(|| Value::String("jina".into()));
+        output.insert("meta".into(), Value::Object(meta));
+        let data = output
+            .remove("data")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                let mut item = item.as_object()?.clone();
+                for name in ["title", "url", "description", "content"] {
+                    item.entry(name)
+                        .or_insert_with(|| Value::String(String::new()));
+                }
+                for name in ["usage", "score", "raw_content"] {
+                    item.entry(name).or_insert(Value::Null);
+                }
+                Some(Value::Object(item))
+            })
+            .collect();
+        output.insert("data".into(), Value::Array(data));
+        return Value::Object(output);
+    }
+    json!({
+        "code":200,
+        "status":20000,
+        "data":[],
+        "meta":{"provider":"unknown","raw":value},
+    })
+}
+
 fn synthetic_chat_stream(value: Value) -> Response<Body> {
     let message = value
         .pointer("/choices/0/message")
@@ -1848,6 +3244,26 @@ fn synthetic_chat_stream(value: Value) -> Response<Body> {
         "usage":value.get("usage").cloned().unwrap_or(Value::Null),
     });
     let wire = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
+    let mut response = Response::new(Body::from(wire));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+fn synthetic_responses_stream(value: Value) -> Response<Body> {
+    let mut created_response = value.clone();
+    if let Some(root) = created_response.as_object_mut() {
+        root.insert("status".into(), Value::String("in_progress".into()));
+        root.insert("output".into(), Value::Array(Vec::new()));
+        root.insert("output_text".into(), Value::String(String::new()));
+    }
+    let created = json!({"type":"response.created","response":created_response});
+    let completed = json!({"type":"response.completed","response":value});
+    let wire = format!(
+        "event: response.created\ndata: {created}\n\nevent: response.completed\ndata: {completed}\n\n"
+    );
     let mut response = Response::new(Body::from(wire));
     response.headers_mut().insert(
         "content-type",
@@ -2589,6 +4005,7 @@ mod tests {
             "/v1/asset-groups",
             "/v1/assets",
             "/v1/alpha/search",
+            "/v1/responses",
         ] {
             assert!(supports(&Method::POST, route), "missing {route}");
         }
@@ -2632,6 +4049,189 @@ mod tests {
         let claude = chat_to_claude(&input, "claude-upstream").unwrap();
         assert_eq!(claude["system"], "system");
         assert_eq!(claude["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn responses_compat_compiles_to_gemini_and_restores_responses_shape() {
+        let provider = test_provider("gemini", "https://generativelanguage.googleapis.com/v1beta");
+        let input = PreparedInput {
+            payload: Some(json!({
+                "model":"public-model",
+                "instructions":"be concise",
+                "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                "tool_choice":{"type":"function","name":"lookup"},
+                "reasoning":{"effort":"high"},
+                "service_tier":"priority",
+                "stream":true
+            })),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        };
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "public-model",
+            "gemini-2.5-pro",
+            &Method::POST,
+            &uri,
+            "/v1/responses",
+            &HeaderMap::new(),
+            &input,
+            "request-a",
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.downstream_protocol,
+            DownstreamProtocol::ResponsesCompat
+        );
+        assert!(prepared.downstream_stream);
+        assert!(prepared.upstream_stream);
+        assert_eq!(prepared.adapter, ResponseAdapter::GeminiToChat);
+        let AttemptBody::Json(body) = prepared.body else {
+            panic!("responses compatibility request must use JSON");
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be concise");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(body["serviceTier"], "PRIORITY");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24576
+        );
+
+        let response = chat_to_responses_response(
+            &json!({
+                "choices":[{"message":{"role":"assistant","content":"done","tool_calls":[{"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}],
+                "usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}
+            }),
+            "public-model",
+        );
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["model"], "public-model");
+        assert_eq!(response["output"][0]["content"][0]["text"], "done");
+        assert_eq!(response["output"][1]["type"], "function_call");
+        assert_eq!(response["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn search_responses_are_normalized_without_losing_provider_fields() {
+        let normalized = normalize_search_response(
+            "https://api.tavily.com/search",
+            &json!({
+                "query":"rust",
+                "results":[{"title":"Rust","url":"https://rust-lang.org","content":"language","score":0.9}],
+                "request_id":"search-a"
+            }),
+        );
+        assert_eq!(normalized["code"], 200);
+        assert_eq!(normalized["data"][0]["description"], "language");
+        assert_eq!(normalized["data"][0]["score"], 0.9);
+        assert_eq!(normalized["meta"]["provider"], "tavily");
+        assert_eq!(normalized["meta"]["request_id"], "search-a");
+    }
+
+    #[test]
+    fn gemini_thought_signatures_round_trip_for_images_and_tools() {
+        let encoded = BASE64.encode(b"\x89PNG\r\n\x1a\nimage");
+        cache_gemini_image_thought_signature(&encoded, "image-signature");
+        let part = data_url_part(&format!("data:image/png;base64,{encoded}")).unwrap();
+        assert_eq!(part["thoughtSignature"], "image-signature");
+
+        let chat = gemini_to_chat(
+            &json!({
+                "candidates":[{"content":{"parts":[{
+                    "functionCall":{"name":"lookup","args":{"q":"rust"}},
+                    "thoughtSignature":"tool-signature"
+                }]}}]
+            }),
+            "gemini-public",
+        );
+        let call_id = chat["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            decode_gemini_thought_signature(call_id).as_deref(),
+            Some("tool-signature")
+        );
+    }
+
+    #[test]
+    fn gemini_audio_and_claude_controls_are_translated() {
+        let input = json!({
+            "messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}]}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+            "tool_choice":"required",
+            "reasoning_effort":"medium",
+            "service_tier":"flex",
+            "modalities":["audio"],
+            "audio":{"voice":"Aoede"}
+        });
+        let gemini = chat_to_gemini(&input, "gemini-3-flash").unwrap();
+        assert_eq!(
+            gemini["contents"][0]["parts"][0]["inlineData"]["mimeType"],
+            "audio/wav"
+        );
+        assert_eq!(
+            gemini["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"],
+            "Aoede"
+        );
+        let claude = chat_to_claude(&input, "claude-sonnet").unwrap();
+        assert_eq!(claude["tool_choice"]["type"], "any");
+        assert_eq!(claude["thinking"]["budget_tokens"], 4096);
+        assert_eq!(claude["service_tier"], "standard_only");
+    }
+
+    #[tokio::test]
+    async fn multipart_media_is_parsed_and_rebuilt_with_the_upstream_model() {
+        let source_boundary = "CaseSensitiveBoundary";
+        let source = format!(
+            "--{source_boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit this\r\n--{source_boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"input.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nbinary\0payload\r\n--{source_boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\npublic-model\r\n--{source_boundary}--\r\n"
+        );
+        let manager = crate::request_spool::SpoolManager::new(
+            crate::resources::ResourceGovernor::unconstrained_for_test(),
+        )
+        .unwrap();
+        let mut writer = manager
+            .begin(None, Some(source.len() as u64), Duration::ZERO)
+            .await
+            .unwrap();
+        writer.append(Bytes::from(source)).await.unwrap();
+        let spool = writer.finish().await.unwrap();
+        let content_type = format!("multipart/form-data; boundary={source_boundary}");
+        assert_eq!(
+            spool
+                .storage
+                .multipart_text_field(&content_type, "model", 4096)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("public-model")
+        );
+        let output_boundary = "rewritten-boundary".to_owned();
+        let stream = multipart_rewrite_stream(
+            spool.storage,
+            spool.observation,
+            &content_type,
+            output_boundary.clone(),
+            "upstream-model".into(),
+        )
+        .await
+        .unwrap();
+        let mut multipart = multer::Multipart::new(stream, output_boundary);
+        let mut fields = HashMap::new();
+        while let Some(field) = multipart.next_field().await.unwrap() {
+            let name = field.name().unwrap().to_owned();
+            fields.insert(name, field.bytes().await.unwrap());
+        }
+        assert_eq!(fields["prompt"], "edit this");
+        assert_eq!(fields["model"], "upstream-model");
+        assert_eq!(fields["image"], b"binary\0payload"[..]);
     }
 
     #[test]

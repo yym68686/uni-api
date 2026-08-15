@@ -17,6 +17,7 @@ const MAX_STREAM_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
+    Chat,
     Responses,
     Gemini,
     Claude,
@@ -26,12 +27,23 @@ pub enum Protocol {
     Cloudflare,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputProtocol {
+    Chat,
+    Responses,
+}
+
 pub struct Translation {
     pub response: Response<Body>,
     pub usage: oneshot::Receiver<(i64, i64, i64)>,
 }
 
-pub fn translate(response: reqwest::Response, protocol: Protocol, model: String) -> Translation {
+pub fn translate(
+    response: reqwest::Response,
+    protocol: Protocol,
+    output_protocol: OutputProtocol,
+    model: String,
+) -> Translation {
     let status = response.status();
     let content_type = response
         .headers()
@@ -42,16 +54,35 @@ pub fn translate(response: reqwest::Response, protocol: Protocol, model: String)
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (usage_tx, usage_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let result = run_translation(response, protocol, &model, &content_type, &tx).await;
+        let result = run_translation(
+            response,
+            protocol,
+            output_protocol,
+            &model,
+            &content_type,
+            &tx,
+        )
+        .await;
         let usage = match result {
             Ok(usage) => usage,
             Err(error) => {
-                let payload = json!({"error":{"message":error}});
-                let _ = send_wire(&tx, &payload).await;
+                let payload = match output_protocol {
+                    OutputProtocol::Chat => json!({"error":{"message":error}}),
+                    OutputProtocol::Responses => json!({
+                        "type":"response.failed",
+                        "response":{
+                            "status":"failed",
+                            "error":{"message":error,"type":"upstream_stream_error"}
+                        }
+                    }),
+                };
+                let _ = send_wire(&tx, &payload, output_protocol).await;
                 (0, 0, 0)
             }
         };
-        let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+        if output_protocol == OutputProtocol::Chat {
+            let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+        }
         let _ = usage_tx.send(usage);
     });
     let mut output = Response::new(Body::from_stream(ReceiverStream::new(rx)));
@@ -73,11 +104,15 @@ pub fn translate(response: reqwest::Response, protocol: Protocol, model: String)
 async fn run_translation(
     response: reqwest::Response,
     protocol: Protocol,
+    output_protocol: OutputProtocol,
     model: &str,
     content_type: &str,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
 ) -> Result<(i64, i64, i64), String> {
-    let mut state = StreamState::new(model);
+    let mut state = StreamState::new(model, output_protocol);
+    for event in state.start_chunks() {
+        send_wire(tx, &event, output_protocol).await?;
+    }
     let mut stream = response.bytes_stream();
     if protocol == Protocol::AwsBedrock {
         let mut buffer = Vec::new();
@@ -98,7 +133,7 @@ async fn run_translation(
     let sse = content_type.contains("text/event-stream")
         || matches!(
             protocol,
-            Protocol::Responses | Protocol::Claude | Protocol::Cloudflare
+            Protocol::Responses | Protocol::Claude | Protocol::Cloudflare | Protocol::Chat
         );
     if sse {
         let mut buffer = Vec::new();
@@ -210,7 +245,7 @@ async fn process_json_bytes(
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
     let chunks = state.convert(protocol, &value);
     for chunk in chunks {
-        send_wire(tx, &chunk).await?;
+        send_wire(tx, &chunk, state.output_protocol).await?;
     }
     Ok(())
 }
@@ -262,13 +297,13 @@ async fn drain_aws_frames(
             _ => state.convert(Protocol::Claude, &payload),
         };
         for chunk in chunks {
-            send_wire(tx, &chunk).await?;
+            send_wire(tx, &chunk, state.output_protocol).await?;
         }
         if let Some(metrics) = payload.get("amazon-bedrock-invocationMetrics") {
             state.prompt_tokens = number(metrics.get("inputTokenCount"));
             state.completion_tokens = number(metrics.get("outputTokenCount"));
-            for chunk in state.finish_chunks("stop") {
-                send_wire(tx, &chunk).await?;
+            for chunk in state.finish_chunks_for_output("stop") {
+                send_wire(tx, &chunk, state.output_protocol).await?;
             }
         }
     }
@@ -277,8 +312,17 @@ async fn drain_aws_frames(
 async fn send_wire(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     value: &Value,
+    output_protocol: OutputProtocol,
 ) -> Result<(), String> {
-    let mut wire = b"data: ".to_vec();
+    let mut wire = Vec::new();
+    if output_protocol == OutputProtocol::Responses {
+        if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+            wire.extend_from_slice(b"event: ");
+            wire.extend_from_slice(event_type.as_bytes());
+            wire.push(b'\n');
+        }
+    }
+    wire.extend_from_slice(b"data: ");
     serde_json::to_writer(&mut wire, value).map_err(|error| error.to_string())?;
     wire.extend_from_slice(b"\n\n");
     tx.send(Ok(Bytes::from(wire)))
@@ -295,10 +339,12 @@ struct StreamState {
     prompt_tokens: i64,
     completion_tokens: i64,
     terminal: bool,
+    output_protocol: OutputProtocol,
+    responses: ResponsesOutputState,
 }
 
 impl StreamState {
-    fn new(model: &str) -> Self {
+    fn new(model: &str, output_protocol: OutputProtocol) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -312,11 +358,22 @@ impl StreamState {
             prompt_tokens: 0,
             completion_tokens: 0,
             terminal: false,
+            output_protocol,
+            responses: ResponsesOutputState::new(model, created),
+        }
+    }
+
+    fn start_chunks(&mut self) -> Vec<Value> {
+        if self.output_protocol == OutputProtocol::Responses {
+            self.responses.start_chunks()
+        } else {
+            Vec::new()
         }
     }
 
     fn convert(&mut self, protocol: Protocol, value: &Value) -> Vec<Value> {
-        match protocol {
+        let chunks = match protocol {
+            Protocol::Chat => self.chat(value),
             Protocol::Responses => self.responses(value),
             Protocol::Gemini => self.gemini(value),
             Protocol::Claude => self.claude(value),
@@ -324,6 +381,35 @@ impl StreamState {
             Protocol::Cohere => self.cohere(value),
             Protocol::Cloudflare => self.cloudflare(value),
             Protocol::AwsBedrock => Vec::new(),
+        };
+        self.encode_chunks(chunks)
+    }
+
+    fn chat(&mut self, value: &Value) -> Vec<Value> {
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            self.id = id.to_owned();
+        }
+        if let Some(usage) = value.get("usage") {
+            self.prompt_tokens = number(usage.get("prompt_tokens"));
+            self.completion_tokens = number(usage.get("completion_tokens"));
+        }
+        if value
+            .pointer("/choices/0/finish_reason")
+            .is_some_and(|value| !value.is_null())
+        {
+            self.terminal = true;
+        }
+        vec![value.clone()]
+    }
+
+    fn encode_chunks(&mut self, chunks: Vec<Value>) -> Vec<Value> {
+        if self.output_protocol == OutputProtocol::Chat {
+            chunks
+        } else {
+            chunks
+                .iter()
+                .flat_map(|chunk| self.responses.encode_chat_chunk(chunk))
+                .collect()
         }
     }
 
@@ -408,7 +494,14 @@ impl StreamState {
                     .get("id")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .unwrap_or_else(|| format!("call_{}", self.next_tool_index + 1));
+                    .unwrap_or_else(|| {
+                        crate::generic_api::gemini_call_id(
+                            part.get("thoughtSignature")
+                                .or_else(|| part.get("thought_signature"))
+                                .and_then(Value::as_str),
+                            self.next_tool_index + 1,
+                        )
+                    });
                 let index = self.tool_index(&call_id);
                 output.push(self.chunk(
                     json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{"name":call.get("name").cloned().unwrap_or(Value::Null),"arguments":serde_json::to_string(call.get("args").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into())}}]}),
@@ -417,6 +510,13 @@ impl StreamState {
                 ));
             }
             if let Some(data) = part.pointer("/inlineData/data").and_then(Value::as_str) {
+                if let Some(signature) = part
+                    .get("thoughtSignature")
+                    .or_else(|| part.get("thought_signature"))
+                    .and_then(Value::as_str)
+                {
+                    crate::generic_api::cache_gemini_image_thought_signature(data, signature);
+                }
                 let mime = part
                     .pointer("/inlineData/mimeType")
                     .and_then(Value::as_str)
@@ -626,6 +726,11 @@ impl StreamState {
         vec![self.chunk(json!({}), Some(reason), Some(usage))]
     }
 
+    fn finish_chunks_for_output(&mut self, reason: &str) -> Vec<Value> {
+        let chunks = self.finish_chunks(reason);
+        self.encode_chunks(chunks)
+    }
+
     fn usage(&self) -> (i64, i64, i64) {
         (
             self.prompt_tokens,
@@ -638,14 +743,465 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        for chunk in self.finish_chunks(if self.tools.is_empty() {
+        if self.output_protocol == OutputProtocol::Responses {
+            for chunk in self.responses.finish() {
+                send_wire(tx, &chunk, self.output_protocol).await?;
+            }
+            return Ok(());
+        }
+        for chunk in self.finish_chunks_for_output(if self.tools.is_empty() {
             "stop"
         } else {
             "tool_calls"
         }) {
-            send_wire(tx, &chunk).await?;
+            send_wire(tx, &chunk, self.output_protocol).await?;
         }
         Ok(())
+    }
+}
+
+struct ResponsesOutputState {
+    id: String,
+    model: String,
+    created: u64,
+    sequence: u64,
+    next_output_index: usize,
+    message: Option<ResponsesTextItem>,
+    reasoning: Option<ResponsesReasoningItem>,
+    tools: HashMap<usize, ResponsesToolItem>,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    completed: bool,
+}
+
+#[derive(Clone)]
+struct ResponsesTextItem {
+    output_index: usize,
+    id: String,
+    text: String,
+}
+
+#[derive(Clone)]
+struct ResponsesReasoningItem {
+    output_index: usize,
+    id: String,
+    text: String,
+}
+
+#[derive(Clone)]
+struct ResponsesToolItem {
+    output_index: usize,
+    id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ResponsesOutputState {
+    fn new(model: &str, created: u64) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self {
+            id: format!("resp_{unique:x}"),
+            model: model.to_owned(),
+            created,
+            sequence: 0,
+            next_output_index: 0,
+            message: None,
+            reasoning: None,
+            tools: HashMap::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            completed: false,
+        }
+    }
+
+    fn start_chunks(&mut self) -> Vec<Value> {
+        let response = self.response("in_progress", Vec::new(), false);
+        vec![
+            self.event("response.created", json!({"response":response.clone()})),
+            self.event("response.in_progress", json!({"response":response})),
+        ]
+    }
+
+    fn encode_chat_chunk(&mut self, chunk: &Value) -> Vec<Value> {
+        if self.completed {
+            return Vec::new();
+        }
+        if let Some(error) = chunk.get("error") {
+            self.completed = true;
+            let response = json!({
+                "id":self.id,
+                "object":"response",
+                "created_at":self.created,
+                "status":"failed",
+                "model":self.model,
+                "output":self.completed_output(),
+                "error":error,
+                "incomplete_details":Value::Null,
+            });
+            return vec![self.event("response.failed", json!({"response":response}))];
+        }
+        if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
+            self.prompt_tokens = number(usage.get("prompt_tokens"));
+            self.completion_tokens = number(usage.get("completion_tokens"));
+        }
+
+        let mut output = Vec::new();
+        let delta = chunk
+            .pointer("/choices/0/delta")
+            .filter(|value| value.is_object());
+        if let Some(reasoning) = delta
+            .and_then(|value| value.get("reasoning_content"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            output.extend(self.ensure_reasoning_started());
+            let item = self.reasoning.as_mut().expect("reasoning item");
+            item.text.push_str(reasoning);
+            let output_index = item.output_index;
+            let item_id = item.id.clone();
+            output.push(self.event(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "output_index":output_index,
+                    "item_id":item_id,
+                    "summary_index":0,
+                    "delta":reasoning,
+                }),
+            ));
+        }
+        if let Some(text) = delta
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            output.extend(self.ensure_message_started());
+            let item = self.message.as_mut().expect("message item");
+            item.text.push_str(text);
+            let output_index = item.output_index;
+            let item_id = item.id.clone();
+            output.push(self.event(
+                "response.output_text.delta",
+                json!({
+                    "output_index":output_index,
+                    "item_id":item_id,
+                    "content_index":0,
+                    "delta":text,
+                    "logprobs":[],
+                }),
+            ));
+        }
+        for tool in delta
+            .and_then(|value| value.get("tool_calls"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let index = tool.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let call_id = tool.get("id").and_then(Value::as_str);
+            let name = tool.pointer("/function/name").and_then(Value::as_str);
+            let arguments = tool
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            output.extend(self.ensure_tool_started(index, call_id, name));
+            let item = self.tools.get_mut(&index).expect("tool item");
+            if let Some(call_id) = call_id.filter(|value| !value.is_empty()) {
+                item.call_id = call_id.to_owned();
+            }
+            if let Some(name) = name.filter(|value| !value.is_empty()) {
+                item.name = name.to_owned();
+            }
+            item.arguments.push_str(arguments);
+            let output_index = item.output_index;
+            let item_id = item.id.clone();
+            if !arguments.is_empty() {
+                output.push(self.event(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "output_index":output_index,
+                        "item_id":item_id,
+                        "delta":arguments,
+                    }),
+                ));
+            }
+        }
+
+        output
+    }
+
+    fn ensure_message_started(&mut self) -> Vec<Value> {
+        if self.message.is_some() {
+            return Vec::new();
+        }
+        let output_index = self.take_output_index();
+        let id = format!("msg_{}_{output_index}", self.id.trim_start_matches("resp_"));
+        self.message = Some(ResponsesTextItem {
+            output_index,
+            id: id.clone(),
+            text: String::new(),
+        });
+        let item = json!({
+            "id":id,
+            "type":"message",
+            "status":"in_progress",
+            "role":"assistant",
+            "content":[],
+        });
+        vec![
+            self.event(
+                "response.output_item.added",
+                json!({"output_index":output_index,"item":item}),
+            ),
+            self.event(
+                "response.content_part.added",
+                json!({
+                    "output_index":output_index,
+                    "item_id":id,
+                    "content_index":0,
+                    "part":{"type":"output_text","text":"","annotations":[],"logprobs":[]},
+                }),
+            ),
+        ]
+    }
+
+    fn ensure_reasoning_started(&mut self) -> Vec<Value> {
+        if self.reasoning.is_some() {
+            return Vec::new();
+        }
+        let output_index = self.take_output_index();
+        let id = format!("rs_{}_{output_index}", self.id.trim_start_matches("resp_"));
+        self.reasoning = Some(ResponsesReasoningItem {
+            output_index,
+            id: id.clone(),
+            text: String::new(),
+        });
+        vec![
+            self.event(
+                "response.output_item.added",
+                json!({
+                    "output_index":output_index,
+                    "item":{"id":id,"type":"reasoning","status":"in_progress","summary":[]},
+                }),
+            ),
+            self.event(
+                "response.reasoning_summary_part.added",
+                json!({
+                    "output_index":output_index,
+                    "item_id":id,
+                    "summary_index":0,
+                    "part":{"type":"summary_text","text":""},
+                }),
+            ),
+        ]
+    }
+
+    fn ensure_tool_started(
+        &mut self,
+        index: usize,
+        call_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Vec<Value> {
+        if self.tools.contains_key(&index) {
+            return Vec::new();
+        }
+        let output_index = self.take_output_index();
+        let suffix = self.id.trim_start_matches("resp_");
+        let id = format!("fc_{suffix}_{index}");
+        let call_id = call_id
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("call_{suffix}_{index}"));
+        let name = name.unwrap_or_default().to_owned();
+        self.tools.insert(
+            index,
+            ResponsesToolItem {
+                output_index,
+                id: id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: String::new(),
+            },
+        );
+        vec![self.event(
+            "response.output_item.added",
+            json!({
+                "output_index":output_index,
+                "item":{
+                    "id":id,
+                    "type":"function_call",
+                    "status":"in_progress",
+                    "call_id":call_id,
+                    "name":name,
+                    "arguments":"",
+                },
+            }),
+        )]
+    }
+
+    fn finish(&mut self) -> Vec<Value> {
+        if self.completed {
+            return Vec::new();
+        }
+        self.completed = true;
+        let mut output = Vec::new();
+        if let Some(reasoning) = self.reasoning.clone() {
+            let output_index = reasoning.output_index;
+            let item_id = reasoning.id.clone();
+            let text = reasoning.text.clone();
+            output.push(self.event(
+                "response.reasoning_summary_text.done",
+                json!({"output_index":output_index,"item_id":item_id,"summary_index":0,"text":text}),
+            ));
+            output.push(self.event(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "output_index":output_index,
+                    "item_id":item_id,
+                    "summary_index":0,
+                    "part":{"type":"summary_text","text":text},
+                }),
+            ));
+            output.push(self.event(
+                "response.output_item.done",
+                json!({"output_index":output_index,"item":self.reasoning_value(&reasoning)}),
+            ));
+        }
+        if let Some(message) = self.message.clone() {
+            let output_index = message.output_index;
+            let item_id = message.id.clone();
+            let text = message.text.clone();
+            output.push(self.event(
+                "response.output_text.done",
+                json!({
+                    "output_index":output_index,
+                    "item_id":item_id,
+                    "content_index":0,
+                    "text":text,
+                    "logprobs":[],
+                }),
+            ));
+            output.push(self.event(
+                "response.content_part.done",
+                json!({
+                    "output_index":output_index,
+                    "item_id":item_id,
+                    "content_index":0,
+                    "part":{"type":"output_text","text":text,"annotations":[],"logprobs":[]},
+                }),
+            ));
+            output.push(self.event(
+                "response.output_item.done",
+                json!({"output_index":output_index,"item":self.message_value(&message)}),
+            ));
+        }
+        let mut tools = self.tools.values().cloned().collect::<Vec<_>>();
+        tools.sort_by_key(|item| item.output_index);
+        for tool in tools {
+            let output_index = tool.output_index;
+            let item_id = tool.id.clone();
+            let arguments = tool.arguments.clone();
+            output.push(self.event(
+                "response.function_call_arguments.done",
+                json!({"output_index":output_index,"item_id":item_id,"arguments":arguments}),
+            ));
+            output.push(self.event(
+                "response.output_item.done",
+                json!({"output_index":output_index,"item":self.tool_value(&tool)}),
+            ));
+        }
+        let response = self.response("completed", self.completed_output(), true);
+        output.push(self.event("response.completed", json!({"response":response})));
+        output
+    }
+
+    fn take_output_index(&mut self) -> usize {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    fn event(&mut self, event_type: &str, mut payload: Value) -> Value {
+        let sequence = self.sequence;
+        self.sequence += 1;
+        let object = payload.as_object_mut().expect("event payload object");
+        object.insert("type".into(), Value::String(event_type.to_owned()));
+        object.insert("sequence_number".into(), json!(sequence));
+        payload
+    }
+
+    fn response(&self, status: &str, output: Vec<Value>, include_usage: bool) -> Value {
+        json!({
+            "id":self.id,
+            "object":"response",
+            "created_at":self.created,
+            "status":status,
+            "model":self.model,
+            "output":output,
+            "output_text":self.message.as_ref().map(|item| item.text.as_str()).unwrap_or_default(),
+            "usage":include_usage.then(|| json!({
+                "input_tokens":self.prompt_tokens,
+                "output_tokens":self.completion_tokens,
+                "total_tokens":self.prompt_tokens + self.completion_tokens,
+                "input_tokens_details":{},
+                "output_tokens_details":{},
+            })),
+            "error":Value::Null,
+            "incomplete_details":Value::Null,
+        })
+    }
+
+    fn completed_output(&self) -> Vec<Value> {
+        let mut output = Vec::new();
+        if let Some(reasoning) = &self.reasoning {
+            output.push((reasoning.output_index, self.reasoning_value(reasoning)));
+        }
+        if let Some(message) = &self.message {
+            output.push((message.output_index, self.message_value(message)));
+        }
+        for tool in self.tools.values() {
+            output.push((tool.output_index, self.tool_value(tool)));
+        }
+        output.sort_by_key(|(index, _)| *index);
+        output.into_iter().map(|(_, value)| value).collect()
+    }
+
+    fn message_value(&self, item: &ResponsesTextItem) -> Value {
+        json!({
+            "id":item.id,
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "content":[{
+                "type":"output_text",
+                "text":item.text,
+                "annotations":[],
+                "logprobs":[],
+            }],
+        })
+    }
+
+    fn reasoning_value(&self, item: &ResponsesReasoningItem) -> Value {
+        json!({
+            "id":item.id,
+            "type":"reasoning",
+            "status":"completed",
+            "summary":[{"type":"summary_text","text":item.text}],
+        })
+    }
+
+    fn tool_value(&self, item: &ResponsesToolItem) -> Value {
+        json!({
+            "id":item.id,
+            "type":"function_call",
+            "status":"completed",
+            "call_id":item.call_id,
+            "name":item.name,
+            "arguments":item.arguments,
+        })
     }
 }
 
@@ -763,11 +1319,11 @@ mod tests {
 
     #[test]
     fn gemini_stream_maps_text_tools_and_usage() {
-        let mut state = StreamState::new("gemini-public");
+        let mut state = StreamState::new("gemini-public", OutputProtocol::Chat);
         let chunks = state.gemini(&json!({
             "candidates":[{"content":{"parts":[
                 {"text":"hello"},
-                {"functionCall":{"name":"lookup","args":{"q":"x"}}}
+                {"functionCall":{"name":"lookup","args":{"q":"x"}},"thoughtSignature":"tool-signature"}
             ]},"finishReason":"STOP"}],
             "usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}
         }));
@@ -779,6 +1335,10 @@ mod tests {
             chunks[1].pointer("/choices/0/delta/tool_calls/0/function/name"),
             Some(&json!("lookup"))
         );
+        assert!(chunks[1]
+            .pointer("/choices/0/delta/tool_calls/0/id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("call_dG9vbC1zaWduYXR1cmU.")));
         assert_eq!(
             chunks.last().unwrap().pointer("/usage/total_tokens"),
             Some(&json!(7))
@@ -787,7 +1347,7 @@ mod tests {
 
     #[test]
     fn claude_stream_maps_incremental_tool_arguments() {
-        let mut state = StreamState::new("claude-public");
+        let mut state = StreamState::new("claude-public", OutputProtocol::Chat);
         let start = state.claude(&json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup"}}));
         let delta = state.claude(&json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}));
         assert_eq!(
@@ -798,6 +1358,77 @@ mod tests {
             delta[0].pointer("/choices/0/delta/tool_calls/0/function/arguments"),
             Some(&json!("{\"q\":"))
         );
+    }
+
+    #[test]
+    fn chat_stream_maps_to_incremental_responses_events() {
+        let mut state = StreamState::new("public-model", OutputProtocol::Responses);
+        let started = state.start_chunks();
+        let first = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-a",
+                "choices":[{"delta":{"role":"assistant","content":"hello "},"finish_reason":null}]
+            }),
+        );
+        let second = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-a",
+                "choices":[{"delta":{"content":"world"},"finish_reason":"stop"}]
+            }),
+        );
+        state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-a",
+                "choices":[],
+                "usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}
+            }),
+        );
+        let completed = state.responses.finish();
+
+        assert_eq!(started[0]["type"], "response.created");
+        assert_eq!(first[0]["type"], "response.output_item.added");
+        assert_eq!(first[1]["type"], "response.content_part.added");
+        assert_eq!(first[2]["type"], "response.output_text.delta");
+        assert_eq!(second[0]["type"], "response.output_text.delta");
+        assert_eq!(completed.last().unwrap()["type"], "response.completed");
+        assert_eq!(
+            completed.last().unwrap()["response"]["output_text"],
+            "hello world"
+        );
+        assert_eq!(
+            completed.last().unwrap()["response"]["usage"]["total_tokens"],
+            5
+        );
+    }
+
+    #[test]
+    fn chat_tool_stream_maps_to_responses_function_call_events() {
+        let mut state = StreamState::new("public-model", OutputProtocol::Responses);
+        state.start_chunks();
+        let start = state.convert(
+            Protocol::Chat,
+            &json!({
+                "choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]
+            }),
+        );
+        let delta = state.convert(
+            Protocol::Chat,
+            &json!({
+                "choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]},"finish_reason":"tool_calls"}]
+            }),
+        );
+        let completed = state.responses.finish();
+
+        assert_eq!(start[0]["type"], "response.output_item.added");
+        assert_eq!(start[1]["type"], "response.function_call_arguments.delta");
+        assert_eq!(delta[0]["type"], "response.function_call_arguments.delta");
+        let response = &completed.last().unwrap()["response"];
+        assert_eq!(response["output"][0]["call_id"], "call-a");
+        assert_eq!(response["output"][0]["name"], "lookup");
+        assert_eq!(response["output"][0]["arguments"], "{\"q\":\"x\"}");
     }
 
     #[test]

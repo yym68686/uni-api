@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import random
 from typing import Any, Callable
 
@@ -126,40 +125,6 @@ class ProviderKeyPool:
                 if self.index == start_index:
                     self._log_warning("All API keys are rate limited!")
                     raise HTTPException(status_code=429, detail="Too many requests")
-
-    async def claim_by_fingerprint(
-        self,
-        fingerprint: str,
-        fingerprint_item: Callable[[str], str],
-        model: str | None = None,
-    ) -> str | None:
-        """Claim one exact configured key without rotating to another key."""
-
-        async with self.lock:
-            item = next(
-                (
-                    candidate
-                    for candidate in self.items
-                    if hmac.compare_digest(
-                        fingerprint_item(candidate),
-                        fingerprint,
-                    )
-                ),
-                None,
-            )
-            if item is None:
-                return None
-            if self.state.is_rate_limited(
-                item,
-                model,
-                self.policy,
-                commit=True,
-            ):
-                raise HTTPException(
-                    status_code=429,
-                    detail="Bound provider credential is temporarily unavailable",
-                )
-            return item
 
     async def is_tpr_exceeded(self, model: str | None = None, tokens: int = 0) -> bool:
         async with self.lock:
