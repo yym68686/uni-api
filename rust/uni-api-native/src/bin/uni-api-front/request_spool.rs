@@ -237,6 +237,13 @@ pub struct StoredBody {
     cleanup: Arc<LocalCleanup>,
 }
 
+pub struct MultipartFile {
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub storage: StoredBody,
+    pub bytes: u64,
+}
+
 impl StoredBody {
     fn local(path: PathBuf) -> Self {
         Self {
@@ -310,6 +317,66 @@ impl StoredBody {
             return std::str::from_utf8(&value)
                 .map(|value| Some(value.trim().to_owned()))
                 .map_err(|error| format!("multipart field {field_name} is not UTF-8: {error}"));
+        }
+        Ok(None)
+    }
+
+    pub async fn multipart_file(
+        &self,
+        content_type: &str,
+        field_name: &str,
+    ) -> Result<Option<MultipartFile>, String> {
+        let boundary = multer::parse_boundary(content_type)
+            .map_err(|error| format!("multipart request is missing a valid boundary: {error}"))?;
+        let file = File::open(&self.path)
+            .await
+            .map_err(|error| format!("open multipart request spool: {error}"))?;
+        let mut multipart = multer::Multipart::new(ReaderStream::new(file), boundary);
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|error| format!("parse multipart request: {error}"))?
+        {
+            if field.name() != Some(field_name) {
+                continue;
+            }
+            let filename = field
+                .file_name()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("audio.bin")
+                .to_owned();
+            let content_type = field.content_type().map(ToString::to_string);
+            let output_path = self.path.with_file_name(unique_name());
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&output_path)
+                .await
+                .map_err(|error| format!("create multipart file spool: {error}"))?;
+            let output_storage = StoredBody::local(output_path);
+            let mut bytes = 0u64;
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|error| format!("read multipart file {field_name}: {error}"))?
+            {
+                bytes = bytes.saturating_add(chunk.len() as u64);
+                output
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|error| format!("write multipart file spool: {error}"))?;
+            }
+            output
+                .flush()
+                .await
+                .map_err(|error| format!("flush multipart file spool: {error}"))?;
+            drop(output);
+            return Ok(Some(MultipartFile {
+                filename,
+                content_type,
+                storage: output_storage,
+                bytes,
+            }));
         }
         Ok(None)
     }

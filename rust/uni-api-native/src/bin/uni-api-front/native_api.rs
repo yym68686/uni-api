@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +29,7 @@ pub async fn handle(
         (&Method::GET, "/v1/observability/runtime") => {
             let (api_keys, providers, models) =
                 state.native_responses_config.runtime_counts().await;
+            let details = state.runtime_observability().await;
             Some(json_response(
                 StatusCode::OK,
                 json!({
@@ -39,6 +41,9 @@ pub async fn handle(
                     "api_key_count": api_keys,
                     "provider_count": providers,
                     "model_count": models,
+                    "resource_governor":details.get("resource_governor").cloned().unwrap_or(Value::Null),
+                    "idempotency":details.get("idempotency").cloned().unwrap_or(Value::Null),
+                    "upstream_http_clients":details.get("upstream_http_clients").cloned().unwrap_or(Value::Null),
                 }),
             ))
         }
@@ -63,6 +68,18 @@ pub async fn handle(
         }
         (&Method::GET, "/v1/api_config") => Some(api_config_response(state, headers).await),
         (&Method::GET, "/openapi.json") => Some(json_response(StatusCode::OK, openapi_document())),
+        (&Method::GET, "/favicon.ico") => Some(binary_response(
+            "image/x-icon",
+            include_bytes!("../../../../../static/favicon.ico"),
+        )),
+        (&Method::GET, "/apple-touch-icon.png") => Some(binary_response(
+            "image/png",
+            include_bytes!("../../../../../static/apple-touch-icon.png"),
+        )),
+        (&Method::GET, "/apple-touch-icon-precomposed.png") => Some(binary_response(
+            "image/png",
+            include_bytes!("../../../../../static/apple-touch-icon-precomposed.png"),
+        )),
         (&Method::GET, "/docs/markdown") => Some(text_response(
             StatusCode::OK,
             "text/markdown; charset=utf-8",
@@ -177,23 +194,46 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             "../../../../../uni_api/api/codex_models_pro_0_144_0.json"
         ))
         .unwrap_or_else(|_| json!({"models":[]}));
-        let allowed = models
-            .iter()
-            .map(String::as_str)
-            .collect::<std::collections::HashSet<_>>();
-        let filtered = catalog
+        let allowed = models.iter().map(String::as_str).collect::<HashSet<_>>();
+        let catalog_models = catalog
             .get("models")
             .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let by_slug = catalog_models
+            .iter()
+            .filter_map(|model| {
+                Some((
+                    model.get("slug")?.as_str()?.to_ascii_lowercase(),
+                    model.clone(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut filtered = catalog_models
             .into_iter()
-            .flatten()
             .filter(|model| {
                 model
                     .get("slug")
                     .and_then(Value::as_str)
                     .is_some_and(|slug| allowed.contains(slug))
             })
-            .cloned()
             .collect::<Vec<_>>();
+        let mut included = filtered
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        for model in &models {
+            if included.contains(model) || !is_codex_catalog_model(model) {
+                continue;
+            }
+            filtered.push(codex_compatible_model(
+                model,
+                100 + filtered.len(),
+                &by_slug,
+            ));
+            included.insert(model.clone());
+        }
         let mut response = json_response(StatusCode::OK, json!({"models":filtered}));
         response.headers_mut().insert(
             "x-uni-api-models-source",
@@ -213,6 +253,89 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             })).collect::<Vec<_>>(),
         }),
     )
+}
+
+fn is_codex_catalog_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    !lower.is_empty()
+        && ![
+            "audio",
+            "dall-e",
+            "embedding",
+            "image",
+            "moderation",
+            "rerank",
+            "seedance",
+            "sora",
+            "speech",
+            "tts",
+            "video",
+            "whisper",
+        ]
+        .into_iter()
+        .any(|token| lower.contains(token))
+}
+
+fn codex_compatible_model(model: &str, priority: usize, catalog: &HashMap<String, Value>) -> Value {
+    let lower = model.to_ascii_lowercase();
+    if let Some(mut template) = catalog
+        .iter()
+        .filter(|(family, _)| lower == **family || lower.starts_with(&format!("{family}-")))
+        .max_by_key(|(family, _)| family.len())
+        .map(|(_, value)| value.clone())
+    {
+        template["slug"] = Value::String(model.to_owned());
+        template["display_name"] = Value::String(model.to_owned());
+        template["description"] = Value::String("Available through uni-api.".into());
+        template["priority"] = json!(priority);
+        return template;
+    }
+    let supports_reasoning = lower.contains("codex")
+        || ["gpt-5", "o1", "o3", "o4"]
+            .into_iter()
+            .any(|prefix| lower.starts_with(prefix));
+    let supports_images = !lower.contains("deepseek");
+    let mut fallback = json!({
+        "slug":model,
+        "display_name":model,
+        "description":"Available through uni-api.",
+        "supported_reasoning_levels":if supports_reasoning { json!([
+            {"effort":"low","description":"Fast responses with lighter reasoning"},
+            {"effort":"medium","description":"Balances speed and reasoning depth for everyday tasks"},
+            {"effort":"high","description":"Greater reasoning depth for complex problems"},
+            {"effort":"xhigh","description":"Extra high reasoning depth for complex problems"}
+        ]) } else { json!([]) },
+        "shell_type":"shell_command",
+        "visibility":"list",
+        "supported_in_api":true,
+        "priority":priority,
+        "additional_speed_tiers":["fast"],
+        "service_tiers":[{"id":"priority","name":"Fast","description":"1.5x speed, increased usage"}],
+        "availability_nux":Value::Null,
+        "upgrade":Value::Null,
+        "base_instructions":"You are Codex, a coding agent. Read the codebase before making focused changes, preserve unrelated work, validate the result, and communicate concise progress.",
+        "supports_reasoning_summaries":supports_reasoning,
+        "default_reasoning_summary":"auto",
+        "support_verbosity":false,
+        "default_verbosity":Value::Null,
+        "apply_patch_tool_type":"freeform",
+        "web_search_tool_type":"text",
+        "truncation_policy":{"mode":"tokens","limit":10000},
+        "supports_parallel_tool_calls":true,
+        "supports_image_detail_original":supports_images,
+        "context_window":272000,
+        "max_context_window":272000,
+        "auto_compact_token_limit":Value::Null,
+        "effective_context_window_percent":95,
+        "experimental_supported_tools":[],
+        "input_modalities":if supports_images { json!(["text","image"]) } else { json!(["text"]) },
+        "supports_search_tool":false,
+        "use_responses_lite":false,
+    });
+    if supports_reasoning {
+        fallback["default_reasoning_level"] = Value::String("medium".into());
+    }
+    fallback
 }
 
 async fn stats_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Response<Body> {
@@ -373,25 +496,29 @@ fn query_value(uri: &Uri, name: &str) -> Option<String> {
 
 fn openapi_document() -> Value {
     let mut paths = serde_json::Map::new();
-    for path in [
-        "/v1/chat/completions",
-        "/v1/responses",
-        "/v1/responses/compact",
-        "/v1/messages",
-        "/v1/models",
-        "/v1/images/generations",
-        "/v1/images/edits",
-        "/v1/embeddings",
-        "/v1/audio/speech",
-        "/v1/audio/transcriptions",
-        "/v1/moderations",
-        "/v1/video/tasks",
-        "/v1/asset-groups",
-        "/v1/assets",
-        "/v1/stats",
-        "/v1/token_usage",
+    for (method, path) in [
+        ("post", "/v1/chat/completions"),
+        ("post", "/v1/responses"),
+        ("post", "/v1/responses/compact"),
+        ("post", "/v1/messages"),
+        ("get", "/v1/models"),
+        ("post", "/v1/images/generations"),
+        ("post", "/v1/images/edits"),
+        ("post", "/v1/embeddings"),
+        ("post", "/v1/audio/speech"),
+        ("post", "/v1/audio/transcriptions"),
+        ("post", "/v1/moderations"),
+        ("post", "/v1/video/tasks"),
+        ("get", "/v1/video/tasks/{task_id}"),
+        ("post", "/v1/asset-groups"),
+        ("get", "/v1/asset-groups/{group_id}"),
+        ("post", "/v1/assets"),
+        ("get", "/v1/assets/{asset_id}"),
+        ("get", "/v1/stats"),
+        ("get", "/v1/token_usage"),
     ] {
-        paths.insert(path.into(), json!({"get":{"responses":{"200":{"description":"OK"}}},"post":{"responses":{"200":{"description":"OK"}}}}));
+        paths.entry(path).or_insert_with(|| json!({}))[method] =
+            json!({"responses":{"200":{"description":"OK"}}});
     }
     json!({"openapi":"3.1.0","info":{"title":"uni-api","version":app_version()},"paths":paths})
 }
@@ -411,6 +538,10 @@ fn text_response(
     value: &'static str,
 ) -> Response<Body> {
     (status, [("content-type", content_type)], value).into_response()
+}
+
+fn binary_response(content_type: &'static str, value: &'static [u8]) -> Response<Body> {
+    (StatusCode::OK, [("content-type", content_type)], value).into_response()
 }
 
 fn redirect_response(location: &str) -> Response<Body> {
@@ -495,5 +626,15 @@ mod tests {
     fn parses_unix_and_iso_time_ranges() {
         assert_eq!(parse_datetime("1700000000"), Some(1_700_000_000));
         assert_eq!(parse_datetime("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn codex_catalog_generates_safe_fallback_models() {
+        let fallback = codex_compatible_model("gpt-5-custom", 101, &HashMap::new());
+        assert_eq!(fallback["slug"], "gpt-5-custom");
+        assert_eq!(fallback["default_reasoning_level"], "medium");
+        assert_eq!(fallback["input_modalities"], json!(["text", "image"]));
+        assert!(is_codex_catalog_model("deepseek-chat"));
+        assert!(!is_codex_catalog_model("text-embedding-3-large"));
     }
 }

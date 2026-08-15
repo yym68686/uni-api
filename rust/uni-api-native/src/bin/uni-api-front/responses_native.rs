@@ -573,6 +573,38 @@ impl NativeConfigStore {
             .unwrap_or((0.3, 1.0))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn generic_timeouts(
+        &self,
+        headers: &HeaderMap,
+        provider: &Provider,
+        request_model: &str,
+        original_model: &str,
+        engine: &str,
+        stream: bool,
+        endpoint: &str,
+        method: &str,
+    ) -> Timeouts {
+        let Some(snapshot) = self.snapshot().await else {
+            return Timeouts::default();
+        };
+        let role = extract_api_key(headers)
+            .and_then(|token| snapshot.api_keys.get(&token).cloned())
+            .map(|key| key.role.to_string())
+            .unwrap_or_default();
+        resolve_timeouts(
+            &snapshot,
+            provider,
+            request_model,
+            original_model,
+            engine,
+            stream,
+            &role,
+            endpoint,
+            method,
+        )
+    }
+
     pub async fn api_config(&self) -> Option<Value> {
         self.snapshot()
             .await
@@ -1068,6 +1100,7 @@ impl NativeRoute {
                 self.stream,
                 self.api_key.role.as_ref(),
                 &self.endpoint,
+                "POST",
             );
             self.upstream_attempts = self.upstream_attempts.saturating_add(1);
             let observation = NativeAttemptObservation {
@@ -1106,6 +1139,9 @@ impl NativeRoute {
                     &self.request_model,
                     &original_model,
                 ),
+                connect_timeout_seconds: timeout.connect,
+                write_timeout_seconds: timeout.write,
+                pool_timeout_seconds: timeout.pool,
                 first_byte_timeout_seconds: timeout.first_byte,
                 idle_timeout_seconds: timeout.idle,
                 total_timeout_seconds: timeout.total,
@@ -2633,10 +2669,14 @@ fn header_or(headers: &HeaderMap, name: &str, default: &str) -> String {
         .to_owned()
 }
 
-struct Timeouts {
-    first_byte: Option<f64>,
-    idle: Option<f64>,
-    total: Option<f64>,
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Timeouts {
+    pub(crate) connect: Option<f64>,
+    pub(crate) write: Option<f64>,
+    pub(crate) pool: Option<f64>,
+    pub(crate) first_byte: Option<f64>,
+    pub(crate) idle: Option<f64>,
+    pub(crate) total: Option<f64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2649,6 +2689,7 @@ fn resolve_timeouts(
     stream: bool,
     role: &str,
     endpoint: &str,
+    method: &str,
 ) -> Timeouts {
     let base = model_timeout(
         provider,
@@ -2659,7 +2700,7 @@ fn resolve_timeouts(
     let context = HashMap::from([
         ("provider", provider.name.as_ref()),
         ("endpoint", endpoint),
-        ("method", "POST"),
+        ("method", method),
         ("engine", engine),
         ("model", request_model),
         ("request_model", request_model),
@@ -2680,6 +2721,9 @@ fn resolve_timeouts(
         stream,
     );
     Timeouts {
+        connect: values.get("connect").and_then(Value::as_f64),
+        write: values.get("write").and_then(Value::as_f64),
+        pool: values.get("pool").and_then(Value::as_f64),
         first_byte: values
             .get("first_byte")
             .and_then(Value::as_f64)

@@ -177,6 +177,31 @@ impl Coordinator {
             }
         }
     }
+
+    pub async fn observability_snapshot(&self) -> serde_json::Value {
+        let state = self.inner.state.lock().await;
+        let completed = state
+            .entries
+            .values()
+            .filter(|entry| entry.response.is_some())
+            .count();
+        let nonreplayable = state
+            .entries
+            .values()
+            .filter(|entry| entry.nonreplayable_reason.is_some())
+            .count();
+        serde_json::json!({
+            "entries":state.entries.len(),
+            "inflight":state.entries.values().filter(|entry| entry.owner_token.is_some()).count(),
+            "completed":completed,
+            "nonreplayable":nonreplayable,
+            "stored_bytes":state.stored_bytes,
+            "inflight_response_bytes":self.inner.inflight_response_bytes.load(Ordering::Acquire),
+            "max_entries":self.inner.max_entries,
+            "max_stored_bytes":self.inner.max_stored_bytes,
+            "max_response_bytes":self.inner.max_response_bytes,
+        })
+    }
 }
 
 impl RequestHasher {

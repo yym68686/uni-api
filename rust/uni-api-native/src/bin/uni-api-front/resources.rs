@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceKind {
@@ -465,6 +466,30 @@ impl ResourceGovernor {
         cached.rejection = sample_global_rejection(&self.inner);
         cached.rejection
     }
+
+    pub fn observability_snapshot(&self) -> Value {
+        let reserved = self
+            .inner
+            .shared_memory_ledger
+            .as_ref()
+            .and_then(|ledger| ledger.total().ok())
+            .unwrap_or_else(|| self.inner.reserved_memory_bytes.load(Ordering::Acquire));
+        let (memory_current, memory_limit) = cgroup_memory().unwrap_or((0, 0));
+        let (open_fds, fd_limit) = file_descriptor_usage().unwrap_or((0, 0));
+        let (ephemeral_ports_used, ephemeral_ports_total) =
+            ephemeral_port_usage().unwrap_or((0, 0));
+        json!({
+            "reserved_memory_bytes":reserved,
+            "cgroup_memory_current_bytes":memory_current,
+            "cgroup_memory_limit_bytes":memory_limit,
+            "open_file_descriptors":open_fds,
+            "file_descriptor_limit":fd_limit,
+            "tcp_connections":tcp_connection_usage().unwrap_or(0),
+            "ephemeral_ports_used":ephemeral_ports_used,
+            "ephemeral_ports_total":ephemeral_ports_total,
+            "rejection_resource":self.global_rejection().map(ResourceKind::as_str),
+        })
+    }
 }
 
 pub struct MemoryReservation {
@@ -556,7 +581,8 @@ fn cgroup_memory() -> Option<(u64, u64)> {
         let Ok(limit_text) = fs::read_to_string(limit_path) else {
             continue;
         };
-        let Ok(mut limit) = limit_text.trim().parse::<u64>() else {
+        let Some(mut limit) = parse_memory_limit(limit_text.trim(), system_memory_total_bytes())
+        else {
             continue;
         };
         if let Some(high) = high_path.and_then(read_u64) {
@@ -569,6 +595,25 @@ fn cgroup_memory() -> Option<(u64, u64)> {
         }
     }
     None
+}
+
+fn parse_memory_limit(value: &str, unbounded_fallback: Option<u64>) -> Option<u64> {
+    let parsed = value.trim().parse::<u64>().ok();
+    match parsed {
+        Some(limit) if limit > 0 && limit < (1_u64 << 60) => Some(limit),
+        _ if value.trim() == "max" || parsed.is_some() => unbounded_fallback,
+        _ => None,
+    }
+}
+
+fn system_memory_total_bytes() -> Option<u64> {
+    fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let kib = line.strip_prefix("MemTotal:")?.split_whitespace().next()?;
+            kib.parse::<u64>().ok()?.checked_mul(1024)
+        })
 }
 
 fn file_descriptor_usage() -> Option<(u64, u64)> {
@@ -744,6 +789,21 @@ mod tests {
         assert_eq!(fraction(100, 500), 5);
         assert_eq!(fraction(1, 500), 1);
         assert!(fraction(u64::MAX, 1_000) > 0);
+    }
+
+    #[test]
+    fn unbounded_cgroup_memory_uses_host_capacity() {
+        let fallback = Some(8 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("max", fallback), fallback);
+        assert_eq!(
+            parse_memory_limit(&(1_u64 << 60).to_string(), fallback),
+            fallback
+        );
+        assert_eq!(
+            parse_memory_limit("2147483648", fallback),
+            Some(2_147_483_648)
+        );
+        assert_eq!(parse_memory_limit("invalid", fallback), None);
     }
 
     #[test]

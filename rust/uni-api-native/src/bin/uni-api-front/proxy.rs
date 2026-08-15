@@ -45,6 +45,7 @@ pub struct AppState {
 struct ClientKey {
     proxy: Option<String>,
     http1_only: bool,
+    connect_timeout_ms: Option<u64>,
 }
 
 impl AppState {
@@ -83,10 +84,13 @@ impl AppState {
         &self,
         proxy: Option<&str>,
         http1_only: bool,
+        connect_timeout: Option<Duration>,
     ) -> Result<reqwest::Client, String> {
         let key = ClientKey {
             proxy: proxy.map(str::to_owned),
             http1_only,
+            connect_timeout_ms: connect_timeout
+                .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64),
         };
         if let Some(client) = self.upstream_clients.lock().await.get(&key).cloned() {
             return Ok(client);
@@ -97,6 +101,9 @@ impl AppState {
             .tcp_keepalive(std::time::Duration::from_secs(30));
         if http1_only {
             builder = builder.http1_only();
+        }
+        if let Some(connect_timeout) = connect_timeout {
+            builder = builder.connect_timeout(connect_timeout);
         }
         if let Some(proxy_url) = proxy.filter(|value| !value.trim().is_empty()) {
             let configured = reqwest::Proxy::all(proxy_url)
@@ -116,6 +123,16 @@ impl AppState {
     pub fn internal_url(&self, path: &str) -> String {
         format!("{}{}", self.backend_origin, path)
     }
+
+    pub async fn runtime_observability(&self) -> serde_json::Value {
+        serde_json::json!({
+            "resource_governor":self.resource_governor.observability_snapshot(),
+            "idempotency":self.idempotency.observability_snapshot().await,
+            "upstream_http_clients":{
+                "pooled_clients":self.upstream_clients.lock().await.len(),
+            },
+        })
+    }
 }
 
 pub async fn handler(State(state): State<AppState>, request: Request) -> Response<Body> {
@@ -123,7 +140,9 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
         Ok(request) => request,
         Err(response) => return response,
     };
-    let path = request.uri().path().to_owned();
+    let raw_path = request.uri().path();
+    let path = raw_path.trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path }.to_owned();
     if path.starts_with(INTERNAL_PREFIX) {
         return json_error(StatusCode::NOT_FOUND, "Not found");
     }
@@ -145,13 +164,17 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
     let use_rust_responses = state.responses_data_plane_enabled
         && request.method() == Method::POST
         && matches!(path.as_str(), "/v1/responses" | "/v1/responses/compact");
+    let generic_idempotency_request = request.method() == Method::POST
+        && matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages")
+        && request.headers().contains_key("idempotency-key");
+    let use_spooled_dispatch = use_rust_responses || generic_idempotency_request;
     let resource_wait = if path == "/healthz" {
         Duration::ZERO
     } else {
         match state.resource_governor.wait_for_global_headroom().await {
             Ok(wait) => wait.waited,
             Err(failure) => {
-                if use_rust_responses {
+                if use_spooled_dispatch {
                     let observation = SpoolObservation {
                         resource_wait_ms: duration_ms(failure.waited),
                         failure_resource: Some(failure.resource.as_str()),
@@ -167,7 +190,7 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
         }
     };
-    if use_rust_responses {
+    if use_spooled_dispatch {
         let idempotency_values = request
             .headers()
             .get_all("idempotency-key")
@@ -272,6 +295,24 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
             None => None,
         };
+        if !use_rust_responses {
+            let body = match storage.into_body(&observation).await {
+                Ok(body) => body,
+                Err(failure) => {
+                    if let Some(owner) = owner {
+                        owner.release().await;
+                    }
+                    log_spool_observation(&parts.headers, failure.status, &failure.observation);
+                    return spool_failure_response(failure, idempotent_request);
+                }
+            };
+            let request = Request::from_parts(parts, body);
+            let response = crate::generic_api::handle(state, request, resource_wait).await;
+            if let Some(owner) = owner {
+                return relay_idempotent_axum_response(response, owner).await;
+            }
+            return response;
+        }
         if state
             .native_responses_config
             .moderation_enabled(&parts.headers)
@@ -335,7 +376,9 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
             NativePreparation::Fallback => {}
         }
-        if path != "/v1/responses" && !state.python_compat_enabled {
+        if !matches!(path.as_str(), "/v1/responses" | "/v1/responses/compact")
+            && !state.python_compat_enabled
+        {
             if let Some(owner) = owner {
                 owner.release().await;
             }
@@ -355,7 +398,7 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
             }
         };
         let request = Request::from_parts(parts, body);
-        if path == "/v1/responses" {
+        if matches!(path.as_str(), "/v1/responses" | "/v1/responses/compact") {
             let response = crate::generic_api::handle(state, request, resource_wait).await;
             if let Some(owner) = owner {
                 return relay_idempotent_axum_response(response, owner).await;
@@ -396,10 +439,10 @@ pub async fn handler(State(state): State<AppState>, request: Request) -> Respons
         return crate::native_api::handle_mutation(&state, request).await;
     }
     if !state.python_compat_enabled {
-        return json_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "Route is not supported by the Rust runtime",
-        );
+        if crate::generic_api::known_path(&path) {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
+        }
+        return json_error(StatusCode::NOT_FOUND, "Not found");
     }
     match proxy_to_backend(&state, request, use_rust_responses, false, None).await {
         Ok((response, session_id)) => {

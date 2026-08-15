@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Response};
@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bytes::Bytes;
 use crc32fast::hash as crc32;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -38,11 +38,19 @@ pub struct Translation {
     pub usage: oneshot::Receiver<(i64, i64, i64)>,
 }
 
+#[derive(Clone, Copy)]
+struct StreamTimeouts {
+    idle: Option<Duration>,
+    total: Option<Duration>,
+}
+
 pub fn translate(
     response: reqwest::Response,
     protocol: Protocol,
     output_protocol: OutputProtocol,
     model: String,
+    idle_timeout_seconds: Option<f64>,
+    total_timeout_seconds: Option<f64>,
 ) -> Translation {
     let status = response.status();
     let content_type = response
@@ -54,6 +62,10 @@ pub fn translate(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (usage_tx, usage_rx) = oneshot::channel();
     tokio::spawn(async move {
+        let timeouts = StreamTimeouts {
+            idle: positive_duration(idle_timeout_seconds),
+            total: positive_duration(total_timeout_seconds),
+        };
         let result = run_translation(
             response,
             protocol,
@@ -61,6 +73,7 @@ pub fn translate(
             &model,
             &content_type,
             &tx,
+            timeouts,
         )
         .await;
         let usage = match result {
@@ -108,15 +121,21 @@ async fn run_translation(
     model: &str,
     content_type: &str,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    timeouts: StreamTimeouts,
 ) -> Result<(i64, i64, i64), String> {
     let mut state = StreamState::new(model, output_protocol);
     for event in state.start_chunks() {
         send_wire(tx, &event, output_protocol).await?;
     }
     let mut stream = response.bytes_stream();
+    let total_deadline = timeouts
+        .total
+        .map(|timeout| tokio::time::Instant::now() + timeout);
     if protocol == Protocol::AwsBedrock {
         let mut buffer = Vec::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) =
+            next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
+        {
             buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
             drain_aws_frames(&mut buffer, &mut state, tx).await?;
             if buffer.len() > MAX_STREAM_FRAME_BYTES {
@@ -137,7 +156,9 @@ async fn run_translation(
         );
     if sse {
         let mut buffer = Vec::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) =
+            next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
+        {
             buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
             drain_sse_events(&mut buffer, protocol, &mut state, tx).await?;
             if buffer.len() > MAX_STREAM_FRAME_BYTES {
@@ -149,7 +170,9 @@ async fn run_translation(
         }
     } else if protocol == Protocol::Cohere {
         let mut buffer = Vec::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) =
+            next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
+        {
             buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
             while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = buffer.drain(..=index).collect::<Vec<_>>();
@@ -162,7 +185,9 @@ async fn run_translation(
         process_json_bytes(&buffer, protocol, &mut state, tx).await?;
     } else {
         let mut framer = JsonObjectFramer::default();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) =
+            next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
+        {
             for frame in framer.feed(&chunk.map_err(|error| error.to_string())?)? {
                 process_json_bytes(&frame, protocol, &mut state, tx).await?;
             }
@@ -171,6 +196,39 @@ async fn run_translation(
     }
     state.finish_if_needed(tx).await?;
     Ok(state.usage())
+}
+
+fn positive_duration(value: Option<f64>) -> Option<Duration> {
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Duration::from_secs_f64)
+}
+
+async fn next_upstream_chunk<S>(
+    stream: &mut S,
+    idle_timeout: Option<Duration>,
+    total_deadline: Option<tokio::time::Instant>,
+) -> Result<Option<Result<Bytes, reqwest::Error>>, String>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let total_remaining = total_deadline
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+    let timeout = match (idle_timeout, total_remaining) {
+        (Some(idle), Some(total)) => Some(idle.min(total)),
+        (Some(idle), None) => Some(idle),
+        (None, Some(total)) => Some(total),
+        (None, None) => None,
+    };
+    let Some(timeout) = timeout else {
+        return Ok(stream.next().await);
+    };
+    if timeout.is_zero() {
+        return Err("upstream stream total timeout exceeded".into());
+    }
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .map_err(|_| "upstream stream idle or total timeout exceeded".to_owned())
 }
 
 async fn drain_sse_events(

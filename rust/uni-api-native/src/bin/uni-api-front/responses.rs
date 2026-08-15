@@ -52,6 +52,12 @@ pub(crate) struct Plan {
     pub(crate) commit_policy: String,
     #[serde(default)]
     pub(crate) normalize_custom_tool_call_ids: bool,
+    #[serde(default)]
+    pub(crate) connect_timeout_seconds: Option<f64>,
+    #[serde(default)]
+    pub(crate) write_timeout_seconds: Option<f64>,
+    #[serde(default)]
+    pub(crate) pool_timeout_seconds: Option<f64>,
     pub(crate) first_byte_timeout_seconds: Option<f64>,
     pub(crate) idle_timeout_seconds: Option<f64>,
     pub(crate) total_timeout_seconds: Option<f64>,
@@ -493,7 +499,11 @@ async fn send_native_nonstream_attempt(
     plan: &Plan,
 ) -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
     let client = state
-        .upstream_client(plan.proxy.as_deref(), plan.http1_only)
+        .upstream_client(
+            plan.proxy.as_deref(),
+            plan.http1_only,
+            positive_duration(plan.connect_timeout_seconds),
+        )
         .await?;
     let mut headers = HeaderMap::new();
     for (name, value) in &plan.headers {
@@ -506,11 +516,12 @@ async fn send_native_nonstream_attempt(
     headers
         .entry("accept-encoding")
         .or_insert(HeaderValue::from_static("identity"));
-    let timeout = plan
-        .total_timeout_seconds
-        .or(plan.first_byte_timeout_seconds)
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(Duration::from_secs_f64);
+    let timeout = earliest_timeout(&[
+        plan.write_timeout_seconds,
+        plan.pool_timeout_seconds,
+        plan.first_byte_timeout_seconds,
+        plan.total_timeout_seconds,
+    ]);
     let request = client
         .post(&plan.url)
         .headers(headers)
@@ -656,7 +667,11 @@ async fn preflight_attempt(
     keepalive_already_sent: bool,
 ) -> Result<PreflightResult, String> {
     let client = state
-        .upstream_client(plan.proxy.as_deref(), plan.http1_only)
+        .upstream_client(
+            plan.proxy.as_deref(),
+            plan.http1_only,
+            positive_duration(plan.connect_timeout_seconds),
+        )
         .await?;
     let mut headers = HeaderMap::new();
     for (name, value) in &plan.headers {
@@ -675,7 +690,13 @@ async fn preflight_attempt(
     let started_at = tokio::time::Instant::now();
     let first_deadline = deadline(started_at, plan.first_byte_timeout_seconds);
     let total_deadline = deadline(started_at, plan.total_timeout_seconds);
-    let send_deadline = earlier_deadline(first_deadline, total_deadline);
+    let send_stage_timeout =
+        earliest_timeout(&[plan.write_timeout_seconds, plan.pool_timeout_seconds]);
+    let send_stage_deadline = send_stage_timeout.map(|timeout| started_at + timeout);
+    let send_deadline = earlier_deadline(
+        earlier_deadline(first_deadline, total_deadline),
+        send_stage_deadline,
+    );
     let request = client
         .post(&plan.url)
         .headers(headers)
@@ -2972,6 +2993,22 @@ fn deadline(started: tokio::time::Instant, seconds: Option<f64>) -> Option<tokio
         .map(|value| started + Duration::from_secs_f64(value))
 }
 
+fn positive_duration(seconds: Option<f64>) -> Option<Duration> {
+    seconds
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Duration::from_secs_f64)
+}
+
+fn earliest_timeout(values: &[Option<f64>]) -> Option<Duration> {
+    values
+        .iter()
+        .copied()
+        .flatten()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .min_by(f64::total_cmp)
+        .map(Duration::from_secs_f64)
+}
+
 fn earlier_deadline(
     first: Option<tokio::time::Instant>,
     second: Option<tokio::time::Instant>,
@@ -3015,6 +3052,9 @@ mod tests {
             http1_only: false,
             commit_policy: "real_output".into(),
             normalize_custom_tool_call_ids: false,
+            connect_timeout_seconds: None,
+            write_timeout_seconds: None,
+            pool_timeout_seconds: None,
             first_byte_timeout_seconds: None,
             idle_timeout_seconds: None,
             total_timeout_seconds: None,

@@ -60,6 +60,7 @@ enum ResponseAdapter {
     CohereToChat,
     CloudflareToChat,
     AwsToChat,
+    LingjingVideo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +80,8 @@ struct PreparedAttempt {
     request_model: String,
     original_model: String,
     downstream_protocol: DownstreamProtocol,
+    provider_key: String,
+    estimated_video_tokens: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -98,6 +101,17 @@ struct ThoughtSignatureCache {
 
 static GEMINI_THOUGHT_SIGNATURES: OnceLock<Mutex<ThoughtSignatureCache>> = OnceLock::new();
 
+#[derive(Clone)]
+struct VideoTaskRoute {
+    provider_name: String,
+    request_model: String,
+    provider_key: String,
+    video_tokens: Option<i64>,
+    created_at: Instant,
+}
+
+static VIDEO_TASK_ROUTES: OnceLock<Mutex<HashMap<String, VideoTaskRoute>>> = OnceLock::new();
+
 enum AttemptBody {
     Json(Vec<u8>),
     Replay(StoredBody, SpoolObservation),
@@ -108,6 +122,13 @@ enum AttemptBody {
         boundary: String,
         model: String,
     },
+    DashscopeTranscription {
+        storage: StoredBody,
+        observation: SpoolObservation,
+        source_content_type: String,
+        model: String,
+        provider_key: String,
+    },
     Empty,
 }
 
@@ -116,7 +137,10 @@ pub fn supports(method: &Method, path: &str) -> bool {
         && (PUBLIC_JSON_ROUTES.contains(&path)
             || matches!(
                 path,
-                "/v1/images/edits" | "/v1/audio/transcriptions" | "/v1/responses"
+                "/v1/images/edits"
+                    | "/v1/audio/transcriptions"
+                    | "/v1/responses"
+                    | "/v1/responses/compact"
             ))
     {
         return true;
@@ -130,6 +154,22 @@ pub fn supports(method: &Method, path: &str) -> bool {
         return true;
     }
     false
+}
+
+pub fn known_path(path: &str) -> bool {
+    PUBLIC_JSON_ROUTES.contains(&path)
+        || matches!(
+            path,
+            "/search"
+                | "/v1/search"
+                | "/v1/images/edits"
+                | "/v1/audio/transcriptions"
+                | "/v1/responses"
+                | "/v1/responses/compact"
+        )
+        || path.starts_with("/v1/video/tasks/")
+        || path.starts_with("/v1/asset-groups/")
+        || path.starts_with("/v1/assets/")
 }
 
 pub async fn handle(state: AppState, request: Request, resource_wait: Duration) -> Response<Body> {
@@ -148,7 +188,15 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         Ok(input) => input,
         Err(response) => return response,
     };
+    if method != Method::GET {
+        if let Some(payload) = input.payload.as_ref() {
+            if let Some(field) = missing_required_field(&path, payload) {
+                return validation_error(field);
+            }
+        }
+    }
     let query_model = query_value(&uri, "model");
+    let video_task_route = video_task_route_for_path(&path);
     let mut request_model = input
         .payload
         .as_ref()
@@ -158,6 +206,9 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .unwrap_or(input.default_model.as_str())
         .trim()
         .to_owned();
+    if let Some(route) = video_task_route.as_ref() {
+        request_model.clone_from(&route.request_model);
+    }
     if request_model.is_empty() {
         request_model = default_model_for_path(&state, &headers, &path).await;
     }
@@ -178,7 +229,8 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         }
     }
     let body_bytes = input.observation.body_bytes;
-    let resolved = match state
+    let request_type = (path == "/v1/responses/compact").then_some("compaction");
+    let mut resolved = match state
         .native_responses_config
         .resolve_route(
             &state.persistence,
@@ -186,7 +238,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             &request_model,
             &path,
             body_bytes,
-            None,
+            request_type,
             true,
         )
         .await
@@ -194,6 +246,17 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         Ok(route) => route,
         Err(error) => return json_error(error.status, &error.message),
     };
+    if let Some(route) = video_task_route.as_ref() {
+        resolved
+            .providers
+            .retain(|provider| provider.name.as_ref() == route.provider_name);
+        if resolved.providers.is_empty() {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The provider used to create this video task is unavailable",
+            );
+        }
+    }
     let max_attempts = compute_retry_count(&resolved.providers)
         .max(resolved.providers.len())
         .min(10);
@@ -214,11 +277,18 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         let Some(original_model) = provider.models.get(&request_model).cloned() else {
             continue;
         };
-        let provider_key_raw = match state
-            .native_responses_config
-            .select_provider_key(&provider, &original_model)
-            .await
+        let key_selection = if let Some(route) = video_task_route
+            .as_ref()
+            .filter(|route| route.provider_name == provider.name.as_ref())
         {
+            ProviderKeySelection::Selected(route.provider_key.clone())
+        } else {
+            state
+                .native_responses_config
+                .select_provider_key(&provider, &original_model)
+                .await
+        };
+        let provider_key_raw = match key_selection {
             ProviderKeySelection::Selected(key) => key,
             ProviderKeySelection::NoProviderKey => {
                 last_status = StatusCode::BAD_GATEWAY;
@@ -289,7 +359,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             "started",
             None,
         );
-        match send_attempt(&state, &provider, prepared).await {
+        match send_attempt(&state, &provider, prepared, &headers, &path).await {
             Ok(success) => {
                 state.persistence.record_channel(ChannelStat {
                     request_id: request_id.clone(),
@@ -416,6 +486,48 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         ..RequestStat::default()
     });
     last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
+}
+
+fn missing_required_field(path: &str, payload: &Value) -> Option<&'static str> {
+    let root = payload.as_object()?;
+    let missing = |field: &'static str| {
+        root.get(field).is_none_or(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(|value| value.trim().is_empty())
+                || value.as_array().is_some_and(Vec::is_empty)
+        })
+    };
+    match path {
+        "/v1/chat/completions" | "/v1/messages" if missing("messages") => Some("messages"),
+        "/v1/images/generations" if missing("prompt") => Some("prompt"),
+        "/v1/embeddings" if missing("input") => Some("input"),
+        "/v1/audio/speech" if missing("input") => Some("input"),
+        "/v1/audio/speech" if missing("voice") => Some("voice"),
+        "/v1/moderations" if missing("input") => Some("input"),
+        "/v1/responses" if missing("input") => Some("input"),
+        "/v1/video/tasks" if missing("prompt") && missing("content") && missing("taskParams") => {
+            Some("prompt")
+        }
+        _ => None,
+    }
+}
+
+fn validation_error(field: &str) -> Response<Body> {
+    let mut response = json_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({
+            "detail":[{
+                "type":"missing",
+                "loc":["body",field],
+                "msg":"Field required",
+                "input":Value::Null,
+            }]
+        }),
+    );
+    response
+        .headers_mut()
+        .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+    response
 }
 
 pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
@@ -578,7 +690,7 @@ pub(crate) async fn run_moderation_preflight(
             &request_id(headers),
         )
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?;
-        match send_attempt(state, &provider, prepared).await {
+        match send_attempt(state, &provider, prepared, headers, "/v1/moderations").await {
             Ok(success) => {
                 let bytes = to_bytes(success.response.into_body(), 4 * 1024 * 1024)
                     .await
@@ -694,7 +806,7 @@ async fn normalize_image_url(
         return Err((StatusCode::BAD_REQUEST, "Invalid image URL".into()));
     }
     let client = state
-        .upstream_client(None, false)
+        .upstream_client(None, false, None)
         .await
         .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
     let response = tokio::time::timeout(
@@ -983,7 +1095,7 @@ fn build_attempt(
 ) -> Result<PreparedAttempt, String> {
     let is_alpha_search = path == ALPHA_SEARCH_ENDPOINT;
     let engine = provider.engine.trim().to_ascii_lowercase();
-    let native_responses_wire = path == "/v1/responses"
+    let native_responses_wire = matches!(path, "/v1/responses" | "/v1/responses/compact")
         && (engine == "codex"
             || (engine == "gpt"
                 && provider
@@ -1003,6 +1115,13 @@ fn build_attempt(
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let provider_stream = downstream_stream;
+    let is_search = matches!(path, "/search" | "/v1/search");
+    let jina_search = is_search
+        && (provider.name.eq_ignore_ascii_case("jina")
+            || provider
+                .base_url
+                .to_ascii_lowercase()
+                .contains("api.jina.ai"));
     let proxy = provider
         .preferences
         .get("proxy")
@@ -1012,13 +1131,18 @@ fn build_attempt(
 
     if let Some((storage, observation)) = &input.replay {
         let url = endpoint_url(provider.base_url.as_ref(), path, method, uri)?;
-        let multipart_boundary = input
-            .content_type
-            .starts_with("multipart/form-data")
-            .then(|| multipart_output_boundary(request_id));
+        let dashscope_transcription = path == "/v1/audio/transcriptions"
+            && provider
+                .base_url
+                .to_ascii_lowercase()
+                .contains("dashscope.aliyuncs.com");
+        let multipart_boundary = (!dashscope_transcription
+            && input.content_type.starts_with("multipart/form-data"))
+        .then(|| multipart_output_boundary(request_id));
         let outgoing_content_type = multipart_boundary
             .as_ref()
-            .map(|boundary| format!("multipart/form-data; boundary={boundary}"));
+            .map(|boundary| format!("multipart/form-data; boundary={boundary}"))
+            .or_else(|| dashscope_transcription.then(|| "application/json".into()));
         let mut headers = provider_headers(
             provider,
             provider_key,
@@ -1031,7 +1155,15 @@ fn build_attempt(
                 .or(Some(input.content_type.as_str())),
         )?;
         headers.remove("content-length");
-        let body = if let Some(boundary) = multipart_boundary {
+        let body = if dashscope_transcription {
+            AttemptBody::DashscopeTranscription {
+                storage: storage.clone_for_replay(),
+                observation: observation.clone(),
+                source_content_type: input.content_type.clone(),
+                model: original_model.to_owned(),
+                provider_key: provider_key.to_owned(),
+            }
+        } else if let Some(boundary) = multipart_boundary {
             AttemptBody::MultipartRewrite {
                 storage: storage.clone_for_replay(),
                 observation: observation.clone(),
@@ -1053,6 +1185,8 @@ fn build_attempt(
             request_model: request_model.to_owned(),
             original_model: original_model.to_owned(),
             downstream_protocol,
+            provider_key: provider_key.to_owned(),
+            estimated_video_tokens: None,
         });
     }
 
@@ -1065,6 +1199,9 @@ fn build_attempt(
     } else {
         path
     };
+    let estimated_video_tokens = (path == "/v1/video/tasks")
+        .then(|| estimate_video_tokens(&payload))
+        .flatten();
     let (url, adapter, upstream_stream) = match engine.as_str() {
         "codex" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_responses(&payload, original_model)?;
@@ -1145,6 +1282,15 @@ fn build_attempt(
                 provider_stream,
             )
         }
+        "doubao-translation" if wire_path == "/v1/chat/completions" => {
+            payload =
+                chat_to_doubao_translation(&payload, original_model, request_model, provider)?;
+            (
+                provider.base_url.to_string(),
+                ResponseAdapter::ResponsesToChat,
+                provider_stream,
+            )
+        }
         "azure" if wire_path == "/v1/chat/completions" => {
             set_model(&mut payload, original_model)?;
             normalize_azure_token_limit(&mut payload, original_model);
@@ -1178,10 +1324,92 @@ fn build_attempt(
                 provider_stream,
             )
         }
-        _ if matches!(path, "/search" | "/v1/search") => {
-            set_model(&mut payload, original_model)?;
+        "lingjing" if path == "/v1/video/tasks" => {
+            payload = content_generation_to_lingjing(&payload, original_model)?;
+            (
+                lingjing_url(provider.base_url.as_ref(), "/draw/task/submit", None)?,
+                ResponseAdapter::LingjingVideo,
+                false,
+            )
+        }
+        "lingjing" if path.starts_with("/v1/video/tasks/") => {
+            let task_id = path.trim_start_matches("/v1/video/tasks/");
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("taskId", task_id)
+                .finish();
+            (
+                lingjing_url(provider.base_url.as_ref(), "/draw/task/query", Some(&query))?,
+                ResponseAdapter::LingjingVideo,
+                false,
+            )
+        }
+        "lingjing"
+            if path == "/v1/asset-groups"
+                || path.starts_with("/v1/asset-groups/")
+                || path == "/v1/assets"
+                || path.starts_with("/v1/assets/") =>
+        {
             (
                 endpoint_url(provider.base_url.as_ref(), wire_path, method, uri)?,
+                ResponseAdapter::Passthrough,
+                false,
+            )
+        }
+        _ if path == "/v1/audio/speech"
+            && provider
+                .base_url
+                .to_ascii_lowercase()
+                .contains("api.minimaxi.com") =>
+        {
+            payload = openai_tts_to_minimax(&payload, original_model)?;
+            (
+                endpoint_url(provider.base_url.as_ref(), wire_path, method, uri)?,
+                ResponseAdapter::Passthrough,
+                false,
+            )
+        }
+        _ if path == "/v1/embeddings"
+            && provider
+                .base_url
+                .to_ascii_lowercase()
+                .starts_with("https://api.jina.ai") =>
+        {
+            normalize_jina_embedding(&mut payload, original_model)?;
+            (
+                endpoint_url(provider.base_url.as_ref(), wire_path, method, uri)?,
+                ResponseAdapter::Passthrough,
+                false,
+            )
+        }
+        _ if matches!(path, "/search" | "/v1/search") => {
+            let query = search_query(&payload)?;
+            payload = if jina_search {
+                json!({"q":query})
+            } else {
+                let defaults = provider
+                    .preferences
+                    .get("search_defaults")
+                    .and_then(Value::as_object);
+                json!({
+                    "query":query,
+                    "topic":defaults.and_then(|value| value.get("topic")).cloned().unwrap_or_else(|| json!("general")),
+                    "search_depth":defaults.and_then(|value| value.get("search_depth")).cloned().unwrap_or_else(|| json!("basic")),
+                    "chunks_per_source":defaults.and_then(|value| value.get("chunks_per_source")).cloned().unwrap_or_else(|| json!(3)),
+                    "max_results":defaults.and_then(|value| value.get("max_results")).cloned().unwrap_or_else(|| json!(7)),
+                })
+            };
+            (
+                if jina_search {
+                    let mut url = Url::parse("https://s.jina.ai/")
+                        .map_err(|error| format!("invalid Jina search URL: {error}"))?;
+                    url.query_pairs_mut().append_pair(
+                        "q",
+                        payload.get("q").and_then(Value::as_str).unwrap_or_default(),
+                    );
+                    url.to_string()
+                } else {
+                    endpoint_url(provider.base_url.as_ref(), wire_path, method, uri)?
+                },
                 ResponseAdapter::Search,
                 false,
             )
@@ -1197,7 +1425,7 @@ fn build_attempt(
     };
     if !matches!(
         adapter,
-        ResponseAdapter::GeminiToChat | ResponseAdapter::AwsToChat
+        ResponseAdapter::GeminiToChat | ResponseAdapter::AwsToChat | ResponseAdapter::LingjingVideo
     ) && engine != "vertex-claude"
         && !is_alpha_search
     {
@@ -1210,6 +1438,12 @@ fn build_attempt(
             sanitize_alpha_search_payload(root);
         } else {
             apply_overrides(root, provider, request_model);
+            if path == "/v1/responses/compact" {
+                root.remove("store");
+            }
+            if engine == "doubao-translation" {
+                root.remove("translation_options");
+            }
         }
     }
     let mut headers = provider_headers(
@@ -1224,7 +1458,14 @@ fn build_attempt(
     if is_alpha_search && engine == "codex" {
         apply_alpha_search_headers(&mut headers, incoming_headers, &payload)?;
     }
-    let outgoing_method = if matches!(path, "/search" | "/v1/search") {
+    if jina_search {
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        headers.insert("x-respond-with", HeaderValue::from_static("no-content"));
+        headers.remove("content-type");
+    }
+    let outgoing_method = if jina_search {
+        Method::GET
+    } else if is_search {
         Method::POST
     } else {
         method.clone()
@@ -1250,7 +1491,30 @@ fn build_attempt(
         request_model: request_model.to_owned(),
         original_model: original_model.to_owned(),
         downstream_protocol,
+        provider_key: provider_key.to_owned(),
+        estimated_video_tokens,
     })
+}
+
+fn search_query(payload: &Value) -> Result<String, String> {
+    let query = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter_map(Value::as_object)
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .map(extract_translation_text)
+        .or_else(|| payload.get("q").and_then(value_text))
+        .unwrap_or_default();
+    let query = query.trim();
+    if query.is_empty() {
+        Err("Missing search query".into())
+    } else {
+        Ok(query.to_owned())
+    }
 }
 
 fn multipart_output_boundary(request_id: &str) -> String {
@@ -1269,6 +1533,136 @@ async fn multipart_rewrite_body(
         multipart_rewrite_stream(storage, observation, source_content_type, boundary, model)
             .await?,
     ))
+}
+
+async fn prepare_dashscope_transcription(
+    client: &reqwest::Client,
+    mut headers: HeaderMap,
+    storage: StoredBody,
+    observation: SpoolObservation,
+    source_content_type: &str,
+    model: &str,
+    provider_key: &str,
+) -> Result<(HeaderMap, Vec<u8>), String> {
+    let audio = storage
+        .multipart_file(source_content_type, "file")
+        .await?
+        .ok_or_else(|| "audio transcription requires multipart file field".to_owned())?;
+    let certificate_response = client
+        .get("https://dashscope.aliyuncs.com/api/v1/uploads")
+        .bearer_auth(provider_key)
+        .header("accept-encoding", "identity")
+        .query(&[("action", "getPolicy"), ("model", model)])
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| format!("request DashScope upload certificate: {error}"))?;
+    if !certificate_response.status().is_success() {
+        return Err(format!(
+            "DashScope upload certificate returned HTTP {}",
+            certificate_response.status()
+        ));
+    }
+    let certificate_body = read_limited_upstream_body(certificate_response, 256 * 1024).await?;
+    let certificate: Value = serde_json::from_slice(&certificate_body)
+        .map_err(|error| format!("decode DashScope upload certificate: {error}"))?;
+    let data = certificate
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "DashScope upload certificate is missing data".to_owned())?;
+    let field = |name: &str, maximum: usize| -> Result<String, String> {
+        let value = data
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("DashScope upload certificate is missing {name}"))?;
+        if value.len() > maximum {
+            return Err(format!(
+                "DashScope upload certificate field {name} is too large"
+            ));
+        }
+        Ok(value.to_owned())
+    };
+    let upload_host = field("upload_host", 2048)?;
+    let upload_dir = field("upload_dir", 1024)?;
+    let parsed_upload_host = Url::parse(&upload_host)
+        .map_err(|error| format!("invalid DashScope upload host: {error}"))?;
+    if !matches!(parsed_upload_host.scheme(), "http" | "https")
+        || parsed_upload_host.host_str().is_none()
+    {
+        return Err("DashScope upload host must be HTTP(S)".into());
+    }
+    if audio.filename.len() > 512 {
+        return Err("DashScope upload filename exceeds 512 bytes".into());
+    }
+    let object_key = format!("{upload_dir}/{}", audio.filename);
+    let audio_body = audio
+        .storage
+        .into_body(&observation)
+        .await
+        .map_err(|error| error.message)?;
+    let mut part = reqwest::multipart::Part::stream_with_length(
+        reqwest::Body::wrap_stream(audio_body.into_data_stream()),
+        audio.bytes,
+    )
+    .file_name(audio.filename);
+    if let Some(content_type) = audio.content_type {
+        part = part
+            .mime_str(&content_type)
+            .map_err(|error| format!("invalid audio MIME type: {error}"))?;
+    }
+    let form = reqwest::multipart::Form::new()
+        .text("key", object_key.clone())
+        .text("policy", field("policy", 64 * 1024)?)
+        .text("OSSAccessKeyId", field("oss_access_key_id", 4096)?)
+        .text("signature", field("signature", 64 * 1024)?)
+        .text("success_action_status", "200")
+        .text("x-oss-object-acl", field("x_oss_object_acl", 256)?)
+        .text(
+            "x-oss-forbid-overwrite",
+            field("x_oss_forbid_overwrite", 256)?,
+        )
+        .part("file", part);
+    let upload = client
+        .post(upload_host)
+        .timeout(Duration::from_secs(3600))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| format!("upload DashScope transcription input: {error}"))?;
+    if !upload.status().is_success() {
+        return Err(format!(
+            "DashScope OSS upload returned HTTP {}",
+            upload.status()
+        ));
+    }
+    let mut payload = json!({
+        "model":model,
+        "input":{"messages":[{"role":"user","content":[{"audio":format!("oss://{object_key}")}]}]},
+    });
+    for field_name in [
+        "prompt",
+        "response_format",
+        "temperature",
+        "language",
+        "timestamp_granularities[]",
+    ] {
+        if let Some(value) = storage
+            .multipart_text_field(source_content_type, field_name, 64 * 1024)
+            .await?
+            .filter(|value| !value.is_empty())
+        {
+            payload[field_name] = Value::String(value);
+        }
+    }
+    headers.remove("content-length");
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-dashscope-ossresourceresolve",
+        HeaderValue::from_static("enable"),
+    );
+    serde_json::to_vec(&payload)
+        .map(|body| (headers, body))
+        .map_err(|error| format!("encode DashScope transcription request: {error}"))
 }
 
 async fn multipart_rewrite_stream(
@@ -1424,11 +1818,27 @@ async fn send_attempt(
     state: &AppState,
     provider: &Provider,
     mut prepared: PreparedAttempt,
+    incoming_headers: &HeaderMap,
+    endpoint: &str,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
+    let timeouts = state
+        .native_responses_config
+        .generic_timeouts(
+            incoming_headers,
+            provider,
+            &prepared.request_model,
+            &prepared.original_model,
+            provider.engine.as_ref(),
+            prepared.upstream_stream,
+            endpoint,
+            prepared.method.as_str(),
+        )
+        .await;
+    let connect_timeout = positive_duration(timeouts.connect);
     let client = state
-        .upstream_client(proxy, http1_only)
+        .upstream_client(proxy, http1_only, connect_timeout)
         .await
         .map_err(|error| AttemptFailure {
             status: StatusCode::BAD_GATEWAY,
@@ -1436,7 +1846,20 @@ async fn send_attempt(
             upstream_url: prepared.url.clone(),
             response: None,
         })?;
-    let timeout = provider_timeout(provider, &prepared.original_model);
+    let base_timeout = provider_timeout(provider, &prepared.original_model);
+    let total_timeout = positive_duration(timeouts.total).unwrap_or(base_timeout);
+    let send_timeout = [
+        timeouts.first_byte,
+        timeouts.write,
+        timeouts.pool,
+        timeouts.total,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| value.is_finite() && *value > 0.0)
+    .min_by(f64::total_cmp)
+    .map(Duration::from_secs_f64)
+    .unwrap_or(base_timeout);
     if matches!(
         provider.engine.to_ascii_lowercase().as_str(),
         "vertex" | "vertex-gemini" | "vertex-claude"
@@ -1464,7 +1887,7 @@ async fn send_attempt(
     let mut request = client
         .request(prepared.method.clone(), &prepared.url)
         .headers(prepared.headers.clone())
-        .timeout(timeout);
+        .timeout(total_timeout);
     request = match prepared.body {
         AttemptBody::Json(body) => request.body(body),
         AttemptBody::Replay(storage, observation) => {
@@ -1495,14 +1918,51 @@ async fn send_attempt(
                     response: None,
                 })?,
         ),
+        AttemptBody::DashscopeTranscription {
+            storage,
+            observation,
+            source_content_type,
+            model,
+            provider_key,
+        } => {
+            let (headers, body) = prepare_dashscope_transcription(
+                &client,
+                prepared.headers.clone(),
+                storage,
+                observation,
+                &source_content_type,
+                &model,
+                &provider_key,
+            )
+            .await
+            .map_err(|detail| AttemptFailure {
+                status: StatusCode::BAD_GATEWAY,
+                detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+            client
+                .request(prepared.method.clone(), &prepared.url)
+                .headers(headers)
+                .timeout(total_timeout)
+                .body(body)
+        }
         AttemptBody::Empty => request,
     };
-    let response = request.send().await.map_err(|error| AttemptFailure {
-        status: StatusCode::BAD_GATEWAY,
-        detail: format!("Upstream transport error: {error}"),
-        upstream_url: prepared.url.clone(),
-        response: None,
-    })?;
+    let response = tokio::time::timeout(send_timeout, request.send())
+        .await
+        .map_err(|_| AttemptFailure {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            detail: "Upstream response headers timed out".into(),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?
+        .map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Upstream transport error: {error}"),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
     let status = response.status();
     if !status.is_success() {
         let headers = filtered_response_headers(response.headers());
@@ -1555,6 +2015,7 @@ async fn send_attempt(
             ResponseAdapter::CohereToChat => StreamProtocol::Cohere,
             ResponseAdapter::CloudflareToChat => StreamProtocol::Cloudflare,
             ResponseAdapter::AwsToChat => StreamProtocol::AwsBedrock,
+            ResponseAdapter::LingjingVideo => unreachable!(),
             ResponseAdapter::Passthrough => StreamProtocol::Chat,
             ResponseAdapter::Search => unreachable!(),
         };
@@ -1569,6 +2030,8 @@ async fn send_attempt(
             protocol,
             output_protocol,
             prepared.request_model.clone(),
+            timeouts.idle,
+            timeouts.total,
         );
         translation
             .response
@@ -1649,6 +2112,12 @@ async fn send_attempt(
             cloudflare_to_chat(&upstream, &prepared.original_model)
         }
         ResponseAdapter::AwsToChat => claude_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::LingjingVideo => normalize_lingjing_video_response(
+            &prepared.method,
+            &prepared.request_model,
+            &prepared.url,
+            &upstream,
+        ),
         ResponseAdapter::Passthrough => upstream,
     };
     let normalized = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
@@ -1656,6 +2125,17 @@ async fn send_attempt(
     } else {
         normalized
     };
+    if prepared.adapter == ResponseAdapter::LingjingVideo && prepared.method == Method::POST {
+        if let Some(task_id) = normalized.get("id").and_then(Value::as_str) {
+            remember_video_task(
+                task_id,
+                provider.name.as_ref(),
+                &prepared.request_model,
+                &prepared.provider_key,
+                prepared.estimated_video_tokens,
+            );
+        }
+    }
     let usage = usage(&normalized);
     let mut output = if prepared.downstream_stream {
         if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
@@ -1730,7 +2210,30 @@ fn provider_headers(
                 .map_err(|_| "request Content-Type is not a valid header".to_owned())?,
         );
     }
-    if engine == "claude" {
+    if engine == "lingjing" {
+        let access_key = provider
+            .preferences
+            .get("access_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Lingjing provider requires preferences.access_key".to_owned())?;
+        let secret_key = provider
+            .preferences
+            .get("secret_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Lingjing provider requires preferences.secret_key".to_owned())?;
+        headers.insert(
+            "x-access-key",
+            HeaderValue::from_str(access_key)
+                .map_err(|_| "Lingjing access key is not a valid header value".to_owned())?,
+        );
+        headers.insert(
+            "x-secret-key",
+            HeaderValue::from_str(secret_key)
+                .map_err(|_| "Lingjing secret key is not a valid header value".to_owned())?,
+        );
+    } else if engine == "claude" {
         headers.insert(
             "x-api-key",
             HeaderValue::from_str(provider_key)
@@ -2790,6 +3293,118 @@ fn chat_to_cohere(input: &Value, original_model: &str) -> Result<Value, String> 
     Ok(output)
 }
 
+fn chat_to_doubao_translation(
+    input: &Value,
+    original_model: &str,
+    request_model: &str,
+    provider: &Provider,
+) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "chat request body must be an object".to_owned())?;
+    let user_text = root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter_map(Value::as_object)
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .map(extract_translation_text)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "No user message".to_owned())?;
+    let translation_overrides = provider
+        .preferences
+        .get("post_body_parameter_overrides")
+        .and_then(Value::as_object)
+        .and_then(|overrides| overrides.get(request_model))
+        .and_then(Value::as_object)
+        .and_then(|overrides| overrides.get("translation_options"))
+        .and_then(Value::as_object);
+    let mut options = Map::from_iter([("target_language".into(), Value::String("zh".into()))]);
+    if let Some(overrides) = translation_overrides {
+        for key in ["source_language", "target_language"] {
+            if let Some(value) = overrides
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                options.insert(key.into(), Value::String(value.to_owned()));
+            }
+        }
+    }
+    let mut output = json!({
+        "model":original_model,
+        "input":[{
+            "role":"user",
+            "content":[{
+                "type":"input_text",
+                "text":user_text,
+                "translation_options":options,
+            }],
+        }],
+    });
+    if root.get("stream").and_then(Value::as_bool) == Some(true) {
+        output["stream"] = Value::Bool(true);
+    }
+    Ok(output)
+}
+
+fn extract_translation_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(extract_translation_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(item) => ["text", "content", "input"]
+            .into_iter()
+            .find_map(|key| item.get(key).map(extract_translation_text))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn openai_tts_to_minimax(input: &Value, original_model: &str) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "text-to-speech request body must be an object".to_owned())?;
+    let text = root
+        .get("input")
+        .cloned()
+        .ok_or_else(|| "text-to-speech input is required".to_owned())?;
+    let voice = root
+        .get("voice")
+        .cloned()
+        .ok_or_else(|| "text-to-speech voice is required".to_owned())?;
+    let mut output = Map::from_iter([
+        ("model".into(), Value::String(original_model.to_owned())),
+        ("text".into(), text),
+        ("voice_setting".into(), json!({"voice_id":voice})),
+    ]);
+    for key in ["response_format", "speed", "stream"] {
+        if let Some(value) = root.get(key) {
+            output.insert(key.into(), value.clone());
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+fn normalize_jina_embedding(input: &mut Value, original_model: &str) -> Result<(), String> {
+    let root = input
+        .as_object_mut()
+        .ok_or_else(|| "embedding request body must be an object".to_owned())?;
+    root.insert("model".into(), Value::String(original_model.to_owned()));
+    if let Some(format) = root.remove("encoding_format") {
+        root.insert("embedding_type".into(), format);
+    }
+    Ok(())
+}
+
 fn chat_to_cloudflare(input: &Value) -> Result<Value, String> {
     let root = input
         .as_object()
@@ -3549,35 +4164,52 @@ fn endpoint_url(base: &str, endpoint: &str, method: &Method, uri: &Uri) -> Resul
         return Ok(video_tasks_url(base));
     }
     if endpoint.starts_with("/v1/asset-groups/") {
+        let query = filtered_lingjing_query(uri.query());
         return lingjing_url(
             base,
             &format!(
                 "/material/asset-groups/{}",
                 endpoint.trim_start_matches("/v1/asset-groups/")
             ),
-            uri.query(),
+            query.as_deref(),
         );
     }
     if endpoint == "/v1/asset-groups" {
-        return lingjing_url(base, "/material/asset-groups", uri.query());
+        let query = filtered_lingjing_query(uri.query());
+        return lingjing_url(base, "/material/asset-groups", query.as_deref());
     }
     if endpoint.starts_with("/v1/assets/") {
+        let query = filtered_lingjing_query(uri.query());
         return lingjing_url(
             base,
             &format!(
                 "/material/assets/{}",
                 endpoint.trim_start_matches("/v1/assets/")
             ),
-            uri.query(),
+            query.as_deref(),
         );
     }
     if endpoint == "/v1/assets" {
-        return lingjing_url(base, "/material/assets/create", uri.query());
+        let query = filtered_lingjing_query(uri.query());
+        return lingjing_url(base, "/material/assets/create", query.as_deref());
     }
     if matches!(endpoint, "/search" | "/v1/search") && *method == Method::GET {
         return Ok(base.to_owned());
     }
     replace_known_endpoint(base, endpoint)
+}
+
+fn filtered_lingjing_query(query: Option<&str>) -> Option<String> {
+    let mut output = url::form_urlencoded::Serializer::new(String::new());
+    let mut retained = false;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        if matches!(key.as_ref(), "model" | "request_model") {
+            continue;
+        }
+        retained = true;
+        output.append_pair(&key, &value);
+    }
+    retained.then(|| output.finish())
 }
 
 fn replace_known_endpoint(base: &str, endpoint: &str) -> Result<String, String> {
@@ -3800,6 +4432,390 @@ fn video_tasks_url(base: &str) -> String {
     }
 }
 
+fn content_generation_to_lingjing(input: &Value, model_code: &str) -> Result<Value, String> {
+    let request = input
+        .as_object()
+        .ok_or_else(|| "video task request body must be an object".to_owned())?;
+    if request.contains_key("taskParams") || request.contains_key("modelCode") {
+        let mut payload = request.clone();
+        payload.insert("modelCode".into(), Value::String(model_code.to_owned()));
+        for key in [
+            "model",
+            "request_model",
+            "provider",
+            "provider_options",
+            "route",
+        ] {
+            payload.remove(key);
+        }
+        return Ok(Value::Object(payload));
+    }
+
+    let mut prompt_parts = Vec::new();
+    let mut content_resources = Vec::new();
+    for part in request
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+    {
+        match part.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "text" => {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    prompt_parts.push(text.to_owned());
+                }
+            }
+            kind @ ("image_url" | "video_url" | "audio_url") => {
+                let resource_type = kind.trim_end_matches("_url");
+                if let Some(url) = content_part_url(part, kind) {
+                    let mut resource = Map::new();
+                    resource.insert("type".into(), Value::String(resource_type.to_owned()));
+                    resource.insert(
+                        "usage".into(),
+                        Value::String(lingjing_resource_usage(
+                            part.get("role"),
+                            resource_type,
+                            content_resources.len(),
+                        )),
+                    );
+                    resource.insert("source".into(), lingjing_source(&url));
+                    if let Some(reference_key) = part.get("reference_key") {
+                        resource.insert("reference_key".into(), reference_key.clone());
+                    }
+                    content_resources.push(Value::Object(resource));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let prompt = request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| prompt_parts.join("\n"));
+    let mut task_input = Map::from_iter([("prompt".into(), Value::String(prompt))]);
+    let quality = request.get("quality").cloned().or_else(|| {
+        request.get("resolution").and_then(|value| {
+            let raw = value.as_str()?.trim().to_ascii_lowercase();
+            Some(Value::String(
+                raw.strip_suffix('p').unwrap_or(raw.as_str()).to_owned(),
+            ))
+        })
+    });
+    if let Some(quality) = quality.filter(|value| !value.is_null()) {
+        task_input.insert(
+            "quality".into(),
+            Value::String(value_text(&quality).unwrap_or_default()),
+        );
+    }
+    for key in ["duration", "ratio", "generate_num", "prompt_optimizer"] {
+        if let Some(value) = request.get(key).filter(|value| !value.is_null()) {
+            task_input.insert(key.into(), value.clone());
+        }
+    }
+    let unified_resources = request
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, resource)| normalize_lingjing_resource(resource, index))
+        .collect::<Vec<_>>();
+    if !unified_resources.is_empty() {
+        task_input.insert("resources".into(), Value::Array(unified_resources));
+    } else if !content_resources.is_empty() {
+        task_input.insert("resources".into(), Value::Array(content_resources));
+    }
+    if let Some(options) = request
+        .get("provider_options")
+        .and_then(Value::as_object)
+        .and_then(|options| {
+            options
+                .get("lingjing")
+                .and_then(Value::as_object)
+                .or(Some(options))
+        })
+    {
+        for (key, value) in options {
+            if !value.is_object() && !value.is_null() {
+                task_input.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    for key in ["generate_audio", "need_audio", "audio"] {
+        if let Some(value) = request.get(key) {
+            task_input.insert(
+                "need_audio".into(),
+                Value::Bool(value.as_bool().unwrap_or(false)),
+            );
+        }
+    }
+    Ok(json!({"modelCode":model_code,"taskParams":{"input":task_input}}))
+}
+
+fn content_part_url(part: &Map<String, Value>, key: &str) -> Option<String> {
+    let value = part.get(key)?;
+    let raw = value
+        .as_str()
+        .or_else(|| value.get("url").and_then(Value::as_str))?
+        .trim();
+    (!raw.is_empty()).then(|| raw.to_owned())
+}
+
+fn lingjing_source(value: &str) -> Value {
+    if let Some(asset_id) = value.strip_prefix("asset://") {
+        return json!({"kind":"asset_id","value":asset_id});
+    }
+    if value.starts_with("Asset-") {
+        return json!({"kind":"asset_id","value":value});
+    }
+    json!({"kind":"url","value":value})
+}
+
+fn lingjing_resource_usage(role: Option<&Value>, resource_type: &str, index: usize) -> String {
+    let role = role
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        role.as_str(),
+        "first_frame" | "last_frame" | "reference" | "keyframe" | "source"
+    ) {
+        return role;
+    }
+    if matches!(
+        role.as_str(),
+        "reference_image" | "reference_video" | "reference_audio"
+    ) {
+        return "reference".into();
+    }
+    if resource_type == "image" && index == 0 {
+        "first_frame".into()
+    } else {
+        "reference".into()
+    }
+}
+
+fn normalize_lingjing_resource(value: &Value, index: usize) -> Option<Value> {
+    let resource = value.as_object()?;
+    let resource_type = resource
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("image")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(resource_type.as_str(), "image" | "video" | "audio") {
+        return None;
+    }
+    let source = resource
+        .get("source")
+        .filter(|value| value.is_object())
+        .cloned()
+        .or_else(|| {
+            ["url", "asset_id", "assetId", "value"]
+                .into_iter()
+                .find_map(|key| resource.get(key).and_then(value_text))
+                .map(|value| lingjing_source(&value))
+        })?;
+    let mut normalized = Map::from_iter([
+        ("type".into(), Value::String(resource_type.clone())),
+        (
+            "usage".into(),
+            Value::String(lingjing_resource_usage(
+                resource.get("usage").or_else(|| resource.get("role")),
+                &resource_type,
+                index,
+            )),
+        ),
+        ("source".into(), source),
+    ]);
+    if let Some(reference_key) = resource
+        .get("reference_key")
+        .or_else(|| resource.get("referenceKey"))
+    {
+        normalized.insert("reference_key".into(), reference_key.clone());
+    }
+    Some(Value::Object(normalized))
+}
+
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_lingjing_video_response(
+    method: &Method,
+    request_model: &str,
+    url: &str,
+    upstream: &Value,
+) -> Value {
+    let Some(root) = upstream.as_object() else {
+        return upstream.clone();
+    };
+    let data = root.get("data").and_then(Value::as_object);
+    if *method == Method::POST {
+        let task_id = data.and_then(|data| {
+            data.get("taskId")
+                .or_else(|| data.get("task_id"))
+                .and_then(value_text)
+        });
+        return task_id.map_or_else(
+            || upstream.clone(),
+            |task_id| {
+                json!({
+                    "id":task_id,
+                    "model":request_model,
+                    "provider":"lingjing",
+                    "status":"queued",
+                    "created_at":unix_seconds(),
+                })
+            },
+        );
+    }
+    if *method != Method::GET {
+        return upstream.clone();
+    }
+    let data = data.cloned().unwrap_or_default();
+    let query_task_id = Url::parse(url).ok().and_then(|url| {
+        url.query_pairs()
+            .find(|(key, _)| key == "taskId")
+            .map(|(_, value)| value.into_owned())
+    });
+    let task_id = data
+        .get("task_id")
+        .or_else(|| data.get("taskId"))
+        .and_then(value_text)
+        .or(query_task_id)
+        .unwrap_or_default();
+    let upstream_status = data
+        .get("status")
+        .and_then(value_text)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let status = match upstream_status.as_str() {
+        "SUCCESS" => "succeeded",
+        "CANCELED" => "cancelled",
+        "FAIL" | "FAILED" | "UNKNOWN" => "failed",
+        "WAITING" | "QUEUED" | "SUBMITTED" | "RUNNING" | "" => "running",
+        other => other,
+    };
+    let video_url = data
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| item.get("url").and_then(Value::as_str));
+    let mut normalized = json!({
+        "id":task_id,
+        "model":request_model,
+        "provider":"lingjing",
+        "status":status.to_ascii_lowercase(),
+        "video":{},
+    });
+    if let Some(url) = video_url {
+        normalized["video"]["url"] = Value::String(url.to_owned());
+    }
+    if let Some(error) = data.get("external_error").filter(|value| !value.is_null()) {
+        normalized["error"] = json!({"message":error});
+    }
+    if normalized["status"] == "succeeded" {
+        let video_tokens = video_task_route(&task_id)
+            .and_then(|route| route.video_tokens)
+            .unwrap_or(108_900);
+        normalized["usage"] = json!({
+            "video_tokens":video_tokens,
+            "completion_tokens":video_tokens,
+            "total_tokens":video_tokens,
+        });
+    }
+    normalized
+}
+
+fn estimate_video_tokens(payload: &Value) -> Option<i64> {
+    let root = payload.as_object()?;
+    let positive = |key: &str| {
+        root.get(key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|value| value as i64))
+                .or_else(|| value.as_str()?.trim_end_matches(['p', 'P']).parse().ok())
+                .filter(|value| *value > 0)
+        })
+    };
+    let duration = positive("duration").unwrap_or(5);
+    let fps = positive("fps")
+        .or_else(|| positive("framespersecond"))
+        .unwrap_or(24);
+    let resolution = positive("quality")
+        .or_else(|| positive("resolution"))
+        .unwrap_or(720);
+    let scale = (resolution as f64 / 720.0).powi(2);
+    Some((duration as f64 * fps as f64 * 907.5 * scale).round() as i64)
+}
+
+fn video_task_routes() -> &'static Mutex<HashMap<String, VideoTaskRoute>> {
+    VIDEO_TASK_ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn video_task_route_for_path(path: &str) -> Option<VideoTaskRoute> {
+    let task_id = path.strip_prefix("/v1/video/tasks/")?;
+    video_task_route(task_id)
+}
+
+fn video_task_route(task_id: &str) -> Option<VideoTaskRoute> {
+    let mut routes = video_task_routes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(86_400));
+    routes.get(task_id).cloned()
+}
+
+fn remember_video_task(
+    task_id: &str,
+    provider_name: &str,
+    request_model: &str,
+    provider_key: &str,
+    video_tokens: Option<i64>,
+) {
+    let mut routes = video_task_routes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if routes.len() >= 4096 {
+        if let Some(oldest) = routes
+            .iter()
+            .min_by_key(|(_, route)| route.created_at)
+            .map(|(task_id, _)| task_id.clone())
+        {
+            routes.remove(&oldest);
+        }
+    }
+    routes.insert(
+        task_id.to_owned(),
+        VideoTaskRoute {
+            provider_name: provider_name.to_owned(),
+            request_model: request_model.to_owned(),
+            provider_key: provider_key.to_owned(),
+            video_tokens,
+            created_at: Instant::now(),
+        },
+    );
+}
+
 fn lingjing_url(base: &str, openapi_path: &str, query: Option<&str>) -> Result<String, String> {
     let mut url =
         Url::parse(base).map_err(|error| format!("invalid Lingjing base URL: {error}"))?;
@@ -3830,6 +4846,12 @@ fn provider_timeout(provider: &Provider, model: &str) -> Duration {
     .filter(|value| value.is_finite() && *value > 0.0)
     .unwrap_or(200.0);
     Duration::from_secs_f64(seconds)
+}
+
+fn positive_duration(value: Option<f64>) -> Option<Duration> {
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Duration::from_secs_f64)
 }
 
 fn usage(value: &Value) -> (i64, i64, i64) {
@@ -4276,6 +5298,120 @@ mod tests {
         assert_eq!(
             cloudflare_url(&cloudflare, "@cf/meta/llama").unwrap(),
             "https://api.cloudflare.com/client/v4/accounts/account-a/ai/run/@cf/meta/llama"
+        );
+    }
+
+    #[test]
+    fn lingjing_video_contract_and_task_affinity_match_legacy_runtime() {
+        let converted = content_generation_to_lingjing(
+            &json!({
+                "model":"seedance-2-0",
+                "prompt":"sunlight",
+                "resources":[{"type":"image","url":"asset://Asset-test","role":"first_frame"}],
+                "duration":5,
+                "resolution":"720p",
+                "ratio":"16:9",
+                "generate_audio":false,
+            }),
+            "sd_2_0",
+        )
+        .unwrap();
+        assert_eq!(converted["modelCode"], "sd_2_0");
+        assert_eq!(converted["taskParams"]["input"]["quality"], "720");
+        assert_eq!(
+            converted["taskParams"]["input"]["resources"][0]["source"],
+            json!({"kind":"asset_id","value":"Asset-test"})
+        );
+
+        let mut provider = test_provider("lingjing", "https://api-llm.lingjingai.cn");
+        provider.preferences = std::sync::Arc::new(Map::from_iter([
+            ("access_key".into(), json!("ak-test")),
+            ("secret_key".into(), json!("sk-test")),
+        ]));
+        let headers = provider_headers(
+            &provider,
+            "routing-key",
+            &HeaderMap::new(),
+            "request-a",
+            "lingjing",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(headers["x-access-key"], "ak-test");
+        assert_eq!(headers["x-secret-key"], "sk-test");
+        assert!(headers.get("authorization").is_none());
+
+        remember_video_task(
+            "task-rust-lingjing",
+            "lingjing",
+            "seedance-2-0",
+            "routing-key",
+            Some(108_900),
+        );
+        let route = video_task_route_for_path("/v1/video/tasks/task-rust-lingjing").unwrap();
+        assert_eq!(route.provider_name, "lingjing");
+        assert_eq!(route.provider_key, "routing-key");
+        let normalized = normalize_lingjing_video_response(
+            &Method::GET,
+            "seedance-2-0",
+            "https://api-llm.lingjingai.cn/draw/task/query?taskId=task-rust-lingjing",
+            &json!({"data":{"task_id":"task-rust-lingjing","status":"SUCCESS","result":[{"url":"https://example.com/out.mp4"}]}}),
+        );
+        assert_eq!(normalized["status"], "succeeded");
+        assert_eq!(normalized["video"]["url"], "https://example.com/out.mp4");
+        assert_eq!(normalized["usage"]["video_tokens"], 108_900);
+    }
+
+    #[test]
+    fn long_tail_payload_adapters_match_python_contracts() {
+        let mut doubao = test_provider("doubao-translation", "https://example.com/responses");
+        doubao.preferences = std::sync::Arc::new(Map::from_iter([(
+            "post_body_parameter_overrides".into(),
+            json!({"translate-public":{"translation_options":{"source_language":"en","target_language":"ja"}}}),
+        )]));
+        let translated = chat_to_doubao_translation(
+            &json!({"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"stream":true}),
+            "doubao-upstream",
+            "translate-public",
+            &doubao,
+        )
+        .unwrap();
+        assert_eq!(translated["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(
+            translated["input"][0]["content"][0]["translation_options"]["target_language"],
+            "ja"
+        );
+        assert_eq!(translated["stream"], true);
+
+        let minimax = openai_tts_to_minimax(
+            &json!({"input":"speak","voice":"alloy","speed":1.25}),
+            "speech-02-hd",
+        )
+        .unwrap();
+        assert_eq!(minimax["text"], "speak");
+        assert_eq!(minimax["voice_setting"]["voice_id"], "alloy");
+
+        let mut jina = json!({"input":"text","encoding_format":"float"});
+        normalize_jina_embedding(&mut jina, "jina-embeddings-v3").unwrap();
+        assert_eq!(jina["embedding_type"], "float");
+        assert!(jina.get("encoding_format").is_none());
+    }
+
+    #[test]
+    fn compact_and_validation_routes_are_native() {
+        assert!(supports(&Method::POST, "/v1/responses/compact"));
+        assert!(known_path("/v1/responses/compact"));
+        assert_eq!(
+            missing_required_field("/v1/chat/completions", &json!({"model":"gpt"})),
+            Some("messages")
+        );
+        assert_eq!(
+            missing_required_field(
+                "/v1/chat/completions",
+                &json!({"model":"gpt","messages":[{"role":"user","content":"hi"}]})
+            ),
+            None
         );
     }
 

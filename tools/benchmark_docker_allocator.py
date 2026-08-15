@@ -131,6 +131,18 @@ def _container_memory(container: str) -> int:
     )
 
 
+def _container_memory_peak(container: str) -> int | None:
+    for path in (
+        "/sys/fs/cgroup/memory.peak",
+        "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+    ):
+        try:
+            return int(_docker("exec", container, "cat", path))
+        except (subprocess.CalledProcessError, ValueError):
+            continue
+    return None
+
+
 def _process_status(container: str) -> dict[str, int]:
     raw = _docker(
         "exec",
@@ -275,6 +287,7 @@ def main() -> None:
                     "response_bytes": response_bytes,
                     "baseline_bytes": baseline,
                     "peak_bytes": max(samples, default=baseline),
+                    "kernel_peak_bytes": _container_memory_peak(container),
                     "idle_bytes": idle,
                     "process_status_kib": status,
                     "fixture_requests": fixture.request_count,
