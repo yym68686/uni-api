@@ -47,7 +47,10 @@ ENTRYPOINT ["/usr/local/bin/uni-api-front"]
 FROM debian:bullseye-slim AS rust-runtime
 ARG SOURCE_COMMIT=unknown
 ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
-    UNI_API_RUNTIME=rust
+    UNI_API_RUNTIME=rust \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=131072 \
+    MALLOC_TRIM_THRESHOLD_=131072
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
