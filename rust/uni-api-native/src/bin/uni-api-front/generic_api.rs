@@ -22,8 +22,10 @@ use crate::proxy::{
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::responses_native::{
     apply_overrides, compute_retry_count, extract_api_key, request_id, FailedRoute, Provider,
-    ProviderKeySelection,
+    ProviderKeySelection, CODEX_USER_AGENT,
 };
+
+const ALPHA_SEARCH_ENDPOINT: &str = "/v1/alpha/search";
 
 const PUBLIC_JSON_ROUTES: &[&str] = &[
     "/v1/chat/completions",
@@ -35,7 +37,7 @@ const PUBLIC_JSON_ROUTES: &[&str] = &[
     "/v1/video/tasks",
     "/v1/asset-groups",
     "/v1/assets",
-    "/v1/alpha/search",
+    ALPHA_SEARCH_ENDPOINT,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -689,12 +691,14 @@ fn build_attempt(
     input: &PreparedInput,
     request_id: &str,
 ) -> Result<PreparedAttempt, String> {
-    let downstream_stream = input
-        .payload
-        .as_ref()
-        .and_then(|payload| payload.get("stream"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let is_alpha_search = path == ALPHA_SEARCH_ENDPOINT;
+    let downstream_stream = !is_alpha_search
+        && input
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let engine = provider.engine.trim().to_ascii_lowercase();
     let proxy = provider
         .preferences
@@ -854,13 +858,18 @@ fn build_attempt(
         adapter,
         ResponseAdapter::GeminiToChat | ResponseAdapter::AwsToChat
     ) && engine != "vertex-claude"
+        && !is_alpha_search
     {
         if let Some(root) = payload.as_object_mut() {
             root.insert("stream".into(), Value::Bool(upstream_stream));
         }
     }
     if let Some(root) = payload.as_object_mut() {
-        apply_overrides(root, provider, request_model);
+        if is_alpha_search {
+            sanitize_alpha_search_payload(root);
+        } else {
+            apply_overrides(root, provider, request_model);
+        }
     }
     let mut headers = provider_headers(
         provider,
@@ -871,6 +880,9 @@ fn build_attempt(
         upstream_stream,
         None,
     )?;
+    if is_alpha_search && engine == "codex" {
+        apply_alpha_search_headers(&mut headers, incoming_headers, &payload)?;
+    }
     let outgoing_method = if matches!(path, "/search" | "/v1/search") {
         Method::POST
     } else {
@@ -896,6 +908,52 @@ fn build_attempt(
         upstream_stream,
         original_model: original_model.to_owned(),
     })
+}
+
+fn sanitize_alpha_search_payload(root: &mut Map<String, Value>) {
+    for field in [
+        "store",
+        "stream",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+    ] {
+        root.remove(field);
+    }
+}
+
+fn apply_alpha_search_headers(
+    headers: &mut HeaderMap,
+    incoming: &HeaderMap,
+    payload: &Value,
+) -> Result<(), String> {
+    if headers.get("openai-beta").is_none() {
+        let value = incoming
+            .get("openai-beta")
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("responses=experimental"));
+        headers.insert("openai-beta", value);
+    }
+    if headers.get("originator").is_none() {
+        let value = incoming
+            .get("originator")
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("codex_cli_rs"));
+        headers.insert("originator", value);
+    }
+    if let Some(session_id) = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        headers.insert(
+            "session_id",
+            HeaderValue::from_str(session_id)
+                .map_err(|_| "alpha/search id is not a valid header value".to_owned())?,
+        );
+    }
+    headers.insert("user-agent", HeaderValue::from_static(CODEX_USER_AGENT));
+    headers.insert("accept", HeaderValue::from_static("application/json"));
+    Ok(())
 }
 
 struct AttemptSuccess {
@@ -2657,6 +2715,113 @@ mod tests {
             "https://github.com/yym68686/uni-api"
         );
         assert_eq!(headers["x-title"], "Uni API");
+    }
+
+    #[test]
+    fn alpha_search_strips_responses_fields_and_skips_provider_overrides() {
+        let mut provider = test_provider("codex", "https://example.com/v1/responses");
+        let mut preferences = Map::new();
+        preferences.insert(
+            "post_body_parameter_overrides".into(),
+            json!({"store": false, "metadata": {"source": "generic-override"}}),
+        );
+        provider.preferences = std::sync::Arc::new(preferences);
+        let input = PreparedInput {
+            payload: Some(json!({
+                "id": "search-session-a",
+                "model": "gpt-public",
+                "input": "query",
+                "commands": [],
+                "settings": {},
+                "max_output_tokens": 256,
+                "store": true,
+                "stream": true,
+                "prompt_cache_key": "cache-a",
+                "prompt_cache_retention": "24h",
+                "future_search_field": {"enabled": true}
+            })),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        };
+        let uri: Uri = ALPHA_SEARCH_ENDPOINT.parse().unwrap();
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "gpt-public",
+            "gpt-upstream",
+            &Method::POST,
+            &uri,
+            ALPHA_SEARCH_ENDPOINT,
+            &HeaderMap::new(),
+            &input,
+            "request-a",
+        )
+        .unwrap();
+        let AttemptBody::Json(body) = prepared.body else {
+            panic!("alpha/search must use a JSON body");
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(prepared.url, "https://example.com/v1/alpha/search");
+        assert!(!prepared.downstream_stream);
+        assert!(!prepared.upstream_stream);
+        assert_eq!(body["model"], "gpt-upstream");
+        assert_eq!(body["future_search_field"]["enabled"], true);
+        for field in [
+            "store",
+            "stream",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "metadata",
+        ] {
+            assert!(body.get(field).is_none(), "unexpected field {field}");
+        }
+        assert_eq!(prepared.headers["openai-beta"], "responses=experimental");
+        assert_eq!(prepared.headers["originator"], "codex_cli_rs");
+        assert_eq!(prepared.headers["session_id"], "search-session-a");
+        assert_eq!(prepared.headers["user-agent"], CODEX_USER_AGENT);
+        assert_eq!(prepared.headers["accept"], "application/json");
+    }
+
+    #[test]
+    fn non_alpha_routes_still_apply_provider_overrides() {
+        let mut provider = test_provider("codex", "https://example.com/v1/responses");
+        let mut preferences = Map::new();
+        preferences.insert(
+            "post_body_parameter_overrides".into(),
+            json!({"store": false}),
+        );
+        provider.preferences = std::sync::Arc::new(preferences);
+        let input = PreparedInput {
+            payload: Some(json!({"model": "gpt-public", "input": "hello"})),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        };
+        let uri: Uri = "/v1/moderations".parse().unwrap();
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "gpt-public",
+            "gpt-upstream",
+            &Method::POST,
+            &uri,
+            "/v1/moderations",
+            &HeaderMap::new(),
+            &input,
+            "request-a",
+        )
+        .unwrap();
+        let AttemptBody::Json(body) = prepared.body else {
+            panic!("moderations must use a JSON body");
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], false);
     }
 
     #[test]
