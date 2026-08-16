@@ -44,11 +44,18 @@ struct StreamTimeouts {
     total: Option<Duration>,
 }
 
+#[derive(Clone, Copy)]
+struct TranslationOptions {
+    include_usage: bool,
+    timeouts: StreamTimeouts,
+}
+
 pub fn translate(
     response: reqwest::Response,
     protocol: Protocol,
     output_protocol: OutputProtocol,
     model: String,
+    include_usage: bool,
     idle_timeout_seconds: Option<f64>,
     total_timeout_seconds: Option<f64>,
 ) -> Translation {
@@ -62,9 +69,12 @@ pub fn translate(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (usage_tx, usage_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let timeouts = StreamTimeouts {
-            idle: positive_duration(idle_timeout_seconds),
-            total: positive_duration(total_timeout_seconds),
+        let options = TranslationOptions {
+            include_usage,
+            timeouts: StreamTimeouts {
+                idle: positive_duration(idle_timeout_seconds),
+                total: positive_duration(total_timeout_seconds),
+            },
         };
         let result = run_translation(
             response,
@@ -73,7 +83,7 @@ pub fn translate(
             &model,
             &content_type,
             &tx,
-            timeouts,
+            options,
         )
         .await;
         let usage = match result {
@@ -121,9 +131,10 @@ async fn run_translation(
     model: &str,
     content_type: &str,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
-    timeouts: StreamTimeouts,
+    options: TranslationOptions,
 ) -> Result<(i64, i64, i64), String> {
-    let mut state = StreamState::new(model, output_protocol);
+    let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
+    let timeouts = options.timeouts;
     for event in state.start_chunks() {
         send_wire(tx, &event, output_protocol).await?;
     }
@@ -394,15 +405,18 @@ struct StreamState {
     created: u64,
     next_tool_index: usize,
     tools: HashMap<String, usize>,
+    response_tool_output_indexes: HashMap<u64, usize>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    chat_usage: Option<Value>,
     terminal: bool,
     output_protocol: OutputProtocol,
+    include_usage: bool,
     responses: ResponsesOutputState,
 }
 
 impl StreamState {
-    fn new(model: &str, output_protocol: OutputProtocol) -> Self {
+    fn new_with_options(model: &str, output_protocol: OutputProtocol, include_usage: bool) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -413,10 +427,13 @@ impl StreamState {
             created,
             next_tool_index: 0,
             tools: HashMap::new(),
+            response_tool_output_indexes: HashMap::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            chat_usage: None,
             terminal: false,
             output_protocol,
+            include_usage,
             responses: ResponsesOutputState::new(model, created),
         }
     }
@@ -490,25 +507,22 @@ impl StreamState {
             "response.output_item.added"
                 if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") =>
             {
-                let call_id = value
-                    .pointer("/item/call_id")
-                    .or_else(|| value.pointer("/item/id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("call");
-                let index = self.tool_index(call_id);
+                let call_id = value.pointer("/item/call_id").and_then(Value::as_str);
+                let item_id = value.pointer("/item/id").and_then(Value::as_str);
+                let output_index = value.get("output_index").and_then(Value::as_u64);
+                let index = self.responses_tool_index(call_id, item_id, output_index);
+                let emitted_call_id = call_id.or(item_id).unwrap_or("call");
                 vec![self.chunk(
-                    json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{"name":value.pointer("/item/name").cloned().unwrap_or(Value::Null),"arguments":""}}]}),
+                    json!({"tool_calls":[{"index":index,"id":emitted_call_id,"type":"function","function":{"name":value.pointer("/item/name").cloned().unwrap_or(Value::Null),"arguments":""}}]}),
                     None,
                     None,
                 )]
             }
             "response.function_call_arguments.delta" => {
-                let call_id = value
-                    .get("call_id")
-                    .or_else(|| value.get("item_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("call");
-                let index = self.tool_index(call_id);
+                let call_id = value.get("call_id").and_then(Value::as_str);
+                let item_id = value.get("item_id").and_then(Value::as_str);
+                let output_index = value.get("output_index").and_then(Value::as_u64);
+                let index = self.responses_tool_index(call_id, item_id, output_index);
                 vec![self.chunk(
                     json!({"tool_calls":[{"index":index,"function":{"arguments":value.get("delta").cloned().unwrap_or(Value::String(String::new()))}}]}),
                     None,
@@ -516,8 +530,10 @@ impl StreamState {
                 )]
             }
             "response.completed" => {
-                self.prompt_tokens = number(value.pointer("/response/usage/input_tokens"));
-                self.completion_tokens = number(value.pointer("/response/usage/output_tokens"));
+                let usage = responses_usage_to_chat(value.pointer("/response/usage"));
+                self.prompt_tokens = number(usage.get("prompt_tokens"));
+                self.completion_tokens = number(usage.get("completion_tokens"));
+                self.chat_usage = Some(usage);
                 self.finish_chunks(if self.tools.is_empty() {
                     "stop"
                 } else {
@@ -754,6 +770,36 @@ impl StreamState {
         index
     }
 
+    fn responses_tool_index(
+        &mut self,
+        call_id: Option<&str>,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+    ) -> usize {
+        let existing = call_id
+            .and_then(|id| self.tools.get(id).copied())
+            .or_else(|| item_id.and_then(|id| self.tools.get(id).copied()))
+            .or_else(|| {
+                output_index
+                    .and_then(|index| self.response_tool_output_indexes.get(&index).copied())
+            });
+        let index = existing.unwrap_or_else(|| {
+            let index = self.next_tool_index;
+            self.next_tool_index += 1;
+            index
+        });
+        for id in [call_id, item_id].into_iter().flatten() {
+            if !id.is_empty() {
+                self.tools.insert(id.to_owned(), index);
+            }
+        }
+        if let Some(output_index) = output_index {
+            self.response_tool_output_indexes
+                .insert(output_index, index);
+        }
+        index
+    }
+
     fn chunk(&self, delta: Value, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
         let mut chunk = json!({
             "id":self.id,
@@ -767,6 +813,11 @@ impl StreamState {
                 .as_object_mut()
                 .expect("chunk object")
                 .insert("usage".into(), usage);
+        } else if self.output_protocol == OutputProtocol::Chat && self.include_usage {
+            chunk
+                .as_object_mut()
+                .expect("chunk object")
+                .insert("usage".into(), Value::Null);
         }
         chunk
     }
@@ -776,12 +827,28 @@ impl StreamState {
             return Vec::new();
         }
         self.terminal = true;
-        let usage = json!({
-            "prompt_tokens":self.prompt_tokens,
-            "completion_tokens":self.completion_tokens,
-            "total_tokens":self.prompt_tokens + self.completion_tokens,
+        let usage = self.chat_usage.clone().unwrap_or_else(|| {
+            json!({
+                "prompt_tokens":self.prompt_tokens,
+                "completion_tokens":self.completion_tokens,
+                "total_tokens":self.prompt_tokens + self.completion_tokens,
+            })
         });
-        vec![self.chunk(json!({}), Some(reason), Some(usage))]
+        if self.output_protocol == OutputProtocol::Responses {
+            return vec![self.chunk(json!({}), Some(reason), Some(usage))];
+        }
+        let mut chunks = vec![self.chunk(json!({}), Some(reason), None)];
+        if self.include_usage {
+            chunks.push(json!({
+                "id":self.id,
+                "object":"chat.completion.chunk",
+                "created":self.created,
+                "model":self.model,
+                "choices":[],
+                "usage":usage,
+            }));
+        }
+        chunks
     }
 
     fn finish_chunks_for_output(&mut self, reason: &str) -> Vec<Value> {
@@ -1273,6 +1340,49 @@ fn number(value: Option<&Value>) -> i64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
+    let prompt_tokens = number(usage.and_then(|value| {
+        value
+            .get("prompt_tokens")
+            .or_else(|| value.get("input_tokens"))
+    }));
+    let completion_tokens = number(usage.and_then(|value| {
+        value
+            .get("completion_tokens")
+            .or_else(|| value.get("output_tokens"))
+    }));
+    let total_tokens = usage
+        .and_then(|value| value.get("total_tokens"))
+        .map(|value| number(Some(value)))
+        .unwrap_or(prompt_tokens + completion_tokens);
+    let prompt_details = usage.and_then(|value| {
+        value
+            .get("prompt_tokens_details")
+            .or_else(|| value.get("input_tokens_details"))
+    });
+    let completion_details = usage.and_then(|value| {
+        value
+            .get("completion_tokens_details")
+            .or_else(|| value.get("output_tokens_details"))
+    });
+    json!({
+        "prompt_tokens":prompt_tokens,
+        "completion_tokens":completion_tokens,
+        "total_tokens":total_tokens,
+        "prompt_tokens_details":{
+            "cached_tokens":number(prompt_details.and_then(|value| value.get("cached_tokens"))),
+            "cache_write_tokens":number(prompt_details.and_then(|value| value.get("cache_write_tokens"))),
+            "audio_tokens":number(prompt_details.and_then(|value| value.get("audio_tokens"))),
+        },
+        "completion_tokens_details":{
+            "reasoning_tokens":number(completion_details.and_then(|value| value.get("reasoning_tokens"))),
+            "audio_tokens":number(completion_details.and_then(|value| value.get("audio_tokens"))),
+            "accepted_prediction_tokens":number(completion_details.and_then(|value| value.get("accepted_prediction_tokens"))),
+            "rejected_prediction_tokens":number(completion_details.and_then(|value| value.get("rejected_prediction_tokens"))),
+        },
+    })
+}
+
 fn trim_ascii(mut value: &[u8]) -> &[u8] {
     while value.first().is_some_and(u8::is_ascii_whitespace) {
         value = &value[1..];
@@ -1377,7 +1487,7 @@ mod tests {
 
     #[test]
     fn gemini_stream_maps_text_tools_and_usage() {
-        let mut state = StreamState::new("gemini-public", OutputProtocol::Chat);
+        let mut state = StreamState::new_with_options("gemini-public", OutputProtocol::Chat, true);
         let chunks = state.gemini(&json!({
             "candidates":[{"content":{"parts":[
                 {"text":"hello"},
@@ -1405,7 +1515,7 @@ mod tests {
 
     #[test]
     fn claude_stream_maps_incremental_tool_arguments() {
-        let mut state = StreamState::new("claude-public", OutputProtocol::Chat);
+        let mut state = StreamState::new_with_options("claude-public", OutputProtocol::Chat, false);
         let start = state.claude(&json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup"}}));
         let delta = state.claude(&json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}));
         assert_eq!(
@@ -1419,8 +1529,110 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_reuses_chat_tool_indexes_across_response_identifiers() {
+        let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, false);
+        let first_start = state.responses(&json!({
+            "type":"response.output_item.added",
+            "output_index":1,
+            "item":{
+                "type":"function_call",
+                "id":"fc-a",
+                "call_id":"call-a",
+                "name":"now",
+                "arguments":"",
+            },
+        }));
+        let first_delta = state.responses(&json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":1,
+            "item_id":"fc-a",
+            "delta":"{\"timezone\":\"Europe/Berlin\"}",
+        }));
+        let second_start = state.responses(&json!({
+            "type":"response.output_item.added",
+            "output_index":2,
+            "item":{
+                "type":"function_call",
+                "id":"fc-b",
+                "call_id":"call-b",
+                "name":"weather",
+                "arguments":"",
+            },
+        }));
+        let second_delta = state.responses(&json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":2,
+            "item_id":"fc-b",
+            "delta":"{\"city\":\"Berlin\"}",
+        }));
+
+        assert_eq!(
+            first_start[0].pointer("/choices/0/delta/tool_calls/0/index"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            first_delta[0].pointer("/choices/0/delta/tool_calls/0/index"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            second_start[0].pointer("/choices/0/delta/tool_calls/0/index"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            second_delta[0].pointer("/choices/0/delta/tool_calls/0/index"),
+            Some(&json!(1))
+        );
+        assert_eq!(state.next_tool_index, 2);
+    }
+
+    #[test]
+    fn responses_stream_emits_usage_only_in_requested_final_chunk() {
+        let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, true);
+        let chunks = state.responses(&json!({
+            "type":"response.completed",
+            "response":{
+                "usage":{
+                    "input_tokens":3,
+                    "output_tokens":5,
+                    "total_tokens":8,
+                    "input_tokens_details":{"cached_tokens":2},
+                    "output_tokens_details":{"reasoning_tokens":4},
+                },
+            },
+        }));
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0]["usage"], Value::Null);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chunks[1]["choices"], json!([]));
+        assert_eq!(chunks[1]["usage"]["prompt_tokens"], 3);
+        assert_eq!(chunks[1]["usage"]["completion_tokens"], 5);
+        assert_eq!(
+            chunks[1]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            2
+        );
+        assert_eq!(
+            chunks[1]["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            4
+        );
+    }
+
+    #[test]
+    fn responses_stream_omits_usage_when_not_requested() {
+        let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, false);
+        let chunks = state.responses(&json!({
+            "type":"response.completed",
+            "response":{"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}},
+        }));
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].get("usage").is_none());
+    }
+
+    #[test]
     fn chat_stream_maps_to_incremental_responses_events() {
-        let mut state = StreamState::new("public-model", OutputProtocol::Responses);
+        let mut state =
+            StreamState::new_with_options("public-model", OutputProtocol::Responses, false);
         let started = state.start_chunks();
         let first = state.convert(
             Protocol::Chat,
@@ -1464,7 +1676,8 @@ mod tests {
 
     #[test]
     fn chat_tool_stream_maps_to_responses_function_call_events() {
-        let mut state = StreamState::new("public-model", OutputProtocol::Responses);
+        let mut state =
+            StreamState::new_with_options("public-model", OutputProtocol::Responses, false);
         state.start_chunks();
         let start = state.convert(
             Protocol::Chat,

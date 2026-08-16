@@ -80,6 +80,7 @@ struct PreparedAttempt {
     request_model: String,
     original_model: String,
     downstream_protocol: DownstreamProtocol,
+    chat_stream_include_usage: bool,
     provider_key: String,
     estimated_video_tokens: Option<i64>,
 }
@@ -1115,6 +1116,13 @@ fn build_attempt(
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let provider_stream = downstream_stream;
+    let chat_stream_include_usage = path == "/v1/chat/completions"
+        && input
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.pointer("/stream_options/include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let is_search = matches!(path, "/search" | "/v1/search");
     let jina_search = is_search
         && (provider.name.eq_ignore_ascii_case("jina")
@@ -1185,6 +1193,7 @@ fn build_attempt(
             request_model: request_model.to_owned(),
             original_model: original_model.to_owned(),
             downstream_protocol,
+            chat_stream_include_usage,
             provider_key: provider_key.to_owned(),
             estimated_video_tokens: None,
         });
@@ -1491,6 +1500,7 @@ fn build_attempt(
         request_model: request_model.to_owned(),
         original_model: original_model.to_owned(),
         downstream_protocol,
+        chat_stream_include_usage,
         provider_key: provider_key.to_owned(),
         estimated_video_tokens,
     })
@@ -2030,6 +2040,7 @@ async fn send_attempt(
             protocol,
             output_protocol,
             prepared.request_model.clone(),
+            prepared.chat_stream_include_usage,
             timeouts.idle,
             timeouts.total,
         );
@@ -2564,13 +2575,65 @@ fn chat_to_responses(input: &Value, original_model: &str) -> Result<Value, Strin
                             "name":function.get("name").cloned().unwrap_or(Value::Null),
                             "description":function.get("description").cloned().unwrap_or(Value::Null),
                             "parameters":function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                            "strict":function.get("strict").and_then(Value::as_bool).unwrap_or(false),
                         }))
                     })
                     .collect(),
             ),
         );
     }
+    if let Some(choice) = root.get("tool_choice") {
+        output.insert("tool_choice".into(), chat_tool_choice_to_responses(choice));
+    }
     Ok(Value::Object(output))
+}
+
+fn chat_tool_choice_to_responses(choice: &Value) -> Value {
+    let Some(root) = choice.as_object() else {
+        return choice.clone();
+    };
+    match root.get("type").and_then(Value::as_str) {
+        Some("function") => json!({
+            "type":"function",
+            "name":choice
+                .pointer("/function/name")
+                .or_else(|| choice.get("name"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        }),
+        Some("allowed_tools") => {
+            let allowed = root
+                .get("allowed_tools")
+                .and_then(Value::as_object)
+                .unwrap_or(root);
+            let tools = allowed
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|tool| {
+                    if tool.get("type").and_then(Value::as_str) == Some("function") {
+                        json!({
+                            "type":"function",
+                            "name":tool
+                                .pointer("/function/name")
+                                .or_else(|| tool.get("name"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        })
+                    } else {
+                        tool.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "type":"allowed_tools",
+                "mode":allowed.get("mode").cloned().unwrap_or_else(|| Value::String("auto".into())),
+                "tools":tools,
+            })
+        }
+        _ => choice.clone(),
+    }
 }
 
 fn responses_content(content: &Value, role: &str) -> Value {
@@ -3486,8 +3549,14 @@ fn responses_to_chat(value: &Value, model: &str) -> Value {
             _ => {}
         }
     }
-    let mut message = json!({"role":"assistant","content":text});
-    if !tool_calls.is_empty() {
+    let has_tool_calls = !tool_calls.is_empty();
+    let content = if text.is_empty() && has_tool_calls {
+        Value::Null
+    } else {
+        Value::String(text)
+    };
+    let mut message = json!({"role":"assistant","content":content});
+    if has_tool_calls {
         message
             .as_object_mut()
             .expect("chat message")
@@ -3498,8 +3567,8 @@ fn responses_to_chat(value: &Value, model: &str) -> Value {
         "object":"chat.completion",
         "created":unix_seconds(),
         "model":model,
-        "choices":[{"index":0,"message":message,"finish_reason":"stop"}],
-        "usage":value.get("usage").cloned().unwrap_or_else(|| json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0})),
+        "choices":[{"index":0,"message":message,"finish_reason":if has_tool_calls { "tool_calls" } else { "stop" }}],
+        "usage":provider_stream::responses_usage_to_chat(value.get("usage")),
     })
 }
 
@@ -5051,6 +5120,117 @@ mod tests {
         assert_eq!(output["max_output_tokens"], 42);
         assert_eq!(output["stream"], false);
         assert_eq!(output["input"][1]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn chat_to_responses_preserves_tool_constraints() {
+        let input = json!({
+            "messages":[{"role":"user","content":"What time is it?"}],
+            "tools":[
+                {
+                    "type":"function",
+                    "function":{
+                        "name":"now",
+                        "parameters":{"type":"object","properties":{}}
+                    }
+                },
+                {
+                    "type":"function",
+                    "function":{
+                        "name":"weather",
+                        "parameters":{"type":"object","properties":{}},
+                        "strict":true
+                    }
+                }
+            ],
+            "tool_choice":{"type":"function","function":{"name":"now"}}
+        });
+
+        let output = chat_to_responses(&input, "gpt-upstream").unwrap();
+
+        assert_eq!(output["tools"][0]["strict"], false);
+        assert_eq!(output["tools"][1]["strict"], true);
+        assert_eq!(
+            output["tool_choice"],
+            json!({"type":"function","name":"now"})
+        );
+    }
+
+    #[test]
+    fn chat_to_responses_flattens_allowed_tools_choice() {
+        let input = json!({
+            "messages":[{"role":"user","content":"Use a tool"}],
+            "tool_choice":{
+                "type":"allowed_tools",
+                "allowed_tools":{
+                    "mode":"required",
+                    "tools":[
+                        {"type":"function","function":{"name":"now"}},
+                        {"type":"function","name":"weather"}
+                    ]
+                }
+            }
+        });
+
+        let output = chat_to_responses(&input, "gpt-upstream").unwrap();
+
+        assert_eq!(
+            output["tool_choice"],
+            json!({
+                "type":"allowed_tools",
+                "mode":"required",
+                "tools":[
+                    {"type":"function","name":"now"},
+                    {"type":"function","name":"weather"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn responses_to_chat_maps_tool_finish_and_usage() {
+        let response = responses_to_chat(
+            &json!({
+                "id":"resp-a",
+                "output":[{
+                    "type":"function_call",
+                    "id":"fc-a",
+                    "call_id":"call-a",
+                    "name":"now",
+                    "arguments":"{\"timezone\":\"Europe/Berlin\"}"
+                }],
+                "usage":{
+                    "input_tokens":3,
+                    "output_tokens":5,
+                    "total_tokens":8,
+                    "input_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},
+                    "output_tokens_details":{"reasoning_tokens":4}
+                }
+            }),
+            "public-model",
+        );
+
+        assert_eq!(response["choices"][0]["message"]["content"], Value::Null);
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call-a"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(response["usage"]["prompt_tokens"], 3);
+        assert_eq!(response["usage"]["completion_tokens"], 5);
+        assert_eq!(response["usage"]["total_tokens"], 8);
+        assert_eq!(
+            response["usage"]["prompt_tokens_details"]["cached_tokens"],
+            2
+        );
+        assert_eq!(
+            response["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            1
+        );
+        assert_eq!(
+            response["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            4
+        );
     }
 
     #[test]
