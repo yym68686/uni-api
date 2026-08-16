@@ -1283,5 +1283,5 @@ python main.py
 ## ⭐ Star 历史
 
 <a href="https://github.com/yym68686/uni-api/stargazers">
-        <img width="500" alt="Star History Chart" src="https://api.star-history.com/svg?repos=yym68686/uni-api&type=Date">
+        <img width="500" alt="Star History Chart" src="https://star-history.dera.page/svg?repos=yym68686/uni-api&type=Date">
 </a>
