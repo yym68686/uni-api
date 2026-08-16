@@ -23,6 +23,7 @@ from uni_api.routing.request_types import (
     detect_request_type,
     provider_accepts_request_type,
 )
+from uni_api.routing.request_rules import provider_accepts_request_rules
 
 
 MODEL_INFO_CREATED = 1720524448858
@@ -117,6 +118,7 @@ def _provider_view(provider: dict, model_dict: dict, model_name: str, request_mo
         "exclude_endpoints": provider.get("exclude_endpoints", []),
         "only_request_types": provider.get("only_request_types"),
         "exclude_request_types": provider.get("exclude_request_types"),
+        "exclude_request_rules": provider.get("exclude_request_rules"),
     }
 
 
@@ -432,6 +434,7 @@ async def get_right_order_providers(
     request_total_tokens: Optional[int] = None,
     request_body_bytes: Optional[int] = None,
     request_type: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     debug: bool = False,
     routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
@@ -457,6 +460,17 @@ async def get_right_order_providers(
         provider
         for provider in matching_providers
         if provider_accepts_request_type(provider, request_type)
+    ]
+    matching_providers = [
+        provider
+        for provider in matching_providers
+        if provider_accepts_request_rules(
+            provider,
+            endpoint=endpoint,
+            request_model=request_model,
+            reasoning_effort=reasoning_effort,
+            request_type=request_type,
+        )
     ]
 
     if request_body_bytes and matching_providers:
@@ -676,6 +690,7 @@ async def _call_provider_resolver(
     request_total_tokens: int = 0,
     request_body_bytes: int = 0,
     request_type: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     debug: bool = False,
     routing_index: Optional[RoutingIndex] = None,
 ) -> list[dict]:
@@ -693,6 +708,8 @@ async def _call_provider_resolver(
             resolver_kwargs["request_body_bytes"] = request_body_bytes
         if "request_type" in params or accepts_kwargs:
             resolver_kwargs["request_type"] = request_type
+        if "reasoning_effort" in params or accepts_kwargs:
+            resolver_kwargs["reasoning_effort"] = reasoning_effort
         if "debug" in params or accepts_kwargs:
             resolver_kwargs["debug"] = debug
         if "routing_index" in params or accepts_kwargs:
@@ -773,6 +790,7 @@ class RoutingPlan:
     request_body_bytes: int
     endpoint: Optional[str]
     request_type: Optional[str]
+    reasoning_effort: Optional[str]
     scheduling_algorithm: str
     auto_retry: Any
     role: str
@@ -831,6 +849,7 @@ class RoutingPlan:
         request_total_tokens: int = 0,
         request_body_bytes: int = 0,
         request_type: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         debug: bool = False,
         provider_resolver=None,
     ) -> "RoutingPlan":
@@ -899,6 +918,7 @@ class RoutingPlan:
             request_total_tokens=request_total_tokens,
             request_body_bytes=request_body_bytes,
             request_type=request_type,
+            reasoning_effort=reasoning_effort,
             debug=debug,
             routing_index=routing_index,
         )
@@ -925,6 +945,7 @@ class RoutingPlan:
             request_body_bytes=request_body_bytes,
             endpoint=endpoint,
             request_type=request_type,
+            reasoning_effort=reasoning_effort,
             scheduling_algorithm=scheduling_algorithm,
             auto_retry=preferences["AUTO_RETRY"]
             if isinstance(preferences, dict) and "AUTO_RETRY" in preferences
@@ -1005,6 +1026,7 @@ class RoutingPlan:
             request_total_tokens=self.request_total_tokens,
             request_body_bytes=self.request_body_bytes,
             request_type=self.request_type,
+            reasoning_effort=self.reasoning_effort,
             debug=debug,
             routing_index=self.routing_index,
         )

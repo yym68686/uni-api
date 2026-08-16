@@ -77,6 +77,14 @@ providers:
       - compaction # /v1/responses/compact，或 input 中包含 type: compaction_trigger 的 /v1/responses 请求。
     # only_request_types: # 选填，该渠道只处理列出的语义请求类型。
     #   - compaction
+    exclude_request_rules: # 选填，一条规则中的所有字段都匹配请求时跳过该渠道。
+      - match:
+          endpoint: /v1/responses
+          request_model: gpt-5.6-luna # 客户端请求的公开模型。
+          upstream_model: codex-auto-review # 别名映射后的渠道模型。
+          reasoning_effort:
+            - max
+        reason: unsupported_reasoning_effort # 选填，供运维识别规则用途。
     preferences:
       max_request_body_bytes: 20000000 # 选填，当入站 JSON 请求体大于该字节数时跳过这个渠道。支持数字，也支持 "20MB" 或 "20MiB" 这类字符串。
 

@@ -22,6 +22,7 @@ from uni_api.routing.planner import (
     get_right_order_providers,
     select_provider_api_key_raw,
 )
+from uni_api.routing.request_rules import request_reasoning_effort
 from uni_api.upstream.urls import normalize_alpha_search_upstream_url
 from upstream import UpstreamRunner
 
@@ -236,6 +237,7 @@ class AlphaSearchRequestHandler:
                 self.locks,
                 endpoint=ALPHA_SEARCH_ENDPOINT,
                 request_body_bytes=len(encoded_request.encode("utf-8")),
+                reasoning_effort=request_reasoning_effort(request_body),
                 debug=bool(self.debug()),
                 provider_resolver=self.provider_resolver,
             )

@@ -5077,6 +5077,7 @@ mod tests {
             excluded_endpoints: std::sync::Arc::new(Vec::new()),
             only_request_types: std::sync::Arc::new(Vec::new()),
             excluded_request_types: std::sync::Arc::new(Vec::new()),
+            excluded_request_rules: std::sync::Arc::new(Vec::new()),
             cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }

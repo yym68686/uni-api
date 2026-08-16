@@ -676,6 +676,10 @@ fn compile_provider(value: &Value) -> Option<Value> {
         ),
         "only_request_types": item.get("only_request_types").cloned().unwrap_or(Value::Null),
         "exclude_request_types": item.get("exclude_request_types").cloned().unwrap_or(Value::Null),
+        "exclude_request_rules": merge_rule_values(
+            item.get("exclude_request_rules"),
+            preferences.get("exclude_request_rules"),
+        ),
     }))
 }
 
@@ -900,6 +904,18 @@ fn merge_endpoint_values(first: Option<&Value>, second: Option<&Value>) -> Vec<V
     values
 }
 
+fn merge_rule_values(first: Option<&Value>, second: Option<&Value>) -> Vec<Value> {
+    let mut values = Vec::new();
+    for source in [first, second].into_iter().flatten() {
+        if let Some(items) = source.as_array() {
+            values.extend(items.iter().filter(|item| item.is_object()).cloned());
+        } else if source.is_object() {
+            values.push(source.clone());
+        }
+    }
+    values
+}
+
 fn scalar_string(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -987,6 +1003,35 @@ api_keys:
         assert_eq!(value["providers"][0]["model_order"][0], "gpt-5.6-sol");
         assert_eq!(value["api_keys"][0]["native_paid_state_safe"], true);
         assert_eq!(value["revision"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn preserves_provider_exclude_request_rules() {
+        let raw = br#"
+providers:
+  - provider: codex-a
+    base_url: https://example.com/v1/responses
+    engine: codex
+    api: secret-upstream
+    model:
+      - codex-auto-review: gpt-5.6-luna
+    exclude_request_rules:
+      - match:
+          endpoint: /v1/responses
+          request_model: gpt-5.6-luna
+          upstream_model: codex-auto-review
+          reasoning_effort: [max]
+        reason: unsupported_reasoning_effort
+api_keys:
+  - api: client-key
+    model: [codex-a/*]
+"#;
+        let value: Value =
+            serde_json::from_slice(&compile_snapshot_bytes(raw, true).unwrap()).unwrap();
+        assert_eq!(
+            value["providers"][0]["exclude_request_rules"][0]["match"]["reasoning_effort"][0],
+            "max"
+        );
     }
 
     #[test]

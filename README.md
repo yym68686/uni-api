@@ -77,6 +77,14 @@ providers:
       - compaction # /v1/responses/compact, or /v1/responses with input type compaction_trigger.
     # only_request_types: # Optional. Restrict this provider to the listed semantic request types.
     #   - compaction
+    exclude_request_rules: # Optional. Skip this provider when every field in a rule matches the incoming request.
+      - match:
+          endpoint: /v1/responses
+          request_model: gpt-5.6-luna # Public model requested by the client.
+          upstream_model: codex-auto-review # Provider model after alias mapping.
+          reasoning_effort:
+            - max
+        reason: unsupported_reasoning_effort # Optional operator-facing description.
     preferences:
       max_request_body_bytes: 20000000 # Optional. Skip this provider when the incoming JSON request body is larger than this many bytes. Numeric values and strings like "20MB" or "20MiB" are supported.
 

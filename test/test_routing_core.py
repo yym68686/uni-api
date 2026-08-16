@@ -1028,6 +1028,67 @@ def test_get_right_order_providers_filters_semantic_request_types():
     asyncio.run(run())
 
 
+def test_get_right_order_providers_filters_provider_request_rules():
+    config = {
+        "providers": [
+            {
+                "provider": "mxamaxai006",
+                "base_url": "https://mxamaxai.example/v1/responses",
+                "api": "key-mxamaxai",
+                "model": [{"codex-auto-review": "gpt-5.6-luna"}],
+                "exclude_request_rules": [
+                    {
+                        "match": {
+                            "endpoint": "/v1/responses",
+                            "request_model": "gpt-5.6-luna",
+                            "upstream_model": "codex-auto-review",
+                            "reasoning_effort": ["max"],
+                        },
+                        "reason": "unsupported_reasoning_effort",
+                    }
+                ],
+            },
+            {
+                "provider": "fallback",
+                "base_url": "https://fallback.example/v1/responses",
+                "api": "key-fallback",
+                "model": ["gpt-5.6-luna"],
+            },
+        ],
+        "api_keys": [{"api": "sk-test", "model": ["gpt-5.6-luna"]}],
+    }
+
+    async def run():
+        excluded = await get_right_order_providers(
+            "gpt-5.6-luna",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.6-luna"]},
+            endpoint="/v1/responses",
+            reasoning_effort="max",
+        )
+        accepted = await get_right_order_providers(
+            "gpt-5.6-luna",
+            config,
+            0,
+            "fixed_priority",
+            ["sk-test"],
+            {"sk-test": ["gpt-5.6-luna"]},
+            endpoint="/v1/responses",
+            reasoning_effort="high",
+        )
+
+        assert [provider["provider"] for provider in excluded] == ["fallback"]
+        assert [provider["provider"] for provider in accepted] == [
+            "mxamaxai006",
+            "fallback",
+        ]
+
+    asyncio.run(run())
+
+
 def test_get_right_order_providers_smart_round_robin_uses_weighted_provider_order():
     config = {
         "providers": [
@@ -1252,8 +1313,8 @@ def test_routing_plan_refresh_preserves_endpoint(monkeypatch):
     asyncio.run(run())
 
 
-def test_routing_plan_refresh_preserves_request_type():
-    request_types = []
+def test_routing_plan_refresh_preserves_request_context():
+    request_contexts = []
 
     async def resolver(
         request_model_name,
@@ -1264,10 +1325,11 @@ def test_routing_plan_refresh_preserves_request_type():
         models_list,
         *,
         request_type=None,
+        reasoning_effort=None,
         **_kwargs,
     ):
         _ = config, api_index, scheduling_algorithm, api_list, models_list
-        request_types.append(request_type)
+        request_contexts.append((request_type, reasoning_effort))
         return [
             {
                 "provider": "provider-a",
@@ -1296,10 +1358,15 @@ def test_routing_plan_refresh_preserves_request_type():
             {},
             endpoint="/v1/responses",
             request_type="compaction",
+            reasoning_effort="max",
             provider_resolver=resolver,
         )
         await plan.refresh_matching_providers()
-        assert request_types == ["compaction", "compaction"]
+        assert request_contexts == [
+            ("compaction", "max"),
+            ("compaction", "max"),
+        ]
         assert plan.request_type == "compaction"
+        assert plan.reasoning_effort == "max"
 
     asyncio.run(run())

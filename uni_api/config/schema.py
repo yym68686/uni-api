@@ -17,6 +17,7 @@ class ProviderConfig(BaseModel):
     exclude_endpoints: Any = None
     only_request_types: Any = None
     exclude_request_types: Any = None
+    exclude_request_rules: Any = None
 
 
 class ApiKeyConfig(BaseModel):

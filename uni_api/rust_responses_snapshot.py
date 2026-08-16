@@ -11,6 +11,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from core.utils import get_model_dict
+from uni_api.routing.request_rules import provider_exclude_request_rules
 from uni_api.routing.request_types import provider_request_type_values
 
 
@@ -89,6 +90,9 @@ def build_rust_responses_snapshot(
                 ),
                 "exclude_request_types": provider_request_type_values(
                     provider, "exclude_request_types"
+                ),
+                "exclude_request_rules": list(
+                    provider_exclude_request_rules(provider)
                 ),
             }
         )

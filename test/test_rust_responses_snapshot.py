@@ -24,6 +24,16 @@ def _config():
                     "exclude_request_types": ["future-type"],
                 },
                 "only_request_types": ["compaction"],
+                "exclude_request_rules": [
+                    {
+                        "match": {
+                            "request_model": "gpt-public",
+                            "upstream_model": "gpt-upstream",
+                            "reasoning_effort": ["max"],
+                        },
+                        "reason": "unsupported_reasoning_effort",
+                    }
+                ],
             }
         ],
         "api_keys": [
@@ -58,6 +68,11 @@ def test_snapshot_contains_compiled_models_and_hot_path_configuration():
     ]
     assert snapshot["providers"][0]["only_request_types"] == ["compaction"]
     assert snapshot["providers"][0]["exclude_request_types"] == ["future-type"]
+    assert snapshot["providers"][0]["exclude_request_rules"][0]["match"] == {
+        "request_model": "gpt-public",
+        "upstream_model": "gpt-upstream",
+        "reasoning_effort": ["max"],
+    }
     assert build_rust_responses_snapshot(
         _config(),
         ["client-key"],

@@ -62,6 +62,7 @@ from uni_api.routing.planner import (
     get_right_order_providers,
     select_provider_api_key_raw,
 )
+from uni_api.routing.request_rules import request_reasoning_effort
 from uni_api.routing.request_types import detect_request_type
 from upstream import (
     UPSTREAM_NETWORK_ERRORS,
@@ -4265,6 +4266,7 @@ class ModelRequestHandler:
             endpoint=routing_endpoint,
             request_total_tokens=request_total_tokens,
             request_body_bytes=request_body_bytes,
+            reasoning_effort=request_reasoning_effort(request_data),
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -6847,6 +6849,7 @@ class ResponsesRequestExecution:
             endpoint=endpoint,
             request_body_bytes=request_body_bytes,
             request_type=request_type,
+            reasoning_effort=request_reasoning_effort(request_data),
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -9687,6 +9690,7 @@ class MessagesPassthroughHandler:
             self.locks,
             endpoint=endpoint,
             request_body_bytes=request_body_bytes,
+            reasoning_effort=request_reasoning_effort(request_body),
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )
@@ -10692,6 +10696,7 @@ class VideoTaskHandler:
             self.locks,
             endpoint=CONTENT_GENERATION_TASKS_ENDPOINT,
             request_body_bytes=request_body_bytes,
+            reasoning_effort=request_reasoning_effort(request_body),
             debug=is_debug,
             provider_resolver=self._provider_resolver(request_body),
         )
@@ -11063,6 +11068,7 @@ class LingjingOpenapiHandler:
             self.locks,
             endpoint=endpoint,
             request_body_bytes=request_body_bytes,
+            reasoning_effort=request_reasoning_effort(payload),
             debug=is_debug,
             provider_resolver=get_right_order_providers,
         )

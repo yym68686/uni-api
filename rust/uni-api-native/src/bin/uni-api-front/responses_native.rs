@@ -114,6 +114,8 @@ struct RawProvider {
     only_request_types: Value,
     #[serde(default)]
     exclude_request_types: Value,
+    #[serde(default)]
+    exclude_request_rules: Value,
 }
 
 #[derive(Clone)]
@@ -155,6 +157,7 @@ pub(crate) struct Provider {
     pub(crate) excluded_endpoints: Arc<Vec<String>>,
     pub(crate) only_request_types: Arc<Vec<String>>,
     pub(crate) excluded_request_types: Arc<Vec<String>>,
+    pub(crate) excluded_request_rules: Arc<Vec<Value>>,
     pub(crate) cursor: Arc<AtomicUsize>,
 }
 
@@ -402,6 +405,7 @@ impl NativeConfigStore {
                 excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
                 only_request_types: Arc::new(request_type_values(&item.only_request_types)),
                 excluded_request_types: Arc::new(request_type_values(&item.exclude_request_types)),
+                excluded_request_rules: Arc::new(request_rule_values(&item.exclude_request_rules)),
                 cursor,
             });
             providers_by_name.insert(name, provider.clone());
@@ -723,6 +727,7 @@ impl NativeConfigStore {
             request_model,
             request_body_bytes,
             request_type,
+            None,
             endpoint.trim_end_matches('/'),
         )
         .map_err(|_| RouteResolutionError {
@@ -1832,6 +1837,7 @@ pub async fn prepare_native_request(
         ));
     }
     let request_type = detect_request_type(object);
+    let reasoning_effort = request_reasoning_effort(object);
     let normalized_endpoint = endpoint.trim_end_matches('/');
     let wants_compact = normalized_endpoint == "/v1/responses/compact";
     let stream_value = object.get("stream").cloned();
@@ -1870,6 +1876,7 @@ pub async fn prepare_native_request(
         &request_model,
         observation.body_bytes,
         request_type,
+        reasoning_effort.as_deref(),
         normalized_endpoint,
     ) {
         Ok(providers) if !providers.is_empty() => providers,
@@ -1996,6 +2003,7 @@ fn matching_providers(
     request_model: &str,
     request_body_bytes: u64,
     request_type: Option<&str>,
+    reasoning_effort: Option<&str>,
     endpoint: &str,
 ) -> Result<Vec<Arc<Provider>>, ()> {
     let mut matches = Vec::new();
@@ -2054,6 +2062,13 @@ fn matching_providers(
                 .eq_ignore_ascii_case(endpoint)
         }) && provider_accepts_body(provider, request_body_bytes)
             && provider_accepts_request_type(provider, request_type)
+            && provider_accepts_request_rules(
+                provider,
+                endpoint,
+                request_model,
+                reasoning_effort,
+                request_type,
+            )
     });
     Ok(matches)
 }
@@ -2295,6 +2310,113 @@ fn provider_accepts_request_type(provider: &Provider, request_type: Option<&str>
             .iter()
             .any(|excluded| excluded.eq_ignore_ascii_case(value))
     })
+}
+
+fn request_rule_values(value: &Value) -> Vec<Value> {
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .filter(|item| item.is_object())
+            .cloned()
+            .collect();
+    }
+    value
+        .is_object()
+        .then(|| value.clone())
+        .into_iter()
+        .collect()
+}
+
+fn request_reasoning_effort(payload: &Map<String, Value>) -> Option<String> {
+    payload
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("reasoning")
+                .and_then(Value::as_object)
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn provider_accepts_request_rules(
+    provider: &Provider,
+    endpoint: &str,
+    request_model: &str,
+    reasoning_effort: Option<&str>,
+    request_type: Option<&str>,
+) -> bool {
+    let upstream_model = provider
+        .models
+        .get(request_model)
+        .map(String::as_str)
+        .unwrap_or(request_model);
+    !provider.excluded_request_rules.iter().any(|rule| {
+        exclude_request_rule_matches(
+            rule,
+            endpoint,
+            request_model,
+            upstream_model,
+            reasoning_effort,
+            request_type,
+        )
+    })
+}
+
+fn exclude_request_rule_matches(
+    rule: &Value,
+    endpoint: &str,
+    request_model: &str,
+    upstream_model: &str,
+    reasoning_effort: Option<&str>,
+    request_type: Option<&str>,
+) -> bool {
+    let Some(condition) = rule.get("match").and_then(Value::as_object) else {
+        return false;
+    };
+    if condition.is_empty() {
+        return false;
+    }
+    condition.iter().all(|(key, expected)| match key.as_str() {
+        "endpoint" => request_rule_value_matches(expected, Some(endpoint), true),
+        "request_model" => request_rule_value_matches(expected, Some(request_model), false),
+        "upstream_model" => request_rule_value_matches(expected, Some(upstream_model), false),
+        "reasoning_effort" => request_rule_value_matches(expected, reasoning_effort, false),
+        "request_type" => request_rule_value_matches(expected, request_type, false),
+        _ => false,
+    })
+}
+
+fn request_rule_value_matches(expected: &Value, actual: Option<&str>, endpoint: bool) -> bool {
+    if let Some(values) = expected.as_array() {
+        return values
+            .iter()
+            .any(|value| request_rule_value_matches(value, actual, endpoint));
+    }
+    let (Some(expected), Some(actual)) = (expected.as_str(), actual) else {
+        return false;
+    };
+    let normalize = |value: &str| {
+        let mut value = value.trim().trim_end_matches('/').to_ascii_lowercase();
+        if endpoint && !value.is_empty() && !value.starts_with('/') {
+            value.insert(0, '/');
+        }
+        value
+    };
+    let expected = normalize(expected);
+    let actual = normalize(actual);
+    if expected.is_empty() || actual.is_empty() {
+        return false;
+    }
+    expected == "*"
+        || expected == actual
+        || expected
+            .strip_suffix('*')
+            .is_some_and(|prefix| actual.starts_with(prefix))
 }
 
 fn parse_byte_limit(value: &Value) -> Option<u64> {
@@ -3250,6 +3372,7 @@ mod tests {
             excluded_endpoints: Arc::new(Vec::new()),
             only_request_types: Arc::new(Vec::new()),
             excluded_request_types: Arc::new(Vec::new()),
+            excluded_request_rules: Arc::new(Vec::new()),
             cursor: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -3515,6 +3638,49 @@ mod tests {
         assert!(!provider_accepts_request_type(
             &provider,
             Some("compaction")
+        ));
+    }
+
+    #[test]
+    fn provider_request_rules_match_public_upstream_model_and_reasoning_effort() {
+        let mut provider = provider();
+        provider.excluded_request_rules = Arc::new(vec![json!({
+            "match": {
+                "endpoint": "/v1/responses",
+                "request_model": "gpt-public",
+                "upstream_model": "gpt-upstream",
+                "reasoning_effort": ["MAX"]
+            },
+            "reason": "unsupported_reasoning_effort"
+        })]);
+
+        assert!(!provider_accepts_request_rules(
+            &provider,
+            "/v1/responses/",
+            "gpt-public",
+            Some("max"),
+            None,
+        ));
+        assert!(provider_accepts_request_rules(
+            &provider,
+            "/v1/responses",
+            "gpt-public",
+            Some("high"),
+            None,
+        ));
+        assert!(provider_accepts_request_rules(
+            &provider,
+            "/v1/responses",
+            "gpt-public",
+            None,
+            None,
+        ));
+        assert!(provider_accepts_request_rules(
+            &provider,
+            "/v1/chat/completions",
+            "gpt-public",
+            Some("max"),
+            None,
         ));
     }
 
