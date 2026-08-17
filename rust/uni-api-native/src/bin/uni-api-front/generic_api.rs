@@ -184,6 +184,13 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let trace_id = trace_id(&headers, &request_id);
     let client_ip = client_ip(&headers);
     let api_key = extract_api_key(&headers).unwrap_or_default();
+    let api_key_role = state
+        .native_responses_config
+        .authorize(&headers)
+        .await
+        .ok()
+        .map(|auth| auth.api_key.role.to_string())
+        .unwrap_or_default();
 
     let input = match prepare_input(&state, request, &method, &uri, &path, resource_wait).await {
         Ok(input) => input,
@@ -352,6 +359,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         emit_attempt(
             &request_id,
             &trace_id,
+            &api_key_role,
             attempt_index,
             &provider,
             &request_model,
@@ -413,6 +421,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                 emit_attempt(
                     &request_id,
                     &trace_id,
+                    &api_key_role,
                     attempt_index,
                     &provider,
                     &request_model,
@@ -458,6 +467,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                 emit_attempt(
                     &request_id,
                     &trace_id,
+                    &api_key_role,
                     attempt_index,
                     &provider,
                     &request_model,
@@ -5008,6 +5018,7 @@ fn truncate_detail(value: &str) -> String {
 fn emit_attempt(
     request_id: &str,
     trace_id: &str,
+    role: &str,
     attempt_index: usize,
     provider: &Provider,
     request_model: &str,
@@ -5026,6 +5037,7 @@ fn emit_attempt(
             "event_type":"rust_native_api_attempt",
             "request_id":request_id,
             "trace_id":trace_id,
+            "role":role,
             "attempt_index":attempt_index + 1,
             "provider":provider.name.as_ref(),
             "request_model":request_model,
