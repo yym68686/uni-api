@@ -2886,20 +2886,54 @@ fn model_timeout(
     original_model: &str,
 ) -> f64 {
     for preferences in [&provider.preferences, global] {
-        if let Some(timeout) = preferences.get("model_timeout") {
-            if let Some(value) = timeout.as_f64() {
-                return value;
-            }
-            if let Some(values) = timeout.as_object() {
-                for key in [request_model, original_model, "default"] {
-                    if let Some(value) = values.get(key).and_then(Value::as_f64) {
-                        return value;
-                    }
-                }
-            }
+        let Some(timeout) = preferences.get("model_timeout") else {
+            continue;
+        };
+        if let Some(value) = timeout.as_f64() {
+            return value;
+        }
+        let Some(values) = timeout.as_object() else {
+            continue;
+        };
+        if let Some(value) = model_timeout_value(values, request_model) {
+            return value;
+        }
+        if let Some(value) = model_timeout_value(values, original_model) {
+            return value;
+        }
+        if let Some(value) = values
+            .iter()
+            .find(|(key, value)| key.eq_ignore_ascii_case("default") && value.as_f64().is_some())
+            .and_then(|(_, value)| value.as_f64())
+        {
+            return value;
         }
     }
     100.0
+}
+
+fn model_timeout_value(values: &Map<String, Value>, model: &str) -> Option<f64> {
+    let normalized_model = model.to_ascii_lowercase();
+
+    values
+        .iter()
+        .find(|(key, value)| {
+            !key.eq_ignore_ascii_case("default")
+                && key.eq_ignore_ascii_case(model)
+                && value.as_f64().is_some()
+        })
+        .and_then(|(_, value)| value.as_f64())
+        .or_else(|| {
+            values
+                .iter()
+                .find(|(key, value)| {
+                    !key.is_empty()
+                        && !key.eq_ignore_ascii_case("default")
+                        && normalized_model.contains(&key.to_ascii_lowercase())
+                        && value.as_f64().is_some()
+                })
+                .and_then(|(_, value)| value.as_f64())
+        })
 }
 
 fn merge_timeout_policy(
@@ -3552,6 +3586,73 @@ mod tests {
         assert_eq!(compaction.total, Some(3000.0));
         assert_eq!(regular.first_byte, Some(20.0));
         assert_eq!(regular.total, None);
+    }
+
+    #[test]
+    fn model_timeout_matches_legacy_fuzzy_and_fallback_order() {
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::from_iter([(
+            "model_timeout".into(),
+            json!({
+                "GPT-5.6-SOL": 15,
+                "gpt-5.6": 20,
+                "upstream-special": 40,
+                "default": 90
+            }),
+        )]));
+        let global = Map::from_iter([(
+            "model_timeout".into(),
+            json!({"gpt-5.6": 20, "global-only": 30, "default": 2000}),
+        )]);
+
+        assert_eq!(
+            model_timeout(&provider, &global, "gpt-5.6-sol", "gpt-5.6-sol"),
+            15.0
+        );
+        assert_eq!(
+            model_timeout(&provider, &global, "public-alias", "upstream-special-v2"),
+            40.0
+        );
+        assert_eq!(
+            model_timeout(&provider, &global, "unknown", "unknown-upstream"),
+            90.0
+        );
+
+        provider.preferences = Arc::new(Map::from_iter([(
+            "model_timeout".into(),
+            json!({"provider-only": 50}),
+        )]));
+        assert_eq!(
+            model_timeout(&provider, &global, "gpt-5.6-terra", "gpt-5.6-terra"),
+            20.0
+        );
+        assert_eq!(
+            model_timeout(&provider, &global, "global-only-v2", "other"),
+            30.0
+        );
+
+        let resolved = resolve_timeouts(
+            &Snapshot {
+                revision: Arc::from("0".repeat(64)),
+                preferences: Arc::new(global),
+                api_keys: Arc::new(HashMap::new()),
+                providers: Arc::new(Vec::new()),
+                providers_by_name: Arc::new(HashMap::new()),
+                api_config: Arc::new(json!({})),
+            },
+            &provider,
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+            "codex",
+            true,
+            None,
+            "user",
+            "/v1/responses",
+            "POST",
+        );
+        assert_eq!(resolved.first_byte, Some(20.0));
+        assert_eq!(resolved.idle, None);
+        assert_eq!(resolved.total, None);
     }
 
     #[test]
