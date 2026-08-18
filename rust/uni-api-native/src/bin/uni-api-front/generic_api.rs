@@ -27,8 +27,8 @@ use crate::proxy::{
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
 use crate::responses_native::{
-    apply_overrides, compute_retry_count, extract_api_key, request_id, FailedRoute, Provider,
-    ProviderKeySelection, CODEX_USER_AGENT,
+    apply_overrides, classify_provider_failure, compute_retry_count, extract_api_key, request_id,
+    FailedRoute, Provider, ProviderKeySelection, CODEX_USER_AGENT,
 };
 
 const ALPHA_SEARCH_ENDPOINT: &str = "/v1/alpha/search";
@@ -268,6 +268,10 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let max_attempts = compute_retry_count(&resolved.providers)
         .max(resolved.providers.len())
         .min(10);
+    let auto_retry = state
+        .native_responses_config
+        .auto_retry_enabled(&headers)
+        .await;
     let (input, _image_reservations) = match prepare_image_inputs(&state, input).await {
         Ok(prepared) => prepared,
         Err((status, detail)) => return json_error(status, &detail),
@@ -433,6 +437,18 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                 return success.response;
             }
             Err(mut failure) => {
+                let policy = classify_provider_failure(
+                    failure.status.as_u16(),
+                    &failure.detail,
+                    Some(&provider),
+                    &path,
+                    auto_retry,
+                );
+                failure.status =
+                    StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                if let Some(response) = failure.response.as_mut() {
+                    *response.status_mut() = failure.status;
+                }
                 last_status = failure.status;
                 last_detail = failure.detail.clone();
                 if let Some(response) = failure.response.take() {
@@ -446,18 +462,20 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     provider_api_key: provider_key_raw.clone(),
                     success: false,
                 });
-                state
-                    .native_responses_config
-                    .cool_failed_route(FailedRoute {
-                        provider: &provider,
-                        key: &provider_key_raw,
-                        original_model: &original_model,
-                        has_alternative: resolved.providers.len() > 1,
-                        status: failure.status.as_u16(),
-                        detail: &failure.detail,
-                        force_quota_cooldown: false,
-                    })
-                    .await;
+                if !policy.request_scoped || policy.force_quota_cooldown {
+                    state
+                        .native_responses_config
+                        .cool_failed_route(FailedRoute {
+                            provider: &provider,
+                            key: &provider_key_raw,
+                            original_model: &original_model,
+                            has_alternative: resolved.providers.len() > 1,
+                            status: failure.status.as_u16(),
+                            detail: &failure.detail,
+                            force_quota_cooldown: policy.force_quota_cooldown,
+                        })
+                        .await;
+                }
                 if provider.engine.eq_ignore_ascii_case("codex")
                     && provider_key_raw.contains(',')
                     && matches!(failure.status.as_u16(), 401..=403)
@@ -476,9 +494,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     "failed",
                     Some(failure.status.as_u16()),
                 );
-                if failure.status.is_client_error()
-                    && failure.status != StatusCode::TOO_MANY_REQUESTS
-                {
+                if !policy.retryable {
                     break;
                 }
             }

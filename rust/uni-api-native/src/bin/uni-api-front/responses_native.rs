@@ -171,6 +171,14 @@ pub(crate) struct FailedRoute<'a> {
     pub(crate) force_quota_cooldown: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderFailurePolicy {
+    pub(crate) status: u16,
+    pub(crate) retryable: bool,
+    pub(crate) request_scoped: bool,
+    pub(crate) force_quota_cooldown: bool,
+}
+
 #[derive(Clone, Debug)]
 struct NativeAttemptObservation {
     request_id: String,
@@ -577,6 +585,21 @@ impl NativeConfigStore {
             .await
             .map(|snapshot| model_prices(&snapshot.preferences, model))
             .unwrap_or((0.3, 1.0))
+    }
+
+    pub(crate) async fn auto_retry_enabled(&self, headers: &HeaderMap) -> bool {
+        let Some(snapshot) = self.snapshot().await else {
+            return true;
+        };
+        let Some(token) = extract_api_key(headers) else {
+            return true;
+        };
+        snapshot
+            .api_keys
+            .get(&token)
+            .and_then(|api_key| api_key.preferences.get("AUTO_RETRY"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1173,17 +1196,14 @@ impl NativeRoute {
             .or_else(|| outcome.get("body"))
             .and_then(Value::as_str)
             .unwrap_or("Responses upstream attempt failed");
-        let status = remap_provider_status(original_status, detail);
-        let codex_model_unsupported = status == 400
-            && self
-                .last_provider
-                .as_ref()
-                .is_some_and(|provider| provider.engine.eq_ignore_ascii_case("codex"))
-            && detail
-                .to_ascii_lowercase()
-                .contains("model is not supported when using codex with a chatgpt account");
-        let missing_persisted_item = status == 404 && is_missing_persisted_item_error(detail);
-        let request_scoped = matches!(status, 400 | 413) || missing_persisted_item;
+        let policy = classify_provider_failure(
+            original_status,
+            detail,
+            self.last_provider.as_deref(),
+            &self.endpoint,
+            self.auto_retry(),
+        );
+        let status = policy.status;
         self.last_status = status;
         self.last_detail = detail.chars().take(4096).collect();
         self.has_attempt_failure = true;
@@ -1208,7 +1228,7 @@ impl NativeRoute {
                 status: Some(status),
             });
         }
-        if !request_scoped || codex_model_unsupported {
+        if !policy.request_scoped || policy.force_quota_cooldown {
             if let (Some(provider), Some(key), Some(original_model)) = (
                 self.last_provider.as_ref(),
                 self.last_provider_key.as_deref(),
@@ -1222,14 +1242,12 @@ impl NativeRoute {
                         has_alternative: self.providers.len() > 1,
                         status,
                         detail,
-                        force_quota_cooldown: codex_model_unsupported,
+                        force_quota_cooldown: policy.force_quota_cooldown,
                     })
                     .await;
             }
         }
-        self.auto_retry()
-            && (!request_scoped || codex_model_unsupported)
-            && self.has_attempts_remaining()
+        policy.retryable && self.has_attempts_remaining()
     }
 
     pub async fn record_success(&self) {
@@ -3184,6 +3202,42 @@ fn remap_provider_status(status: u16, detail: &str) -> u16 {
     status
 }
 
+pub(crate) fn classify_provider_failure(
+    original_status: u16,
+    detail: &str,
+    provider: Option<&Provider>,
+    endpoint: &str,
+    auto_retry: bool,
+) -> ProviderFailurePolicy {
+    let status = remap_provider_status(original_status, detail);
+    let codex_model_unsupported = status == 400
+        && matches!(endpoint, "/v1/responses" | "/v1/responses/compact")
+        && provider.is_some_and(|provider| provider.engine.eq_ignore_ascii_case("codex"))
+        && detail
+            .to_ascii_lowercase()
+            .contains("model is not supported when using codex with a chatgpt account");
+    let missing_persisted_item = status == 404 && is_missing_persisted_item_error(detail);
+    let request_scoped = matches!(status, 400 | 413) || missing_persisted_item;
+    let azure_request = matches!(status, 400 | 413)
+        && provider.is_some_and(|provider| is_azure_provider(&provider.base_url));
+    ProviderFailurePolicy {
+        status,
+        retryable: auto_retry && (!request_scoped || codex_model_unsupported || azure_request),
+        request_scoped,
+        force_quota_cooldown: codex_model_unsupported,
+    }
+}
+
+fn is_azure_provider(base_url: &str) -> bool {
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+    url.host_str() == Some("models.inference.ai.azure.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 fn is_model_pricing_unconfigured(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
     [
@@ -3821,6 +3875,117 @@ mod tests {
         );
         assert_eq!(terminal_error_sha256(true, "earlier attempt failed"), None);
         assert!(terminal_error_sha256(false, "terminal failure").is_some());
+    }
+
+    #[test]
+    fn provider_failure_policy_matches_python_retry_matrix() {
+        let base_provider = provider();
+        for status in [401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504] {
+            let policy = classify_provider_failure(
+                status,
+                "upstream failure",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                true,
+            );
+            assert!(policy.retryable, "status {status} should fail over");
+            assert!(
+                !policy.request_scoped,
+                "status {status} should not be request scoped"
+            );
+        }
+
+        assert!(
+            !classify_provider_failure(
+                400,
+                "invalid request",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                true
+            )
+            .retryable
+        );
+        assert!(
+            !classify_provider_failure(
+                413,
+                "payload too large",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                true
+            )
+            .retryable
+        );
+        assert!(
+            !classify_provider_failure(
+                403,
+                "upstream failure",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                false
+            )
+            .retryable
+        );
+        assert!(!classify_provider_failure(
+            404,
+            "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Item with id 'rs_1' not found. Items are not persisted when store is false.\"}}",
+            Some(&base_provider),
+            "/v1/responses",
+            true,
+        ).retryable);
+
+        let pricing = classify_provider_failure(
+            400,
+            r#"{"error":{"code":"model_not_priced","message":"missing"}}"#,
+            Some(&base_provider),
+            "/v1/chat/completions",
+            true,
+        );
+        assert_eq!(pricing.status, 502);
+        assert!(pricing.retryable);
+
+        let codex = classify_provider_failure(
+            400,
+            "model is not supported when using codex with a ChatGPT account",
+            Some(&base_provider),
+            "/v1/responses",
+            true,
+        );
+        assert!(codex.retryable);
+        assert!(codex.force_quota_cooldown);
+        assert!(
+            !classify_provider_failure(
+                400,
+                "model is not supported when using codex with a ChatGPT account",
+                Some(&base_provider),
+                "/v1/chat/completions",
+                true,
+            )
+            .retryable
+        );
+
+        let mut azure = provider();
+        azure.engine = Arc::from("gpt");
+        azure.base_url = Arc::from("https://models.inference.ai.azure.com");
+        assert!(
+            classify_provider_failure(
+                400,
+                "provider validation",
+                Some(&azure),
+                "/v1/chat/completions",
+                true
+            )
+            .retryable
+        );
+        assert!(
+            classify_provider_failure(
+                413,
+                "provider validation",
+                Some(&azure),
+                "/v1/chat/completions",
+                true
+            )
+            .retryable
+        );
     }
 
     #[tokio::test]
