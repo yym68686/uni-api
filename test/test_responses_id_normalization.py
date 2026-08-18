@@ -127,6 +127,25 @@ def test_wrong_canonical_prefix_is_rewritten_for_actual_item_type():
     assert payload["input"][1]["id"] == "msg_message123"
 
 
+def test_tool_search_call_uses_tsc_item_id_prefix():
+    payload = {
+        "input": [
+            {
+                "type": "tool_search_call",
+                "id": "fc_3e812ff47c529a7d687ecf89239a0f57433566d7",
+            }
+        ]
+    }
+
+    result = ResponsesCustomToolCallIdNormalizer().normalize(payload)
+
+    assert result.normalized_ids == 1
+    assert (
+        payload["input"][0]["id"]
+        == "tsc_3e812ff47c529a7d687ecf89239a0f57433566d7"
+    )
+
+
 def test_unknown_item_type_is_not_guessed_or_mutated():
     payload = {"input": [{"type": "future_item", "id": "item_future123"}]}
 

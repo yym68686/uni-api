@@ -14,6 +14,7 @@ _ITEM_ID_PREFIX_BY_TYPE = {
     "reasoning": "rs",
     "function_call": "fc",
     "function_call_output": "fco",
+    "tool_search_call": "tsc",
     "custom_tool_call": "ctc",
     "custom_tool_call_output": "ctco",
 }

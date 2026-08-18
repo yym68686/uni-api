@@ -187,6 +187,7 @@ fn item_prefix(item_type: &str) -> Option<&'static str> {
         "reasoning" => Some("rs"),
         "function_call" => Some("fc"),
         "function_call_output" => Some("fco"),
+        "tool_search_call" => Some("tsc"),
         "custom_tool_call" => Some("ctc"),
         "custom_tool_call_output" => Some("ctco"),
         _ => None,
@@ -279,6 +280,7 @@ mod tests {
         let mut payload = json!({"input":[
             {"type":"message","id":"item_message123"},
             {"type":"function_call","id":"item_function123"},
+            {"type":"tool_search_call","id":"fc_3e812ff47c529a7d687ecf89239a0f57433566d7"},
             {"type":"custom_tool_call","id":"fc_custom123"},
             {"type":"custom_tool_call","id":"ctc_not-canonical"},
             {"type":"message","id":format!("resp_{}_msg", "a".repeat(76))},
@@ -289,18 +291,22 @@ mod tests {
         assert!(normalizer.normalize(&mut payload).unwrap());
         assert_eq!(payload["input"][0]["id"], "msg_message123");
         assert_eq!(payload["input"][1]["id"], "fc_function123");
-        assert_eq!(payload["input"][2]["id"], "ctc_custom123");
-        assert!(payload["input"][3]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("ctc_"));
-        assert!(!payload["input"][3]["id"].as_str().unwrap().contains('-'));
+        assert_eq!(
+            payload["input"][2]["id"],
+            "tsc_3e812ff47c529a7d687ecf89239a0f57433566d7"
+        );
+        assert_eq!(payload["input"][3]["id"], "ctc_custom123");
         assert!(payload["input"][4]["id"]
             .as_str()
             .unwrap()
+            .starts_with("ctc_"));
+        assert!(!payload["input"][4]["id"].as_str().unwrap().contains('-'));
+        assert!(payload["input"][5]["id"]
+            .as_str()
+            .unwrap()
             .starts_with("msg_"));
-        assert!(payload["input"][4]["id"].as_str().unwrap().len() <= 64);
-        assert_eq!(payload["input"][5]["id"], "item_future123");
+        assert!(payload["input"][5]["id"].as_str().unwrap().len() <= 64);
+        assert_eq!(payload["input"][6]["id"], "item_future123");
     }
 
     #[test]
