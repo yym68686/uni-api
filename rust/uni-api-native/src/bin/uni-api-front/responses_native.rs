@@ -3713,7 +3713,7 @@ mod tests {
                 "winner_policy": "first_valid_success"
             }),
         )]));
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.max_inflight_attempts, 2);
         assert_eq!(config.winner_policy, WinnerPolicy::FirstValidSuccess);
 
