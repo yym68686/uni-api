@@ -763,7 +763,7 @@ wheels = [
 
 [[package]]
 name = "uni-api"
-version = "1.7.251"
+version = "1.7.252"
 source = { virtual = "." }
 dependencies = [
     { name = "aiofiles" },
