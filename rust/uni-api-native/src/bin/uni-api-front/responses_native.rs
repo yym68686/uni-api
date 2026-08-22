@@ -259,6 +259,10 @@ pub struct NativeRoute {
     request_body_bytes: u64,
     cursor: usize,
     max_attempts: usize,
+    hedging: HedgingConfig,
+    attempt_contexts: HashMap<String, NativeAttemptObservation>,
+    hedge_trigger_count: usize,
+    hedge_cancelled_attempt_count: usize,
     last_provider: Option<Arc<Provider>>,
     last_provider_key: Option<String>,
     last_original_model: Option<String>,
@@ -276,6 +280,59 @@ pub struct NativeRoute {
     started_at: tokio::time::Instant,
     final_emitted: bool,
     _memory_reservation: MemoryReservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HedgingConfig {
+    pub(crate) enabled: bool,
+    pub(crate) max_inflight_attempts: usize,
+    pub(crate) winner_policy: WinnerPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WinnerPolicy {
+    FirstValidSuccess,
+}
+
+impl Default for HedgingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_inflight_attempts: 1,
+            winner_policy: WinnerPolicy::FirstValidSuccess,
+        }
+    }
+}
+
+fn parse_hedging(preferences: &Map<String, Value>) -> HedgingConfig {
+    let Some(value) = preferences.get("hedging").and_then(Value::as_object) else {
+        return HedgingConfig::default();
+    };
+    let max_inflight_attempts = value
+        .get("max_inflight_attempts")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let winner_policy = match value
+        .get("winner_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("first_valid_success")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "first_valid_success" => WinnerPolicy::FirstValidSuccess,
+        _ => return HedgingConfig::default(),
+    };
+    HedgingConfig {
+        enabled: value
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        max_inflight_attempts,
+        winner_policy,
+    }
 }
 
 impl NativeConfigStore {
@@ -1011,6 +1068,50 @@ impl NativeRoute {
         self.stream
     }
 
+    pub(crate) fn hedging_enabled(&self) -> bool {
+        self.hedging.enabled
+            && self.hedging.max_inflight_attempts > 1
+            && self.hedging.winner_policy == WinnerPolicy::FirstValidSuccess
+    }
+
+    pub(crate) fn hedge_slots(&self) -> usize {
+        self.hedging.max_inflight_attempts
+    }
+
+    pub(crate) fn record_hedge_trigger(&mut self) {
+        self.hedge_trigger_count = self.hedge_trigger_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_hedge_cancellations(&mut self, count: usize) {
+        self.hedge_cancelled_attempt_count =
+            self.hedge_cancelled_attempt_count.saturating_add(count);
+    }
+
+    pub(crate) fn set_current_plan(&mut self, plan: &Plan) {
+        let Some(provider_name) = plan.provider_name.as_deref() else {
+            return;
+        };
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.name.as_ref() == provider_name)
+            .cloned()
+        else {
+            return;
+        };
+        self.last_provider = Some(provider);
+        self.last_provider_key = plan.provider_key.clone();
+        self.last_original_model = plan.original_model.clone();
+        if let Some(observation) = self.attempt_contexts.get(&plan.attempt_id).cloned() {
+            self.last_attempt = Some(observation);
+        }
+    }
+
+    pub(crate) async fn record_failure_for(&mut self, plan: &Plan, outcome: &Value) -> bool {
+        self.set_current_plan(plan);
+        self.record_failure(outcome).await
+    }
+
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -1148,9 +1249,11 @@ impl NativeRoute {
                 started_at: tokio::time::Instant::now(),
             };
             self.last_provider = Some(provider.clone());
-            self.last_provider_key = Some(provider_key_raw);
+            self.last_provider_key = Some(provider_key_raw.clone());
             self.last_original_model = Some(original_model.clone());
             self.last_attempt = Some(observation.clone());
+            self.attempt_contexts
+                .insert(attempt_id.clone(), observation);
             return Ok(Some(Plan {
                 attempt_id,
                 url: normalize_upstream_url(&provider.base_url, &engine, self.wants_compact),
@@ -1177,6 +1280,9 @@ impl NativeRoute {
                 first_byte_timeout_seconds: timeout.first_byte,
                 idle_timeout_seconds: timeout.idle,
                 total_timeout_seconds: timeout.total,
+                provider_name: Some(provider.name.to_string()),
+                provider_key: Some(provider_key_raw),
+                original_model: Some(original_model),
                 max_event_bytes: UNLIMITED_SSE_EVENT_BYTES,
                 max_precommit_items: DEFAULT_MAX_PRECOMMIT_ITEMS,
                 max_precommit_bytes: DEFAULT_MAX_PRECOMMIT_BYTES,
@@ -1214,16 +1320,16 @@ impl NativeRoute {
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
-            let attempt_id = self
-                .last_attempt
-                .as_ref()
-                .map(|attempt| attempt.attempt_id.clone());
+            let attempt = self.last_attempt.clone();
             self.emit_routing_attempt(RoutingAttemptEvent {
-                attempt_number: self.cursor.saturating_sub(1),
+                attempt_number: attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt_index.saturating_sub(1))
+                    .unwrap_or_else(|| self.cursor.saturating_sub(1)),
                 provider: &provider,
                 original_model: &original_model,
                 outcome: "failed",
-                attempt_id: attempt_id.as_deref(),
+                attempt_id: attempt.as_ref().map(|attempt| attempt.attempt_id.as_str()),
                 skip_reason: None,
                 status: Some(status),
             });
@@ -1280,12 +1386,12 @@ impl NativeRoute {
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
-            let attempt_id = self
-                .last_attempt
-                .as_ref()
-                .map(|attempt| attempt.attempt_id.clone());
+            let attempt = self.last_attempt.clone();
             self.emit_routing_attempt(RoutingAttemptEvent {
-                attempt_number: self.cursor.saturating_sub(1),
+                attempt_number: attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt_index.saturating_sub(1))
+                    .unwrap_or_else(|| self.cursor.saturating_sub(1)),
                 provider: &provider,
                 original_model: &original_model,
                 outcome: if success {
@@ -1293,7 +1399,7 @@ impl NativeRoute {
                 } else {
                     "completed_with_error"
                 },
-                attempt_id: attempt_id.as_deref(),
+                attempt_id: attempt.as_ref().map(|attempt| attempt.attempt_id.as_str()),
                 skip_reason: None,
                 status: Some(status),
             });
@@ -1502,6 +1608,13 @@ impl NativeRoute {
             "routing_attempt_count": self.routing_attempts,
             "routing_skip_count": self.routing_skips,
             "upstream_attempt_count": self.upstream_attempts,
+            "hedging": {
+                "enabled": self.hedging.enabled,
+                "max_inflight_attempts": self.hedging.max_inflight_attempts,
+                "winner_policy": "first_valid_success",
+                "trigger_count": self.hedge_trigger_count,
+                "cancelled_attempt_count": self.hedge_cancelled_attempt_count,
+            },
             "upstream_duration_ms": self.upstream_duration_ms,
             "routing_attempts": self.routing_ledger,
             "upstream_attempts": self.upstream_ledger,
@@ -1999,7 +2112,7 @@ pub async fn prepare_native_request(
         store: store.clone(),
         codex_oauth,
         persistence,
-        snapshot,
+        snapshot: snapshot.clone(),
         api_key,
         providers,
         base_payload: payload,
@@ -2013,6 +2126,10 @@ pub async fn prepare_native_request(
         request_body_bytes: observation.body_bytes,
         cursor: 0,
         max_attempts: retry_count,
+        hedging: parse_hedging(&snapshot.preferences),
+        attempt_contexts: HashMap::new(),
+        hedge_trigger_count: 0,
+        hedge_cancelled_attempt_count: 0,
         last_provider: None,
         last_provider_key: None,
         last_original_model: None,
@@ -3532,6 +3649,10 @@ mod tests {
             request_body_bytes: 64,
             cursor: 0,
             max_attempts,
+            hedging: HedgingConfig::default(),
+            attempt_contexts: HashMap::new(),
+            hedge_trigger_count: 0,
+            hedge_cancelled_attempt_count: 0,
             last_provider: None,
             last_provider_key: None,
             last_original_model: None,
@@ -3580,6 +3701,27 @@ mod tests {
         assert!(payload.get("previous_response_id").is_none());
         assert!(payload["input"][0].get("id").is_none());
         assert!(payload["input"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn hedging_preferences_parse_with_safe_defaults() {
+        let config = parse_hedging(&Map::from_iter([(
+            "hedging".into(),
+            json!({
+                "enabled": true,
+                "max_inflight_attempts": 2,
+                "winner_policy": "first_valid_success"
+            }),
+        )]));
+        assert_eq!(config.enabled, true);
+        assert_eq!(config.max_inflight_attempts, 2);
+        assert_eq!(config.winner_policy, WinnerPolicy::FirstValidSuccess);
+
+        let invalid = parse_hedging(&Map::from_iter([(
+            "hedging".into(),
+            json!({"enabled": true, "winner_policy": "unknown"}),
+        )]));
+        assert_eq!(invalid, HedgingConfig::default());
     }
 
     #[test]

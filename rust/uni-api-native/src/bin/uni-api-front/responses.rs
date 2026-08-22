@@ -61,6 +61,12 @@ pub(crate) struct Plan {
     pub(crate) first_byte_timeout_seconds: Option<f64>,
     pub(crate) idle_timeout_seconds: Option<f64>,
     pub(crate) total_timeout_seconds: Option<f64>,
+    #[serde(default)]
+    pub(crate) provider_name: Option<String>,
+    #[serde(default)]
+    pub(crate) provider_key: Option<String>,
+    #[serde(default)]
+    pub(crate) original_model: Option<String>,
     #[serde(default = "default_max_event_bytes")]
     pub(crate) max_event_bytes: usize,
     #[serde(default = "default_max_precommit_items")]
@@ -236,6 +242,12 @@ enum PreflightResult {
     Started(ActiveAttempt),
 }
 
+enum HedgeSignal {
+    Trigger,
+    Started { plan: Plan, active: ActiveAttempt },
+    Retry { plan: Plan, outcome: Value },
+}
+
 enum Coordinator {
     Python { session_id: String },
     Native { route: NativeRoute },
@@ -305,6 +317,85 @@ impl Coordinator {
     }
 }
 
+fn spawn_hedge_attempt(
+    state: AppState,
+    plan: Plan,
+    sender: mpsc::UnboundedSender<HedgeSignal>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result =
+            preflight_attempt_with_trigger(&state, plan.clone(), false, Some(&sender)).await;
+        let signal = match result {
+            Ok(PreflightResult::Started(active)) => HedgeSignal::Started { plan, active },
+            Ok(PreflightResult::Retry(outcome)) => HedgeSignal::Retry { plan, outcome },
+            Err(error) => HedgeSignal::Retry {
+                plan,
+                outcome: json!({
+                    "kind": "protocol_error",
+                    "status_code": 502,
+                    "detail": error,
+                    "committed": false,
+                }),
+            },
+        };
+        let _ = sender.send(signal);
+    })
+}
+
+async fn preflight_native_hedged(
+    state: &AppState,
+    route: &mut NativeRoute,
+) -> Result<Option<ActiveAttempt>, String> {
+    let max_inflight = route.hedge_slots().max(1);
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let mut running = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+
+    let Some(plan) = route.next_plan().await? else {
+        return Ok(None);
+    };
+    let attempt_id = plan.attempt_id.clone();
+    let handle = spawn_hedge_attempt(state.clone(), plan, sender.clone());
+    running.insert(attempt_id, handle);
+
+    while let Some(signal) = receiver.recv().await {
+        match signal {
+            HedgeSignal::Trigger => {
+                route.record_hedge_trigger();
+                if running.len() < max_inflight {
+                    if let Some(next) = route.next_plan().await? {
+                        let attempt_id = next.attempt_id.clone();
+                        let handle = spawn_hedge_attempt(state.clone(), next, sender.clone());
+                        running.insert(attempt_id, handle);
+                    }
+                }
+            }
+            HedgeSignal::Started { plan, active } => {
+                route.record_hedge_cancellations(running.len().saturating_sub(1));
+                for (_, handle) in running.drain() {
+                    handle.abort();
+                }
+                route.set_current_plan(&plan);
+                return Ok(Some(active));
+            }
+            HedgeSignal::Retry { plan, outcome } => {
+                running.remove(&plan.attempt_id);
+                let retryable = route.record_failure_for(&plan, &outcome).await;
+                if retryable && running.len() < max_inflight {
+                    if let Some(next) = route.next_plan().await? {
+                        let attempt_id = next.attempt_id.clone();
+                        let handle = spawn_hedge_attempt(state.clone(), next, sender.clone());
+                        running.insert(attempt_id, handle);
+                    }
+                }
+                if running.is_empty() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub async fn serve_native(
     state: AppState,
     mut route: NativeRoute,
@@ -312,6 +403,38 @@ pub async fn serve_native(
 ) -> Response<Body> {
     if !route.stream() {
         return serve_native_nonstream(state, route, idempotency_owner).await;
+    }
+    if route.hedging_enabled() && route.stream() {
+        match preflight_native_hedged(&state, &mut route).await {
+            Ok(Some(active)) => {
+                let mut control_headers = HeaderMap::new();
+                if let Ok(value) = HeaderValue::from_str(route.request_id()) {
+                    control_headers.insert("x-request-id", value);
+                }
+                control_headers
+                    .insert("access-control-allow-origin", HeaderValue::from_static("*"));
+                return start_public_stream(
+                    state,
+                    Coordinator::Native { route },
+                    active,
+                    control_headers,
+                    None,
+                    idempotency_owner.take(),
+                );
+            }
+            Ok(None) => {
+                let status =
+                    StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+                route.emit_final_response(status.as_u16(), "native_hedge_exhausted");
+                release_owner(&mut idempotency_owner).await;
+                return json_error(status, route.last_detail());
+            }
+            Err(error) => {
+                route.emit_internal_failure(502, "native_hedge_error", &error);
+                release_owner(&mut idempotency_owner).await;
+                return json_error(StatusCode::BAD_GATEWAY, &error);
+            }
+        }
     }
     loop {
         let plan = match route.next_plan().await {
@@ -666,6 +789,15 @@ async fn preflight_attempt(
     plan: Plan,
     keepalive_already_sent: bool,
 ) -> Result<PreflightResult, String> {
+    preflight_attempt_with_trigger(state, plan, keepalive_already_sent, None).await
+}
+
+async fn preflight_attempt_with_trigger(
+    state: &AppState,
+    plan: Plan,
+    keepalive_already_sent: bool,
+    trigger: Option<&mpsc::UnboundedSender<HedgeSignal>>,
+) -> Result<PreflightResult, String> {
     let client = state
         .upstream_client(
             plan.proxy.as_deref(),
@@ -701,10 +833,41 @@ async fn preflight_attempt(
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
-    let response = await_deadline(request.send(), send_deadline)
-        .await
-        .map_err(|error| format!("upstream response headers failed: {error}"))?
-        .map_err(|error| format!("upstream response headers failed: {error}"))?;
+    let mut request_future = Box::pin(request.send());
+    let mut hedge_triggered = false;
+    let response = if let Some(trigger) = trigger {
+        let first_can_trigger = first_deadline.is_some_and(|first| {
+            send_stage_deadline.is_none_or(|stage| first < stage)
+                && total_deadline.is_none_or(|total| first < total)
+        });
+        if first_can_trigger {
+            tokio::select! {
+                result = &mut request_future => result
+                    .map_err(|error| format!("upstream response headers failed: {error}"))?,
+                _ = tokio::time::sleep_until(first_deadline.expect("checked first deadline")) => {
+                    hedge_triggered = true;
+                    let _ = trigger.send(HedgeSignal::Trigger);
+                    await_deadline(
+                        &mut request_future,
+                        earlier_deadline(total_deadline, send_stage_deadline),
+                    )
+                    .await
+                    .map_err(|error| format!("upstream response headers failed: {error}"))?
+                    .map_err(|error| format!("upstream response headers failed: {error}"))?
+                }
+            }
+        } else {
+            await_deadline(&mut request_future, send_deadline)
+                .await
+                .map_err(|error| format!("upstream response headers failed: {error}"))?
+                .map_err(|error| format!("upstream response headers failed: {error}"))?
+        }
+    } else {
+        await_deadline(&mut request_future, send_deadline)
+            .await
+            .map_err(|error| format!("upstream response headers failed: {error}"))?
+            .map_err(|error| format!("upstream response headers failed: {error}"))?
+    };
     let status = response.status();
     let unsupported_encoding = response
         .headers()
@@ -743,7 +906,7 @@ async fn preflight_attempt(
             plan.normalize_custom_tool_call_ids,
         ),
         mode,
-        plan,
+        plan: plan.clone(),
         status,
         headers: response_headers,
         stream,
@@ -763,9 +926,11 @@ async fn preflight_attempt(
         active.business_committed = true;
         return Ok(PreflightResult::Started(active));
     }
-
     loop {
-        let next_deadline = earlier_deadline(first_deadline, active.total_deadline);
+        let next_deadline = earlier_deadline(
+            (!hedge_triggered).then_some(first_deadline).flatten(),
+            active.total_deadline,
+        );
         let chunk = match await_deadline(active.stream.next(), next_deadline).await {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(error))) => {
@@ -793,13 +958,24 @@ async fn preflight_attempt(
                 })));
             }
             Err(error) => {
+                if trigger.is_some()
+                    && first_deadline.is_some()
+                    && !hedge_triggered
+                    && error == "upstream deadline exceeded"
+                {
+                    hedge_triggered = true;
+                    if let Some(trigger) = trigger {
+                        let _ = trigger.send(HedgeSignal::Trigger);
+                    }
+                    continue;
+                }
                 return Ok(PreflightResult::Retry(json!({
                     "kind": "transport_error",
                     "status_code": 504,
                     "upstream_status_code": status.as_u16(),
                     "detail": error,
                     "committed": false,
-                })))
+                })));
             }
         };
         active.stats.observe_upstream(&chunk);
@@ -3058,6 +3234,9 @@ mod tests {
             first_byte_timeout_seconds: None,
             idle_timeout_seconds: None,
             total_timeout_seconds: None,
+            provider_name: None,
+            provider_key: None,
+            original_model: None,
             max_event_bytes: 4096,
             max_precommit_items: 128,
             max_precommit_bytes: 64 * 1024,

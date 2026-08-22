@@ -1186,6 +1186,20 @@ providers:
 
 解析顺序是：全局 `timeout_policy.default` → provider `timeout_policy.default` → 命中维度最多的全局 `timeout_policy.rules` → 命中维度最多的 provider `timeout_policy.rules`。如果没有任何 timeout policy 设置有效值，uni-api 会继续回退到 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`。
 
+- 如何开启流式请求的延迟对冲？
+
+`hedging` 是全局 `preferences` 下的请求编排策略，只对 Rust Responses 原生流式数据面生效。它不会改变 `timeout_policy` 的超时语义：当前 attempt 的有效 `first_byte` 到期且仍未产生有效 Responses 输出时，uni-api 会启动下一个渠道；原 attempt 继续运行。任一 attempt 先产生有效结果就作为赢家，其他未完成 attempt 会被取消。每个 attempt 的 `total` 仍从该 attempt 发起时开始计算，不会改成整个客户端请求的共享总时限。
+
+```yaml
+preferences:
+  hedging:
+    enabled: true
+    max_inflight_attempts: 2
+    winner_policy: first_valid_success
+```
+
+`enabled` 默认关闭；`max_inflight_attempts` 至少为 1，当前实现最多允许 4；`winner_policy` 当前支持 `first_valid_success`。如果普通流式请求没有匹配到 `timeout_policy` 的 `total`，每个 attempt 会继续使用现有流生命周期规则，建议为需要对冲的模型显式配置 `total`，避免多个慢渠道长期占用并发槽位。
+
 - api_key_rate_limit 是怎么工作的？我如何给多个模型设置相同的频率限制？
 
 如果你想同时给 gemini-1.5-pro-latest，gemini-1.5-pro，gemini-1.5-pro-001，gemini-1.5-pro-002 这四个模型设置相同的频率限制，可以这样设置：
