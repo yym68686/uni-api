@@ -295,11 +295,74 @@ async fn initialize_sqlite(path: PathBuf) -> Result<(), String> {
         }
         let connection = sqlite_connection(&path)?;
         connection
-            .execute_batch(SQLITE_SCHEMA)
-            .map_err(|error| format!("initialize SQLite stats schema: {error}"))
+            .execute_batch(SQLITE_SCHEMA_TABLES)
+            .map_err(|error| format!("initialize SQLite stats schema: {error}"))?;
+        migrate_sqlite_columns(&connection, "request_stats", REQUEST_STATS_COLUMNS)?;
+        connection
+            .execute_batch(SQLITE_SCHEMA_INDEXES)
+            .map_err(|error| format!("initialize SQLite stats indexes: {error}"))
     })
     .await
     .map_err(|error| format!("join SQLite schema initialization: {error}"))?
+}
+
+// Columns added to request_stats after its initial release. New deployments get
+// them from {SQLITE,POSTGRES}_SCHEMA_TABLES; existing databases need them
+// backfilled by migrate_sqlite_columns / migrate_postgres_columns below. This is
+// the single source of truth for both backends — add a column here once.
+const REQUEST_STATS_COLUMNS: &[(&str, &str, &str)] =
+    &[("trace_id", "TEXT", "VARCHAR"), ("timing_spans", "TEXT", "TEXT")];
+
+fn migrate_sqlite_columns(
+    connection: &Connection,
+    table: &str,
+    columns: &[(&str, &str, &str)],
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    let existing: std::collections::HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("inspect {table} schema: {error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    for (name, sqlite_type, _) in columns {
+        if !existing.contains(*name) {
+            connection
+                .execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {sqlite_type}"), [])
+                .map_err(|error| format!("migrate {table}.{name}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+async fn migrate_postgres_columns(
+    client: &Client,
+    table: &str,
+    columns: &[(&str, &str, &str)],
+) -> Result<(), String> {
+    let rows = client
+        .query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+            &[&table],
+        )
+        .await
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    let existing: std::collections::HashSet<String> =
+        rows.iter().map(|row| row.get::<_, String>(0)).collect();
+    for (name, _, postgres_type) in columns {
+        if !existing.contains(*name) {
+            client
+                .execute(
+                    format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {postgres_type}")
+                        .as_str(),
+                    &[],
+                )
+                .await
+                .map_err(|error| format!("migrate {table}.{name}: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_connection(path: &PathBuf) -> Result<Connection, String> {
@@ -361,9 +424,14 @@ fn sqlite_write(path: &PathBuf, event: WriteEvent) -> Result<(), String> {
 
 async fn initialize_postgres(client: &Client) -> Result<(), String> {
     client
-        .batch_execute(POSTGRES_SCHEMA)
+        .batch_execute(POSTGRES_SCHEMA_TABLES)
         .await
-        .map_err(|error| format!("initialize PostgreSQL stats schema: {error}"))
+        .map_err(|error| format!("initialize PostgreSQL stats schema: {error}"))?;
+    migrate_postgres_columns(client, "request_stats", REQUEST_STATS_COLUMNS).await?;
+    client
+        .batch_execute(POSTGRES_SCHEMA_INDEXES)
+        .await
+        .map_err(|error| format!("initialize PostgreSQL stats indexes: {error}"))
 }
 
 async fn postgres_write(client: &Client, event: WriteEvent) -> Result<(), String> {
@@ -743,7 +811,7 @@ fn unix_seconds() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
-const SQLITE_SCHEMA: &str = r#"
+const SQLITE_SCHEMA_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS request_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT,
@@ -765,11 +833,6 @@ CREATE TABLE IF NOT EXISTS request_stats (
     timing_spans TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
-CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);
-CREATE INDEX IF NOT EXISTS ix_request_stats_model ON request_stats(model);
-CREATE INDEX IF NOT EXISTS ix_request_stats_api_key ON request_stats(api_key);
-CREATE INDEX IF NOT EXISTS ix_request_stats_timestamp ON request_stats(timestamp);
 CREATE TABLE IF NOT EXISTS channel_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT,
@@ -780,13 +843,21 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     success INTEGER DEFAULT 0,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+"#;
+
+const SQLITE_SCHEMA_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
+CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);
+CREATE INDEX IF NOT EXISTS ix_request_stats_model ON request_stats(model);
+CREATE INDEX IF NOT EXISTS ix_request_stats_api_key ON request_stats(api_key);
+CREATE INDEX IF NOT EXISTS ix_request_stats_timestamp ON request_stats(timestamp);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider ON channel_stats(provider);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_model ON channel_stats(model);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider_api_key ON channel_stats(provider_api_key);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_timestamp ON channel_stats(timestamp);
 "#;
 
-const POSTGRES_SCHEMA: &str = r#"
+const POSTGRES_SCHEMA_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS request_stats (
     id BIGSERIAL PRIMARY KEY,
     request_id VARCHAR,
@@ -808,11 +879,6 @@ CREATE TABLE IF NOT EXISTS request_stats (
     timing_spans TEXT,
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
-CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);
-CREATE INDEX IF NOT EXISTS ix_request_stats_model ON request_stats(model);
-CREATE INDEX IF NOT EXISTS ix_request_stats_api_key ON request_stats(api_key);
-CREATE INDEX IF NOT EXISTS ix_request_stats_timestamp ON request_stats(timestamp);
 CREATE TABLE IF NOT EXISTS channel_stats (
     id BIGSERIAL PRIMARY KEY,
     request_id VARCHAR,
@@ -823,6 +889,14 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     success BOOLEAN DEFAULT FALSE,
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
+"#;
+
+const POSTGRES_SCHEMA_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
+CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);
+CREATE INDEX IF NOT EXISTS ix_request_stats_model ON request_stats(model);
+CREATE INDEX IF NOT EXISTS ix_request_stats_api_key ON request_stats(api_key);
+CREATE INDEX IF NOT EXISTS ix_request_stats_timestamp ON request_stats(timestamp);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider ON channel_stats(provider);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_model ON channel_stats(model);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider_api_key ON channel_stats(provider_api_key);
@@ -847,5 +921,28 @@ mod tests {
     fn masks_long_keys_without_exposing_the_middle() {
         assert_eq!(mask_key("sk-1234567890"), "sk-1234...7890");
         assert_eq!(mask_key("short"), "short");
+    }
+
+    #[test]
+    fn migrate_sqlite_columns_backfills_missing_columns_idempotently() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Simulate a pre-migration database: request_stats without trace_id/timing_spans.
+        connection
+            .execute_batch("CREATE TABLE request_stats (id INTEGER PRIMARY KEY, provider TEXT);")
+            .unwrap();
+
+        migrate_sqlite_columns(&connection, "request_stats", REQUEST_STATS_COLUMNS).unwrap();
+        // Running it again against an already-migrated table must not error.
+        migrate_sqlite_columns(&connection, "request_stats", REQUEST_STATS_COLUMNS).unwrap();
+
+        let mut statement = connection.prepare("PRAGMA table_info(request_stats)").unwrap();
+        let columns: std::collections::HashSet<String> = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        for (name, _, _) in REQUEST_STATS_COLUMNS {
+            assert!(columns.contains(*name), "missing backfilled column {name}");
+        }
     }
 }
