@@ -45,7 +45,7 @@ COPY --from=native-builder /tmp/lib_uni_api_native.so /home/uni_api/_uni_api_nat
 COPY --from=native-builder /tmp/uni-api-front /usr/local/bin/uni-api-front
 ENTRYPOINT ["/usr/local/bin/uni-api-front"]
 
-FROM debian:bullseye-slim AS rust-runtime
+FROM debian:bookworm-slim AS rust-runtime
 ARG SOURCE_COMMIT=unknown
 ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
     UNI_API_RUNTIME=rust \
