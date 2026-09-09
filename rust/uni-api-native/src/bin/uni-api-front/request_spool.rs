@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::idempotency::{RequestHasher, RequestIdentity};
+use crate::request_decompression::RequestBodyLimits;
 use crate::resources::{CapacityFailure, ResourceGovernor, ResourceKind};
 
 static NEXT_SPOOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -42,6 +43,16 @@ pub struct SpoolFailure {
 }
 
 impl SpoolFailure {
+    fn body_too_large(observation: SpoolObservation) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "request body too large".into(),
+            resource: None,
+            retry_after: false,
+            observation,
+        }
+    }
+
     fn capacity(failure: CapacityFailure, mut observation: SpoolObservation) -> Self {
         observation.resource_wait_ms = observation
             .resource_wait_ms
@@ -75,6 +86,7 @@ impl SpoolFailure {
 pub struct SpoolManager {
     root: Arc<PathBuf>,
     governor: ResourceGovernor,
+    max_body_bytes: u64,
 }
 
 impl SpoolManager {
@@ -88,6 +100,7 @@ impl SpoolManager {
         Ok(Self {
             root: Arc::new(root),
             governor,
+            max_body_bytes: RequestBodyLimits::from_env().max_bytes as u64,
         })
     }
 
@@ -101,6 +114,9 @@ impl SpoolManager {
             resource_wait_ms: duration_ms(initial_wait),
             ..SpoolObservation::default()
         };
+        if content_length.is_some_and(|length| length > self.max_body_bytes) {
+            return Err(SpoolFailure::body_too_large(observation));
+        }
         let (wait, capacity) = self
             .governor
             .wait_for_local_capacity(&self.root, content_length.unwrap_or(0))
@@ -164,6 +180,9 @@ impl RequestSpoolWriter {
             .observation
             .body_bytes
             .saturating_add(chunk.len() as u64);
+        if self.observation.body_bytes > self.manager.max_body_bytes {
+            return Err(SpoolFailure::body_too_large(self.observation.clone()));
+        }
         self.observation.memory_peak_bytes =
             self.observation.memory_peak_bytes.max(chunk.len() as u64);
         let (wait, _) = self
@@ -443,6 +462,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_declared_body_is_rejected_before_disk_admission() {
+        let mut manager = SpoolManager::new(ResourceGovernor::unconstrained_for_test()).unwrap();
+        manager.max_body_bytes = 10;
+        let error = manager
+            .begin(None, Some(11), Duration::ZERO)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!error.retry_after);
+        assert_eq!(error.observation.local_disk_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_and_underdeclared_bodies_are_bounded_and_partial_spools_cleaned() {
+        let mut manager = SpoolManager::new(ResourceGovernor::unconstrained_for_test()).unwrap();
+        manager.max_body_bytes = 10;
+        for content_length in [None, Some(1), Some(10)] {
+            let mut writer = manager
+                .begin(None, content_length, Duration::ZERO)
+                .await
+                .unwrap();
+            let path = writer.writer.as_ref().unwrap().path.clone();
+            writer.append(Bytes::from_static(b"12345")).await.unwrap();
+            writer.append(Bytes::from_static(b"67890")).await.unwrap();
+            let error = writer.append(Bytes::from_static(b"x")).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(error.observation.local_disk_bytes, 10);
+            assert!(!error.retry_after);
+            drop(writer);
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_body_limit_is_replayable() {
+        let mut manager = SpoolManager::new(ResourceGovernor::unconstrained_for_test()).unwrap();
+        manager.max_body_bytes = 10;
+        let mut writer = manager
+            .begin(Some(request_hasher()), None, Duration::ZERO)
+            .await
+            .unwrap();
+        writer
+            .append(Bytes::from_static(b"1234567890"))
+            .await
+            .unwrap();
+        let spool = writer.finish().await.unwrap();
+        assert!(spool.identity.is_some());
+        let body = spool.storage.into_body(&spool.observation).await.unwrap();
+        assert_eq!(to_bytes(body, 10).await.unwrap().as_ref(), b"1234567890");
+    }
+
+    #[tokio::test]
     async fn local_spool_is_streamed_without_whole_body_buffering() {
         let manager = SpoolManager::new(ResourceGovernor::unconstrained_for_test()).unwrap();
         let mut writer = manager
@@ -464,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spool_has_no_single_request_byte_ceiling() {
+    async fn spool_streams_bodies_larger_than_legacy_16_mib_threshold() {
         let manager = SpoolManager::new(ResourceGovernor::unconstrained_for_test()).unwrap();
         let mut writer = manager
             .begin(Some(request_hasher()), None, Duration::ZERO)

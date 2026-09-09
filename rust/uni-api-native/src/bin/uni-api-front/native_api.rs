@@ -34,6 +34,7 @@ pub async fn handle(
                 json!({
                     "runtime": "rust",
                     "python_compat_enabled": state.python_compat_enabled,
+                    "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),
                     "persistence": if state.persistence.disabled() { "disabled" } else { "rust" },

@@ -784,7 +784,11 @@ fn spool_failure_response(failure: SpoolFailure, idempotent_request: bool) -> Re
         idempotency_error(
             failure.status,
             &failure.message,
-            "capacity-exhausted",
+            if failure.status == StatusCode::PAYLOAD_TOO_LARGE {
+                "request-too-large"
+            } else {
+                "capacity-exhausted"
+            },
             failure.retry_after,
         )
     } else {
