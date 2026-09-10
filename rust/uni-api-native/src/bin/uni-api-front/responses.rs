@@ -1746,18 +1746,6 @@ async fn run_raw_committed(
     }
 }
 
-fn inspect_raw_frames(
-    frames: Vec<SseFrame>,
-    stats: &mut StreamStats,
-) -> Result<Option<Terminal>, String> {
-    for frame in frames {
-        if let Some(terminal) = inspect_terminal_frame(&frame, stats)? {
-            return Ok(Some(terminal));
-        }
-    }
-    Ok(None)
-}
-
 /// Return only the wire prefix through the first terminal event.
 ///
 /// Upstream providers sometimes append heartbeats or unrelated bytes after
@@ -3355,8 +3343,10 @@ mod tests {
             )
             .unwrap();
         let mut stats = StreamStats::new("raw-terminal-test");
-        let terminal = inspect_raw_frames(frames, &mut stats).unwrap();
-        assert!(matches!(terminal, Some(Terminal::Completed)));
+        let (_prefix, terminal) = raw_terminal_prefix(frames, &mut stats)
+            .unwrap()
+            .expect("completed terminal expected");
+        assert!(matches!(terminal, Terminal::Completed));
         assert_eq!(stats.event_count, 2);
         assert_eq!(stats.delta_events, 1);
         assert_eq!(stats.usage.as_ref().unwrap()["total_tokens"], 3);
