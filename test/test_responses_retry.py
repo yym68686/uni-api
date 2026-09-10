@@ -2397,8 +2397,7 @@ def test_responses_stream_does_not_wait_for_oaix_marker_after_completed(monkeypa
     assert diagnostics["oaix_terminal_flush_marker_expected"] is True
     assert diagnostics.get("oaix_terminal_flush_marker_seen") is not True
     assert diagnostics.get("oaix_terminal_flush_marker_hash_matched") is not True
-    assert len(hop_observations) == 1
-    assert hop_observations[0]["request_id"] == "terminal-marker"
+    assert hop_observations == []
 
 
 @pytest.mark.parametrize(
