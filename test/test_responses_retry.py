@@ -2316,7 +2316,7 @@ def test_postcommit_delta_fast_path_coexists_with_custom_tool_id_normalizer(
     assert current_info["responses_delta_fast_path_bytes"] == 0
 
 
-def test_responses_stream_consumes_exact_oaix_terminal_flush_marker(monkeypatch):
+def test_responses_stream_does_not_wait_for_oaix_marker_after_completed(monkeypatch):
     _configure_responses_test(monkeypatch, engine="codex")
     hop_observations = []
     monkeypatch.setattr(
@@ -2395,13 +2395,8 @@ def test_responses_stream_consumes_exact_oaix_terminal_flush_marker(monkeypatch)
     assert "oaix-terminal-flush-v1" not in body
     diagnostics = current_info["responses_stream_diagnostics"]
     assert diagnostics["oaix_terminal_flush_marker_expected"] is True
-    assert diagnostics["oaix_terminal_flush_marker_seen"] is True
-    assert diagnostics["oaix_terminal_flush_marker_hash_matched"] is True
-    assert diagnostics[
-        "oaix_terminal_flush_to_ember_receive_observed"
-    ] is True
-    assert diagnostics["oaix_terminal_flush_to_ember_receive_ms"] >= 1900
-    assert "oaix_terminal_flush_marker_missing" not in diagnostics
+    assert diagnostics.get("oaix_terminal_flush_marker_seen") is not True
+    assert diagnostics.get("oaix_terminal_flush_marker_hash_matched") is not True
     assert len(hop_observations) == 1
     assert hop_observations[0]["request_id"] == "terminal-marker"
 

@@ -9123,10 +9123,8 @@ class ResponsesRequestExecution:
 
                         if terminal_success:
                             # The semantic terminal ends the business response.
-                            # Do not wait for EOF/[DONE] on a keep-alive
-                            # connection. When OAIX explicitly advertises its
-                            # marker contract, consume only that immediate,
-                            # bounded diagnostic comment.
+                            # Do not read EOF, [DONE], or diagnostic markers
+                            # after a completed response.
                             self._finalize_stream_attempt_success(attempt)
                             terminal_queue_handoff_completed = True
                             diagnostics.mark_terminal_queue_handoff_completed()
@@ -9136,10 +9134,11 @@ class ResponsesRequestExecution:
                             await event_owner.aclose()
                             event_owner = None
                             event_payload = None
-                            await _consume_expected_oaix_terminal_flush_marker(
-                                source,
-                                diagnostics,
-                            )
+                            if event_type != "response.completed":
+                                await _consume_expected_oaix_terminal_flush_marker(
+                                    source,
+                                    diagnostics,
+                                )
                             return
                     finally:
                         terminal_success = False
