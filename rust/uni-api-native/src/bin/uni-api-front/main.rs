@@ -4,6 +4,7 @@ mod channel_metrics;
 mod codex_oauth;
 mod config;
 mod cors;
+mod facts_s3;
 mod generic_api;
 mod hedging;
 mod idempotency;

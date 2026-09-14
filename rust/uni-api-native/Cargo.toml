@@ -12,6 +12,7 @@ base64 = "=0.22.1"
 bytes = "=1.10.1"
 crc32fast = "=1.5.0"
 futures-util = "=0.3.31"
+hex = "=0.4.3"
 hmac = "=0.12.1"
 hyper-rustls = { version = "=0.27.7", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
 libc = "=0.2.189"
