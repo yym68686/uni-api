@@ -27,6 +27,7 @@ pub async fn handle(
                 | "/v1/model-channels"
                 | "/v1/channel-metrics"
                 | "/v1/channel-metrics/timeseries"
+                | "/v1/channel-balances"
                 | "/v1/stats"
                 | "/v1/token_usage"
                 | "/v1/channel_key_rankings"
@@ -81,6 +82,9 @@ pub async fn handle(
             Some(model_channels_response(state, uri, headers).await)
         }
         (&Method::GET, "/v1/api-keys") => Some(api_keys_response(state, headers).await),
+        (&Method::GET, "/v1/channel-balances") => {
+            Some(channel_balances_response(state, uri, headers).await)
+        }
         (&Method::GET, "/v1/channel-metrics") => {
             Some(channel_metrics_response(state, uri, headers).await)
         }
@@ -194,6 +198,34 @@ async fn model_channels_response(
         StatusCode::OK,
         json!({"data":rows,"snapshot_revision":revision,"order":if selected_key_id.is_empty() { "provider_config" } else { "api_key_config" },"api_key_id":selected_key_id,"generated_at":unix_seconds()}),
     )
+}
+
+async fn channel_balances_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let Some(name) = query_value(uri, "provider").filter(|name| !name.is_empty()) else {
+        return json_error(StatusCode::BAD_REQUEST, "provider is required");
+    };
+    match state
+        .native_responses_config
+        .balance_provider(headers, &name)
+        .await
+    {
+        Ok((provider, proxy)) => json_response(
+            StatusCode::OK,
+            crate::channel_balances::query(&provider, proxy.as_deref()).await,
+        ),
+        Err(status) => json_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            if status == 404 {
+                "Unknown provider"
+            } else {
+                "Balance access denied or configuration unavailable"
+            },
+        ),
+    }
 }
 
 async fn channel_metrics_response(
@@ -582,6 +614,7 @@ fn openapi_document() -> Value {
         ("get", "/v1/models"),
         ("get", "/v1/model-channels"),
         ("get", "/v1/api-keys"),
+        ("get", "/v1/channel-balances"),
         ("get", "/v1/channel-metrics"),
         ("get", "/v1/channel-metrics/timeseries"),
         ("post", "/v1/images/generations"),

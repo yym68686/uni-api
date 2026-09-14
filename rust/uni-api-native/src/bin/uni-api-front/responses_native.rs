@@ -637,6 +637,27 @@ impl NativeConfigStore {
         Ok(())
     }
 
+    pub(crate) async fn balance_provider(
+        &self,
+        headers: &HeaderMap,
+        name: &str,
+    ) -> Result<(Arc<Provider>, Option<String>), u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        if !crate::channel_catalog::can_inspect_all(&snapshot, caller) {
+            return Err(403);
+        }
+        let provider = snapshot
+            .providers_by_name
+            .get(name)
+            .cloned()
+            .ok_or(404u16)?;
+        let proxy = preference_string(&provider.preferences, "proxy")
+            .or_else(|| preference_string(&snapshot.preferences, "proxy"));
+        Ok((provider, proxy))
+    }
+
     pub(crate) async fn api_key_catalog(&self, headers: &HeaderMap) -> Result<Value, u16> {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let snapshot = self.snapshot().await.ok_or(503u16)?;
@@ -4208,6 +4229,10 @@ mod tests {
             let headers = catalog_headers(token);
             assert_eq!(store.api_key_catalog(&headers).await.unwrap_err(), 403);
             assert_eq!(store.authorize_catalog(&headers).await.unwrap_err(), 403);
+            assert!(matches!(
+                store.balance_provider(&headers, "z-first").await,
+                Err(403)
+            ));
             for selected in [
                 None,
                 Some(crate::channel_catalog::key_id(token)),
@@ -4227,6 +4252,20 @@ mod tests {
         }
         for token in ["dashboard-first", "admin-key"] {
             let headers = catalog_headers(token);
+            assert_eq!(
+                store
+                    .balance_provider(&headers, "z-first")
+                    .await
+                    .unwrap()
+                    .0
+                    .name
+                    .as_ref(),
+                "z-first"
+            );
+            assert!(matches!(
+                store.balance_provider(&headers, "unknown").await,
+                Err(404)
+            ));
             let listing = store.api_key_catalog(&headers).await.unwrap();
             assert_eq!(listing["data"].as_array().unwrap().len(), 5);
             assert_eq!(listing["can_inspect_all"], true);
