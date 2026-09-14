@@ -240,7 +240,7 @@ async fn retry_spool(c: UploadConfig) {
     }
 }
 
-async fn upload_body(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
+async fn upload_body(c: &UploadConfig, _key: &str, body: &str) -> Result<(), String> {
     let batch: Vec<Value> = body
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
