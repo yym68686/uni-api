@@ -13,6 +13,7 @@ type HmacSha256 = Hmac<Sha256>;
 const QUEUE_CAPACITY: usize = 4096;
 const BATCH_SIZE: usize = 128;
 const BATCH_WAIT: Duration = Duration::from_secs(2);
+const UPLOAD_RETRIES: usize = 3;
 
 #[derive(Clone)]
 struct UploadConfig {
@@ -80,7 +81,7 @@ impl FactWriter {
                         Err(_) => break,
                     }
                 }
-                if let Err(error) = upload_batch(&config, &batch).await {
+                if let Err(error) = upload_batch_with_retry(&config, &batch).await {
                     eprintln!(
                         "{{\"event_type\":\"facts_s3_upload_error\",\"error\":{:?}}}",
                         error
@@ -115,13 +116,14 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
         .join("\n")
         + "\n";
     let hash = hex_sha(&body);
+    let nonce = format!("{}-{}", now.as_nanos(), &hex_sha(&body)[..16]);
     let key = format!(
         "{}/{}/{}/batch-{}-{}.jsonl",
         c.prefix.trim_matches('/'),
         secs / 86400,
         c.instance,
         secs,
-        &hex_sha(&body)[..16]
+        nonce
     );
     let url = format!("{}/{}/{}", c.endpoint, c.bucket, key);
     let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
@@ -174,6 +176,22 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
     }
     Ok(())
 }
+
+async fn upload_batch_with_retry(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
+    let mut last = String::from("S3 fact upload failed");
+    for attempt in 0..UPLOAD_RETRIES {
+        match upload_batch(c, batch).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = error;
+                if attempt + 1 < UPLOAD_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(200 * (1u64 << attempt))).await;
+                }
+            }
+        }
+    }
+    Err(last)
+}
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut m = HmacSha256::new_from_slice(key).expect("HMAC key");
     m.update(data);
@@ -213,10 +231,12 @@ pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
     let key = hex_sha(&s.api_key);
     let stream = s.timing_spans.contains("\\\"stream\\\":true")
         || s.timing_spans.contains("\\\"streaming\\\":true");
-    json!({"schema":1,"kind":"request","event_id":format!("request-{}",s.request_id),"at_ms":now_ms(),"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":s.prompt_tokens,"output_tokens":s.completion_tokens})
+    let at = now_ms();
+    json!({"schema":1,"kind":"request","event_id":format!("request-{}-{}",s.request_id,at),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":s.prompt_tokens,"output_tokens":s.completion_tokens})
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
-    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}-{}",s.request_id,s.provider,s.model),"at_ms":now_ms(),"request_id":s.request_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":false,"outcome":if s.success{"success"}else{"failed"}})
+    let at = now_ms();
+    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}-{}-{}",s.request_id,s.provider,s.model,at),"at_ms":at,"request_id":s.request_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":false,"outcome":if s.success{"success"}else{"failed"}})
 }
 fn now_ms() -> i64 {
     SystemTime::now()
