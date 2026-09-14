@@ -37,6 +37,25 @@ is configuration order, not the currently rotated/random/weighted dispatch
 sequence. Queries never select provider credentials, advance scheduling cursors,
 consume rate limits, alter cooldowns, or call upstream models.
 
+`endpoint=all` includes all endpoints, and `stream=all` combines streaming and
+non-streaming attempts. Either filter can be used independently. The catalog
+keeps one row per provider/model; aggregate rows use `endpoint="all"` and/or
+`stream=null`. Explicit endpoint filtering still applies configuration endpoint
+exclusions. Aggregate availability means the provider/model's general cooldown
+and credential state, not a claim that every endpoint is supported.
+
+Metrics merge raw minute buckets and latency histograms before calculating
+success rates and p50/p95, both for totals and timeseries; quantiles are never
+averaged. `filters` declares the applied scope and `available_endpoints` lists
+observed endpoint names for selector discovery. Omitting these query parameters
+preserves the existing API defaults (`/v1/responses`, `stream=true`). The console
+explicitly requests `endpoint=all&stream=all` by default.
+
+The generic request path now records the actual downstream streaming mode for
+started, failed, completed and hedged attempt metrics. Previous releases labeled
+all generic attempts as non-streaming. Historical process-memory metrics cannot
+be relabeled reliably; after deployment, new samples start with correct labels.
+
 Platform GET routes protected by this policy: `/v1/api-keys`, `/v1/model-channels`,
 `/v1/channel-metrics`, `/v1/channel-metrics/timeseries`,
 `/v1/observability/runtime`, `/v1/stats`, `/v1/token_usage`,

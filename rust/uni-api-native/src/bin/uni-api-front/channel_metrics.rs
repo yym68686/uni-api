@@ -1,6 +1,6 @@
 //! Volatile, bounded attempt metrics. Never reads/writes serving configuration.
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -297,38 +297,67 @@ impl ChannelMetrics {
         let now = self.now();
         let start_minute = (now / 60).saturating_sub(minutes - 1);
         let mut output = Vec::new();
-        let (snapshots, dropped) = match self.inner.lock() {
+        let (snapshots, dropped, endpoints) = match self.inner.lock() {
             Ok(store) => (
-                entries
-                    .iter()
-                    .map(|row| {
-                        let key = MetricKey::new(
-                            row["provider"].as_str().unwrap_or(""),
-                            row["model"].as_str().unwrap_or(""),
-                            row["upstream_model"].as_str().unwrap_or(""),
-                            row["endpoint"].as_str().unwrap_or(""),
-                            row["stream"].as_bool().unwrap_or(true),
-                        );
-                        let mut aggregate = Bucket::default();
-                        let mut points = Vec::new();
-                        let mut inflight = 0;
-                        if let Some(series) = store.series.get(&key) {
-                            inflight = series.inflight;
+                {
+                    // Visit each stored series once. Aggregate rows match either endpoint
+                    // and/or stream dimension; histograms merge before quantiles are computed.
+                    let mut snapshots =
+                        vec![(Bucket::default(), BTreeMap::<u64, Bucket>::new(), 0); entries.len()];
+                    let mut targets = HashMap::<(&str, &str, &str), Vec<usize>>::new();
+                    for (i, row) in entries.iter().enumerate() {
+                        targets
+                            .entry((
+                                row["provider"].as_str().unwrap_or(""),
+                                row["model"].as_str().unwrap_or(""),
+                                row["upstream_model"].as_str().unwrap_or(""),
+                            ))
+                            .or_default()
+                            .push(i);
+                    }
+                    for (source_key, series) in &store.series {
+                        let Some(indices) = targets.get(&(
+                            source_key.provider.as_str(),
+                            source_key.model.as_str(),
+                            source_key.upstream_model.as_str(),
+                        )) else {
+                            continue;
+                        };
+                        for &i in indices {
+                            let row = &entries[i];
+                            let endpoint_matches = row["endpoint"].as_str() == Some("all")
+                                || row["endpoint"].as_str() == Some(source_key.endpoint.as_str());
+                            let stream_matches = row["stream"].is_null()
+                                || row["stream"].as_bool() == Some(source_key.stream);
+                            if !endpoint_matches || !stream_matches {
+                                continue;
+                            }
+                            let (aggregate, points, inflight) = &mut snapshots[i];
+                            *inflight += series.inflight;
                             for bucket in &series.buckets {
                                 if bucket.minute >= start_minute && bucket.minute <= now / 60 {
                                     aggregate.merge(bucket);
                                     if timeseries {
-                                        points.push(bucket.clone());
+                                        points.entry(bucket.minute).or_default().merge(bucket);
                                     }
                                 }
                             }
                         }
-                        (aggregate, points, inflight)
-                    })
-                    .collect::<Vec<_>>(),
+                    }
+                    snapshots
+                },
                 store.dropped,
+                store
+                    .series
+                    .keys()
+                    .map(|key| key.endpoint.clone())
+                    .collect::<BTreeSet<_>>(),
             ),
-            Err(_) => (vec![(Bucket::default(), Vec::new(), 0); entries.len()], 1),
+            Err(_) => (
+                vec![(Bucket::default(), BTreeMap::new(), 0); entries.len()],
+                1,
+                BTreeSet::new(),
+            ),
         };
         for (mut row, (aggregate, points, inflight)) in entries.into_iter().zip(snapshots) {
             row["stats"] = aggregate.json();
@@ -337,12 +366,7 @@ impl ChannelMetrics {
                 row["points"] = Value::Array(
                     (start_minute..=now / 60)
                         .map(|minute| {
-                            let mut point = points
-                                .iter()
-                                .find(|p| p.minute == minute)
-                                .cloned()
-                                .unwrap_or_default()
-                                .json();
+                            let mut point = points.get(&minute).cloned().unwrap_or_default().json();
                             point["timestamp"] = json!(minute * 60);
                             point["covered"] = json!(minute * 60 >= self.started_at);
                             point
@@ -352,7 +376,7 @@ impl ChannelMetrics {
             }
             output.push(row);
         }
-        json!({"data":output,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":if self.started_at<=start_minute*60 && dropped==0 {"complete_for_instance"} else {"partial"},"dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":3600,"measurement":"attempt_start_to_first_semantic_output","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","request_to_dispatch_measurement":"uni_api_handler_entry_to_upstream_http_send","request_to_dispatch_sample_basis":"dispatch_at","persistence":"memory"})
+        json!({"data":output,"available_endpoints":endpoints,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":if self.started_at<=start_minute*60 && dropped==0 {"complete_for_instance"} else {"partial"},"dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":3600,"measurement":"attempt_start_to_first_semantic_output","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","request_to_dispatch_measurement":"uni_api_handler_entry_to_upstream_http_send","request_to_dispatch_sample_basis":"dispatch_at","persistence":"memory"})
     }
 }
 pub(crate) fn global() -> ChannelMetrics {
@@ -377,4 +401,71 @@ pub(crate) fn parse_window(raw: Option<&str>, default: std::time::Duration) -> s
             std::time::Duration::from_secs(v.saturating_mul(multiplier).min(RETENTION_MINUTES * 60))
         })
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_endpoint_and_stream_filters_merge_histograms_without_double_counting() {
+        let metrics = ChannelMetrics::new();
+        // A large fast population and one slow sample must not average p50 values.
+        for (endpoint, stream, count, elapsed, outcome) in [
+            ("/v1/messages", true, 19, 100., "completed"),
+            ("/v1/messages", false, 1, 5000., "failed"),
+            ("/v1/responses", true, 2, 200., "completed"),
+            ("/v1/responses", false, 3, 300., "completed"),
+        ] {
+            for _ in 0..count {
+                metrics.start("p", "m", "u", endpoint, stream);
+                metrics.observe_dispatch(&MetricKey::new("p", "m", "u", endpoint, stream), elapsed);
+                metrics.finish(
+                    "p",
+                    "m",
+                    "u",
+                    endpoint,
+                    stream,
+                    outcome,
+                    Some(elapsed),
+                    Some(elapsed),
+                );
+            }
+        }
+        metrics.start("other-provider", "m", "u", "/v1/messages", true);
+        metrics.start("p", "other-model", "u", "/v1/messages", true);
+        metrics.start("p", "m", "old-upstream", "/v1/messages", true);
+        for (endpoint, stream, started, success, failed) in [
+            ("all", Value::Null, 25, 24, 1),
+            ("all", json!(true), 21, 21, 0),
+            ("all", json!(false), 4, 3, 1),
+            ("/v1/messages", Value::Null, 20, 19, 1),
+            ("/v1/messages", json!(true), 19, 19, 0),
+            ("/v1/messages", json!(false), 1, 0, 1),
+            ("/v1/chat/completions", Value::Null, 0, 0, 0),
+        ] {
+            let output = metrics.query(vec![json!({"provider":"p","model":"m","upstream_model":"u","endpoint":endpoint,"stream":stream})], "test", 60, true);
+            let row = &output["data"][0];
+            let stats = &row["stats"];
+            assert_eq!(stats["started"], started);
+            assert_eq!(stats["success"], success);
+            assert_eq!(stats["failed"], failed);
+            assert_eq!(stats["request_to_dispatch"]["sample_count"], started);
+            assert_eq!(stats["inflight"], 0);
+            assert_eq!(
+                row["points"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["started"].as_u64().unwrap())
+                    .sum::<u64>(),
+                started
+            );
+            if endpoint == "all" && stream.is_null() {
+                assert_eq!(stats["first_output"]["p50_ms"], 100.);
+                assert_eq!(stats["first_output"]["p95_ms"], 300.);
+                assert_eq!(stats["success_rate"], 24. / 25.);
+            }
+        }
+    }
 }

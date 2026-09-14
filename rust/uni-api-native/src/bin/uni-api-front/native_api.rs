@@ -186,12 +186,19 @@ async fn model_channels_response(
             )
         }
     };
+    let all_streams = query_value(uri, "stream").as_deref() == Some("all");
     let rows: Vec<Value> = rows
         .into_iter()
         .filter(|row| {
             model
                 .as_deref()
                 .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
+        })
+        .map(|mut row| {
+            if all_streams {
+                row["stream"] = Value::Null;
+            }
+            row
         })
         .collect();
     json_response(
@@ -277,12 +284,19 @@ async fn channel_metrics_response_inner(
             )
         }
     };
+    let all_streams = query_value(uri, "stream").as_deref() == Some("all");
     let rows: Vec<Value> = rows
         .into_iter()
         .filter(|row| {
             model
                 .as_deref()
                 .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
+        })
+        .map(|mut row| {
+            if all_streams {
+                row["stream"] = Value::Null;
+            }
+            row
         })
         .collect();
     let mut response = state.channel_metrics.query(
@@ -297,6 +311,7 @@ async fn channel_metrics_response_inner(
         "api_key_config"
     });
     response["statistics_scope"] = json!("channel_all_requests");
+    response["filters"] = json!({"endpoint":endpoint,"stream":if all_streams { "all" } else if stream { "true" } else { "false" }});
     response["api_key_id"] = Value::String(selected_key_id);
     json_response(StatusCode::OK, response)
 }

@@ -38,7 +38,20 @@ class Upstream(BaseHTTPRequestHandler):
             return
         self.server.second_started.set()
         self.server.release_second.wait(8)
-        if self.path.endswith("/responses"):
+        if self.path.endswith("/messages"):
+            response = {"id": "msg_fixture", "type": "message", "role": "assistant", "model": "m",
+                        "content": [{"type": "text", "text": "OK"}], "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}}
+            frames = [
+                {"type": "message_start", "message": {**response, "content": [], "stop_reason": None}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "OK"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+                {"type": "message_stop"},
+            ]
+            stream_body = "".join(f"event: {frame['type']}\ndata: {json.dumps(frame)}\n\n" for frame in frames).encode()
+        elif self.path.endswith("/responses"):
             response = {"id": "resp_fixture", "object": "response", "status": "completed",
                         "model": "m", "output": [{"id": "msg_fixture", "type": "message", "role": "assistant",
                         "status": "completed", "content": [{"type": "output_text", "text": "OK", "annotations": []}]}],
@@ -82,7 +95,7 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
         root = Path(directory)
         config = {"providers": [
             {"provider": name, "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}{endpoint}",
-             "api": "fixture-upstream-key", "model": ["m"], "engine": "gpt",
+             "api": "fixture-upstream-key", "model": ["m"], "engine": "claude" if endpoint == "/v1/messages" else "gpt",
              "preferences": {"cooldown_period": 0, "timeout_policy": {"default": {"first_byte": 0.18 if hedging else 3, "total": 5}}}}
             for name in ["first", "second"]],
             "api_keys": [{"api": "fixture-key", "model": ["first/*", "second/*"], "preferences": {"AUTO_RETRY": True}}],
@@ -135,9 +148,28 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                 conn.close()
                 after = get_json(port, query)
                 assert all(row["stats"]["request_to_dispatch"]["sample_count"] == 1 for row in after["data"])
+                # Completion is recorded by a detached observer after stream EOF.
+                for _ in range(40):
+                    after = get_json(port, query)
+                    if sum(row["stats"]["success"] for row in after["data"]) == 1:
+                        break
+                    time.sleep(0.025)
+                stats = {row["provider"]: row["stats"] for row in after["data"]}
+                assert stats["first"]["started"] == stats["second"]["started"] == 1, stats
+                assert stats["second"]["success"] == 1, stats
+                if not hedging or endpoint == "/v1/chat/completions":
+                    assert stats["first"]["failed"] + stats["first"]["hedge_cancelled"] == 1, stats
+                other = get_json(port, "/v1/channel-metrics?" + urlencode({"endpoint": endpoint, "stream": str(not streaming).lower(), "window": "15m", "model": "m"}))
+                assert all(row["stats"]["started"] == row["stats"]["success"] == row["stats"]["failed"] == 0 for row in other["data"]), other
+                combined = get_json(port, "/v1/channel-metrics?" + urlencode({"endpoint": "all", "stream": "all", "window": "15m", "model": "m"}))
+                assert len(combined["data"]) == 2
+                assert all(row["endpoint"] == "all" and row["stream"] is None for row in combined["data"])
+                assert {row["provider"]: row["stats"] for row in combined["data"]} == stats, combined
                 points = get_json(port, query.replace("/channel-metrics?", "/channel-metrics/timeseries?"))
                 for row in points["data"]:
                     assert sum(point["request_to_dispatch"]["sample_count"] for point in row["points"]) == 1
+                    assert sum(point["started"] for point in row["points"]) == 1
+                    assert sum(point["success"] for point in row["points"]) == stats[row["provider"]]["success"]
                 log.flush()
                 events = [json.loads(line) for line in (root / "log").read_text().splitlines() if line.startswith('{"')]
                 dispatched = [event for event in events if event.get("event") == "channel_dispatch"]
@@ -169,6 +201,8 @@ if __name__ == "__main__":
     parser.add_argument("binary", type=Path)
     binary = parser.parse_args().binary.resolve()
     for endpoint, streaming, hedging, idempotent in [
+        ("/v1/messages", True, False, False),
+        ("/v1/messages", False, False, False),
         ("/v1/responses", True, False, False),
         ("/v1/responses", False, False, False),
         ("/v1/chat/completions", True, False, False),

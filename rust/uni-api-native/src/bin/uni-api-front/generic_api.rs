@@ -458,6 +458,7 @@ struct GenericHedgeContext {
     original_model: String,
     provider_key: String,
     upstream_url: String,
+    downstream_stream: bool,
 }
 
 struct GenericHedgePlan {
@@ -638,6 +639,7 @@ async fn next_generic_hedge_plan(
             &execution.request_model,
             &original_model,
             &execution.path,
+            prepared.downstream_stream,
             &execution.method,
             &prepared.url,
             "started",
@@ -652,6 +654,7 @@ async fn next_generic_hedge_plan(
                 original_model,
                 provider_key: provider_key_raw,
                 upstream_url,
+                downstream_stream: prepared.downstream_stream,
             },
             prepared,
         });
@@ -773,6 +776,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                             &execution.request_model,
                             &context.original_model,
                             &execution.path,
+                            context.downstream_stream,
                             &execution.method,
                             &context.upstream_url,
                             "cancelled",
@@ -838,6 +842,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     &execution.request_model,
                     &context.original_model,
                     &execution.path,
+                    context.downstream_stream,
                     &execution.method,
                     &upstream_url,
                     "completed",
@@ -919,6 +924,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     &execution.request_model,
                     &context.original_model,
                     &execution.path,
+                    context.downstream_stream,
                     &execution.method,
                     &failure.upstream_url,
                     "failed",
@@ -1080,6 +1086,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 format!("{request_id}-r{}", attempt_index + 1),
             )
         });
+        let downstream_stream = prepared.downstream_stream;
         emit_attempt(
             &request_id,
             &trace_id,
@@ -1089,6 +1096,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             &request_model,
             &original_model,
             &path,
+            downstream_stream,
             &method,
             &prepared.url,
             "started",
@@ -1229,6 +1237,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             &outcome_model,
                             &outcome_original_model,
                             &outcome_path,
+                            downstream_stream,
                             &outcome_method,
                             &upstream_url,
                             if outcome.success {
@@ -1264,6 +1273,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &request_model,
                     &original_model,
                     &path,
+                    downstream_stream,
                     &method,
                     &upstream_url,
                     "completed",
@@ -1333,6 +1343,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &request_model,
                     &original_model,
                     &path,
+                    downstream_stream,
                     &method,
                     &failure.upstream_url,
                     "failed",
@@ -6420,6 +6431,7 @@ fn emit_attempt(
     request_model: &str,
     original_model: &str,
     endpoint: &str,
+    downstream_stream: bool,
     method: &Method,
     url: &str,
     outcome: &str,
@@ -6434,6 +6446,7 @@ fn emit_attempt(
         request_model,
         original_model,
         endpoint,
+        downstream_stream,
         method,
         url,
         outcome,
@@ -6452,6 +6465,7 @@ fn emit_attempt_with_first_output(
     request_model: &str,
     original_model: &str,
     endpoint: &str,
+    downstream_stream: bool,
     method: &Method,
     url: &str,
     outcome: &str,
@@ -6466,7 +6480,7 @@ fn emit_attempt_with_first_output(
             request_model,
             upstream_model,
             endpoint,
-            false,
+            downstream_stream,
         );
     } else {
         metrics.finish(
@@ -6474,7 +6488,7 @@ fn emit_attempt_with_first_output(
             request_model,
             upstream_model,
             endpoint,
-            false,
+            downstream_stream,
             outcome,
             None,
             first_output_ms,
@@ -6505,6 +6519,7 @@ fn emit_attempt_with_first_output(
             "request_id": request_id,
             "trace_id": trace_id,
             "path": endpoint,
+            "streaming": downstream_stream,
             "path_template": endpoint,
             "route": format!("{} {endpoint}", method.as_str()),
             "method": method.as_str(),
