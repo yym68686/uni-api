@@ -109,7 +109,7 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
     let amz = chrono_timestamp(secs);
     let body = batch
         .iter()
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?
         .join("\n")
@@ -121,7 +121,7 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
         secs / 86400,
         c.instance,
         secs,
-        hex_sha(&body)[..16].to_string()
+        &hex_sha(&body)[..16]
     );
     let url = format!("{}/{}/{}", c.endpoint, c.bucket, key);
     let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
