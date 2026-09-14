@@ -11,6 +11,7 @@ const DEFAULT_WRITE_QUEUE: usize = 4096;
 
 #[derive(Clone)]
 pub struct Persistence {
+    fact_writer: Option<crate::facts_s3::FactWriter>,
     backend: Arc<Backend>,
     writer: Option<mpsc::Sender<WriteEvent>>,
 }
@@ -61,10 +62,12 @@ impl Persistence {
     pub async fn initialize(disabled: bool) -> Result<Self, String> {
         if disabled {
             return Ok(Self {
+                fact_writer: crate::facts_s3::global(),
                 backend: Arc::new(Backend::Disabled),
                 writer: None,
             });
         }
+        let fact_writer = crate::facts_s3::global();
         let backend = match std::env::var("DB_TYPE")
             .unwrap_or_else(|_| "sqlite".into())
             .trim()
@@ -123,6 +126,7 @@ impl Persistence {
         let (writer, receiver) = mpsc::channel(queue_capacity);
         spawn_writer(backend.clone(), receiver);
         Ok(Self {
+            fact_writer,
             backend,
             writer: Some(writer),
         })
@@ -133,32 +137,25 @@ impl Persistence {
     }
 
     pub fn record_request(&self, stat: RequestStat) {
+        if let Some(writer) = &self.fact_writer {
+            writer.enqueue(crate::facts_s3::request_event(&stat));
+        }
         let Some(writer) = &self.writer else {
             return;
         };
         if writer.try_send(WriteEvent::Request(stat)).is_err() {
-            eprintln!(
-                "{}",
-                json!({
-                    "event_type": "rust_persistence_write_dropped",
-                    "record_type": "request_stat",
-                })
-            );
+            eprintln!("rust_persistence_write_dropped record_type=request_stat");
         }
     }
-
     pub fn record_channel(&self, stat: ChannelStat) {
+        if let Some(writer) = &self.fact_writer {
+            writer.enqueue(crate::facts_s3::attempt_event(&stat));
+        }
         let Some(writer) = &self.writer else {
             return;
         };
         if writer.try_send(WriteEvent::Channel(stat)).is_err() {
-            eprintln!(
-                "{}",
-                json!({
-                    "event_type": "rust_persistence_write_dropped",
-                    "record_type": "channel_stat",
-                })
-            );
+            eprintln!("rust_persistence_write_dropped record_type=channel_stat");
         }
     }
 
