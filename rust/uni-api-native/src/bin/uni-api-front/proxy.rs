@@ -137,7 +137,10 @@ impl AppState {
     }
 }
 
-pub async fn handler(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn handler(State(state): State<AppState>, mut request: Request) -> Response<Body> {
+    request
+        .extensions_mut()
+        .insert(crate::request_timing::RequestArrival::now());
     let cors = crate::cors::CorsRequest::from_headers(request.headers());
     if let Some(response) = cors.preflight_response(request.method(), request.headers()) {
         return response;

@@ -77,6 +77,7 @@ enum DownstreamProtocol {
 }
 
 struct PreparedAttempt {
+    dispatch: Option<crate::request_timing::AttemptDispatch>,
     method: Method,
     url: String,
     headers: HeaderMap,
@@ -182,6 +183,10 @@ pub fn known_path(path: &str) -> bool {
 
 pub async fn handle(state: AppState, request: Request, resource_wait: Duration) -> Response<Body> {
     let started = Instant::now();
+    let arrival = request
+        .extensions()
+        .get::<crate::request_timing::RequestArrival>()
+        .copied();
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path().trim_end_matches('/').to_owned();
@@ -310,6 +315,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let execution = AttemptLoop {
         state,
         started,
+        arrival,
         method,
         uri,
         path,
@@ -342,6 +348,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
 struct AttemptLoop {
     state: AppState,
     started: Instant,
+    arrival: Option<crate::request_timing::RequestArrival>,
     method: Method,
     uri: Uri,
     path: String,
@@ -609,6 +616,19 @@ async fn next_generic_hedge_plan(
             }
         }
         let attempt_started = Instant::now();
+        prepared.dispatch = execution.arrival.map(|arrival| {
+            arrival.attempt(
+                crate::channel_metrics::MetricKey::new(
+                    provider.name.as_ref(),
+                    &execution.request_model,
+                    &original_model,
+                    &execution.path,
+                    prepared.downstream_stream,
+                ),
+                execution.request_id.clone(),
+                attempt_id,
+            )
+        });
         emit_attempt(
             &execution.request_id,
             &execution.trace_id,
@@ -946,6 +966,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let AttemptLoop {
         state,
         started,
+        arrival,
         method,
         uri,
         path,
@@ -1046,6 +1067,19 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
         }
         let attempt_started = Instant::now();
+        prepared.dispatch = arrival.map(|arrival| {
+            arrival.attempt(
+                crate::channel_metrics::MetricKey::new(
+                    provider.name.as_ref(),
+                    &request_model,
+                    &original_model,
+                    &path,
+                    prepared.downstream_stream,
+                ),
+                request_id.clone(),
+                format!("{request_id}-r{}", attempt_index + 1),
+            )
+        });
         emit_attempt(
             &request_id,
             &trace_id,
@@ -2138,6 +2172,7 @@ fn build_attempt(
             AttemptBody::Replay(storage.clone_for_replay(), observation.clone())
         };
         return Ok(PreparedAttempt {
+            dispatch: None,
             method: method.clone(),
             url,
             headers,
@@ -2476,6 +2511,7 @@ fn build_attempt(
         AttemptBody::Json(body)
     };
     Ok(PreparedAttempt {
+        dispatch: None,
         method: outgoing_method,
         url,
         headers,
@@ -2956,6 +2992,9 @@ async fn send_attempt(
         }
         AttemptBody::Empty => request,
     };
+    if let Some(dispatch) = &prepared.dispatch {
+        dispatch.record(&state.channel_metrics);
+    }
     let response = if let Some(trigger) = hedge_trigger {
         let started = tokio::time::Instant::now();
         let hard_timeout = [timeouts.write, timeouts.pool, timeouts.total]

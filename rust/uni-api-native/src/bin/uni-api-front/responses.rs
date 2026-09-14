@@ -39,6 +39,8 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Sen
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Plan {
+    #[serde(skip)]
+    pub(crate) dispatch: Option<crate::request_timing::AttemptDispatch>,
     pub(crate) attempt_id: String,
     pub(crate) url: String,
     pub(crate) headers: HashMap<String, String>,
@@ -636,6 +638,9 @@ async fn send_native_nonstream_attempt(
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.record(&state.channel_metrics);
+    }
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, request.send())
             .await
@@ -820,6 +825,9 @@ async fn preflight_attempt_with_trigger(
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.record(&state.channel_metrics);
+    }
     let mut request_future = Box::pin(request.send());
     let mut hedge_triggered = false;
     let response = if let Some(trigger) = trigger {
@@ -3260,6 +3268,7 @@ mod tests {
 
     fn test_active(engine: &str) -> ActiveAttempt {
         let plan = Plan {
+            dispatch: None,
             attempt_id: "attempt-1".into(),
             url: "http://provider.example/v1/responses".into(),
             headers: HashMap::new(),

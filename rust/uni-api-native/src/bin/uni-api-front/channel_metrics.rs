@@ -127,6 +127,7 @@ struct Bucket {
     cancelled_unknown: u64,
     skipped: u64,
     first_output: Distribution,
+    request_to_dispatch: Distribution,
     first_text: Distribution,
     duration: Distribution,
     last_success: Option<u64>,
@@ -142,6 +143,7 @@ impl Bucket {
         self.cancelled_unknown += other.cancelled_unknown;
         self.skipped += other.skipped;
         self.first_output.merge(&other.first_output);
+        self.request_to_dispatch.merge(&other.request_to_dispatch);
         self.first_text.merge(&other.first_text);
         self.duration.merge(&other.duration);
         self.last_success = self.last_success.max(other.last_success);
@@ -149,7 +151,7 @@ impl Bucket {
     }
     fn json(&self) -> Value {
         let denominator = self.success + self.failed;
-        json!({"started":self.started,"success":self.success,"failed":self.failed,"client_cancelled":self.client_cancelled,"hedge_cancelled":self.hedge_cancelled,"cancelled_unknown":self.cancelled_unknown,"skipped":self.skipped,"success_rate_denominator":denominator,"success_rate":(denominator>0).then(||self.success as f64/denominator as f64),"first_output":self.first_output.json(),"first_text":self.first_text.json(),"duration":self.duration.json(),"last_success_at":self.last_success,"last_failure_at":self.last_failure,"quality":if denominator == 0 {"no_samples"} else if denominator < 10 {"low_samples"} else {"sufficient"}})
+        json!({"started":self.started,"success":self.success,"failed":self.failed,"client_cancelled":self.client_cancelled,"hedge_cancelled":self.hedge_cancelled,"cancelled_unknown":self.cancelled_unknown,"skipped":self.skipped,"success_rate_denominator":denominator,"success_rate":(denominator>0).then(||self.success as f64/denominator as f64),"request_to_dispatch":self.request_to_dispatch.json(),"first_output":self.first_output.json(),"first_text":self.first_text.json(),"duration":self.duration.json(),"last_success_at":self.last_success,"last_failure_at":self.last_failure,"quality":if denominator == 0 {"no_samples"} else if denominator < 10 {"low_samples"} else {"sufficient"}})
     }
 }
 #[derive(Debug, Default)]
@@ -234,6 +236,18 @@ impl ChannelMetrics {
         self.mutate(&key, |s, now| {
             s.bucket(now / 60).started += 1;
             s.inflight += 1;
+        });
+    }
+
+    pub(crate) fn observe_dispatch(&self, key: &MetricKey, elapsed_ms: f64) {
+        if !elapsed_ms.is_finite() || elapsed_ms < 0. {
+            return;
+        }
+        self.mutate(key, |series, now| {
+            series
+                .bucket(now / 60)
+                .request_to_dispatch
+                .observe(now, elapsed_ms);
         });
     }
     #[allow(clippy::too_many_arguments)]
@@ -338,7 +352,7 @@ impl ChannelMetrics {
             }
             output.push(row);
         }
-        json!({"data":output,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":if self.started_at<=start_minute*60 && dropped==0 {"complete_for_instance"} else {"partial"},"dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":3600,"measurement":"attempt_start_to_first_semantic_output","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","persistence":"memory"})
+        json!({"data":output,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":if self.started_at<=start_minute*60 && dropped==0 {"complete_for_instance"} else {"partial"},"dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":3600,"measurement":"attempt_start_to_first_semantic_output","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","request_to_dispatch_measurement":"uni_api_handler_entry_to_upstream_http_send","request_to_dispatch_sample_basis":"dispatch_at","persistence":"memory"})
     }
 }
 pub(crate) fn global() -> ChannelMetrics {

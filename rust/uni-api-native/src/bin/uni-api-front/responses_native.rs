@@ -284,6 +284,7 @@ pub struct NativeRoute {
     upstream_duration_ms: u64,
     routing_ledger: Vec<Value>,
     upstream_ledger: Vec<Value>,
+    arrival: Option<crate::request_timing::RequestArrival>,
     started_at: tokio::time::Instant,
     final_emitted: bool,
     _memory_reservation: MemoryReservation,
@@ -1422,6 +1423,19 @@ impl NativeRoute {
                 self.stream,
             );
             return Ok(Some(Plan {
+                dispatch: self.arrival.map(|arrival| {
+                    arrival.attempt(
+                        crate::channel_metrics::MetricKey::new(
+                            provider.name.as_ref(),
+                            &self.request_model,
+                            original_model.as_str(),
+                            &self.endpoint,
+                            self.stream,
+                        ),
+                        self.request_id.clone(),
+                        attempt_id.clone(),
+                    )
+                }),
                 attempt_id,
                 url: normalize_upstream_url(&provider.base_url, &engine, self.wants_compact),
                 headers,
@@ -2380,6 +2394,10 @@ pub async fn prepare_native_request(
         upstream_duration_ms: 0,
         routing_ledger: Vec::new(),
         upstream_ledger: Vec::new(),
+        arrival: parts
+            .extensions
+            .get::<crate::request_timing::RequestArrival>()
+            .copied(),
         started_at: tokio::time::Instant::now(),
         final_emitted: false,
         _memory_reservation: memory_reservation,
@@ -4047,6 +4065,7 @@ mod tests {
             upstream_duration_ms: 0,
             routing_ledger: Vec::new(),
             upstream_ledger: Vec::new(),
+            arrival: Some(crate::request_timing::RequestArrival::now()),
             started_at: tokio::time::Instant::now(),
             final_emitted: false,
             _memory_reservation: memory_reservation,

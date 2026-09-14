@@ -20,3 +20,7 @@ jobs:
           cargo fmt --check --manifest-path rust/uni-api-native/Cargo.toml
           cargo clippy --manifest-path rust/uni-api-native/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path rust/uni-api-native/Cargo.toml --locked
+      - name: Verify arrival-to-dispatch timing with isolated upstreams
+        run: |
+          cargo build --manifest-path rust/uni-api-native/Cargo.toml --locked
+          python3 scripts/verify_dispatch_timing.py rust/uni-api-native/target/debug/uni-api-front

@@ -13,6 +13,7 @@ mod provider_stream;
 mod proxy;
 mod request_decompression;
 mod request_spool;
+mod request_timing;
 mod resources;
 mod responses;
 mod responses_item_ids;
