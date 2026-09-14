@@ -39,6 +39,7 @@ pub struct AppState {
     pub config_publisher: RuntimeConfigPublisher,
     pub native_responses_config: NativeConfigStore,
     pub codex_oauth: CodexOAuthManager,
+    pub(crate) channel_metrics: crate::channel_metrics::ChannelMetrics,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -77,6 +78,7 @@ impl AppState {
             config_publisher,
             native_responses_config: NativeConfigStore::new(),
             codex_oauth: CodexOAuthManager::new(),
+            channel_metrics: crate::channel_metrics::global(),
         })
     }
 

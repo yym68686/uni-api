@@ -1122,6 +1122,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 success: false,
                                 status_code: 502,
                                 detail: "provider stream outcome was canceled".into(),
+                                first_output_ms: None,
                             }
                         });
                         let mut request_stat = request_stat;
@@ -1135,6 +1136,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             "upstream_ms": attempt_started.elapsed().as_millis(),
                             "terminal": if outcome.success { "stream_completed" } else { "stream_failed" },
                             "status_code": outcome.status_code,
+                            "first_output_ms": outcome.first_output_ms,
                         })
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
@@ -6383,6 +6385,28 @@ fn emit_attempt(
     outcome: &str,
     status: Option<u16>,
 ) {
+    let metrics = crate::channel_metrics::global();
+    let upstream_model = original_model;
+    if outcome == "started" {
+        metrics.start(
+            provider.name.as_ref(),
+            request_model,
+            upstream_model,
+            endpoint,
+            false,
+        );
+    } else {
+        metrics.finish(
+            provider.name.as_ref(),
+            request_model,
+            upstream_model,
+            endpoint,
+            false,
+            outcome,
+            None,
+            None,
+        );
+    }
     let upstream_host = Url::parse(url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))

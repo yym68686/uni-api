@@ -46,6 +46,15 @@ pub async fn handle(
             ))
         }
         (&Method::GET, "/v1/models") => Some(models_response(state, uri, headers).await),
+        (&Method::GET, "/v1/model-channels") => {
+            Some(model_channels_response(state, uri, headers).await)
+        }
+        (&Method::GET, "/v1/channel-metrics") => {
+            Some(channel_metrics_response(state, uri, headers).await)
+        }
+        (&Method::GET, "/v1/channel-metrics/timeseries") => {
+            Some(channel_metrics_timeseries_response(state, uri, headers).await)
+        }
         (&Method::GET, "/v1/generate-api-key") => {
             if let Err(error) = state.native_responses_config.authorize(headers).await {
                 Some(json_error(error.status, &error.message))
@@ -98,6 +107,108 @@ pub async fn handle(
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
     }
     response
+}
+
+async fn model_channels_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let model = query_value(uri, "model");
+    let endpoint = query_value(uri, "endpoint").unwrap_or_else(|| "/v1/responses".into());
+    let stream = query_value(uri, "stream")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let (rows, revision) = match state
+        .native_responses_config
+        .channel_catalog(headers, &endpoint, stream)
+        .await
+    {
+        Ok(v) => v,
+        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .filter(|row| {
+            model
+                .as_deref()
+                .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({"data":rows,"snapshot_revision":revision,"generated_at":unix_seconds()}),
+    )
+}
+
+async fn channel_metrics_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    channel_metrics_response_inner(state, uri, headers, false).await
+}
+
+async fn channel_metrics_response_inner(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    timeseries: bool,
+) -> Response<Body> {
+    let endpoint = query_value(uri, "endpoint").unwrap_or_else(|| "/v1/responses".into());
+    let stream = query_value(uri, "stream")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let model = query_value(uri, "model");
+    let window = crate::channel_metrics::parse_window(
+        query_value(uri, "window").as_deref(),
+        std::time::Duration::from_secs(900),
+    );
+    let (rows, revision) = match state
+        .native_responses_config
+        .channel_catalog(headers, &endpoint, stream)
+        .await
+    {
+        Ok(v) => v,
+        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .filter(|row| {
+            model
+                .as_deref()
+                .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        state.channel_metrics.query(
+            rows,
+            &revision,
+            (window.as_secs().saturating_add(59) / 60).clamp(1, 60),
+            timeseries,
+        ),
+    )
+}
+
+async fn channel_metrics_timeseries_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    channel_metrics_response_inner(state, uri, headers, true).await
 }
 
 pub fn supports_mutation(method: &Method, path: &str) -> bool {
@@ -392,6 +503,9 @@ fn openapi_document() -> Value {
         ("post", "/v1/responses/compact"),
         ("post", "/v1/messages"),
         ("get", "/v1/models"),
+        ("get", "/v1/model-channels"),
+        ("get", "/v1/channel-metrics"),
+        ("get", "/v1/channel-metrics/timeseries"),
         ("post", "/v1/images/generations"),
         ("post", "/v1/images/edits"),
         ("post", "/v1/embeddings"),

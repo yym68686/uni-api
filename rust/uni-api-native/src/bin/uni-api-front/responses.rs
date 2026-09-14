@@ -139,6 +139,8 @@ struct StreamStats {
     normalized_events: u64,
     usage: Option<Value>,
     wire_hash: Option<Sha256>,
+    started_at: tokio::time::Instant,
+    first_output_ms: Option<f64>,
 }
 
 impl StreamStats {
@@ -158,6 +160,8 @@ impl StreamStats {
             normalized_events: 0,
             usage: None,
             wire_hash: sampled.then(Sha256::new),
+            started_at: tokio::time::Instant::now(),
+            first_output_ms: None,
         }
     }
 
@@ -178,6 +182,7 @@ impl StreamStats {
             "wire_sha256": hash,
             "wire_hash_sampled": self.wire_hash.is_some(),
             "stream_mode": self.stream_mode,
+            "first_output_ms": self.first_output_ms,
         })
     }
 
@@ -976,6 +981,10 @@ fn process_preflight_frames(
     let semantic_guard = precommit_semantic_guard(&active.plan);
     for frame in frames {
         let processed = active.processor.process(frame, &mut active.stats)?;
+        if processed.commits && active.stats.first_output_ms.is_none() {
+            active.stats.first_output_ms =
+                Some(active.stats.started_at.elapsed().as_secs_f64() * 1000.0);
+        }
         if let Some(Terminal::SemanticFailure {
             event_type,
             payload,
@@ -2280,6 +2289,10 @@ async fn process_active_frames(
                 return ActiveFrameResult::Done(false);
             }
         };
+        if processed.commits && active.stats.first_output_ms.is_none() {
+            active.stats.first_output_ms =
+                Some(active.stats.started_at.elapsed().as_secs_f64() * 1000.0);
+        }
         if let Some(Terminal::SemanticFailure {
             event_type,
             payload,

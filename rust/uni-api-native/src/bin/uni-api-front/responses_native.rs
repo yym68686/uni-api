@@ -591,6 +591,77 @@ impl NativeConfigStore {
         )
     }
 
+    pub(crate) async fn channel_catalog(
+        &self,
+        headers: &HeaderMap,
+        endpoint: &str,
+        stream: bool,
+    ) -> Result<(Vec<Value>, String), u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let mut models = BTreeSet::new();
+        for rule in api_key.model_rules.iter() {
+            if rule == "all" {
+                models.extend(
+                    snapshot
+                        .providers
+                        .iter()
+                        .flat_map(|p| p.models.keys().cloned()),
+                );
+            } else if let Some((provider, model)) = rule.split_once('/') {
+                if let Some(p) = snapshot.providers_by_name.get(provider) {
+                    if model == "*" {
+                        models.extend(p.models.keys().cloned());
+                    } else {
+                        models.insert(model.to_owned());
+                    }
+                }
+            } else if rule.starts_with('<') && rule.ends_with('>') {
+                models.insert(rule[1..rule.len() - 1].to_owned());
+            } else {
+                models.insert(rule.clone());
+            }
+        }
+        let mut rows = Vec::new();
+        for model in models {
+            for provider in snapshot
+                .providers
+                .iter()
+                .filter(|p| p.models.contains_key(&model))
+            {
+                if provider
+                    .excluded_endpoints
+                    .iter()
+                    .any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint))
+                {
+                    continue;
+                }
+                let upstream = provider
+                    .models
+                    .get(&model)
+                    .cloned()
+                    .unwrap_or_else(|| model.clone());
+                let route_cooling = self
+                    .channel_cooldowns
+                    .lock()
+                    .await
+                    .get(&(provider.name.to_string(), upstream.clone()))
+                    .is_some_and(|until| *until > tokio::time::Instant::now());
+                let (eligible, reason) =
+                    if provider.api_keys.is_empty() && provider.client_email.is_none() {
+                        (false, "no_provider_key")
+                    } else if route_cooling {
+                        (false, "channel_cooldown")
+                    } else {
+                        (true, "eligible")
+                    };
+                rows.push(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}));
+            }
+        }
+        Ok((rows, snapshot.revision.to_string()))
+    }
+
     pub(crate) async fn prices_for_model(&self, model: &str) -> (f64, f64) {
         self.snapshot()
             .await
@@ -1528,6 +1599,33 @@ impl NativeRoute {
 
     fn emit_routing_attempt(&mut self, event: RoutingAttemptEvent<'_>) {
         let status = event.status.unwrap_or_default();
+        let metrics = crate::channel_metrics::global();
+        let upstream_model = event
+            .provider
+            .models
+            .get(event.original_model)
+            .map(String::as_str)
+            .unwrap_or(event.original_model);
+        if event.outcome == "started" {
+            metrics.start(
+                event.provider.name.as_ref(),
+                self.request_model.as_str(),
+                upstream_model,
+                self.endpoint.as_str(),
+                self.stream,
+            );
+        } else if event.outcome == "skipped" {
+            metrics.finish(
+                event.provider.name.as_ref(),
+                self.request_model.as_str(),
+                upstream_model,
+                self.endpoint.as_str(),
+                self.stream,
+                "skipped",
+                None,
+                None,
+            );
+        }
         if self.routing_ledger.len() < 64 {
             self.routing_ledger.push(json!({
                 "attempt_id": event.attempt_id,
@@ -1593,6 +1691,16 @@ impl NativeRoute {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
+        crate::channel_metrics::global().finish(
+            &attempt.provider,
+            &attempt.request_model,
+            &attempt.actual_model,
+            &self.endpoint,
+            attempt.stream,
+            if success { "success" } else { "failed" },
+            Some(duration_ms as f64),
+            None,
+        );
         self.upstream_duration_ms = self.upstream_duration_ms.saturating_add(duration_ms);
         let attempt_outcome = outcome
             .get("kind")

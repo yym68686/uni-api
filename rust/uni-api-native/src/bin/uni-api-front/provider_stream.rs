@@ -39,12 +39,13 @@ pub struct Translation {
     pub outcome: oneshot::Receiver<StreamOutcome>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StreamOutcome {
     pub usage: (i64, i64, i64),
     pub success: bool,
     pub status_code: u16,
     pub detail: String,
+    pub first_output_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,6 +277,7 @@ fn spawn_translation(
                     success: false,
                     status_code: 502,
                     detail: error,
+                    first_output_ms: None,
                 }
             }
         };
@@ -720,10 +722,41 @@ async fn process_json_bytes(
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
     let chunks = state.convert(protocol, &value);
+    if state.first_output_ms.is_none() && semantic_output_value(protocol, &value) {
+        state.first_output_ms = Some(state.started_at.elapsed().as_secs_f64() * 1000.0);
+    }
     for chunk in chunks {
         send_wire(tx, &chunk, state.output_protocol).await?;
     }
     Ok(())
+}
+
+fn semantic_output_value(protocol: Protocol, value: &Value) -> bool {
+    if protocol == Protocol::Responses {
+        return responses_event_has_real_output(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            value,
+        );
+    }
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|c| {
+                c.pointer("/delta/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+                    || c.pointer("/delta/reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                    || c.pointer("/delta/tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|v| !v.is_empty())
+            })
+        })
 }
 
 async fn drain_aws_frames(
@@ -826,6 +859,8 @@ struct StreamState {
     output_protocol: OutputProtocol,
     include_usage: bool,
     responses: ResponsesOutputState,
+    started_at: tokio::time::Instant,
+    first_output_ms: Option<f64>,
 }
 
 impl StreamState {
@@ -849,6 +884,8 @@ impl StreamState {
             output_protocol,
             include_usage,
             responses: ResponsesOutputState::new(model, created),
+            started_at: tokio::time::Instant::now(),
+            first_output_ms: None,
         }
     }
 
@@ -1327,12 +1364,14 @@ impl StreamState {
                 success: false,
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
+                first_output_ms: self.first_output_ms,
             },
             None => StreamOutcome {
                 usage: self.usage(),
                 success: true,
                 status_code: 200,
                 detail: String::new(),
+                first_output_ms: self.first_output_ms,
             },
         }
     }
