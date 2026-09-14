@@ -5,6 +5,7 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -25,6 +26,7 @@ struct UploadConfig {
     secret: String,
     token: Option<String>,
     instance: String,
+    spool: PathBuf,
 }
 #[derive(Clone)]
 pub struct FactWriter {
@@ -61,7 +63,18 @@ impl FactWriter {
             token: std::env::var("FACTS_S3_SESSION_TOKEN").ok(),
             instance: std::env::var("INSTANCE_ID")
                 .unwrap_or_else(|_| format!("uni-api-{}", std::process::id())),
+            spool: PathBuf::from(
+                std::env::var("FACTS_S3_SPOOL_DIR").unwrap_or_else(|_| "./data/facts-spool".into()),
+            ),
         };
+        if std::fs::create_dir_all(&config.spool).is_err() {
+            eprintln!("facts_s3_init_failed reason=spool_unavailable");
+            return None;
+        }
+        let retry_config = config.clone();
+        tokio::spawn(async move {
+            retry_spool(retry_config).await;
+        });
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(BATCH_SIZE);
             loop {
@@ -82,6 +95,7 @@ impl FactWriter {
                     }
                 }
                 if let Err(error) = upload_batch_with_retry(&config, &batch).await {
+                    persist_failed_batch(&config, &batch).await;
                     eprintln!(
                         "{{\"event_type\":\"facts_s3_upload_error\",\"error\":{:?}}}",
                         error
@@ -116,7 +130,9 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
         .join("\n")
         + "\n";
     let hash = hex_sha(&body);
-    let nonce = format!("{}-{}", now.as_nanos(), &hex_sha(&body)[..16]);
+    // Content-addressed object names make retries idempotent even if a response
+    // is lost after R2 has committed the object.
+    let nonce = hex_sha(&body);
     let key = format!(
         "{}/{}/{}/batch-{}-{}.jsonl",
         c.prefix.trim_matches('/'),
@@ -175,6 +191,64 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
         return Err(format!("S3 fact upload HTTP {}", resp.status()));
     }
     Ok(())
+}
+
+async fn persist_failed_batch(c: &UploadConfig, batch: &[Value]) {
+    let body = match batch
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(lines) => lines.join("\n") + "\n",
+        Err(_) => return,
+    };
+    let name = format!("{}.jsonl", hex_sha(&body));
+    let pending = c.spool.join(format!("{}.pending", name));
+    let target = c.spool.join(name);
+    if tokio::fs::write(&pending, body.as_bytes()).await.is_ok() {
+        let _ = tokio::fs::rename(pending, target).await;
+    }
+}
+
+async fn retry_spool(c: UploadConfig) {
+    loop {
+        if let Ok(mut entries) = tokio::fs::read_dir(&c.spool).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(body) = tokio::fs::read_to_string(&path).await else {
+                    continue;
+                };
+                let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
+                    continue;
+                };
+                let key = format!(
+                    "{}/{}/{}/batch-{}.jsonl",
+                    c.prefix.trim_matches('/'),
+                    now_ms() as u64 / 1000 / 86400,
+                    c.instance,
+                    name
+                );
+                if upload_body(&c, &key, &body).await.is_ok() {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+async fn upload_body(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
+    let batch: Vec<Value> = body
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if batch.is_empty() {
+        return Ok(());
+    }
+    upload_batch(c, &batch).await
 }
 
 async fn upload_batch_with_retry(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
