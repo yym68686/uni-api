@@ -2513,8 +2513,10 @@ fn matching_providers(
         &mut matches,
         &mut std::collections::BTreeSet::new(),
     );
-    matches.sort_by(|a, b| a.name.cmp(&b.name));
-    matches.dedup_by(|a, b| a.name == b.name);
+    // First occurrence defines priority, including nested key and wildcard rules.
+    // Sorting to deduplicate silently changes fixed_priority into name order.
+    let mut seen = BTreeSet::new();
+    matches.retain(|provider| seen.insert(provider.name.clone()));
     matches.retain(|provider| {
         !provider.excluded_endpoints.iter().any(|excluded| {
             excluded
@@ -4159,6 +4161,51 @@ mod tests {
                 )
             })
             .collect()
+    }
+    #[tokio::test]
+    async fn fixed_priority_preserves_key_graph_order_when_deduplicating_matches() {
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        for (token, model, endpoint, expected) in [
+            (
+                "restricted",
+                "shared",
+                "/v1/messages",
+                vec!["m-third", "a-second"],
+            ),
+            (
+                "parent",
+                "shared",
+                "/v1/messages",
+                vec!["m-third", "a-second"],
+            ),
+            ("parent", "extra", "/v1/messages", vec!["z-first"]),
+            (
+                "mixed",
+                "shared",
+                "/v1/responses",
+                vec!["z-first", "a-second", "m-third"],
+            ),
+            (
+                "admin-key",
+                "shared",
+                "/v1/messages",
+                vec!["z-first", "a-second", "m-third", "excluded"],
+            ),
+        ] {
+            let key = snapshot.api_keys.get(token).unwrap();
+            let matched =
+                matching_providers(&snapshot, key, model, 0, None, None, endpoint).unwrap();
+            let scheduled = store.schedule_providers(key, model, matched).await;
+            assert_eq!(
+                scheduled
+                    .iter()
+                    .map(|p| p.name.as_ref())
+                    .collect::<Vec<_>>(),
+                expected,
+                "key={token} model={model}"
+            );
+        }
     }
     #[tokio::test]
     async fn catalog_default_keeps_provider_order_and_does_not_change_routing_state() {

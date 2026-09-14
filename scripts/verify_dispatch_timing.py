@@ -93,12 +93,15 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
     request_id = f"fixture-{endpoint.split('/')[-1]}-{streaming}-{hedging}-{idempotent}"
     with tempfile.TemporaryDirectory(prefix="uni-dispatch-") as directory:
         root = Path(directory)
+        # Names intentionally oppose lexical order; nested key rules must retain priority.
         config = {"providers": [
-            {"provider": name, "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}{endpoint}",
+            {"provider": name, "base_url": f"http://127.0.0.1:{upstream.server_port}/{path}{endpoint}",
              "api": "fixture-upstream-key", "model": ["m"], "engine": "claude" if endpoint == "/v1/messages" else "gpt",
              "preferences": {"cooldown_period": 0, "timeout_policy": {"default": {"first_byte": 0.18 if hedging else 3, "total": 5}}}}
-            for name in ["first", "second"]],
-            "api_keys": [{"api": "fixture-key", "model": ["first/*", "second/*"], "preferences": {"AUTO_RETRY": True}}],
+            for name, path in [("z-first", "first"), ("a-second", "second")]],
+            "api_keys": [
+                {"api": "fixture-key", "model": ["fixture-child/*", "z-first/*"], "preferences": {"AUTO_RETRY": True}},
+                {"api": "fixture-child", "model": ["z-first/*", "a-second/*", "z-first/*"]}],
             "preferences": {"hedging": {"enabled": hedging, "max_inflight_attempts": 2}}}
         config_file = root / "api.json"
         config_file.write_text(json.dumps(config))
@@ -135,8 +138,8 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                 query = "/v1/channel-metrics?" + urlencode({"endpoint": endpoint, "stream": str(streaming).lower(), "window": "15m", "model": "m"})
                 data = get_json(port, query)
                 timings = {row["provider"]: row["stats"]["request_to_dispatch"] for row in data["data"]}
-                assert set(timings) == {"first", "second"}
-                first, second = timings["first"], timings["second"]
+                assert set(timings) == {"z-first", "a-second"}
+                first, second = timings["z-first"], timings["a-second"]
                 assert first["sample_count"] == second["sample_count"] == 1, timings
                 assert first["last_ms"] >= 200, timings
                 assert second["last_ms"] - first["last_ms"] >= (130 if hedging else 400), timings
@@ -155,10 +158,10 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                         break
                     time.sleep(0.025)
                 stats = {row["provider"]: row["stats"] for row in after["data"]}
-                assert stats["first"]["started"] == stats["second"]["started"] == 1, stats
-                assert stats["second"]["success"] == 1, stats
+                assert stats["z-first"]["started"] == stats["a-second"]["started"] == 1, stats
+                assert stats["a-second"]["success"] == 1, stats
                 if not hedging or endpoint == "/v1/chat/completions":
-                    assert stats["first"]["failed"] + stats["first"]["hedge_cancelled"] == 1, stats
+                    assert stats["z-first"]["failed"] + stats["z-first"]["hedge_cancelled"] == 1, stats
                 other = get_json(port, "/v1/channel-metrics?" + urlencode({"endpoint": endpoint, "stream": str(not streaming).lower(), "window": "15m", "model": "m"}))
                 assert all(row["stats"]["started"] == row["stats"]["success"] == row["stats"]["failed"] == 0 for row in other["data"]), other
                 combined = get_json(port, "/v1/channel-metrics?" + urlencode({"endpoint": "all", "stream": "all", "window": "15m", "model": "m"}))
