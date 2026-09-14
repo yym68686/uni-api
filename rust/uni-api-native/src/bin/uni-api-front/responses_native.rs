@@ -1406,6 +1406,13 @@ impl NativeRoute {
             self.last_attempt = Some(observation.clone());
             self.attempt_contexts
                 .insert(attempt_id.clone(), observation);
+            crate::channel_metrics::global().start(
+                provider.name.as_ref(),
+                self.request_model.as_str(),
+                original_model.as_str(),
+                self.endpoint.as_str(),
+                self.stream,
+            );
             return Ok(Some(Plan {
                 attempt_id,
                 url: normalize_upstream_url(&provider.base_url, &engine, self.wants_compact),
