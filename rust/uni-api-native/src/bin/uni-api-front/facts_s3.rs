@@ -312,6 +312,15 @@ pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
     json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}-{}-{}",s.request_id,s.provider,s.model,at),"at_ms":at,"request_id":s.request_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":false,"outcome":if s.success{"success"}else{"failed"}})
 }
+
+pub fn dispatch_event(
+    key: &crate::channel_metrics::MetricKey,
+    request_id: &str,
+    attempt_id: &str,
+    elapsed_ms: f64,
+) -> Value {
+    json!({"schema":1,"kind":"dispatch","event_id":format!("dispatch-{}-{}",request_id,attempt_id),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
+}
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
