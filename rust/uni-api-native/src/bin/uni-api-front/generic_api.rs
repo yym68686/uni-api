@@ -1186,7 +1186,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             policy.status
                         };
                         outcome_state.persistence.record_request(request_stat);
-                        emit_attempt(
+                        emit_attempt_with_first_output(
                             &outcome_request_id,
                             &outcome_trace_id,
                             &outcome_role,
@@ -1203,6 +1203,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 "failed"
                             },
                             Some(recorded_status),
+                            outcome.first_output_ms,
                         );
                     });
                     return response;
@@ -6385,6 +6386,39 @@ fn emit_attempt(
     outcome: &str,
     status: Option<u16>,
 ) {
+    emit_attempt_with_first_output(
+        request_id,
+        trace_id,
+        role,
+        attempt_index,
+        provider,
+        request_model,
+        original_model,
+        endpoint,
+        method,
+        url,
+        outcome,
+        status,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_attempt_with_first_output(
+    request_id: &str,
+    trace_id: &str,
+    role: &str,
+    attempt_index: usize,
+    provider: &Provider,
+    request_model: &str,
+    original_model: &str,
+    endpoint: &str,
+    method: &Method,
+    url: &str,
+    outcome: &str,
+    status: Option<u16>,
+    first_output_ms: Option<f64>,
+) {
     let metrics = crate::channel_metrics::global();
     let upstream_model = original_model;
     if outcome == "started" {
@@ -6404,7 +6438,7 @@ fn emit_attempt(
             false,
             outcome,
             None,
-            None,
+            first_output_ms,
         );
     }
     let upstream_host = Url::parse(url)

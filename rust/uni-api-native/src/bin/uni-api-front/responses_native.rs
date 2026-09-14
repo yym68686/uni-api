@@ -1706,7 +1706,7 @@ impl NativeRoute {
             attempt.stream,
             if success { "success" } else { "failed" },
             Some(duration_ms as f64),
-            None,
+            outcome.get("first_output_ms").and_then(Value::as_f64),
         );
         self.upstream_duration_ms = self.upstream_duration_ms.saturating_add(duration_ms);
         let attempt_outcome = outcome
