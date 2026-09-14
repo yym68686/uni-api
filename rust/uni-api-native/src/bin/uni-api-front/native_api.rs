@@ -19,6 +19,37 @@ pub async fn handle(
 ) -> Option<Response<Body>> {
     let path = request_path.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
+    if *method == Method::GET
+        && matches!(
+            path,
+            "/v1/observability/runtime"
+                | "/v1/api-keys"
+                | "/v1/model-channels"
+                | "/v1/channel-metrics"
+                | "/v1/channel-metrics/timeseries"
+                | "/v1/stats"
+                | "/v1/token_usage"
+                | "/v1/channel_key_rankings"
+                | "/v1/api_keys_states"
+                | "/v1/api_config"
+                | "/v1/generate-api-key"
+        )
+    {
+        if let Err(status) = state
+            .native_responses_config
+            .authorize_catalog(headers)
+            .await
+        {
+            return Some(json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                if status == 503 {
+                    "Runtime configuration is not ready"
+                } else {
+                    "Platform API requires the first configured key or an admin key"
+                },
+            ));
+        }
+    }
     let mut response = match (method, path) {
         (&Method::GET, "/healthz") => Some(json_response(
             StatusCode::OK,
@@ -49,6 +80,7 @@ pub async fn handle(
         (&Method::GET, "/v1/model-channels") => {
             Some(model_channels_response(state, uri, headers).await)
         }
+        (&Method::GET, "/v1/api-keys") => Some(api_keys_response(state, headers).await),
         (&Method::GET, "/v1/channel-metrics") => {
             Some(channel_metrics_response(state, uri, headers).await)
         }
@@ -101,6 +133,11 @@ pub async fn handle(
         _ => None,
     };
     if let Some(response) = response.as_mut() {
+        if path.starts_with("/v1/") {
+            response
+                .headers_mut()
+                .insert("cache-control", HeaderValue::from_static("no-store"));
+        }
         insert_request_id(response.headers_mut(), headers);
         response
             .headers_mut()
@@ -119,13 +156,25 @@ async fn model_channels_response(
     let stream = query_value(uri, "stream")
         .map(|v| v != "false")
         .unwrap_or(true);
-    let (rows, revision) = match state
+    let selected_key = query_value(uri, "api_key_id");
+    let (rows, revision, selected_key_id) = match state
         .native_responses_config
-        .channel_catalog(headers, &endpoint, stream)
+        .channel_catalog(headers, &endpoint, stream, selected_key.as_deref())
         .await
     {
         Ok(v) => v,
-        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(403) => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "Invalid API key or catalog access denied",
+            )
+        }
+        Err(404) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Selected API key no longer exists; refresh the key list",
+            )
+        }
         Err(_) => {
             return json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -143,7 +192,7 @@ async fn model_channels_response(
         .collect();
     json_response(
         StatusCode::OK,
-        json!({"data":rows,"snapshot_revision":revision,"generated_at":unix_seconds()}),
+        json!({"data":rows,"snapshot_revision":revision,"order":if selected_key_id.is_empty() { "provider_config" } else { "api_key_config" },"api_key_id":selected_key_id,"generated_at":unix_seconds()}),
     )
 }
 
@@ -170,13 +219,25 @@ async fn channel_metrics_response_inner(
         query_value(uri, "window").as_deref(),
         std::time::Duration::from_secs(900),
     );
-    let (rows, revision) = match state
+    let selected_key = query_value(uri, "api_key_id");
+    let (rows, revision, selected_key_id) = match state
         .native_responses_config
-        .channel_catalog(headers, &endpoint, stream)
+        .channel_catalog(headers, &endpoint, stream, selected_key.as_deref())
         .await
     {
         Ok(v) => v,
-        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(403) => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "Invalid API key or catalog access denied",
+            )
+        }
+        Err(404) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Selected API key no longer exists; refresh the key list",
+            )
+        }
         Err(_) => {
             return json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -192,15 +253,31 @@ async fn channel_metrics_response_inner(
                 .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
         })
         .collect();
-    json_response(
-        StatusCode::OK,
-        state.channel_metrics.query(
-            rows,
-            &revision,
-            (window.as_secs().saturating_add(59) / 60).clamp(1, 60),
-            timeseries,
+    let mut response = state.channel_metrics.query(
+        rows,
+        &revision,
+        (window.as_secs().saturating_add(59) / 60).clamp(1, 60),
+        timeseries,
+    );
+    response["order"] = json!(if selected_key_id.is_empty() {
+        "provider_config"
+    } else {
+        "api_key_config"
+    });
+    response["statistics_scope"] = json!("channel_all_requests");
+    response["api_key_id"] = Value::String(selected_key_id);
+    json_response(StatusCode::OK, response)
+}
+
+async fn api_keys_response(state: &AppState, headers: &HeaderMap) -> Response<Body> {
+    match state.native_responses_config.api_key_catalog(headers).await {
+        Ok(data) => json_response(StatusCode::OK, data),
+        Err(403) => json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Runtime configuration is not ready",
         ),
-    )
+    }
 }
 
 async fn channel_metrics_timeseries_response(
@@ -504,6 +581,7 @@ fn openapi_document() -> Value {
         ("post", "/v1/messages"),
         ("get", "/v1/models"),
         ("get", "/v1/model-channels"),
+        ("get", "/v1/api-keys"),
         ("get", "/v1/channel-metrics"),
         ("get", "/v1/channel-metrics/timeseries"),
         ("post", "/v1/images/generations"),

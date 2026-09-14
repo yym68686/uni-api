@@ -1,3 +1,4 @@
+mod channel_catalog;
 mod channel_metrics;
 mod codex_oauth;
 mod config;

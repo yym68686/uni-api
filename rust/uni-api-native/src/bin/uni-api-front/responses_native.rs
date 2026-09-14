@@ -125,6 +125,7 @@ pub(crate) struct Snapshot {
     pub(crate) revision: Arc<str>,
     pub(crate) preferences: Arc<Map<String, Value>>,
     pub(crate) api_keys: Arc<HashMap<String, Arc<ApiKey>>>,
+    pub(crate) api_key_order: Arc<Vec<String>>,
     pub(crate) providers: Arc<Vec<Arc<Provider>>>,
     pub(crate) providers_by_name: Arc<HashMap<String, Arc<Provider>>>,
     pub(crate) api_config: Arc<Value>,
@@ -433,6 +434,12 @@ impl NativeConfigStore {
         }
         drop(cursors);
 
+        let api_key_order = raw
+            .api_keys
+            .iter()
+            .map(|item| item.token.trim().to_owned())
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
         let api_keys = raw
             .api_keys
             .into_iter()
@@ -464,6 +471,7 @@ impl NativeConfigStore {
             revision: raw.revision.into(),
             preferences: Arc::new(raw.preferences),
             api_keys: Arc::new(api_keys),
+            api_key_order: Arc::new(api_key_order),
             providers: Arc::new(providers),
             providers_by_name: Arc::new(providers_by_name),
             api_config: Arc::new(raw.api_config),
@@ -596,70 +604,49 @@ impl NativeConfigStore {
         headers: &HeaderMap,
         endpoint: &str,
         stream: bool,
-    ) -> Result<(Vec<Value>, String), u16> {
+        selected_key_id: Option<&str>,
+    ) -> Result<(Vec<Value>, String, String), u16> {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let snapshot = self.snapshot().await.ok_or(503u16)?;
-        let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
-        let mut models = BTreeSet::new();
-        for rule in api_key.model_rules.iter() {
-            if rule == "all" {
-                models.extend(
-                    snapshot
-                        .providers
-                        .iter()
-                        .flat_map(|p| p.models.keys().cloned()),
-                );
-            } else if let Some((provider, model)) = rule.split_once('/') {
-                if let Some(p) = snapshot.providers_by_name.get(provider) {
-                    if model == "*" {
-                        models.extend(p.models.keys().cloned());
-                    } else {
-                        models.insert(model.to_owned());
-                    }
-                }
-            } else if rule.starts_with('<') && rule.ends_with('>') {
-                models.insert(rule[1..rule.len() - 1].to_owned());
-            } else {
-                models.insert(rule.clone());
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let selected_id = selected_key_id.unwrap_or_default();
+        let entries = crate::channel_catalog::entries(&snapshot, caller, Some(selected_id))?;
+        let cooldowns = self.channel_cooldowns.lock().await.clone();
+        let now = tokio::time::Instant::now();
+        let rows = entries.into_iter().filter_map(|(provider, model)| {
+            if provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
+                return None;
             }
+            let upstream = provider.models.get(&model)?;
+            let route_cooling = cooldowns.get(&(provider.name.to_string(), upstream.clone())).is_some_and(|until| *until > now);
+            let (eligible, reason) = if provider.api_keys.is_empty() && provider.client_email.is_none() {
+                (false, "no_provider_key")
+            } else if route_cooling { (false, "channel_cooldown") } else { (true, "eligible") };
+            Some(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}))
+        }).collect();
+        Ok((rows, snapshot.revision.to_string(), selected_id.to_owned()))
+    }
+
+    pub(crate) async fn authorize_catalog(&self, headers: &HeaderMap) -> Result<(), u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        if !crate::channel_catalog::can_inspect_all(&snapshot, caller) {
+            return Err(403);
         }
-        let mut rows = Vec::new();
-        for model in models {
-            for provider in snapshot
-                .providers
-                .iter()
-                .filter(|p| p.models.contains_key(&model))
-            {
-                if provider
-                    .excluded_endpoints
-                    .iter()
-                    .any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint))
-                {
-                    continue;
-                }
-                let upstream = provider
-                    .models
-                    .get(&model)
-                    .cloned()
-                    .unwrap_or_else(|| model.clone());
-                let route_cooling = self
-                    .channel_cooldowns
-                    .lock()
-                    .await
-                    .get(&(provider.name.to_string(), upstream.clone()))
-                    .is_some_and(|until| *until > tokio::time::Instant::now());
-                let (eligible, reason) =
-                    if provider.api_keys.is_empty() && provider.client_email.is_none() {
-                        (false, "no_provider_key")
-                    } else if route_cooling {
-                        (false, "channel_cooldown")
-                    } else {
-                        (true, "eligible")
-                    };
-                rows.push(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}));
-            }
+        Ok(())
+    }
+
+    pub(crate) async fn api_key_catalog(&self, headers: &HeaderMap) -> Result<Value, u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        if !crate::channel_catalog::can_inspect_all(&snapshot, caller) {
+            return Err(403);
         }
-        Ok((rows, snapshot.revision.to_string()))
+        Ok(
+            json!({"data":crate::channel_catalog::keys(&snapshot, caller),"snapshot_revision":snapshot.revision.as_ref(),"can_inspect_all":true}),
+        )
     }
 
     pub(crate) async fn prices_for_model(&self, model: &str) -> (f64, f64) {
@@ -3982,6 +3969,7 @@ mod tests {
             revision: Arc::from("0".repeat(64)),
             preferences: Arc::new(Map::new()),
             api_keys: Arc::new(HashMap::new()),
+            api_key_order: Arc::new(Vec::new()),
             providers: Arc::new(vec![provider.clone()]),
             providers_by_name: Arc::new(HashMap::from([(
                 provider.name.to_string(),
@@ -4041,6 +4029,251 @@ mod tests {
             started_at: tokio::time::Instant::now(),
             final_emitted: false,
             _memory_reservation: memory_reservation,
+        }
+    }
+
+    async fn catalog_fixture() -> NativeConfigStore {
+        let store = NativeConfigStore::new();
+        let mut providers = Vec::new();
+        for name in ["z-first", "a-second", "m-third", "excluded"] {
+            let mut p = provider();
+            p.name = name.into();
+            p.models = Arc::new(HashMap::from([
+                ("shared".into(), "actual-shared".into()),
+                ("extra".into(), "actual-extra".into()),
+                ("vendor/model".into(), "actual-slash".into()),
+            ]));
+            if name == "excluded" {
+                p.excluded_endpoints = Arc::new(vec!["/v1/responses".into()]);
+            }
+            providers.push(Arc::new(p));
+        }
+        let mut keys = HashMap::new();
+        for (token, role, rules) in [
+            ("dashboard-first", "user", vec!["z-first/shared"]),
+            (
+                "restricted",
+                "user",
+                vec!["m-third/shared", "a-second/*", "m-third/shared"],
+            ),
+            ("parent", "user", vec!["restricted/shared", "z-first/extra"]),
+            (
+                "mixed",
+                "user",
+                vec!["m-third/extra", "shared", "<vendor/model>", "z-first/*"],
+            ),
+            ("admin-key", "admin", vec!["all"]),
+        ] {
+            keys.insert(
+                token.to_owned(),
+                Arc::new(ApiKey {
+                    token: token.into(),
+                    model_rules: Arc::new(vec!["all".into()]),
+                    role: role.into(),
+                    preferences: Arc::new(Map::from_iter([("__route_graph".into(), json!(rules))])),
+                    weights: Arc::new(Map::new()),
+                    native_supported: true,
+                }),
+            );
+        }
+        *store.current.write().await = Some(Arc::new(Snapshot {
+            revision: "0".repeat(64).into(),
+            preferences: Arc::new(Map::new()),
+            api_keys: Arc::new(keys),
+            api_key_order: Arc::new(
+                [
+                    "dashboard-first",
+                    "restricted",
+                    "parent",
+                    "mixed",
+                    "admin-key",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            ),
+            providers_by_name: Arc::new(
+                providers
+                    .iter()
+                    .map(|p| (p.name.to_string(), p.clone()))
+                    .collect(),
+            ),
+            providers: Arc::new(providers),
+            api_config: Arc::new(json!({})),
+        }));
+        store
+    }
+    fn catalog_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+    fn catalog_pairs(rows: &[Value]) -> Vec<(&str, &str)> {
+        rows.iter()
+            .map(|r| {
+                (
+                    r["provider"].as_str().unwrap(),
+                    r["model"].as_str().unwrap(),
+                )
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn catalog_default_keeps_provider_order_and_does_not_change_routing_state() {
+        let store = catalog_fixture().await;
+        let headers = catalog_headers("dashboard-first");
+        let (rows, _, selection) = store
+            .channel_catalog(&headers, "/v1/responses", true, None)
+            .await
+            .unwrap();
+        assert!(selection.is_empty());
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("z-first", "extra"),
+                ("z-first", "shared"),
+                ("z-first", "vendor/model"),
+                ("a-second", "extra"),
+                ("a-second", "shared"),
+                ("a-second", "vendor/model"),
+                ("m-third", "extra"),
+                ("m-third", "shared"),
+                ("m-third", "vendor/model"),
+            ]
+        );
+        assert!(store.client_windows.lock().await.is_empty());
+        assert!(store.provider_windows.lock().await.is_empty());
+        assert!(store.routing_cursors.lock().await.is_empty());
+        for p in store.snapshot().await.unwrap().providers.iter() {
+            assert_eq!(p.cursor.load(Ordering::Relaxed), 0);
+        }
+    }
+    #[tokio::test]
+    async fn catalog_selected_key_preserves_rules_filters_and_nested_model_restriction() {
+        let store = catalog_fixture().await;
+        let headers = catalog_headers("dashboard-first");
+        let id = crate::channel_catalog::key_id("restricted");
+        let (rows, _, selected) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(id, selected);
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("m-third", "shared"),
+                ("a-second", "extra"),
+                ("a-second", "shared"),
+                ("a-second", "vendor/model")
+            ]
+        );
+        let id = crate::channel_catalog::key_id("parent");
+        let (rows, _, _) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("m-third", "shared"),
+                ("a-second", "shared"),
+                ("z-first", "extra")
+            ]
+        );
+        let id = crate::channel_catalog::key_id("mixed");
+        let (rows, _, _) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("m-third", "extra"),
+                ("z-first", "shared"),
+                ("a-second", "shared"),
+                ("m-third", "shared"),
+                ("z-first", "vendor/model"),
+                ("a-second", "vendor/model"),
+                ("m-third", "vendor/model"),
+                ("z-first", "extra"),
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn catalog_key_selection_is_redacted_and_cannot_escalate_access() {
+        let store = catalog_fixture().await;
+        for token in ["restricted", "parent", "mixed", "invalid"] {
+            let headers = catalog_headers(token);
+            assert_eq!(store.api_key_catalog(&headers).await.unwrap_err(), 403);
+            assert_eq!(store.authorize_catalog(&headers).await.unwrap_err(), 403);
+            for selected in [
+                None,
+                Some(crate::channel_catalog::key_id(token)),
+                Some(crate::channel_catalog::key_id("dashboard-first")),
+            ] {
+                assert_eq!(
+                    store
+                        .channel_catalog(&headers, "/v1/responses", true, selected.as_deref())
+                        .await
+                        .unwrap_err(),
+                    403
+                );
+            }
+            if token != "invalid" {
+                assert!(store.models_for_headers(&headers).await.is_ok());
+            }
+        }
+        for token in ["dashboard-first", "admin-key"] {
+            let headers = catalog_headers(token);
+            let listing = store.api_key_catalog(&headers).await.unwrap();
+            assert_eq!(listing["data"].as_array().unwrap().len(), 5);
+            assert_eq!(listing["can_inspect_all"], true);
+            assert!(!listing.to_string().contains("restricted"));
+            assert!(store.authorize_catalog(&headers).await.is_ok());
+            assert_eq!(
+                store
+                    .channel_catalog(&headers, "/v1/responses", true, Some("stale-id"))
+                    .await
+                    .unwrap_err(),
+                404
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_metrics_keep_selected_order_and_channel_wide_statistics() {
+        let store = catalog_fixture().await;
+        let headers = catalog_headers("dashboard-first");
+        let id = crate::channel_catalog::key_id("parent");
+        let (rows, revision, _) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        let metrics = crate::channel_metrics::ChannelMetrics::new();
+        metrics.start("m-third", "shared", "actual-shared", "/v1/responses", true);
+        metrics.finish(
+            "m-third",
+            "shared",
+            "actual-shared",
+            "/v1/responses",
+            true,
+            "success",
+            Some(1000.),
+            Some(200.),
+        );
+        for timeseries in [false, true] {
+            let response = metrics.query(rows.clone(), &revision, 15, timeseries);
+            assert_eq!(
+                catalog_pairs(response["data"].as_array().unwrap()),
+                catalog_pairs(&rows)
+            );
+            assert_eq!(response["data"][0]["stats"]["success"], 1);
+            assert_eq!(
+                response["data"][0]["stats"]["first_output"]["last_ms"],
+                200.
+            );
         }
     }
 
@@ -4122,6 +4355,7 @@ mod tests {
                 ),
             ])),
             api_keys: Arc::new(HashMap::new()),
+            api_key_order: Arc::new(Vec::new()),
             providers: Arc::new(Vec::new()),
             providers_by_name: Arc::new(HashMap::new()),
             api_config: Arc::new(json!({})),
@@ -4206,6 +4440,7 @@ mod tests {
                 revision: Arc::from("0".repeat(64)),
                 preferences: Arc::new(global),
                 api_keys: Arc::new(HashMap::new()),
+                api_key_order: Arc::new(Vec::new()),
                 providers: Arc::new(Vec::new()),
                 providers_by_name: Arc::new(HashMap::new()),
                 api_config: Arc::new(json!({})),
