@@ -61,7 +61,7 @@ jobs:
           sed -i 's/^version = .*/version = "'$NEW_VERSION'"/' rust/uni-api-native/Cargo.toml
           # Keep the lockfile package metadata in sync with the release bump;
           # Docker builds intentionally use --locked.
-          cargo update --workspace
+          cargo update --manifest-path rust/uni-api-native/Cargo.toml --workspace
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
