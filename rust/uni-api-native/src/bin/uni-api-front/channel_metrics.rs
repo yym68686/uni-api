@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const RETENTION_MINUTES: u64 = 60;
+// Historical channel statistics are served by the S3/DuckDB analytics API.
+// Keep only the current minute here for live gauges; this process must not
+// become a second history store.
+const RETENTION_MINUTES: u64 = 1;
 const MAX_SERIES: usize = 1024;
 const BOUNDS: [f64; 30] = [
     1.,
@@ -295,7 +298,8 @@ impl ChannelMetrics {
         timeseries: bool,
     ) -> Value {
         let now = self.now();
-        let start_minute = (now / 60).saturating_sub(minutes - 1);
+        let effective_minutes = minutes.min(1);
+        let start_minute = (now / 60).saturating_sub(effective_minutes - 1);
         let mut output = Vec::new();
         let (snapshots, dropped, endpoints) = match self.inner.lock() {
             Ok(store) => (
@@ -376,7 +380,7 @@ impl ChannelMetrics {
             }
             output.push(row);
         }
-        json!({"data":output,"available_endpoints":endpoints,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":if self.started_at<=start_minute*60 && dropped==0 {"complete_for_instance"} else {"partial"},"dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":3600,"measurement":"attempt_start_to_first_semantic_output","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","request_to_dispatch_measurement":"uni_api_handler_entry_to_upstream_http_send","request_to_dispatch_sample_basis":"dispatch_at","persistence":"memory"})
+        json!({"data":output,"available_endpoints":endpoints,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":effective_minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":"live_only","dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":60,"measurement":"live_attempt_gauge","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","request_to_dispatch_measurement":"uni_api_handler_entry_to_upstream_http_send","request_to_dispatch_sample_basis":"dispatch_at","persistence":"live_gauge"})
     }
 }
 pub(crate) fn global() -> ChannelMetrics {
