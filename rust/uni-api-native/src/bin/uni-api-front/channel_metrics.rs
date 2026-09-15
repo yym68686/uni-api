@@ -378,6 +378,16 @@ impl ChannelMetrics {
         }
         json!({"data":output,"available_endpoints":endpoints,"scope":"instance","instance_id":self.instance_id.as_ref(),"collection_started_at":self.started_at,"generated_at":now,"from":start_minute*60,"to":now,"window_minutes":minutes,"bucket_seconds":60,"snapshot_revision":revision,"coverage":if self.started_at<=start_minute*60 && dropped==0 {"complete_for_instance"} else {"partial"},"dropped":dropped,"max_series":MAX_SERIES,"retention_seconds":3600,"measurement":"attempt_start_to_first_semantic_output","timing_sample_basis":"first_observed_at","success_sample_basis":"terminal_at","request_to_dispatch_measurement":"uni_api_handler_entry_to_upstream_http_send","request_to_dispatch_sample_basis":"dispatch_at","persistence":"memory"})
     }
+
+    pub(crate) fn live_snapshot(&self) -> Vec<Value> {
+        let Ok(store) = self.inner.lock() else {
+            return Vec::new();
+        };
+        store.series.iter().map(|(key, series)| json!({
+            "provider": key.provider, "model": key.model, "upstream_model": key.upstream_model,
+            "endpoint": key.endpoint, "stream": key.stream, "inflight": series.inflight
+        })).collect()
+    }
 }
 pub(crate) fn global() -> ChannelMetrics {
     static INSTANCE: OnceLock<ChannelMetrics> = OnceLock::new();
