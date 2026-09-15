@@ -1943,6 +1943,8 @@ impl NativeRoute {
             api_key: self.api_key.token.to_string(),
             provider_api_key: provider_key.clone(),
             success,
+            endpoint: self.endpoint.clone(),
+            stream: self.stream,
         });
     }
 }

@@ -310,7 +310,7 @@ pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
-    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}-{}-{}",s.request_id,s.provider,s.model,at),"at_ms":at,"request_id":s.request_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":false,"outcome":if s.success{"success"}else{"failed"}})
+    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}-{}-{}",s.request_id,s.provider,s.model,at),"at_ms":at,"request_id":s.request_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
 }
 
 pub fn dispatch_event(

@@ -800,6 +800,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
                     success: true,
+                    endpoint: execution.path.clone(),
+                    stream: context.downstream_stream,
                 });
                 execution
                     .state
@@ -888,6 +890,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
                     success: false,
+                    endpoint: execution.path.clone(),
+                    stream: context.downstream_stream,
                 });
                 if !policy.request_scoped || policy.force_quota_cooldown {
                     execution
@@ -1188,6 +1192,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             api_key: outcome_api_key,
                             provider_api_key: outcome_provider_key.clone(),
                             success: outcome.success,
+                            endpoint: outcome_path.clone(),
+                            stream: downstream_stream,
                         });
                         let recorded_status = if outcome.success {
                             outcome_state
@@ -1258,6 +1264,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
                     success: true,
+                    endpoint: path.clone(),
+                    stream: downstream_stream,
                 });
                 state
                     .native_responses_config
@@ -1312,6 +1320,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
                     success: false,
+                    endpoint: path.clone(),
+                    stream: downstream_stream,
                 });
                 if !policy.request_scoped || policy.force_quota_cooldown {
                     state

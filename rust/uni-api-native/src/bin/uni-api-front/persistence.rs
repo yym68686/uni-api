@@ -51,6 +51,8 @@ pub struct ChannelStat {
     pub api_key: String,
     pub provider_api_key: String,
     pub success: bool,
+    pub endpoint: String,
+    pub stream: bool,
 }
 
 enum WriteEvent {
