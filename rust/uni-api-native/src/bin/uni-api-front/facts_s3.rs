@@ -154,7 +154,7 @@ async fn upload_body(c: &UploadConfig, key: &str, body: &str) -> Result<(), Stri
     let secs = now.as_secs();
     let date = chrono_date(secs);
     let amz = chrono_timestamp(secs);
-    let hash = hex_sha(&body);
+    let hash = hex_sha(body);
     let url = format!("{}/{}/{}", c.endpoint, c.bucket, key);
     let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
     let host = parsed.host_str().ok_or("S3 endpoint host missing")?;
