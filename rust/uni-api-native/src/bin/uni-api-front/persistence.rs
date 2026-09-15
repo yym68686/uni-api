@@ -46,6 +46,7 @@ pub struct RequestStat {
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStat {
     pub request_id: String,
+    pub attempt_id: String,
     pub provider: String,
     pub model: String,
     pub api_key: String,

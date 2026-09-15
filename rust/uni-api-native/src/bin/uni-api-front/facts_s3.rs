@@ -317,11 +317,16 @@ pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
     let stream = s.timing_spans.contains("\\\"stream\\\":true")
         || s.timing_spans.contains("\\\"streaming\\\":true");
     let at = now_ms();
-    json!({"schema":1,"kind":"request","event_id":format!("request-{}-{}",s.request_id,at),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":s.prompt_tokens,"output_tokens":s.completion_tokens})
+    json!({"schema":1,"kind":"request","event_id":format!("request-{}",s.request_id),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":s.prompt_tokens,"output_tokens":s.completion_tokens})
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
-    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}-{}-{}",s.request_id,s.provider,s.model,at),"at_ms":at,"request_id":s.request_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
+    let attempt_id = if s.attempt_id.is_empty() {
+        format!("{}-unknown", s.request_id)
+    } else {
+        s.attempt_id.clone()
+    };
+    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}",attempt_id),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
 }
 
 pub fn dispatch_event(
@@ -343,6 +348,30 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::{ChannelStat, RequestStat};
+
+    #[test]
+    fn request_and_attempt_event_ids_are_stable_and_carry_attempt_identity() {
+        let request = RequestStat {
+            request_id: "req-1".into(),
+            ..RequestStat::default()
+        };
+        let first = request_event(&request);
+        let second = request_event(&request);
+        assert_eq!(first["event_id"], "request-req-1");
+        assert_eq!(first["event_id"], second["event_id"]);
+
+        let attempt = ChannelStat {
+            request_id: "req-1".into(),
+            attempt_id: "req-1-r2".into(),
+            provider: "provider".into(),
+            model: "model".into(),
+            ..ChannelStat::default()
+        };
+        let event = attempt_event(&attempt);
+        assert_eq!(event["event_id"], "attempt-req-1-r2");
+        assert_eq!(event["attempt_id"], "req-1-r2");
+    }
 
     #[tokio::test]
     async fn batch_wait_coalesces_facts_that_arrive_after_the_first() {

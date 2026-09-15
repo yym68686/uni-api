@@ -1938,6 +1938,11 @@ impl NativeRoute {
         };
         self.persistence.record_channel(ChannelStat {
             request_id: self.request_id.clone(),
+            attempt_id: self
+                .last_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.clone())
+                .unwrap_or_default(),
             provider: provider.name.to_string(),
             model: self.request_model.clone(),
             api_key: self.api_key.token.to_string(),

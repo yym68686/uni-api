@@ -795,6 +795,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                 debug_assert!(stream_outcome.is_none());
                 execution.state.persistence.record_channel(ChannelStat {
                     request_id: execution.request_id.clone(),
+                    attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
                     api_key: execution.api_key.clone(),
@@ -885,6 +886,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                 }
                 execution.state.persistence.record_channel(ChannelStat {
                     request_id: execution.request_id.clone(),
+                    attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
                     api_key: execution.api_key.clone(),
@@ -1187,6 +1189,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
                             request_id: outcome_request_id.clone(),
+                            attempt_id: format!("{}-r{}", outcome_request_id, attempt_index + 1),
                             provider: outcome_provider.name.to_string(),
                             model: outcome_model.clone(),
                             api_key: outcome_api_key,
@@ -1259,6 +1262,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 }
                 state.persistence.record_channel(ChannelStat {
                     request_id: request_id.clone(),
+                    attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
                     model: request_model.clone(),
                     api_key: api_key.clone(),
@@ -1315,6 +1319,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 }
                 state.persistence.record_channel(ChannelStat {
                     request_id: request_id.clone(),
+                    attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
                     model: request_model.clone(),
                     api_key: api_key.clone(),
