@@ -357,7 +357,7 @@ mod tests {
             ..RequestStat::default()
         };
         let first = request_event(&request);
-        let second = request_event(&request);
+        let _second = request_event(&request);
         assert!(first["event_id"]
             .as_str()
             .unwrap()
