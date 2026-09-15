@@ -33,12 +33,20 @@ share a wallet.
 - `subscription`: subscription remaining allowance; `unlimited` represents the
   sub2api `-1` sentinel. Missing data stays null and is not displayed as zero.
 
+The optional `start_date`, `end_date` and `model` query parameters are forwarded
+to the upstream usage endpoint. Successful responses include
+`actual_cost_usd`, `actual_cost_samples` and `actual_cost_source` when sub2api
+provides them. This is the provider's own recorded deduction (`actual_cost`),
+so a wallet top-up is not mistaken for consumption. Without `model`, all model
+rows for the selected key are summed; with `model`, only that model is summed.
+This is a calendar-day aggregate. Callers must not display it as an exact
+rolling 5-minute, 15-minute or 1-hour value.
+
 Queries use an isolated HTTP client, at most three global upstream requests at
 once, six-second request timeouts and a 256 KiB response cap. Results and failures
-are cached for five minutes per URL/credential/proxy; concurrent requests for the
-same tuple are coalesced. The cache is bounded to 512 entries. Optional sub2api
-usage queries are restricted to one day. Cache timestamps are included; data is
-volatile and requires no database.
+are cached for five minutes per URL/credential/proxy/date/model tuple; concurrent
+requests for the same tuple are coalesced. The cache is bounded to 512 entries.
+Cache timestamps are included; data is volatile and requires no database.
 
 The frontend fetches balances independently after rendering channel metrics,
 queries each distinct displayed provider once per refresh and shows unsupported,

@@ -32,7 +32,7 @@ fn now() -> u64 {
 
 // Derive only a sibling endpoint on the configured service; never follow a
 // redirect or accept arbitrary destination URLs from platform API callers.
-fn usage_url(base: &str) -> Option<Url> {
+fn usage_url(base: &str, start_date: &str, end_date: &str) -> Option<Url> {
     let mut url = Url::parse(base).ok()?;
     if url.scheme() != "https"
         || !url.username().is_empty()
@@ -60,13 +60,12 @@ fn usage_url(base: &str) -> Option<Url> {
     };
     let path = format!("{prefix}/v1/usage");
     url.set_path(&path);
-    // Sub2api otherwise also computes 30 days of per-model usage. Balance
-    // inspection only needs the current state; constrain optional usage data.
-    let date = utc_date(now());
+    // Ask sub2api for the requested calendar-day range. The response contains
+    // provider-reported actual_cost values that are independent of wallet
+    // balance changes (including top-ups).
     url.query_pairs_mut()
-        .append_pair("days", "1")
-        .append_pair("start_date", &date)
-        .append_pair("end_date", &date);
+        .append_pair("start_date", start_date)
+        .append_pair("end_date", end_date);
     Some(url)
 }
 
@@ -85,11 +84,26 @@ fn utc_date(seconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+pub(crate) fn today_utc() -> String {
+    utc_date(now())
+}
+
+pub(crate) fn valid_date(value: &str) -> bool {
+    value.len() == 10
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 4 | 7) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+}
+
 fn number(value: &Value) -> Option<f64> {
     value.as_f64().filter(|v| v.is_finite())
 }
 
-fn normalize(value: &Value) -> Option<Value> {
+fn normalize(value: &Value, model: Option<&str>) -> Option<Value> {
     if !matches!(
         value["mode"].as_str(),
         Some("unrestricted" | "quota_limited")
@@ -131,10 +145,38 @@ fn normalize(value: &Value) -> Option<Value> {
     } else {
         ("subscription", None, false)
     };
-    Some(
-        json!({"status":"ok","source":"sub2api","kind":kind,"amount":amount,
-        "currency":currency,"unlimited":unlimited,"windows":windows,"key_valid":value["isValid"]}),
-    )
+    let mut result = json!({"status":"ok","source":"sub2api","kind":kind,"amount":amount,
+        "currency":currency,"unlimited":unlimited,"windows":windows,"key_valid":value["isValid"]});
+
+    // Sub2API exposes actual deductions in usage.total and per-model usage in
+    // model_stats. Keep the selected model dimension here so the dashboard can
+    // compare its token estimate with the upstream's own charge.
+    let model_stats = value["model_stats"].as_array();
+    let matching = model_stats.map(|stats| {
+        stats
+            .iter()
+            .filter(|row| model.is_none_or(|wanted| row["model"].as_str() == Some(wanted)))
+            .collect::<Vec<_>>()
+    });
+    if let Some(rows) = matching {
+        let mut actual = 0.0;
+        let mut samples = 0_u64;
+        for row in rows {
+            if let Some(cost) = number(&row["actual_cost"]) {
+                actual += cost;
+                samples = samples.saturating_add(row["requests"].as_u64().unwrap_or(0));
+            }
+        }
+        result["actual_cost_usd"] = json!(actual);
+        result["actual_cost_samples"] = json!(samples);
+        result["actual_cost_source"] = json!("sub2api_usage");
+    } else if let Some(cost) = number(&value["usage"]["total"]["actual_cost"]) {
+        result["actual_cost_usd"] = json!(cost);
+        result["actual_cost_samples"] =
+            json!(value["usage"]["total"]["requests"].as_u64().unwrap_or(0));
+        result["actual_cost_source"] = json!("sub2api_usage");
+    }
+    Some(result)
 }
 
 fn failure(status: &str) -> Value {
@@ -149,8 +191,15 @@ impl Balances {
         }
     }
 
-    async fn get(&self, url: &Url, credential: &str, proxy: Option<&str>) -> Value {
-        let identity = serde_json::to_vec(&(url.as_str(), credential, proxy)).unwrap_or_default();
+    async fn get(
+        &self,
+        url: &Url,
+        credential: &str,
+        proxy: Option<&str>,
+        model: Option<&str>,
+    ) -> Value {
+        let identity =
+            serde_json::to_vec(&(url.as_str(), credential, proxy, model)).unwrap_or_default();
         let id = format!("{:x}", Sha256::digest(identity));
         let slot = {
             let mut cache = self.cache.lock().await;
@@ -179,7 +228,7 @@ impl Balances {
         else {
             return failure("busy");
         };
-        let mut value = fetch(url, credential, proxy).await;
+        let mut value = fetch(url, credential, proxy, model).await;
         value["checked_at"] = json!(now());
         value["cached"] = json!(false);
         value["age_seconds"] = json!(0);
@@ -188,7 +237,7 @@ impl Balances {
     }
 }
 
-async fn fetch(url: &Url, credential: &str, proxy: Option<&str>) -> Value {
+async fn fetch(url: &Url, credential: &str, proxy: Option<&str>, model: Option<&str>) -> Value {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
@@ -257,14 +306,20 @@ async fn fetch(url: &Url, credential: &str, proxy: Option<&str>) -> Value {
     }
     serde_json::from_slice(&body)
         .ok()
-        .and_then(|v| normalize(&v))
+        .and_then(|v| normalize(&v, model))
         .unwrap_or_else(|| failure("unsupported"))
 }
 
-pub(crate) async fn query(provider: &Provider, proxy: Option<&str>) -> Value {
+pub(crate) async fn query(
+    provider: &Provider,
+    proxy: Option<&str>,
+    start_date: &str,
+    end_date: &str,
+    model: Option<&str>,
+) -> Value {
     static SERVICE: OnceLock<Balances> = OnceLock::new();
     let service = SERVICE.get_or_init(Balances::new);
-    let Some(url) = usage_url(&provider.base_url)
+    let Some(url) = usage_url(&provider.base_url, start_date, end_date)
         .filter(|_| provider.preferences.get("balance_query") != Some(&Value::Bool(false)))
     else {
         return json!({"provider":provider.name.as_ref(),"status":"unsupported","keys":[]});
@@ -286,7 +341,7 @@ pub(crate) async fn query(provider: &Provider, proxy: Option<&str>) -> Value {
                 {
                     failure("unsupported_credential")
                 } else {
-                    service.get(&url, &key, proxy.as_deref()).await
+                    service.get(&url, &key, proxy.as_deref(), model).await
                 };
                 value["position"] = json!(index + 1);
                 value
@@ -298,8 +353,26 @@ pub(crate) async fn query(provider: &Provider, proxy: Option<&str>) -> Value {
     .collect()
     .await;
     values.sort_by_key(|v| v["position"].as_u64());
-    json!({"provider":provider.name.as_ref(),"status":if total == 0 { "no_key" } else { "complete" },
-        "keys":values,"key_count":total,"omitted_keys":total.saturating_sub(MAX_KEYS),"cache_ttl_seconds":TTL.as_secs()})
+    let actual_values = values
+        .iter()
+        .filter(|value| value["status"] == "ok" && value.get("actual_cost_usd").is_some());
+    let mut actual_cost = 0.0;
+    let mut actual_samples = 0_u64;
+    let mut actual_available = false;
+    for value in actual_values {
+        actual_available = true;
+        actual_cost += number(&value["actual_cost_usd"]).unwrap_or(0.0);
+        actual_samples =
+            actual_samples.saturating_add(value["actual_cost_samples"].as_u64().unwrap_or(0));
+    }
+    let mut result = json!({"provider":provider.name.as_ref(),"status":if total == 0 { "no_key" } else { "complete" },
+        "keys":values,"key_count":total,"omitted_keys":total.saturating_sub(MAX_KEYS),"cache_ttl_seconds":TTL.as_secs()});
+    if actual_available {
+        result["actual_cost_usd"] = json!(actual_cost);
+        result["actual_cost_samples"] = json!(actual_samples);
+        result["actual_cost_source"] = json!("sub2api_usage");
+    }
+    result
 }
 
 #[cfg(test)]
@@ -310,15 +383,23 @@ mod tests {
         assert_eq!(utc_date(0), "1970-01-01");
         assert_eq!(utc_date(1789385360), "2026-09-14");
         assert_eq!(
-            usage_url("https://example.test/prefix/v1/responses")
-                .unwrap()
-                .path(),
+            usage_url(
+                "https://example.test/prefix/v1/responses",
+                "2026-09-01",
+                "2026-09-02"
+            )
+            .unwrap()
+            .path(),
             "/prefix/v1/usage"
         );
         assert_eq!(
-            usage_url("https://example.test/v1/chat/completions/")
-                .unwrap()
-                .path(),
+            usage_url(
+                "https://example.test/v1/chat/completions/",
+                "2026-09-01",
+                "2026-09-02"
+            )
+            .unwrap()
+            .path(),
             "/v1/usage"
         );
         for url in [
@@ -328,31 +409,53 @@ mod tests {
             "https://example.test/v1beta",
             "https://api.openai.com/v1",
         ] {
-            assert!(usage_url(url).is_none());
+            assert!(usage_url(url, "2026-09-01", "2026-09-02").is_none());
         }
     }
     #[test]
     fn distinguishes_wallet_quota_subscription_and_missing_data() {
-        let wallet = normalize(&json!({"mode":"unrestricted","isValid":true,"balance":0,"unit":"USD","secret":"never return"})).unwrap();
+        let wallet = normalize(&json!({"mode":"unrestricted","isValid":true,"balance":0,"unit":"USD","secret":"never return"}), None).unwrap();
         assert_eq!(wallet["amount"], 0.0);
         assert_eq!(wallet["kind"], "wallet");
         assert!(wallet.get("secret").is_none());
-        let quota = normalize(&json!({"mode":"quota_limited","isValid":true,"quota":{"remaining":12.5},"balance":900})).unwrap();
+        let quota = normalize(&json!({"mode":"quota_limited","isValid":true,"quota":{"remaining":12.5},"balance":900}), None).unwrap();
         assert_eq!(quota["amount"], 12.5);
         assert_eq!(quota["kind"], "key_quota");
         let unlimited = normalize(
             &json!({"mode":"unrestricted","isValid":true,"remaining":-1,"subscription":{}}),
+            None,
         )
         .unwrap();
         assert_eq!(unlimited["unlimited"], true);
         assert!(unlimited["amount"].is_null());
-        let missing = normalize(&json!({"mode":"unrestricted","isValid":true})).unwrap();
+        let missing = normalize(&json!({"mode":"unrestricted","isValid":true}), None).unwrap();
         assert!(missing["amount"].is_null());
-        assert!(normalize(&json!({"balance":100,"error":"unrelated API"})).is_none());
-        let limited = normalize(&json!({"mode":"quota_limited","isValid":true,"rate_limits":[{"window":"5h","remaining":3.5}]})).unwrap();
+        assert!(normalize(&json!({"balance":100,"error":"unrelated API"}), None).is_none());
+        let limited = normalize(&json!({"mode":"quota_limited","isValid":true,"rate_limits":[{"window":"5h","remaining":3.5}]}), None).unwrap();
         assert_eq!(limited["kind"], "key_rate_limits");
         assert!(limited["amount"].is_null());
         assert_eq!(limited["windows"][0]["remaining"], 3.5);
+    }
+
+    #[test]
+    fn uses_provider_actual_cost_and_model_filter_instead_of_balance_delta() {
+        let payload = json!({
+            "mode": "unrestricted",
+            "isValid": true,
+            "balance": 120.0,
+            "unit": "USD",
+            "usage": {"total": {"actual_cost": 99.0, "requests": 999}},
+            "model_stats": [
+                {"model":"model-a","actual_cost":2.5,"requests":4},
+                {"model":"model-b","actual_cost":7.0,"requests":3}
+            ]
+        });
+        let selected = normalize(&payload, Some("model-a")).unwrap();
+        assert_eq!(selected["actual_cost_usd"], 2.5);
+        assert_eq!(selected["actual_cost_samples"], 4);
+        let all = normalize(&payload, None).unwrap();
+        assert_eq!(all["actual_cost_usd"], 9.5);
+        assert_eq!(all["actual_cost_samples"], 7);
     }
     #[tokio::test]
     async fn coalesces_requests_caches_failures_and_blocks_redirects() {
@@ -381,19 +484,25 @@ mod tests {
         });
         let service = Balances::new();
         let url = Url::parse(&format!("http://{address}/usage")).unwrap();
-        let (a, b) = tokio::join!(service.get(&url, "a", None), service.get(&url, "a", None));
+        let (a, b) = tokio::join!(
+            service.get(&url, "a", None, None),
+            service.get(&url, "a", None, None)
+        );
         assert_eq!(a["amount"], 2.5);
         assert_eq!(b["amount"], 2.5);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(a["cached"] == true || b["cached"] == true);
-        service.get(&url, "different-key", None).await;
+        service.get(&url, "different-key", None, None).await;
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let redirect = Url::parse(&format!("http://{address}/redirect")).unwrap();
         assert_eq!(
-            service.get(&redirect, "a", None).await["status"],
+            service.get(&redirect, "a", None, None).await["status"],
             "redirect_blocked"
         );
-        assert_eq!(service.get(&redirect, "a", None).await["cached"], true);
+        assert_eq!(
+            service.get(&redirect, "a", None, None).await["cached"],
+            true
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         task.abort();
     }
