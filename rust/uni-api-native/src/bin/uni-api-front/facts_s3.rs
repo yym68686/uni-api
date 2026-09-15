@@ -79,27 +79,8 @@ impl FactWriter {
             retry_spool(retry_config).await;
         });
         tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(BATCH_SIZE);
-            loop {
-                let Some(first) = rx.recv().await else { break };
-                batch.push(first);
-                // Hold the first fact briefly so normal traffic forms useful
-                // batches. The previous select uploaded immediately after the
-                // first receive, making BATCH_WAIT ineffective and producing
-                // one-object S3 files under light load.
-                let deadline = tokio::time::sleep(BATCH_WAIT);
-                tokio::pin!(deadline);
-                while batch.len() < BATCH_SIZE {
-                    tokio::select! {
-                        value = rx.recv() => match value {
-                            Some(v) => batch.push(v),
-                            None => break,
-                        },
-                        _ = &mut deadline => break,
-                    }
-                }
+            while let Some(batch) = receive_batch(&mut rx, BATCH_WAIT).await {
                 let Some((key, body)) = batch_payload(&config, &batch) else {
-                    batch.clear();
                     continue;
                 };
                 let spool = persist_batch(&config, &key, &body).await;
@@ -115,10 +96,6 @@ impl FactWriter {
                     )
                     .await;
                 }
-                batch.clear();
-                if rx.is_closed() {
-                    break;
-                }
             }
         });
         Some(Self { sender })
@@ -129,6 +106,27 @@ impl FactWriter {
         }
     }
 }
+
+async fn receive_batch(rx: &mut mpsc::Receiver<Value>, wait: Duration) -> Option<Vec<Value>> {
+    // recv returns None only after all buffered facts are drained, even when
+    // every sender has already closed. is_closed alone is not an empty check.
+    let first = rx.recv().await?;
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    batch.push(first);
+    let deadline = tokio::time::sleep(wait);
+    tokio::pin!(deadline);
+    while batch.len() < BATCH_SIZE {
+        tokio::select! {
+            value = rx.recv() => match value {
+                Some(v) => batch.push(v),
+                None => break,
+            },
+            _ = &mut deadline => break,
+        }
+    }
+    Some(batch)
+}
+
 fn batch_payload(c: &UploadConfig, batch: &[Value]) -> Option<(String, String)> {
     let body = batch
         .iter()
@@ -345,6 +343,54 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn batch_wait_coalesces_facts_that_arrive_after_the_first() {
+        let (tx, mut rx) = mpsc::channel(16);
+        tx.send(json!({"event_id":"first"})).await.unwrap();
+        let send_later = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx.send(json!({"event_id":"second"})).await.unwrap();
+        };
+        let (batch, ()) = tokio::join!(receive_batch(&mut rx, Duration::from_secs(1)), send_later);
+        assert_eq!(batch.unwrap().len(), 2);
+        assert!(receive_batch(&mut rx, Duration::from_secs(1))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_queue_drains_every_batch_in_order() {
+        let count = BATCH_SIZE * 2 + 7;
+        let (tx, mut rx) = mpsc::channel(count);
+        for i in 0..count {
+            tx.send(json!(i)).await.unwrap();
+        }
+        drop(tx);
+        let mut actual = Vec::new();
+        let mut sizes = Vec::new();
+        while let Some(batch) = receive_batch(&mut rx, Duration::from_secs(1)).await {
+            sizes.push(batch.len());
+            actual.extend(batch);
+        }
+        assert_eq!(sizes, vec![BATCH_SIZE, BATCH_SIZE, 7]);
+        assert_eq!(actual, (0..count).map(|i| json!(i)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn sparse_batch_flushes_while_sender_remains_open() {
+        let (tx, mut rx) = mpsc::channel(16);
+        tx.send(json!(1)).await.unwrap();
+        let batch = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_batch(&mut rx, Duration::from_millis(20)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(batch, vec![json!(1)]);
+        assert!(!tx.is_closed());
+    }
 
     #[test]
     fn batch_object_key_is_stable_for_retries() {
