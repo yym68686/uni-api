@@ -1856,6 +1856,10 @@ impl NativeRoute {
             "last_failure_origin": self.last_failure_origin,
             "snapshot_revision": self.snapshot.revision.to_string(),
             "rust_responses_data_plane": true,
+            // Keep numeric usage metadata in the fact envelope so the
+            // analytics service can calculate cache rates without parsing
+            // provider-specific response bodies later.
+            "usage": outcome.get("usage").cloned().unwrap_or(Value::Null),
         });
         let (prompt_tokens, completion_tokens, total_tokens) = usage_tokens(outcome);
         let (prompt_price, completion_price) =

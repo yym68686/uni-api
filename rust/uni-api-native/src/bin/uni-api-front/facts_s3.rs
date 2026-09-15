@@ -317,7 +317,29 @@ pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
     let stream = s.timing_spans.contains("\\\"stream\\\":true")
         || s.timing_spans.contains("\\\"streaming\\\":true");
     let at = now_ms();
-    json!({"schema":1,"kind":"request","event_id":format!("request-{}-{}",s.request_id,at),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":s.prompt_tokens,"output_tokens":s.completion_tokens})
+    let spans = serde_json::from_str::<Value>(&s.timing_spans).unwrap_or(Value::Null);
+    let usage = spans.get("usage").filter(|value| value.is_object());
+    let input_details = usage.and_then(|value| {
+        value
+            .get("prompt_tokens_details")
+            .or_else(|| value.get("input_tokens_details"))
+    });
+    let cache_read = input_details
+        .and_then(|value| value.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0);
+    let cache_write = input_details
+        .and_then(|value| value.get("cache_write_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0);
+    let cache_write_1h = usage
+        .and_then(|value| value.get("cache_creation"))
+        .and_then(|value| value.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0);
+    let input_tokens = (s.prompt_tokens > 0).then_some(s.prompt_tokens);
+    let output_tokens = (s.completion_tokens > 0).then_some(s.completion_tokens);
+    json!({"schema":1,"kind":"request","event_id":format!("request-{}-{}",s.request_id,at),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_read_tokens":cache_read,"cache_write_tokens":cache_write,"cache_write_1h_tokens":cache_write_1h})
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
@@ -376,6 +398,28 @@ mod tests {
             .unwrap()
             .starts_with("attempt-req-1-r2-"));
         assert_eq!(event["attempt_id"], "req-1-r2");
+    }
+
+    #[test]
+    fn request_event_preserves_cache_usage_as_nullable_facts() {
+        let event = request_event(&RequestStat {
+            request_id: "req-cache".into(),
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            timing_spans: serde_json::json!({
+                "usage": {
+                    "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 10},
+                    "cache_creation": {"ephemeral_1h_input_tokens": 3}
+                }
+            })
+            .to_string(),
+            ..RequestStat::default()
+        });
+        assert_eq!(event["input_tokens"], 100);
+        assert_eq!(event["cache_read_tokens"], 40);
+        assert_eq!(event["cache_write_tokens"], 10);
+        assert_eq!(event["cache_write_1h_tokens"], 3);
+        assert_eq!(event["output_tokens"], 20);
     }
 
     #[tokio::test]
