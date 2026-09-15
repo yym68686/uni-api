@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -789,15 +790,19 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     response,
                     status,
                     usage,
+                    fact_usage,
                     stream_outcome,
                     upstream_url,
                 } = success;
                 debug_assert!(stream_outcome.is_none());
                 execution.state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
                     request_id: execution.request_id.clone(),
                     attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
+                    upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
                     success: true,
@@ -810,6 +815,9 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     .reset_route_failure(&context.provider, &context.original_model)
                     .await;
                 execution.state.persistence.record_request(RequestStat {
+                    fact_usage,
+                    stream: context.downstream_stream,
+                    status: status.as_u16(),
                     request_id: execution.request_id.clone(),
                     trace_id: execution.trace_id.clone(),
                     endpoint: execution.path.clone(),
@@ -818,6 +826,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     first_response_time: context.attempt_started.elapsed().as_secs_f64(),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
+                    upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     prompt_tokens: usage.0,
                     completion_tokens: usage.1,
@@ -885,10 +894,13 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     }
                 }
                 execution.state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
                     request_id: execution.request_id.clone(),
                     attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
+                    upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
                     success: false,
@@ -954,6 +966,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
     }
 
     execution.state.persistence.record_request(RequestStat {
+        is_flagged: true,
+        status: last_status.as_u16(),
         request_id: execution.request_id,
         trace_id: execution.trace_id,
         endpoint: execution.path,
@@ -1124,10 +1138,15 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     response,
                     status,
                     usage,
+                    fact_usage,
                     stream_outcome,
                     upstream_url,
                 } = success;
                 let request_stat = RequestStat {
+                    fact_usage,
+                    stream: downstream_stream,
+                    upstream_model: original_model.clone(),
+                    status: status.as_u16(),
                     request_id: request_id.clone(),
                     trace_id: trace_id.clone(),
                     endpoint: path.clone(),
@@ -1167,7 +1186,9 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         let outcome = stream_outcome.await.unwrap_or_else(|_| {
                             provider_stream::StreamOutcome {
                                 usage: (0, 0, 0),
+                                fact_usage: Default::default(),
                                 success: false,
+                                observational_only: false,
                                 status_code: 502,
                                 detail: "provider stream outcome was canceled".into(),
                                 first_output_ms: None,
@@ -1178,6 +1199,10 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.prompt_tokens = outcome.usage.0;
                         request_stat.completion_tokens = outcome.usage.1;
                         request_stat.total_tokens = outcome.usage.2;
+                        request_stat.fact_usage = outcome.fact_usage.clone();
+                        request_stat.first_output_ms = outcome.first_output_ms;
+                        request_stat.status = outcome.status_code;
+                        request_stat.is_flagged = !outcome.success;
                         request_stat.timing_spans = json!({
                             "runtime": "rust",
                             "attempt_count": attempt_index + 1,
@@ -1188,10 +1213,13 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         })
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
+                            duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
+                            first_output_ms: outcome.first_output_ms,
                             request_id: outcome_request_id.clone(),
                             attempt_id: format!("{}-r{}", outcome_request_id, attempt_index + 1),
                             provider: outcome_provider.name.to_string(),
                             model: outcome_model.clone(),
+                            upstream_model: outcome_original_model.clone(),
                             api_key: outcome_api_key,
                             provider_api_key: outcome_provider_key.clone(),
                             success: outcome.success,
@@ -1199,11 +1227,15 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             stream: downstream_stream,
                         });
                         let recorded_status = if outcome.success {
-                            outcome_state
-                                .native_responses_config
-                                .reset_route_failure(&outcome_provider, &outcome_original_model)
-                                .await;
+                            if !outcome.observational_only {
+                                outcome_state
+                                    .native_responses_config
+                                    .reset_route_failure(&outcome_provider, &outcome_original_model)
+                                    .await;
+                            }
                             status.as_u16()
+                        } else if outcome.observational_only {
+                            outcome.status_code
                         } else {
                             let policy = classify_provider_failure(
                                 outcome.status_code,
@@ -1261,10 +1293,13 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     return response;
                 }
                 state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
                     request_id: request_id.clone(),
                     attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
                     model: request_model.clone(),
+                    upstream_model: original_model.clone(),
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
                     success: true,
@@ -1318,10 +1353,13 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     }
                 }
                 state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
                     request_id: request_id.clone(),
                     attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
                     model: request_model.clone(),
+                    upstream_model: original_model.clone(),
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
                     success: false,
@@ -1372,6 +1410,14 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     }
 
     state.persistence.record_request(RequestStat {
+        is_flagged: true,
+        status: last_status.as_u16(),
+        stream: input
+            .payload
+            .as_ref()
+            .and_then(|v| v.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         request_id,
         trace_id,
         endpoint: path,
@@ -2861,6 +2907,7 @@ struct AttemptSuccess {
     response: Response<Body>,
     status: StatusCode,
     usage: (i64, i64, i64),
+    fact_usage: crate::fact_usage::FactUsage,
     stream_outcome: Option<tokio::sync::oneshot::Receiver<provider_stream::StreamOutcome>>,
     upstream_url: String,
 }
@@ -3021,6 +3068,7 @@ async fn send_attempt(
     if let Some(dispatch) = &prepared.dispatch {
         dispatch.record(&state.channel_metrics);
     }
+    let send_started = Instant::now();
     let response = if let Some(trigger) = hedge_trigger {
         let started = tokio::time::Instant::now();
         let hard_timeout = [timeouts.write, timeouts.pool, timeouts.total]
@@ -3082,6 +3130,32 @@ async fn send_attempt(
         && prepared.downstream_protocol == DownstreamProtocol::Native
         && prepared.upstream_stream
     {
+        if response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"))
+        {
+            // Preserve the existing routing reset at response-header success;
+            // the completion observer never changes routing/cooldown policy.
+            state
+                .native_responses_config
+                .reset_route_failure(provider, &prepared.original_model)
+                .await;
+            let mut translation = crate::passthrough_observation::observe(response, send_started);
+            translation
+                .response
+                .headers_mut()
+                .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+            return Ok(AttemptSuccess {
+                response: translation.response,
+                status,
+                usage: (0, 0, 0),
+                fact_usage: Default::default(),
+                stream_outcome: Some(translation.outcome),
+                upstream_url: prepared.url,
+            });
+        }
         let headers = filtered_response_headers(response.headers());
         let mut output = Response::new(Body::from_stream(response.bytes_stream()));
         *output.status_mut() = status;
@@ -3093,6 +3167,7 @@ async fn send_attempt(
             response: output,
             status,
             usage: (0, 0, 0),
+            fact_usage: Default::default(),
             stream_outcome: None,
             upstream_url: prepared.url,
         });
@@ -3158,6 +3233,7 @@ async fn send_attempt(
             response: translation.response,
             status,
             usage: (0, 0, 0),
+            fact_usage: Default::default(),
             stream_outcome: Some(translation.outcome),
             upstream_url: prepared.url,
         });
@@ -3174,10 +3250,10 @@ async fn send_attempt(
                 upstream_url: prepared.url.clone(),
                 response: None,
             })?;
-        let usage = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .map(|value| usage(&value))
-            .unwrap_or((0, 0, 0));
+        let parsed = serde_json::from_slice::<Value>(&body).ok();
+        let fact_usage =
+            crate::fact_usage::FactUsage::from_usage(parsed.as_ref().and_then(|v| v.get("usage")));
+        let usage = parsed.as_ref().map(usage).unwrap_or((0, 0, 0));
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
@@ -3188,6 +3264,7 @@ async fn send_attempt(
             response: output,
             status,
             usage,
+            fact_usage,
             stream_outcome: None,
             upstream_url: prepared.url,
         });
@@ -3219,6 +3296,11 @@ async fn send_attempt(
             response: None,
         })?
     };
+    let fact_usage = crate::fact_usage::FactUsage::from_usage(
+        upstream
+            .get("usage")
+            .or_else(|| upstream.get("usageMetadata")),
+    );
     let normalized = match prepared.adapter {
         ResponseAdapter::Search => normalize_search_response(&prepared.url, &upstream),
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
@@ -3280,6 +3362,7 @@ async fn send_attempt(
         response: output,
         status: StatusCode::OK,
         usage,
+        fact_usage,
         stream_outcome: None,
         upstream_url: prepared.url,
     })

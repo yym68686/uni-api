@@ -42,7 +42,9 @@ pub struct Translation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamOutcome {
     pub usage: (i64, i64, i64),
+    pub fact_usage: crate::fact_usage::FactUsage,
     pub success: bool,
+    pub observational_only: bool,
     pub status_code: u16,
     pub detail: String,
     pub first_output_ms: Option<f64>,
@@ -274,7 +276,9 @@ fn spawn_translation(
                 let _ = send_wire(&tx, &payload, output_protocol).await;
                 StreamOutcome {
                     usage: (0, 0, 0),
+                    fact_usage: Default::default(),
                     success: false,
+                    observational_only: false,
                     status_code: 502,
                     detail: error,
                     first_output_ms: None,
@@ -816,6 +820,11 @@ async fn drain_aws_frames(
                 "completion_tokens":state.completion_tokens,
                 "total_tokens":state.prompt_tokens.saturating_add(state.completion_tokens),
             }));
+            state
+                .fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(
+                    state.chat_usage.as_ref(),
+                ));
             for chunk in state.finish_chunks_for_output("stop") {
                 send_wire(tx, &chunk, state.output_protocol).await?;
             }
@@ -854,6 +863,7 @@ struct StreamState {
     prompt_tokens: i64,
     completion_tokens: i64,
     chat_usage: Option<Value>,
+    fact_usage: crate::fact_usage::FactUsage,
     terminal: bool,
     failure: Option<PrecommitFailure>,
     output_protocol: OutputProtocol,
@@ -879,6 +889,7 @@ impl StreamState {
             prompt_tokens: 0,
             completion_tokens: 0,
             chat_usage: None,
+            fact_usage: Default::default(),
             terminal: false,
             failure: None,
             output_protocol,
@@ -916,6 +927,8 @@ impl StreamState {
             self.id = id.to_owned();
         }
         if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+            self.fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(Some(usage)));
             self.prompt_tokens = number(usage.get("prompt_tokens"));
             self.completion_tokens = number(usage.get("completion_tokens"));
             self.chat_usage = Some(usage.clone());
@@ -986,6 +999,8 @@ impl StreamState {
                     .pointer("/response/usage")
                     .filter(|usage| usage.is_object())
                 {
+                    self.fact_usage
+                        .merge(crate::fact_usage::FactUsage::from_usage(Some(source_usage)));
                     let usage = responses_usage_to_chat(Some(source_usage));
                     self.prompt_tokens = number(usage.get("prompt_tokens"));
                     self.completion_tokens = number(usage.get("completion_tokens"));
@@ -1077,6 +1092,8 @@ impl StreamState {
             self.prompt_tokens = number(usage.get("promptTokenCount"));
             self.completion_tokens =
                 number(usage.get("candidatesTokenCount")) + number(usage.get("thoughtsTokenCount"));
+            self.fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(Some(usage)));
             self.chat_usage = Some(gemini_usage_to_chat(usage));
         }
         if value
@@ -1213,6 +1230,10 @@ impl StreamState {
                 "completion_tokens":self.completion_tokens,
                 "total_tokens":self.prompt_tokens.saturating_add(self.completion_tokens),
             }));
+            self.fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(
+                    self.chat_usage.as_ref(),
+                ));
             return self.finish_chunks("stop");
         }
         Vec::new()
@@ -1281,6 +1302,8 @@ impl StreamState {
         let Some(usage) = usage.filter(|usage| usage.is_object()) else {
             return;
         };
+        self.fact_usage
+            .merge(crate::fact_usage::FactUsage::from_usage(Some(usage)));
         let mut merged = self.chat_usage.take().unwrap_or_else(|| json!({}));
         merge_usage_objects(&mut merged, usage);
         let mapped = claude_usage_to_chat(&merged);
@@ -1360,14 +1383,18 @@ impl StreamState {
     fn outcome(&self) -> StreamOutcome {
         match &self.failure {
             Some(failure) => StreamOutcome {
+                observational_only: false,
                 usage: self.usage(),
+                fact_usage: self.fact_usage.clone(),
                 success: false,
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
                 first_output_ms: self.first_output_ms,
             },
             None => StreamOutcome {
+                observational_only: false,
                 usage: self.usage(),
+                fact_usage: self.fact_usage.clone(),
                 success: true,
                 status_code: 200,
                 detail: String::new(),

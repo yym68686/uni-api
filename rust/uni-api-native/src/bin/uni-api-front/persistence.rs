@@ -24,6 +24,11 @@ enum Backend {
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestStat {
+    pub fact_usage: crate::fact_usage::FactUsage,
+    pub stream: bool,
+    pub upstream_model: String,
+    pub status: u16,
+    pub first_output_ms: Option<f64>,
     pub request_id: String,
     pub trace_id: String,
     pub endpoint: String,
@@ -45,10 +50,13 @@ pub struct RequestStat {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStat {
+    pub duration_ms: Option<f64>,
+    pub first_output_ms: Option<f64>,
     pub request_id: String,
     pub attempt_id: String,
     pub provider: String,
     pub model: String,
+    pub upstream_model: String,
     pub api_key: String,
     pub provider_api_key: String,
     pub success: bool,

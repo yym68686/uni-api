@@ -3,9 +3,11 @@
 //! explicit counter, while serving remains available.
 use hmac::{Hmac, Mac};
 use reqwest::Client;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -314,32 +316,8 @@ pub fn global() -> Option<FactWriter> {
 }
 pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
     let key = hex_sha(&s.api_key);
-    let stream = s.timing_spans.contains("\\\"stream\\\":true")
-        || s.timing_spans.contains("\\\"streaming\\\":true");
     let at = now_ms();
-    let spans = serde_json::from_str::<Value>(&s.timing_spans).unwrap_or(Value::Null);
-    let usage = spans.get("usage").filter(|value| value.is_object());
-    let input_details = usage.and_then(|value| {
-        value
-            .get("prompt_tokens_details")
-            .or_else(|| value.get("input_tokens_details"))
-    });
-    let cache_read = input_details
-        .and_then(|value| value.get("cached_tokens"))
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0);
-    let cache_write = input_details
-        .and_then(|value| value.get("cache_write_tokens"))
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0);
-    let cache_write_1h = usage
-        .and_then(|value| value.get("cache_creation"))
-        .and_then(|value| value.get("ephemeral_1h_input_tokens"))
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0);
-    let input_tokens = (s.prompt_tokens > 0).then_some(s.prompt_tokens);
-    let output_tokens = (s.completion_tokens > 0).then_some(s.completion_tokens);
-    json!({"schema":1,"kind":"request","event_id":format!("request-{}-{}",s.request_id,at),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.model,"stream":stream,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":(s.first_response_time>0.0).then_some(s.first_response_time*1000.0),"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_read_tokens":cache_read,"cache_write_tokens":cache_write,"cache_write_1h_tokens":cache_write_1h})
+    json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
@@ -348,7 +326,7 @@ pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     } else {
         s.attempt_id.clone()
     };
-    json!({"schema":1,"kind":"attempt","event_id":format!("attempt-{}-{}",attempt_id,at),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"provider":s.provider,"model":s.model,"upstream_model":s.model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
+    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"first_output_ms":s.first_output_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
 }
 
 pub fn dispatch_event(
@@ -357,8 +335,32 @@ pub fn dispatch_event(
     attempt_id: &str,
     elapsed_ms: f64,
 ) -> Value {
-    json!({"schema":1,"kind":"dispatch","event_id":format!("dispatch-{}-{}",request_id,attempt_id),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
+    json!({"schema":1,"kind":"dispatch","event_id":new_event_id("dispatch"),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
 }
+// Generate once when creating the fact. Retries replay the serialized value;
+// caller request IDs may repeat and must never be storage uniqueness keys.
+fn new_event_id(kind: &str) -> String {
+    static PROCESS: OnceLock<String> = OnceLock::new();
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let process = PROCESS.get_or_init(|| {
+        let mut random = [0u8; 16];
+        if SystemRandom::new().fill(&mut random).is_ok() {
+            hex::encode(random)
+        } else {
+            hex_sha(&format!(
+                "{:?}-{}-{}",
+                SystemTime::now(),
+                std::process::id(),
+                std::env::var("HOSTNAME").unwrap_or_default()
+            ))
+        }
+    });
+    format!(
+        "{kind}-{process}-{:016x}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -373,17 +375,17 @@ mod tests {
     use crate::persistence::{ChannelStat, RequestStat};
 
     #[test]
-    fn request_and_attempt_event_ids_are_stable_and_carry_attempt_identity() {
+    fn repeated_caller_ids_do_not_collide_and_replays_keep_the_created_fact() {
         let request = RequestStat {
             request_id: "req-1".into(),
             ..RequestStat::default()
         };
         let first = request_event(&request);
-        let _second = request_event(&request);
-        assert!(first["event_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("request-req-1-"));
+        let second = request_event(&request);
+        assert_ne!(first["event_id"], second["event_id"]);
+        let replay: Value = serde_json::from_str(&first.to_string()).unwrap();
+        assert_eq!(first, replay);
+        assert!(first["event_id"].as_str().unwrap().starts_with("request-"));
 
         let attempt = ChannelStat {
             request_id: "req-1".into(),
@@ -393,11 +395,9 @@ mod tests {
             ..ChannelStat::default()
         };
         let event = attempt_event(&attempt);
-        assert!(event["event_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("attempt-req-1-r2-"));
+        assert!(event["event_id"].as_str().unwrap().starts_with("attempt-"));
         assert_eq!(event["attempt_id"], "req-1-r2");
+        assert_ne!(event["event_id"], attempt_event(&attempt)["event_id"]);
     }
 
     #[test]
@@ -406,13 +406,16 @@ mod tests {
             request_id: "req-cache".into(),
             prompt_tokens: 100,
             completion_tokens: 20,
-            timing_spans: serde_json::json!({
-                "usage": {
-                    "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 10},
-                    "cache_creation": {"ephemeral_1h_input_tokens": 3}
-                }
-            })
-            .to_string(),
+            fact_usage: crate::fact_usage::FactUsage {
+                input: Some(100),
+                output: Some(20),
+                cache_read: Some(40),
+                cache_write: Some(10),
+                cache_write_1h: Some(3),
+            },
+            stream: true,
+            status: 200,
+            upstream_model: "upstream".into(),
             ..RequestStat::default()
         });
         assert_eq!(event["input_tokens"], 100);
@@ -420,6 +423,22 @@ mod tests {
         assert_eq!(event["cache_write_tokens"], 10);
         assert_eq!(event["cache_write_1h_tokens"], 3);
         assert_eq!(event["output_tokens"], 20);
+        assert_eq!(event["stream"], true);
+        assert_eq!(event["status"], 200);
+        assert_eq!(event["upstream_model"], "upstream");
+        let unknown = request_event(&RequestStat::default());
+        assert!(unknown["input_tokens"].is_null());
+        let zero = request_event(&RequestStat {
+            fact_usage: crate::fact_usage::FactUsage {
+                input: Some(0),
+                output: Some(0),
+                cache_read: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(zero["input_tokens"], 0);
+        assert_eq!(zero["cache_read_tokens"], 0);
     }
 
     #[tokio::test]

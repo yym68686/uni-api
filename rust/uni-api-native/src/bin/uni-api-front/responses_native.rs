@@ -1503,7 +1503,7 @@ impl NativeRoute {
             false,
             policy.provider_model_unavailable,
         );
-        self.record_current_channel(false);
+        self.record_current_channel(false, outcome);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
@@ -1570,7 +1570,7 @@ impl NativeRoute {
             self.last_failure_origin = failure_origin(outcome).to_owned();
         }
         self.emit_upstream_attempt(outcome, upstream_status, success, false);
-        self.record_current_channel(success);
+        self.record_current_channel(success, outcome);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
@@ -1856,15 +1856,16 @@ impl NativeRoute {
             "last_failure_origin": self.last_failure_origin,
             "snapshot_revision": self.snapshot.revision.to_string(),
             "rust_responses_data_plane": true,
-            // Keep numeric usage metadata in the fact envelope so the
-            // analytics service can calculate cache rates without parsing
-            // provider-specific response bodies later.
-            "usage": outcome.get("usage").cloned().unwrap_or(Value::Null),
         });
         let (prompt_tokens, completion_tokens, total_tokens) = usage_tokens(outcome);
         let (prompt_price, completion_price) =
             model_prices(&self.snapshot.preferences, &self.request_model);
         self.persistence.record_request(RequestStat {
+            fact_usage: crate::fact_usage::FactUsage::from_usage(outcome.get("usage")),
+            stream: self.stream,
+            upstream_model: final_actual_model.unwrap_or_default().to_owned(),
+            status,
+            first_output_ms: outcome.get("first_output_ms").and_then(Value::as_f64),
             request_id: self.request_id.clone(),
             trace_id: trace_id(&self.request_headers, &self.request_id),
             endpoint: self.endpoint.clone(),
@@ -1934,13 +1935,18 @@ impl NativeRoute {
             .unwrap_or(true)
     }
 
-    fn record_current_channel(&self, success: bool) {
+    fn record_current_channel(&self, success: bool, outcome: &Value) {
         let (Some(provider), Some(provider_key)) =
             (self.last_provider.as_ref(), self.last_provider_key.as_ref())
         else {
             return;
         };
         self.persistence.record_channel(ChannelStat {
+            duration_ms: self
+                .last_attempt
+                .as_ref()
+                .map(|a| a.started_at.elapsed().as_secs_f64() * 1000.0),
+            first_output_ms: outcome.get("first_output_ms").and_then(Value::as_f64),
             request_id: self.request_id.clone(),
             attempt_id: self
                 .last_attempt
@@ -1949,6 +1955,7 @@ impl NativeRoute {
                 .unwrap_or_default(),
             provider: provider.name.to_string(),
             model: self.request_model.clone(),
+            upstream_model: self.last_original_model.clone().unwrap_or_default(),
             api_key: self.api_key.token.to_string(),
             provider_api_key: provider_key.clone(),
             success,
