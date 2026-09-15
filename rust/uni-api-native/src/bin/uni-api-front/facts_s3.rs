@@ -81,20 +81,21 @@ impl FactWriter {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(BATCH_SIZE);
             loop {
-                let first = tokio::select! {v=rx.recv()=>v,_=tokio::time::sleep(BATCH_WAIT)=>{if batch.is_empty(){continue}else{None}}};
-                if let Some(v) = first {
-                    batch.push(v)
-                } else if batch.is_empty() {
-                    if rx.is_closed() {
-                        break;
-                    } else {
-                        continue;
-                    }
-                };
+                let Some(first) = rx.recv().await else { break };
+                batch.push(first);
+                // Hold the first fact briefly so normal traffic forms useful
+                // batches. The previous select uploaded immediately after the
+                // first receive, making BATCH_WAIT ineffective and producing
+                // one-object S3 files under light load.
+                let deadline = tokio::time::sleep(BATCH_WAIT);
+                tokio::pin!(deadline);
                 while batch.len() < BATCH_SIZE {
-                    match rx.try_recv() {
-                        Ok(v) => batch.push(v),
-                        Err(_) => break,
+                    tokio::select! {
+                        value = rx.recv() => match value {
+                            Some(v) => batch.push(v),
+                            None => break,
+                        },
+                        _ = &mut deadline => break,
                     }
                 }
                 let Some((key, body)) = batch_payload(&config, &batch) else {
