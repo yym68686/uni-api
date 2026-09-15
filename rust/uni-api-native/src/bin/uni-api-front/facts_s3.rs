@@ -109,7 +109,10 @@ impl FactWriter {
                         spool
                     )
                 } else if spool {
-                    let _ = tokio::fs::remove_file(config.spool.join(format!("{}.jsonl", hex_sha(&body)))).await;
+                    let _ = tokio::fs::remove_file(
+                        config.spool.join(format!("{}.jsonl", hex_sha(&body))),
+                    )
+                    .await;
                 }
                 batch.clear();
                 if rx.is_closed() {
@@ -134,7 +137,13 @@ fn batch_payload(c: &UploadConfig, batch: &[Value]) -> Option<(String, String)> 
         .join("\n")
         + "\n";
     let digest = hex_sha(&body);
-    let key = format!("{}/{}/{}/batch-{}.jsonl", c.prefix.trim_matches('/'), c.instance, "immutable", digest);
+    let key = format!(
+        "{}/{}/{}/batch-{}.jsonl",
+        c.prefix.trim_matches('/'),
+        c.instance,
+        "immutable",
+        digest
+    );
     Some((key, body))
 }
 
@@ -209,7 +218,11 @@ async fn persist_batch(c: &UploadConfig, key: &str, body: &str) -> bool {
         eprintln!("facts_s3_spool_write_failed digest={digest}");
         return false;
     }
-    if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(&pending).await {
+    if let Ok(file) = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&pending)
+        .await
+    {
         let _ = file.sync_all().await;
     }
     if tokio::fs::rename(&pending, &target).await.is_err() {
@@ -234,7 +247,13 @@ async fn retry_spool(c: UploadConfig) {
                 let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
                     continue;
                 };
-                let key = format!("{}/{}/{}/batch-{}.jsonl", c.prefix.trim_matches('/'), c.instance, "immutable", name);
+                let key = format!(
+                    "{}/{}/{}/batch-{}.jsonl",
+                    c.prefix.trim_matches('/'),
+                    c.instance,
+                    "immutable",
+                    name
+                );
                 if upload_body_with_retry(&c, &key, &body).await.is_ok() {
                     let _ = tokio::fs::remove_file(path).await;
                 }
@@ -360,8 +379,12 @@ mod tests {
             instance: "instance".into(),
             spool: PathBuf::from("/tmp/facts-test"),
         };
-        let a = batch_payload(&config, &[json!({"event_id":"one"})]).unwrap().0;
-        let b = batch_payload(&config, &[json!({"event_id":"two"})]).unwrap().0;
+        let a = batch_payload(&config, &[json!({"event_id":"one"})])
+            .unwrap()
+            .0;
+        let b = batch_payload(&config, &[json!({"event_id":"two"})])
+            .unwrap()
+            .0;
         assert_ne!(a, b);
     }
 }
