@@ -54,7 +54,10 @@ impl FactWriter {
         }
         let (sender, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let config = UploadConfig {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .ok()?,
             endpoint,
             bucket,
             prefix: std::env::var("FACTS_S3_PREFIX").unwrap_or_else(|_| "uni-api-facts/v1".into()),
@@ -94,13 +97,20 @@ impl FactWriter {
                         Err(_) => break,
                     }
                 }
-                if let Err(error) = upload_batch_with_retry(&config, &batch).await {
-                    persist_failed_batch(&config, &batch).await;
-                    eprintln!(
-                        "{{\"event_type\":\"facts_s3_upload_error\",\"error\":{:?}}}",
-                        error
-                    )
+                let Some((key, body)) = batch_payload(&config, &batch) else {
+                    batch.clear();
+                    continue;
                 };
+                let spool = persist_batch(&config, &key, &body).await;
+                if let Err(error) = upload_body_with_retry(&config, &key, &body).await {
+                    eprintln!(
+                        "{{\"event_type\":\"facts_s3_upload_error\",\"error\":{:?},\"spooled\":{}}}",
+                        error,
+                        spool
+                    )
+                } else if spool {
+                    let _ = tokio::fs::remove_file(config.spool.join(format!("{}.jsonl", hex_sha(&body)))).await;
+                }
                 batch.clear();
                 if rx.is_closed() {
                     break;
@@ -115,32 +125,27 @@ impl FactWriter {
         }
     }
 }
-async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
+fn batch_payload(c: &UploadConfig, batch: &[Value]) -> Option<(String, String)> {
+    let body = batch
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .join("\n")
+        + "\n";
+    let digest = hex_sha(&body);
+    let key = format!("{}/{}/{}/batch-{}.jsonl", c.prefix.trim_matches('/'), c.instance, "immutable", digest);
+    Some((key, body))
+}
+
+async fn upload_body(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?;
     let secs = now.as_secs();
     let date = chrono_date(secs);
     let amz = chrono_timestamp(secs);
-    let body = batch
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
-        .join("\n")
-        + "\n";
     let hash = hex_sha(&body);
-    // Content-addressed object names make retries idempotent even if a response
-    // is lost after R2 has committed the object.
-    let nonce = hex_sha(&body);
-    let key = format!(
-        "{}/{}/{}/batch-{}-{}.jsonl",
-        c.prefix.trim_matches('/'),
-        secs / 86400,
-        c.instance,
-        secs,
-        nonce
-    );
     let url = format!("{}/{}/{}", c.endpoint, c.bucket, key);
     let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
     let host = parsed.host_str().ok_or("S3 endpoint host missing")?;
@@ -179,7 +184,7 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
         .header("x-amz-date", amz)
         .header("Authorization", auth)
         .header("Content-Type", "application/x-ndjson")
-        .body(body);
+        .body(body.to_owned());
     if let Some(token) = &c.token {
         req = req.header("x-amz-security-token", token)
     }
@@ -193,21 +198,26 @@ async fn upload_batch(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-async fn persist_failed_batch(c: &UploadConfig, batch: &[Value]) {
-    let body = match batch
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(lines) => lines.join("\n") + "\n",
-        Err(_) => return,
-    };
-    let name = format!("{}.jsonl", hex_sha(&body));
-    let pending = c.spool.join(format!("{}.pending", name));
-    let target = c.spool.join(name);
-    if tokio::fs::write(&pending, body.as_bytes()).await.is_ok() {
-        let _ = tokio::fs::rename(pending, target).await;
+async fn persist_batch(c: &UploadConfig, key: &str, body: &str) -> bool {
+    let digest = hex_sha(body);
+    let target = c.spool.join(format!("{}.jsonl", digest));
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+        return true;
     }
+    let pending = c.spool.join(format!("{}.pending", digest));
+    if tokio::fs::write(&pending, body.as_bytes()).await.is_err() {
+        eprintln!("facts_s3_spool_write_failed digest={digest}");
+        return false;
+    }
+    if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(&pending).await {
+        let _ = file.sync_all().await;
+    }
+    if tokio::fs::rename(&pending, &target).await.is_err() {
+        eprintln!("facts_s3_spool_commit_failed digest={digest}");
+        return false;
+    }
+    let _ = key;
+    true
 }
 
 async fn retry_spool(c: UploadConfig) {
@@ -224,14 +234,8 @@ async fn retry_spool(c: UploadConfig) {
                 let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
                     continue;
                 };
-                let key = format!(
-                    "{}/{}/{}/batch-{}.jsonl",
-                    c.prefix.trim_matches('/'),
-                    now_ms() as u64 / 1000 / 86400,
-                    c.instance,
-                    name
-                );
-                if upload_body(&c, &key, &body).await.is_ok() {
+                let key = format!("{}/{}/{}/batch-{}.jsonl", c.prefix.trim_matches('/'), c.instance, "immutable", name);
+                if upload_body_with_retry(&c, &key, &body).await.is_ok() {
                     let _ = tokio::fs::remove_file(path).await;
                 }
             }
@@ -240,21 +244,10 @@ async fn retry_spool(c: UploadConfig) {
     }
 }
 
-async fn upload_body(c: &UploadConfig, _key: &str, body: &str) -> Result<(), String> {
-    let batch: Vec<Value> = body
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    if batch.is_empty() {
-        return Ok(());
-    }
-    upload_batch(c, &batch).await
-}
-
-async fn upload_batch_with_retry(c: &UploadConfig, batch: &[Value]) -> Result<(), String> {
+async fn upload_body_with_retry(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
     let mut last = String::from("S3 fact upload failed");
     for attempt in 0..UPLOAD_RETRIES {
-        match upload_batch(c, batch).await {
+        match upload_body(c, key, body).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last = error;
@@ -327,4 +320,48 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_object_key_is_stable_for_retries() {
+        let config = UploadConfig {
+            client: Client::new(),
+            endpoint: "https://example.invalid".into(),
+            bucket: "bucket".into(),
+            prefix: "facts/v1".into(),
+            access: "access".into(),
+            secret: "secret".into(),
+            token: None,
+            instance: "instance".into(),
+            spool: PathBuf::from("/tmp/facts-test"),
+        };
+        let batch = vec![json!({"event_id":"one","schema":1})];
+        let (key_a, body_a) = batch_payload(&config, &batch).expect("payload");
+        let (key_b, body_b) = batch_payload(&config, &batch).expect("payload");
+        assert_eq!(body_a, body_b);
+        assert_eq!(key_a, key_b);
+        assert!(key_a.contains(&hex_sha(&body_a)));
+    }
+
+    #[test]
+    fn different_batches_have_different_object_keys() {
+        let config = UploadConfig {
+            client: Client::new(),
+            endpoint: "https://example.invalid".into(),
+            bucket: "bucket".into(),
+            prefix: "facts/v1".into(),
+            access: "access".into(),
+            secret: "secret".into(),
+            token: None,
+            instance: "instance".into(),
+            spool: PathBuf::from("/tmp/facts-test"),
+        };
+        let a = batch_payload(&config, &[json!({"event_id":"one"})]).unwrap().0;
+        let b = batch_payload(&config, &[json!({"event_id":"two"})]).unwrap().0;
+        assert_ne!(a, b);
+    }
 }
