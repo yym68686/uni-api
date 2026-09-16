@@ -341,7 +341,10 @@ pub fn dispatch_event(
 fn instance_id() -> String {
     static INSTANCE: OnceLock<String> = OnceLock::new();
     INSTANCE
-        .get_or_init(|| std::env::var("INSTANCE_ID").unwrap_or_else(|_| format!("uni-api-{}", std::process::id())))
+        .get_or_init(|| {
+            std::env::var("INSTANCE_ID")
+                .unwrap_or_else(|_| format!("uni-api-{}", std::process::id()))
+        })
         .clone()
 }
 // Generate once when creating the fact. Retries replay the serialized value;
