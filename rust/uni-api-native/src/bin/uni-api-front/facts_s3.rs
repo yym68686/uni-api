@@ -317,7 +317,7 @@ pub fn global() -> Option<FactWriter> {
 pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
     let key = hex_sha(&s.api_key);
     let at = now_ms();
-    json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
+    json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
@@ -326,7 +326,7 @@ pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     } else {
         s.attempt_id.clone()
     };
-    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"first_output_ms":s.first_output_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
+    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"first_output_ms":s.first_output_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
 }
 
 pub fn dispatch_event(
@@ -335,7 +335,14 @@ pub fn dispatch_event(
     attempt_id: &str,
     elapsed_ms: f64,
 ) -> Value {
-    json!({"schema":1,"kind":"dispatch","event_id":new_event_id("dispatch"),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
+    json!({"schema":1,"kind":"dispatch","event_id":new_event_id("dispatch"),"instance_id":instance_id(),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
+}
+
+fn instance_id() -> String {
+    static INSTANCE: OnceLock<String> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| std::env::var("INSTANCE_ID").unwrap_or_else(|_| format!("uni-api-{}", std::process::id())))
+        .clone()
 }
 // Generate once when creating the fact. Retries replay the serialized value;
 // caller request IDs may repeat and must never be storage uniqueness keys.
