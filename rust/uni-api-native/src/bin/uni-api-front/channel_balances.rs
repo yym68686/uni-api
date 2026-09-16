@@ -151,30 +151,32 @@ fn normalize(value: &Value, model: Option<&str>) -> Option<Value> {
     // Sub2API exposes actual deductions in usage.total and per-model usage in
     // model_stats. Keep the selected model dimension here so the dashboard can
     // compare its token estimate with the upstream's own charge.
-    let model_stats = value["model_stats"].as_array();
-    let matching = model_stats.map(|stats| {
-        stats
-            .iter()
-            .filter(|row| model.is_none_or(|wanted| row["model"].as_str() == Some(wanted)))
-            .collect::<Vec<_>>()
-    });
-    if let Some(rows) = matching {
-        let mut actual = 0.0;
-        let mut samples = 0_u64;
-        for row in rows {
-            if let Some(cost) = number(&row["actual_cost"]) {
-                actual += cost;
-                samples = samples.saturating_add(row["requests"].as_u64().unwrap_or(0));
+    if currency == "USD" {
+        let model_stats = value["model_stats"].as_array();
+        let matching = model_stats.map(|stats| {
+            stats
+                .iter()
+                .filter(|row| model.is_none_or(|wanted| row["model"].as_str() == Some(wanted)))
+                .collect::<Vec<_>>()
+        });
+        if let Some(rows) = matching {
+            let mut actual = 0.0;
+            let mut samples = 0_u64;
+            for row in rows {
+                if let Some(cost) = number(&row["actual_cost"]) {
+                    actual += cost;
+                    samples = samples.saturating_add(row["requests"].as_u64().unwrap_or(0));
+                }
             }
+            result["actual_cost_usd"] = json!(actual);
+            result["actual_cost_samples"] = json!(samples);
+            result["actual_cost_source"] = json!("sub2api_usage");
+        } else if let Some(cost) = number(&value["usage"]["total"]["actual_cost"]) {
+            result["actual_cost_usd"] = json!(cost);
+            result["actual_cost_samples"] =
+                json!(value["usage"]["total"]["requests"].as_u64().unwrap_or(0));
+            result["actual_cost_source"] = json!("sub2api_usage");
         }
-        result["actual_cost_usd"] = json!(actual);
-        result["actual_cost_samples"] = json!(samples);
-        result["actual_cost_source"] = json!("sub2api_usage");
-    } else if let Some(cost) = number(&value["usage"]["total"]["actual_cost"]) {
-        result["actual_cost_usd"] = json!(cost);
-        result["actual_cost_samples"] =
-            json!(value["usage"]["total"]["requests"].as_u64().unwrap_or(0));
-        result["actual_cost_source"] = json!("sub2api_usage");
     }
     Some(result)
 }
