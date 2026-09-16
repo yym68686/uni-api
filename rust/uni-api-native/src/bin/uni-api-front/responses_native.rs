@@ -1562,6 +1562,13 @@ impl NativeRoute {
             .unwrap_or("completed");
         let success = matches!(kind, "completed" | "incomplete");
         let status = outcome_status(outcome, if success { 200 } else { 502 });
+        if matches!(kind, "semantic_failure" | "semantic_error") {
+            // Apply the normal failure accounting and cooldown policy, but
+            // never dispatch a retry after output has been committed.
+            let _ = self.record_failure(outcome).await;
+            self.emit_final_event(self.last_status, kind, outcome);
+            return;
+        }
         let upstream_status = outcome_status_from(outcome, "upstream_status_code", status);
         if success {
             self.record_success().await;

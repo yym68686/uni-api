@@ -242,7 +242,6 @@ struct ActiveAttempt {
     commit_reason: &'static str,
     precommit_keepalive_sent: bool,
     business_committed: bool,
-    raw_pending_forwarded: bool,
 }
 
 enum PreflightResult {
@@ -256,10 +255,6 @@ enum Coordinator {
 }
 
 impl Coordinator {
-    fn is_native(&self) -> bool {
-        matches!(self, Self::Native { .. })
-    }
-
     async fn commit(&mut self, state: &AppState, observation: &Value) -> Result<(), String> {
         match self {
             Self::Python { session_id } => control_commit(state, session_id, observation)
@@ -913,7 +908,6 @@ async fn preflight_attempt_with_trigger(
         commit_reason: "real_output",
         precommit_keepalive_sent: keepalive_already_sent,
         business_committed: false,
-        raw_pending_forwarded: false,
     };
 
     if active.mode == StreamMode::OpaqueRaw {
@@ -1003,11 +997,6 @@ fn process_preflight_frames(
                     active, event_type, payload, false,
                 ))));
             }
-            if active.business_committed {
-                if let Some(wire) = processed.wire {
-                    active.buffered.push(wire);
-                }
-            }
             active.terminal = processed.terminal;
             return Ok(Some(PreflightResult::Started(take_active(active)?)));
         }
@@ -1084,7 +1073,6 @@ fn process_preflight_frames(
 }
 
 fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
-    stage_raw_pending(active);
     let placeholder = ActiveAttempt {
         plan: active.plan.clone(),
         status: active.status,
@@ -1101,21 +1089,8 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
         commit_reason: active.commit_reason,
         precommit_keepalive_sent: active.precommit_keepalive_sent,
         business_committed: active.business_committed,
-        raw_pending_forwarded: false,
     };
     Ok(std::mem::replace(active, placeholder))
-}
-
-fn stage_raw_pending(active: &mut ActiveAttempt) {
-    if active.business_committed
-        && active.mode.relays_raw_after_commit()
-        && !active.raw_pending_forwarded
-    {
-        if let Some(pending) = active.decoder.pending_copy() {
-            active.buffered.push(pending);
-        }
-        active.raw_pending_forwarded = true;
-    }
 }
 
 fn start_public_stream(
@@ -1319,6 +1294,15 @@ async fn run_active_attempt(
                     }
                     Err(_) => break 'request false,
                 }
+            }
+            if let Terminal::SemanticFailure {
+                event_type,
+                payload,
+            } = terminal
+            {
+                let outcome = semantic_failure_outcome(&active, &event_type, &payload, true);
+                let _ = coordinator.complete(&state, &outcome).await;
+                break 'request false;
             }
             finish_terminal(
                 &state,
@@ -1593,24 +1577,6 @@ async fn run_raw_committed(
     output: &mut OutputSink,
     cancellation: &CancellationToken,
 ) -> bool {
-    if !active.raw_pending_forwarded {
-        if let Some(pending) = active.decoder.pending_copy() {
-            active.stats.observe_wire(&pending);
-            if output.send_wire(pending).await.is_err() {
-                complete_disconnect(
-                    state,
-                    coordinator,
-                    active.plan.attempt_id.clone(),
-                    active.status,
-                    &mut active.stats,
-                )
-                .await;
-                return false;
-            }
-        }
-        active.raw_pending_forwarded = true;
-    }
-
     loop {
         let idle_deadline = deadline(
             tokio::time::Instant::now(),
@@ -1634,17 +1600,16 @@ async fn run_raw_committed(
         match next {
             Ok(Some(Ok(chunk))) => {
                 active.stats.observe_upstream(&chunk);
-                let already_forwarded_bytes = active.decoder.buffer.len();
                 let inspection = match active.decoder.feed(&chunk) {
-                    Ok(frames) => {
-                        raw_terminal_prefix(frames, &mut active.stats, already_forwarded_bytes)
-                    }
+                    Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
                     Err(error) => Err(error),
                 };
                 match inspection {
-                    Ok(Some((prefix, terminal))) => {
-                        active.stats.observe_wire(&prefix);
-                        if output.send_wire(prefix).await.is_err() {
+                    Ok((prefix, terminal)) => {
+                        if !prefix.is_empty() {
+                            active.stats.observe_wire(&prefix);
+                        }
+                        if !prefix.is_empty() && output.send_wire(prefix).await.is_err() {
                             complete_disconnect(
                                 state,
                                 coordinator,
@@ -1655,23 +1620,12 @@ async fn run_raw_committed(
                             .await;
                             return false;
                         }
-                        finish_observed_terminal(state, coordinator, active, terminal).await;
-                        return true;
-                    }
-                    Ok(None) => {
-                        active.stats.observe_wire(&chunk);
-                        if output.send_wire(chunk).await.is_err() {
-                            complete_disconnect(
-                                state,
-                                coordinator,
-                                active.plan.attempt_id.clone(),
-                                active.status,
-                                &mut active.stats,
-                            )
-                            .await;
-                            return false;
+                        if let Some(terminal) = terminal {
+                            return finish_observed_terminal(state, coordinator, active, terminal)
+                                .await;
                         }
                     }
+
                     Err(error) => {
                         complete_failure(
                             state,
@@ -1688,17 +1642,16 @@ async fn run_raw_committed(
                 }
             }
             Ok(None) => {
-                let already_forwarded_bytes = active.decoder.buffer.len();
                 let inspection = match active.decoder.finish() {
-                    Ok(frames) => {
-                        raw_terminal_prefix(frames, &mut active.stats, already_forwarded_bytes)
-                    }
+                    Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
                     Err(error) => Err(error),
                 };
                 match inspection {
-                    Ok(Some((prefix, terminal))) => {
-                        active.stats.observe_wire(&prefix);
-                        if output.send_wire(prefix).await.is_err() {
+                    Ok((prefix, terminal)) => {
+                        if !prefix.is_empty() {
+                            active.stats.observe_wire(&prefix);
+                        }
+                        if !prefix.is_empty() && output.send_wire(prefix).await.is_err() {
                             complete_disconnect(
                                 state,
                                 coordinator,
@@ -1709,10 +1662,10 @@ async fn run_raw_committed(
                             .await;
                             return false;
                         }
-                        finish_observed_terminal(state, coordinator, active, terminal).await;
-                        return true;
-                    }
-                    Ok(None) => {
+                        if let Some(terminal) = terminal {
+                            return finish_observed_terminal(state, coordinator, active, terminal)
+                                .await;
+                        }
                         complete_failure(
                             state,
                             coordinator,
@@ -1723,6 +1676,7 @@ async fn run_raw_committed(
                             "Responses upstream ended without a terminal response event",
                         )
                         .await;
+                        return false;
                     }
                     Err(error) => {
                         complete_failure(
@@ -1769,30 +1723,34 @@ async fn run_raw_committed(
     }
 }
 
-/// Return only the wire prefix through the first terminal event.
+/// Return only the safe wire prefix before the first terminal event.
 ///
 /// Upstream providers sometimes append heartbeats or unrelated bytes after
 /// `response.completed` in the same HTTP chunk. Raw forwarding must stop at
-/// the semantic terminal instead of sending that suffix first.
+/// the semantic terminal instead of sending that suffix first. A semantic
+/// failure is omitted from the returned wire prefix so the downstream stream
+/// closes without exposing the provider's error event.
 fn raw_terminal_prefix(
     frames: Vec<SseFrame>,
     stats: &mut StreamStats,
-    already_forwarded_bytes: usize,
-) -> Result<Option<(Bytes, Terminal)>, String> {
+) -> Result<(Bytes, Option<Terminal>), String> {
     let mut prefix = BytesMut::new();
     for frame in frames {
         let wire = frame.wire.clone();
         let terminal = inspect_terminal_frame(&frame, stats)?;
-        prefix.extend_from_slice(&wire);
         if let Some(terminal) = terminal {
-            let already_forwarded_bytes = already_forwarded_bytes.min(prefix.len());
-            return Ok(Some((
-                prefix.freeze().slice(already_forwarded_bytes..),
-                terminal,
-            )));
+            // A semantic failure after committed output is an internal
+            // terminal only. Do not leak the provider's error event to the
+            // downstream SSE client; the transport closes after the already
+            // emitted content.
+            if !matches!(terminal, Terminal::SemanticFailure { .. }) {
+                prefix.extend_from_slice(&wire);
+            }
+            return Ok((prefix.freeze(), Some(terminal)));
         }
+        prefix.extend_from_slice(&wire);
     }
-    Ok(None)
+    Ok((prefix.freeze(), None))
 }
 
 async fn finish_observed_terminal(
@@ -1800,7 +1758,7 @@ async fn finish_observed_terminal(
     coordinator: &mut Coordinator,
     active: &mut ActiveAttempt,
     terminal: Terminal,
-) {
+) -> bool {
     if let Terminal::SemanticFailure {
         event_type,
         payload,
@@ -1808,7 +1766,7 @@ async fn finish_observed_terminal(
     {
         let outcome = semantic_failure_outcome(active, event_type, payload, true);
         let _ = coordinator.complete(state, &outcome).await;
-        return;
+        return false;
     }
     finish_terminal(
         state,
@@ -1819,6 +1777,7 @@ async fn finish_observed_terminal(
         terminal,
     )
     .await;
+    true
 }
 
 async fn run_selective_committed(
@@ -2311,23 +2270,8 @@ async fn process_active_frames(
                 return ActiveFrameResult::Retry(outcome);
             }
             let outcome = semantic_failure_outcome(active, event_type, payload, true);
-            let mut terminal_sent = false;
-            if let Some(reply) = coordinator.complete(state, &outcome).await {
-                if let Some(encoded) = reply.get("terminal_b64").and_then(Value::as_str) {
-                    if let Ok(terminal) = BASE64.decode(encoded) {
-                        let wire = Bytes::from(terminal);
-                        active.stats.observe_wire(&wire);
-                        terminal_sent = output.send_wire(wire).await.is_ok();
-                    }
-                }
-            }
-            if coordinator.is_native() && !terminal_sent {
-                if let Ok(wire) = encode_event(event_type, payload) {
-                    active.stats.observe_wire(&wire);
-                    terminal_sent = output.send_wire(wire).await.is_ok();
-                }
-            }
-            return ActiveFrameResult::Done(terminal_sent);
+            let _ = coordinator.complete(state, &outcome).await;
+            return ActiveFrameResult::Done(false);
         }
 
         let suppress_repeated_keepalive = !active.business_committed
@@ -2665,6 +2609,22 @@ fn is_terminal_event_type(event_type: &[u8]) -> bool {
 }
 
 fn terminal_candidate(frame: &SseFrame) -> bool {
+    // A data-only event's type is in JSON and may use arbitrary whitespace.
+    if declared_event_bytes(frame.raw()).is_none() && frame_has_data(frame.raw()) {
+        if let Ok(parsed) = parse_sse_frame(frame) {
+            if let Some(data) = parsed.data {
+                if let Ok(payload) = serde_json::from_str::<Value>(&data) {
+                    if payload
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|event| is_terminal_event_type(event.as_bytes()))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     if declared_event_bytes(frame.raw()).is_some_and(is_terminal_event_type) {
         return true;
     }
@@ -2975,10 +2935,6 @@ impl SseDecoder {
         self.buffer.clear();
         self.scan_from = 0;
         Ok(frames)
-    }
-
-    fn pending_copy(&self) -> Option<Bytes> {
-        (!self.buffer.is_empty()).then(|| Bytes::copy_from_slice(&self.buffer))
     }
 }
 
@@ -3309,7 +3265,6 @@ mod tests {
             commit_reason: "real_output",
             precommit_keepalive_sent: false,
             business_committed: false,
-            raw_pending_forwarded: false,
         }
     }
 
@@ -3376,9 +3331,8 @@ mod tests {
             )
             .unwrap();
         let mut stats = StreamStats::new("raw-terminal-test");
-        let (_prefix, terminal) = raw_terminal_prefix(frames, &mut stats, 0)
-            .unwrap()
-            .expect("completed terminal expected");
+        let (_prefix, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("completed terminal expected");
         assert!(matches!(terminal, Terminal::Completed));
         assert_eq!(stats.event_count, 2);
         assert_eq!(stats.delta_events, 1);
@@ -3396,9 +3350,8 @@ mod tests {
             )
             .unwrap();
         let mut stats = StreamStats::new("raw-terminal-prefix-test");
-        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats, 0)
-            .unwrap()
-            .expect("completed must terminate raw forwarding");
+        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("completed must terminate raw forwarding");
         let wire = String::from_utf8(prefix.to_vec()).unwrap();
         assert!(matches!(terminal, Terminal::Completed));
         assert!(wire.contains("event: response.completed"));
@@ -3406,20 +3359,62 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_filters_semantic_failure_after_committed_output() {
+        let mut decoder = SseDecoder::new(4096);
+        let frames = decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n\\
+                  event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\",\"code\":\"server_error\",\"message\":\"temporarily unavailable\"}}\n\n",
+            )
+            .unwrap();
+        let mut stats = StreamStats::new("raw-semantic-failure-test");
+        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("semantic terminal expected");
+        let wire = String::from_utf8(prefix.to_vec()).unwrap();
+        assert!(matches!(terminal, Terminal::SemanticFailure { .. }));
+        assert!(wire.contains("\"delta\":\"test\""));
+        assert!(!wire.contains("event: error"));
+    }
+
+    #[test]
+    fn raw_mode_filters_fragmented_semantic_failure_without_leaking_partial_error() {
+        let mut decoder = SseDecoder::new(4096);
+        let first = decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n\
+                  event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\"",
+            )
+            .unwrap();
+        let mut stats = StreamStats::new("raw-fragmented-semantic-failure-test");
+        let (first_wire, first_terminal) = raw_terminal_prefix(first, &mut stats).unwrap();
+        assert!(first_terminal.is_none());
+        assert!(String::from_utf8(first_wire.to_vec())
+            .unwrap()
+            .contains("delta"));
+
+        let second = decoder
+            .feed(b",\"message\":\"temporarily unavailable\"}}\n\n")
+            .unwrap();
+        let (second_wire, second_terminal) = raw_terminal_prefix(second, &mut stats).unwrap();
+        assert!(second_wire.is_empty());
+        assert!(matches!(
+            second_terminal,
+            Some(Terminal::SemanticFailure { .. })
+        ));
+    }
+
+    #[test]
     fn raw_mode_does_not_repeat_fragmented_terminal_prefix() {
         let mut decoder = SseDecoder::new(4096);
         let first = b"event: response.completed\ndata: {\"type\":\"response.com";
         assert!(decoder.feed(first).unwrap().is_empty());
-        let already_forwarded_bytes = decoder.buffer.len();
         let second = b"pleted\",\"response\":{\"status\":\"completed\"}}\n\n";
         let frames = decoder.feed(second).unwrap();
         let mut stats = StreamStats::new("raw-terminal-fragment-test");
-        let (new_bytes, terminal) =
-            raw_terminal_prefix(frames, &mut stats, already_forwarded_bytes)
-                .unwrap()
-                .expect("completed terminal expected");
+        let (new_bytes, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("completed terminal expected");
         assert!(matches!(terminal, Terminal::Completed));
-        assert_eq!(new_bytes.as_ref(), second);
+        assert!(new_bytes.ends_with(second));
     }
 
     #[test]
@@ -3600,9 +3595,8 @@ mod tests {
             panic!("expected the transparent stream to remain committed");
         };
         assert!(active.business_committed);
-        assert_eq!(active.buffered.len(), 2);
+        assert_eq!(active.buffered.len(), 1);
         assert!(active.buffered[0].starts_with(b"event: response.created\n"));
-        assert!(active.buffered[1].starts_with(b"event: response.failed\n"));
         assert!(matches!(
             active.terminal,
             Some(Terminal::SemanticFailure { .. })
