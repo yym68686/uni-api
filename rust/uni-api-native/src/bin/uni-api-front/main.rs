@@ -45,6 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = state.native_responses_config.refresh().await;
     state.native_responses_config.start_watcher();
 
+    state
+        .native_responses_config
+        .restore_controls_on_start()
+        .await?;
+
     let app = Router::new()
         .fallback(any(proxy::handler))
         .with_state(state);

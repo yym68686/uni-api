@@ -188,6 +188,19 @@ impl StreamStats {
         })
     }
 
+    fn observe_semantic_output(&mut self, event_type: &str, payload: &Value) {
+        if self.first_output_ms.is_none()
+            && (has_real_output(event_type, payload)
+                || matches!(event_type, "response.completed" | "response.incomplete")
+                    && payload
+                        .pointer("/response/output")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| items.iter().any(item_has_output)))
+        {
+            self.first_output_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
     fn observe_upstream(&mut self, chunk: &[u8]) {
         self.upstream_bytes = self.upstream_bytes.saturating_add(chunk.len() as u64);
         self.upstream_chunks = self.upstream_chunks.saturating_add(1);
@@ -510,7 +523,15 @@ async fn serve_native_nonstream(
             }
         };
         match send_native_nonstream_attempt(&state, &plan).await {
-            Ok((status, mut headers, mut body)) if status.is_success() => {
+            Ok((status, mut headers, mut body, elapsed_ms)) if status.is_success() => {
+                let first_output_ms = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .filter(|p| {
+                        p.get("output")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| items.iter().any(item_has_output))
+                    })
+                    .map(|_| elapsed_ms);
                 let usage = serde_json::from_slice::<Value>(&body)
                     .ok()
                     .and_then(|payload| {
@@ -554,6 +575,7 @@ async fn serve_native_nonstream(
                     "status_code": status.as_u16(),
                     "upstream_status_code": status.as_u16(),
                     "downstream_bytes": body.len(),
+                    "first_output_ms":first_output_ms,
                 });
                 if let Some(usage) = usage {
                     outcome["usage"] = usage;
@@ -564,7 +586,7 @@ async fn serve_native_nonstream(
                 *response.headers_mut() = headers;
                 return response;
             }
-            Ok((status, _headers, body)) => {
+            Ok((status, _headers, body, _elapsed_ms)) => {
                 let detail = String::from_utf8_lossy(&body)
                     .chars()
                     .take(4096)
@@ -604,7 +626,7 @@ async fn serve_native_nonstream(
 async fn send_native_nonstream_attempt(
     state: &AppState,
     plan: &Plan,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
+) -> Result<(StatusCode, HeaderMap, Vec<u8>, f64), String> {
     let client = state
         .upstream_client(
             plan.proxy.as_deref(),
@@ -636,6 +658,7 @@ async fn send_native_nonstream_attempt(
     if let Some(dispatch) = &plan.dispatch {
         dispatch.record(&state.channel_metrics);
     }
+    let observation_started = tokio::time::Instant::now();
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, request.send())
             .await
@@ -654,7 +677,12 @@ async fn send_native_nonstream_attempt(
         .await
         .map_err(|error| format!("read upstream non-streaming body: {error}"))?
         .to_vec();
-    Ok((status, headers, body))
+    Ok((
+        status,
+        headers,
+        body,
+        observation_started.elapsed().as_secs_f64() * 1000.0,
+    ))
 }
 
 pub async fn serve_session(
@@ -888,6 +916,7 @@ async fn preflight_attempt_with_trigger(
     let mode = StreamMode::for_plan(&plan);
     let mut stats = StreamStats::new(&plan.attempt_id);
     stats.stream_mode = mode.as_str();
+    stats.started_at = started_at;
     let stream = Box::pin(response.bytes_stream());
     let mut active = ActiveAttempt {
         decoder: SseDecoder::new(plan.max_event_bytes),
@@ -983,10 +1012,6 @@ fn process_preflight_frames(
     let semantic_guard = precommit_semantic_guard(&active.plan);
     for frame in frames {
         let processed = active.processor.process(frame, &mut active.stats)?;
-        if processed.commits && active.stats.first_output_ms.is_none() {
-            active.stats.first_output_ms =
-                Some(active.stats.started_at.elapsed().as_secs_f64() * 1000.0);
-        }
         if let Some(Terminal::SemanticFailure {
             event_type,
             payload,
@@ -1909,7 +1934,7 @@ async fn relay_selective_frames(
             || frame_is_comment_only(frame.raw())
             || terminal_candidate(&frame);
         if !special {
-            observe_light_frame(&mut active.stats, &frame);
+            let _ = inspect_terminal_frame(&frame, &mut active.stats);
             batch.extend_from_slice(&frame.canonical_wire());
             continue;
         }
@@ -2256,10 +2281,6 @@ async fn process_active_frames(
                 return ActiveFrameResult::Done(false);
             }
         };
-        if processed.commits && active.stats.first_output_ms.is_none() {
-            active.stats.first_output_ms =
-                Some(active.stats.started_at.elapsed().as_secs_f64() * 1000.0);
-        }
         if let Some(Terminal::SemanticFailure {
             event_type,
             payload,
@@ -2552,6 +2573,7 @@ impl ResponsesProcessor {
             None
         };
         let canonical_keepalive = event_type == "keepalive" && is_canonical_keepalive(&payload);
+        stats.observe_semantic_output(&event_type, &payload);
         let commits = terminal.is_some()
             || (!matches!(
                 event_type.as_str(),
@@ -2680,6 +2702,20 @@ fn inspect_terminal_frame(
     stats: &mut StreamStats,
 ) -> Result<Option<Terminal>, String> {
     observe_light_frame(stats, frame);
+    if stats.first_output_ms.is_none() {
+        // Observation is best-effort and cannot reject or rewrite raw traffic.
+        if let Ok(parsed) = parse_sse_frame(frame) {
+            if let Some(data) = parsed.data {
+                if let Ok(payload) = serde_json::from_str::<Value>(&data) {
+                    let kind = payload
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    stats.observe_semantic_output(kind, &payload);
+                }
+            }
+        }
+    }
     if !terminal_candidate(frame) {
         return Ok(None);
     }
@@ -3268,6 +3304,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raw_stream_observes_semantic_latency_without_rewriting_or_counting_keepalive() {
+        let mut stats = StreamStats::new("latency");
+        stats.started_at = tokio::time::Instant::now() - Duration::from_millis(400);
+        let mut decoder = SseDecoder::new(4096);
+        let keepalive =
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n";
+        let (wire, _) = raw_terminal_prefix(decoder.feed(keepalive).unwrap(), &mut stats).unwrap();
+        assert_eq!(wire.as_ref(), keepalive);
+        assert!(stats.first_output_ms.is_none());
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n";
+        let (wire, _) = raw_terminal_prefix(decoder.feed(delta).unwrap(), &mut stats).unwrap();
+        assert_eq!(wire.as_ref(), delta);
+        let first = stats.first_output_ms.unwrap();
+        assert!(first >= 400.0);
+        raw_terminal_prefix(decoder.feed(delta).unwrap(), &mut stats).unwrap();
+        assert_eq!(stats.first_output_ms, Some(first));
+        let mut failed = StreamStats::new("failure");
+        let body=b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n";
+        raw_terminal_prefix(decoder.feed(body).unwrap(), &mut failed).unwrap();
+        assert!(failed.first_output_ms.is_none());
+    }
     #[test]
     fn decoder_preserves_fragmented_canonical_frames() {
         let mut decoder = SseDecoder::new(1024);

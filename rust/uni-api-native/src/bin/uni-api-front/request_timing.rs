@@ -19,12 +19,14 @@ impl RequestArrival {
         key: MetricKey,
         request_id: String,
         attempt_id: String,
+        api_key: &str,
     ) -> AttemptDispatch {
         AttemptDispatch {
             arrival: self,
             key,
             request_id,
             attempt_id,
+            key_id: crate::channel_catalog::key_id(api_key),
             recorded: Arc::new(OnceLock::new()),
         }
     }
@@ -36,6 +38,7 @@ pub(crate) struct AttemptDispatch {
     key: MetricKey,
     request_id: String,
     attempt_id: String,
+    key_id: String,
     recorded: Arc<OnceLock<f64>>,
 }
 
@@ -51,6 +54,7 @@ impl AttemptDispatch {
                     &self.key,
                     &self.request_id,
                     &self.attempt_id,
+                    &self.key_id,
                     elapsed,
                 ));
             }
@@ -84,7 +88,12 @@ mod tests {
             json!({"provider":"channel","model":"model","upstream_model":"upstream","endpoint":"/v1/responses","stream":true}),
         ];
         let arrival = RequestArrival(Instant::now() - std::time::Duration::from_millis(250));
-        let dispatch = arrival.attempt(key.clone(), "request".into(), "attempt-1".into());
+        let dispatch = arrival.attempt(
+            key.clone(),
+            "request".into(),
+            "attempt-1".into(),
+            "fixture-key",
+        );
         // A selected plan that was never sent must not create a timing sample.
         let before = metrics.query(rows.clone(), "test", 15, false);
         assert_eq!(
@@ -95,7 +104,12 @@ mod tests {
         assert!(first >= 250.);
         assert_eq!(dispatch.clone().record(&metrics), first);
         // Retrying uses the same arrival clock, not a new attempt clock.
-        let retry = arrival.attempt(key.clone(), "request".into(), "attempt-2".into());
+        let retry = arrival.attempt(
+            key.clone(),
+            "request".into(),
+            "attempt-2".into(),
+            "fixture-key",
+        );
         let second = retry.record(&metrics);
         assert!(second >= first);
         metrics.observe_dispatch(&key, f64::NAN);

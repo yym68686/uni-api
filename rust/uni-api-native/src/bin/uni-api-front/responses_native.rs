@@ -492,6 +492,10 @@ impl NativeConfigStore {
         Ok(true)
     }
 
+    pub(crate) async fn base_snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.current.read().await.clone()
+    }
+
     pub(crate) async fn snapshot(&self) -> Option<Arc<Snapshot>> {
         let base = self.current.read().await.clone()?;
         Some(self.channel_controls.read().await.overlay(base))
@@ -1517,6 +1521,7 @@ impl NativeRoute {
                         ),
                         self.request_id.clone(),
                         attempt_id.clone(),
+                        &self.api_key.token,
                     )
                 }),
                 attempt_id,
@@ -4564,6 +4569,95 @@ mod tests {
             )
             .await
             .is_err());
+    }
+    #[tokio::test]
+    async fn retained_controls_replace_atomically_and_validate_before_serving() {
+        use crate::channel_controls::{RestoreMutation, RetainedChannel, RetainedSnapshot, Rule};
+        let store = catalog_fixture().await;
+        let admin = catalog_headers("dashboard-first");
+        let key = crate::channel_catalog::key_id("restricted");
+        let snapshot = RetainedSnapshot {
+            version: 1,
+            rules: vec![Rule {
+                api_key_id: key.clone(),
+                model: "shared".into(),
+                order: vec!["sub2api-retained".into()],
+                disabled: vec!["sub2api-retained".into()],
+            }],
+            temporary_channels: vec![RetainedChannel {
+                provider: "sub2api-retained".into(),
+                api_key_id: key,
+                base_url: "https://example.com/v1/responses".into(),
+                api_key: "restore-secret".into(),
+                models: vec!["shared".into()],
+            }],
+        };
+        let initial = store.controls_view(&admin).await.unwrap();
+        let restored = store
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: initial["revision"].as_str().unwrap().into(),
+                    snapshot: snapshot.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored["temporary_channels"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            restored["rules"][0]["disabled"],
+            json!(["sub2api-retained"])
+        );
+        assert!(!restored.to_string().contains("restore-secret"));
+        let before = restored.clone();
+        let mut invalid = snapshot.clone();
+        invalid.rules[0].order.push("missing".into());
+        assert!(store
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: restored["revision"].as_str().unwrap().into(),
+                    snapshot: invalid
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(before, store.controls_view(&admin).await.unwrap());
+        assert!(store
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: initial["revision"].as_str().unwrap().into(),
+                    snapshot: snapshot.clone()
+                }
+            )
+            .await
+            .is_err());
+        assert!(store
+            .restore_controls(
+                &catalog_headers("restricted"),
+                RestoreMutation {
+                    revision: restored["revision"].as_str().unwrap().into(),
+                    snapshot: snapshot.clone()
+                }
+            )
+            .await
+            .is_err());
+        let fresh = catalog_fixture().await;
+        let view = fresh.controls_view(&admin).await.unwrap();
+        let after = fresh
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: view["revision"].as_str().unwrap().into(),
+                    snapshot,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(after["rules"], restored["rules"]);
+        assert_eq!(after["temporary_channels"], restored["temporary_channels"]);
+        assert_ne!(after["instance_id"], restored["instance_id"]);
     }
     fn catalog_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

@@ -560,6 +560,7 @@ async fn next_generic_hedge_plan(
                 ),
                 execution.request_id.clone(),
                 attempt_id,
+                &execution.api_key,
             )
         });
         emit_attempt(
@@ -1038,6 +1039,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 ),
                 request_id.clone(),
                 format!("{request_id}-r{}", attempt_index + 1),
+                &api_key,
             )
         });
         let downstream_stream = prepared.downstream_stream;

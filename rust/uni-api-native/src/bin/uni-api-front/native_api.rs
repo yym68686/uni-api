@@ -373,6 +373,7 @@ pub fn supports_mutation(method: &Method, path: &str) -> bool {
             "/v1/api_config/update"
                 | "/v1/add_credits"
                 | "/v1/channel-controls"
+                | "/v1/channel-controls/restore"
                 | "/v1/temporary-channels"
         )
 }
@@ -380,7 +381,10 @@ pub fn supports_mutation(method: &Method, path: &str) -> bool {
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
     let path = request.uri().path().trim_end_matches('/').to_owned();
     let headers = request.headers().clone();
-    if path == "/v1/channel-controls" || path == "/v1/temporary-channels" {
+    if path == "/v1/channel-controls"
+        || path == "/v1/temporary-channels"
+        || path == "/v1/channel-controls/restore"
+    {
         if let Err(status) = state
             .native_responses_config
             .authorize_catalog(&headers)
@@ -391,12 +395,37 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
                 "Platform administrator key required",
             );
         }
-        let body = match to_bytes(request.into_body(), 64 * 1024).await {
+        let limit = if path == "/v1/channel-controls/restore" {
+            2 * 1024 * 1024
+        } else {
+            64 * 1024
+        };
+        let body = match to_bytes(request.into_body(), limit).await {
             Ok(body) => body,
             Err(_) => {
                 return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Control request too large")
             }
         };
+        if path == "/v1/channel-controls/restore" {
+            let input =
+                match serde_json::from_slice::<crate::channel_controls::RestoreMutation>(&body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "Invalid retained configuration",
+                        )
+                    }
+                };
+            return match state
+                .native_responses_config
+                .restore_controls(&headers, input)
+                .await
+            {
+                Ok(v) => json_response(StatusCode::OK, v),
+                Err((code, msg)) => json_error(code, &msg),
+            };
+        }
         if path == "/v1/temporary-channels" {
             let input =
                 match serde_json::from_slice::<crate::channel_controls::ImportMutation>(&body) {

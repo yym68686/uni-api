@@ -71,7 +71,7 @@ impl Controls {
         format!("{}:{}:{}", self.instance, self.sequence, snapshot.revision)
     }
     fn view(&self, snapshot: &Snapshot) -> Value {
-        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","temporary_channel_import":true,"temporary_channel_management":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
+        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
     }
     pub fn overlay(&self, base: Arc<Snapshot>) -> Arc<Snapshot> {
         if self.temporary.is_empty() {
@@ -630,5 +630,273 @@ impl NativeConfigStore {
             json!({"event_type":"temporary_channel_managed","action":input.action,"provider":input.provider,"api_key_id":input.api_key_id,"models":input.models})
         );
         Ok(state.view(&snapshot))
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedChannel {
+    pub provider: String,
+    pub api_key_id: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub models: Vec<String>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedSnapshot {
+    pub version: u8,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub temporary_channels: Vec<RetainedChannel>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestoreMutation {
+    pub revision: String,
+    pub snapshot: RetainedSnapshot,
+}
+impl NativeConfigStore {
+    pub(crate) async fn restore_controls(
+        &self,
+        headers: &HeaderMap,
+        input: RestoreMutation,
+    ) -> Result<Value, (StatusCode, String)> {
+        self.authorize_catalog(headers).await.map_err(|s| {
+            (
+                StatusCode::from_u16(s).unwrap_or(StatusCode::FORBIDDEN),
+                "Platform administrator key required".into(),
+            )
+        })?;
+        let base = self.base_snapshot().await.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable".into(),
+        ))?;
+        let bad = |s: &str| (StatusCode::BAD_REQUEST, s.to_string());
+        if input.snapshot.version != 1
+            || input.snapshot.rules.len() > 128
+            || input.snapshot.temporary_channels.len() > 128
+        {
+            return Err(bad("Invalid retained configuration"));
+        }
+        let mut state = self.channel_controls.write().await;
+        if state.revision(&base) != input.revision {
+            return Err((
+                StatusCode::CONFLICT,
+                "Controls changed before restoration".into(),
+            ));
+        }
+        // Construct and validate the whole overlay before touching serving state.
+        let mut candidate = Controls {
+            instance: state.instance.clone(),
+            sequence: state.sequence + 1,
+            ..Controls::default()
+        };
+        for p in input.snapshot.temporary_channels {
+            if !p.provider.starts_with("sub2api-")
+                || p.provider.len() > 100
+                || !p
+                    .provider
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                || base.providers_by_name.contains_key(&p.provider)
+                || candidate.temporary.contains_key(&p.provider)
+                || p.api_key.is_empty()
+                || p.api_key.len() > 8192
+                || p.api_key.contains(['\r', '\n'])
+                || p.models.is_empty()
+                || p.models.len() > 32
+                || p.models.iter().any(|m| {
+                    m.is_empty() || m.len() > 256 || m.contains('/') || m.contains(['\r', '\n'])
+                })
+                || p.models.iter().collect::<BTreeSet<_>>().len() != p.models.len()
+            {
+                return Err(bad("Invalid retained temporary channel"));
+            }
+            if !base
+                .api_keys
+                .values()
+                .any(|k| crate::channel_catalog::key_id(&k.token) == p.api_key_id)
+            {
+                return Err(bad("Retained API key no longer exists"));
+            }
+            let url = url::Url::parse(&p.base_url).map_err(|_| bad("Invalid retained address"))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !url.path().ends_with("/v1/responses")
+            {
+                return Err(bad("Invalid retained address"));
+            }
+            let provider = Arc::new(Provider {
+                name: p.provider.clone().into(),
+                base_url: p.base_url.into(),
+                engine: "gpt".into(),
+                api_keys: Arc::new(vec![p.api_key]),
+                project_id: None,
+                private_key: None,
+                client_email: None,
+                aws_access_key: None,
+                aws_secret_key: None,
+                aws_session_token: None,
+                cf_account_id: None,
+                region: "global".into(),
+                models: Arc::new(p.models.into_iter().map(|m| (m.clone(), m)).collect()),
+                preferences: Arc::new(serde_json::Map::from_iter([(
+                    "__temporary_key_id".into(),
+                    json!(p.api_key_id),
+                )])),
+                excluded_endpoints: Arc::new(Vec::new()),
+                only_request_types: Arc::new(Vec::new()),
+                excluded_request_types: Arc::new(Vec::new()),
+                excluded_request_rules: Arc::new(Vec::new()),
+                cursor: Arc::new(AtomicUsize::new(0)),
+            });
+            candidate.temporary.insert(p.provider, provider);
+        }
+        let overlay = candidate.overlay(base.clone());
+        let caller = overlay
+            .api_keys
+            .values()
+            .find(|k| crate::channel_catalog::can_inspect_all(&overlay, k))
+            .ok_or(bad("Administrator unavailable"))?;
+        for rule in input.snapshot.rules {
+            if rule.order.len() > 1024
+                || rule.disabled.len() > 1024
+                || rule.model.len() > 512
+                || rule.api_key_id.len() > 128
+            {
+                return Err(bad("Retained rule too large"));
+            }
+            let allowed = entries(&overlay, caller, Some(&rule.api_key_id))
+                .map_err(|_| bad("Retained key unavailable"))?;
+            let names: BTreeSet<_> = allowed
+                .into_iter()
+                .filter(|(_, m)| rule.model.is_empty() || m == &rule.model)
+                .map(|(p, _)| p.name.to_string())
+                .collect();
+            for values in [&rule.order, &rule.disabled] {
+                if values.iter().collect::<BTreeSet<_>>().len() != values.len()
+                    || values.iter().any(|p| !names.contains(p))
+                {
+                    return Err(bad("Retained rule references an unavailable channel"));
+                }
+            }
+            let scope = (rule.api_key_id.clone(), rule.model.clone());
+            if candidate.rules.contains_key(&scope) {
+                return Err(bad("Duplicate retained rule"));
+            }
+            if !rule.order.is_empty() || !rule.disabled.is_empty() {
+                candidate.rules.insert(scope, rule);
+            }
+        }
+        if self
+            .base_snapshot()
+            .await
+            .is_none_or(|latest| latest.revision != base.revision)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Configuration changed during restoration".into(),
+            ));
+        }
+        *state = candidate;
+        eprintln!(
+            "{}",
+            json!({"event_type":"channel_controls_restored","channels":state.temporary.len(),"rules":state.rules.len()})
+        );
+        Ok(state.view(&base))
+    }
+    // Optional control-plane intent is fetched before opening the model-serving
+    // socket. Standalone uni-api remains database-free and unchanged by default.
+    pub(crate) async fn restore_controls_on_start(&self) -> Result<(), String> {
+        let Ok(url) = std::env::var("UNI_API_CONTROL_RESTORE_URL") else {
+            return Ok(());
+        };
+        if url.trim().is_empty() {
+            return Ok(());
+        }
+        let token = std::env::var("UNI_API_CONTROL_RESTORE_TOKEN")
+            .map_err(|_| "Restore credential missing")?;
+        let parsed = url::Url::parse(&url).map_err(|_| "Invalid restore URL")?;
+        if !matches!(parsed.scheme(), "https" | "http")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("Invalid restore URL".into());
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|_| "Restore client unavailable")?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|_| "Invalid restore credential")?,
+        );
+        loop {
+            let attempt = async {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .map_err(|_| "Restore service unavailable")?;
+                if !response.status().is_success() {
+                    return Err("Restore service rejected request");
+                }
+                use futures_util::StreamExt;
+                let mut stream = response.bytes_stream();
+                let mut bytes = Vec::new();
+                while let Some(part) = stream.next().await {
+                    let part = part.map_err(|_| "Restore response interrupted")?;
+                    if bytes.len() + part.len() > 2 * 1024 * 1024 {
+                        return Err("Restore snapshot too large");
+                    };
+                    bytes.extend_from_slice(&part);
+                }
+                #[derive(Deserialize)]
+                struct Bootstrap {
+                    enabled: bool,
+                    snapshot: Option<RetainedSnapshot>,
+                }
+                let payload: Bootstrap =
+                    serde_json::from_slice(&bytes).map_err(|_| "Invalid restore response")?;
+                if !payload.enabled {
+                    return Ok(());
+                }
+                let snapshot = payload.snapshot.ok_or("Restore snapshot missing")?;
+                let view = self
+                    .controls_view(&headers)
+                    .await
+                    .map_err(|_| "Restore authentication failed")?;
+                self.restore_controls(
+                    &headers,
+                    RestoreMutation {
+                        revision: view["revision"].as_str().unwrap_or_default().into(),
+                        snapshot,
+                    },
+                )
+                .await
+                .map_err(|_| "Retained configuration validation failed")?;
+                Ok(())
+            }
+            .await;
+            match attempt {
+                Ok(()) => return Ok(()),
+                Err(reason) => {
+                    eprintln!("channel_controls_restore_waiting reason={reason}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
     }
 }

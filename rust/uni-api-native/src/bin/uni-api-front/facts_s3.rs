@@ -333,9 +333,10 @@ pub fn dispatch_event(
     key: &crate::channel_metrics::MetricKey,
     request_id: &str,
     attempt_id: &str,
+    key_id: &str,
     elapsed_ms: f64,
 ) -> Value {
-    json!({"schema":1,"kind":"dispatch","event_id":new_event_id("dispatch"),"instance_id":instance_id(),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
+    json!({"schema":1,"kind":"dispatch","key_id":key_id,"event_id":new_event_id("dispatch"),"instance_id":instance_id(),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
 }
 
 fn instance_id() -> String {
@@ -410,6 +411,22 @@ mod tests {
         assert_ne!(event["event_id"], attempt_event(&attempt)["event_id"]);
     }
 
+    #[test]
+    fn dispatch_carries_same_caller_fingerprint_as_attempt_without_secrets() {
+        let token = "caller-secret";
+        let id = crate::channel_catalog::key_id(token);
+        let metric = crate::channel_metrics::MetricKey::new("p", "m", "m", "/v1/responses", true);
+        let d = dispatch_event(&metric, "r", "r-1", &id, 25.0);
+        let a = attempt_event(&ChannelStat {
+            api_key: token.into(),
+            request_id: "r".into(),
+            attempt_id: "r-1".into(),
+            ..Default::default()
+        });
+        assert_eq!(d["key_id"], a["key_id"]);
+        assert_eq!(d["dispatch_ms"], 25.0);
+        assert!(!d.to_string().contains(token));
+    }
     #[test]
     fn request_event_preserves_cache_usage_as_nullable_facts() {
         let event = request_event(&RequestStat {
