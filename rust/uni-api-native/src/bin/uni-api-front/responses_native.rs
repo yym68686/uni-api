@@ -3141,16 +3141,23 @@ pub(crate) fn apply_overrides(
     provider: &Provider,
     request_model: &str,
 ) {
-    let Some(overrides) = provider
+    if let Some(overrides) = provider
         .preferences
         .get("post_body_parameter_overrides")
         .and_then(Value::as_object)
-    else {
-        return;
-    };
-    apply_override_section(root, overrides, provider, true);
-    if let Some(model) = overrides.get(request_model).and_then(Value::as_object) {
-        apply_override_section(root, model, provider, false);
+    {
+        apply_override_section(root, overrides, provider, true);
+        if let Some(model) = overrides.get(request_model).and_then(Value::as_object) {
+            apply_override_section(root, model, provider, false);
+        }
+    }
+    // Codex wire requirements also apply when no overrides are configured,
+    // and cannot be undone by provider-wide or model-specific overrides.
+    // Endpoint-specific sanitizers still run afterwards (e.g. compact drops store).
+    if provider.engine.trim().eq_ignore_ascii_case("codex") {
+        root.insert("store".into(), Value::Bool(false));
+        root.remove("response_format");
+        root.remove("temperature");
     }
 }
 
@@ -4835,12 +4842,15 @@ mod tests {
 
     #[test]
     fn payload_compiler_matches_codex_contract_without_double_json_envelope() {
-        let provider = provider();
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::new());
         let mut payload = json!({
             "model": "gpt-public",
             "input": [{"type":"reasoning","id":"rs_1","cache_control":{}}],
             "stream": true,
             "temperature": 1,
+            "response_format": {"type": "json_object"},
+            "store": true,
             "max_output_tokens": 42,
             "previous_response_id": "resp_1"
         });
@@ -4857,10 +4867,73 @@ mod tests {
         assert_eq!(payload["store"], false);
         assert_eq!(payload["instructions"], "");
         assert!(payload.get("temperature").is_none());
+        assert!(payload.get("response_format").is_none());
         assert!(payload.get("max_output_tokens").is_none());
         assert!(payload.get("previous_response_id").is_none());
         assert!(payload["input"][0].get("id").is_none());
         assert!(payload["input"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn codex_defaults_follow_overrides_without_mutating_provider_or_other_engines() {
+        for engine in ["codex", " CODEX ", "gpt"] {
+            let mut provider = provider();
+            provider.engine = Arc::from(engine);
+            let preferences = Map::from_iter([(
+                "post_body_parameter_overrides".into(),
+                json!({
+                    "store": true,
+                    "temperature": 0.5,
+                    "response_format": {"type": "json_object"},
+                    "__remove__": ["metadata.remove"],
+                    "gpt-public": {
+                        "__remove__": ["store"],
+                        "temperature": 0.7,
+                        "response_format": {"type": "text"},
+                        "metadata": {"model_specific": true}
+                    }
+                }),
+            )]);
+            provider.preferences = Arc::new(preferences.clone());
+            let mut payload = json!({"metadata": {"remove": true, "keep": true}});
+            apply_overrides(payload.as_object_mut().unwrap(), &provider, "gpt-public");
+            assert_eq!(
+                payload["metadata"],
+                json!({"keep": true, "model_specific": true})
+            );
+            if engine == "gpt" {
+                assert!(payload.get("store").is_none());
+                assert_eq!(payload["temperature"], 0.7);
+                assert_eq!(payload["response_format"], json!({"type": "text"}));
+            } else {
+                assert_eq!(payload["store"], false);
+                assert!(payload.get("temperature").is_none());
+                assert!(payload.get("response_format").is_none());
+            }
+            assert_eq!(*provider.preferences, preferences);
+        }
+    }
+
+    #[test]
+    fn codex_compact_omits_store_after_applying_defaults() {
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::new());
+        let mut payload = json!({
+            "model": "gpt-public", "input": "hello", "store": true,
+            "temperature": 1, "response_format": {"type": "json_object"}
+        });
+        compile_payload(
+            &mut payload,
+            &provider,
+            "gpt-public",
+            "gpt-upstream",
+            "codex",
+            true,
+        )
+        .unwrap();
+        for field in ["store", "temperature", "response_format"] {
+            assert!(payload.get(field).is_none(), "unexpected field {field}");
+        }
     }
 
     #[test]

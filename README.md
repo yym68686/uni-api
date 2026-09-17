@@ -339,6 +339,8 @@ If you want to use Codex CLI / OpenAI Responses API clients directly against uni
 2. Add a provider with `engine: codex`, and configure multiple account credentials via `api` (list supported; use `account_id,refresh_token` comma format; uni-api will automatically mint/refresh an `access_token`).
 3. When an account runs out of quota, uni-api will cool down that token and automatically switch to the next one (default cooldown is 6 hours; override with `api_key_quota_cooldown_period`).
 
+`engine: codex` automatically forces `store: false` and removes the top-level `response_format` and `temperature` fields from upstream request bodies, so providers do not need repeated `post_body_parameter_overrides` entries. These rules run after provider-wide and model-specific overrides for both native Responses requests and converted Chat requests. `/v1/responses/compact` still omits `store`, and `/v1/alpha/search` retains its separate payload handling. Other engines are unaffected.
+
 Example:
 
 ```yaml

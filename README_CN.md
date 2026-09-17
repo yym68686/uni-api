@@ -339,6 +339,8 @@ yym68686/uni-api:latest
 2. 在 uni-api 的 `providers` 中新增一个 `engine: codex` 的渠道，配置多个账号凭据（`api` 支持列表；使用 `account_id,refresh_token` 逗号格式，uni-api 会自动换取/刷新 `access_token`）。
 3. 当某个账号额度耗尽时，uni-api 会对该 token 进行冷却并自动切换到下一个账号（默认冷却 6 小时，可用 `api_key_quota_cooldown_period` 覆盖）。
 
+`engine: codex` 会自动将上游请求体的 `store` 强制设为 `false`，并删除顶层 `response_format` 和 `temperature`，无需为每个渠道重复填写 `post_body_parameter_overrides`。这些规则在渠道及模型专属覆盖之后执行，适用于原生 Responses 请求和转换后的 Chat 请求。`/v1/responses/compact` 仍按协议省略 `store`；`/v1/alpha/search` 保持独立的请求体处理。其他引擎不受影响。
+
 示例配置：
 
 ```yaml
