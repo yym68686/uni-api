@@ -71,7 +71,7 @@ impl Controls {
         format!("{}:{}:{}", self.instance, self.sequence, snapshot.revision)
     }
     fn view(&self, snapshot: &Snapshot) -> Value {
-        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","temporary_channel_import":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
+        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","temporary_channel_import":true,"temporary_channel_management":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
     }
     pub fn overlay(&self, base: Arc<Snapshot>) -> Arc<Snapshot> {
         if self.temporary.is_empty() {
@@ -318,9 +318,15 @@ pub(crate) struct ImportMutation {
     pub revision: String,
     pub api_key_id: String,
     pub provider: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
     pub position: usize,
 }
 impl NativeConfigStore {
@@ -340,6 +346,13 @@ impl NativeConfigStore {
             "Configuration unavailable".into(),
         ))?;
         let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+        if input.action == "delete" || input.action == "replace" {
+            return self.manage_temporary_channel(snapshot, input).await;
+        }
+        if !input.action.is_empty() {
+            return Err(bad("Invalid action"));
+        }
+
         if !input.provider.starts_with("sub2api-")
             || input.provider.len() > 100
             || !input
@@ -488,6 +501,133 @@ impl NativeConfigStore {
         eprintln!(
             "{}",
             json!({"event_type":"temporary_channel_added","provider":input.provider,"api_key_id":input.api_key_id,"models":input.models,"position":input.position})
+        );
+        Ok(state.view(&snapshot))
+    }
+}
+
+impl NativeConfigStore {
+    async fn manage_temporary_channel(
+        &self,
+        snapshot: Arc<Snapshot>,
+        input: ImportMutation,
+    ) -> Result<Value, (StatusCode, String)> {
+        let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+        let mut state = self.channel_controls.write().await;
+        if input.revision != state.revision(&snapshot) {
+            return Err((
+                StatusCode::CONFLICT,
+                "Controls changed; refresh before editing".into(),
+            ));
+        }
+        let existing = state.temporary.get(&input.provider).cloned().ok_or((
+            StatusCode::NOT_FOUND,
+            "Temporary channel no longer exists".into(),
+        ))?;
+        if existing
+            .preferences
+            .get("__temporary_key_id")
+            .and_then(Value::as_str)
+            != Some(input.api_key_id.as_str())
+        {
+            return Err(bad("Temporary channel belongs to another key"));
+        }
+        let mut orders = Vec::new();
+        if input.action == "replace" {
+            if input.models.is_empty()
+                || input.models.len() > 32
+                || input.position == 0
+                || input.position > 1025
+                || input.models.iter().any(|m| {
+                    m.is_empty() || m.len() > 256 || m.contains('/') || m.contains(['\r', '\n'])
+                })
+                || input.models.iter().collect::<BTreeSet<_>>().len() != input.models.len()
+            {
+                return Err(bad("Invalid models or position"));
+            }
+            let caller = snapshot
+                .api_keys
+                .values()
+                .find(|k| crate::channel_catalog::can_inspect_all(&snapshot, k))
+                .ok_or(bad("Administrator unavailable"))?;
+            let available = entries(&snapshot, caller, Some(&input.api_key_id))
+                .map_err(|_| bad("Selected key unavailable"))?;
+            for model in &input.models {
+                let mut names = available
+                    .iter()
+                    .filter(|(p, m)| m == model && p.name.as_ref() != input.provider)
+                    .map(|(p, _)| p.name.to_string())
+                    .collect::<Vec<_>>();
+                if let Some(order) = state.order(&input.api_key_id, model) {
+                    let ranks: HashMap<_, _> =
+                        order.iter().enumerate().map(|(i, n)| (n, i)).collect();
+                    names.sort_by_key(|n| ranks.get(n).copied().unwrap_or(usize::MAX));
+                }
+                if input.position > names.len() + 1 {
+                    return Err(bad("Position exceeds model channel count"));
+                }
+                names.insert(input.position - 1, input.provider.clone());
+                orders.push((model.clone(), names));
+            }
+            let new_scopes = input
+                .models
+                .iter()
+                .filter(|m| {
+                    !state
+                        .rules
+                        .contains_key(&(input.api_key_id.clone(), (*m).clone()))
+                })
+                .count();
+            if state.rules.len() + new_scopes > 128 {
+                return Err(bad("Too many temporary scopes"));
+            }
+        }
+        // Remove only this provider from affected orders/disable lists. Preserve
+        // other providers and their settings, even in the same key/model scope.
+        let removed: BTreeSet<_> = existing
+            .models
+            .keys()
+            .filter(|m| input.action == "delete" || !input.models.contains(m))
+            .cloned()
+            .collect();
+        state.rules.retain(|_, rule| {
+            if input.action == "delete" || (!rule.model.is_empty() && removed.contains(&rule.model))
+            {
+                rule.order.retain(|p| p != &input.provider);
+                rule.disabled.retain(|p| p != &input.provider);
+            }
+            !rule.order.is_empty() || !rule.disabled.is_empty()
+        });
+        if input.action == "delete" {
+            state.temporary.remove(&input.provider);
+        } else {
+            let mut provider = (*existing).clone();
+            provider.models = Arc::new(
+                input
+                    .models
+                    .iter()
+                    .map(|m| (m.clone(), m.clone()))
+                    .collect(),
+            );
+            state
+                .temporary
+                .insert(input.provider.clone(), Arc::new(provider));
+            for (model, order) in orders {
+                let rule = state
+                    .rules
+                    .entry((input.api_key_id.clone(), model.clone()))
+                    .or_insert_with(|| Rule {
+                        api_key_id: input.api_key_id.clone(),
+                        model,
+                        ..Rule::default()
+                    });
+                rule.order = order;
+            }
+        }
+        state.sequence += 1;
+        eprintln!(
+            "{}",
+            json!({"event_type":"temporary_channel_managed","action":input.action,"provider":input.provider,"api_key_id":input.api_key_id,"models":input.models})
         );
         Ok(state.view(&snapshot))
     }

@@ -4365,6 +4365,7 @@ mod tests {
         let initial = store.controls_view(&admin).await.unwrap();
         let input = |revision: &Value, position| crate::channel_controls::ImportMutation {
             revision: revision.as_str().unwrap().into(),
+            action: String::new(),
             api_key_id: key.clone(),
             provider: "sub2api-fixture".into(),
             base_url: "https://example.com/v1/responses".into(),
@@ -4471,6 +4472,98 @@ mod tests {
             .unwrap()
             .providers_by_name
             .contains_key("sub2api-fixture"));
+    }
+    #[tokio::test]
+    async fn temporary_channel_management_preserves_other_routes_and_rejects_stale_edits() {
+        let store = catalog_fixture().await;
+        let admin = catalog_headers("dashboard-first");
+        let key = crate::channel_catalog::key_id("restricted");
+        let original = store.current.read().await.clone().unwrap();
+        let mut view = store.controls_view(&admin).await.unwrap();
+        let input = |view: &Value, provider: &str, action: &str, models: Vec<&str>| {
+            crate::channel_controls::ImportMutation {
+                revision: view["revision"].as_str().unwrap().into(),
+                action: action.into(),
+                api_key_id: key.clone(),
+                provider: provider.into(),
+                base_url: "https://example.com/v1/responses".into(),
+                api_key: "fixture-secret".into(),
+                models: models.into_iter().map(String::from).collect(),
+                position: 1,
+            }
+        };
+        for p in ["sub2api-one", "sub2api-two"] {
+            view = store
+                .import_temporary_channel(&admin, input(&view, p, "", vec!["shared", "new-model"]))
+                .await
+                .unwrap();
+        }
+        view = store
+            .mutate_controls(
+                &admin,
+                crate::channel_controls::Mutation {
+                    revision: view["revision"].as_str().unwrap().into(),
+                    action: "set".into(),
+                    api_key_id: key.clone(),
+                    model: "shared".into(),
+                    order: vec!["sub2api-two".into(), "sub2api-one".into()],
+                    disabled: vec!["sub2api-two".into()],
+                },
+            )
+            .await
+            .unwrap();
+        let before = view.clone();
+        let mut wrong = input(&view, "sub2api-one", "delete", vec![]);
+        wrong.api_key_id = crate::channel_catalog::key_id("admin-key");
+        assert!(store.import_temporary_channel(&admin, wrong).await.is_err());
+        assert_eq!(view, store.controls_view(&admin).await.unwrap());
+        view = store
+            .import_temporary_channel(
+                &admin,
+                input(&view, "sub2api-one", "replace", vec!["new-model"]),
+            )
+            .await
+            .unwrap();
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(!snapshot.providers_by_name["sub2api-one"]
+            .models
+            .contains_key("shared"));
+        assert!(snapshot.providers_by_name["sub2api-two"]
+            .models
+            .contains_key("shared"));
+        let rule = view["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model"] == "shared")
+            .unwrap();
+        assert_eq!(rule["order"], json!(["sub2api-two"]));
+        assert_eq!(rule["disabled"], json!(["sub2api-two"]));
+        let rejected = store
+            .import_temporary_channel(&admin, input(&before, "sub2api-one", "delete", vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        view = store
+            .import_temporary_channel(&admin, input(&view, "sub2api-one", "delete", vec![]))
+            .await
+            .unwrap();
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(!snapshot.providers_by_name.contains_key("sub2api-one"));
+        assert!(snapshot.providers_by_name.contains_key("sub2api-two"));
+        assert!(!view["rules"].to_string().contains("sub2api-one"));
+        assert!(!view.to_string().contains("fixture-secret"));
+        assert!(Arc::ptr_eq(
+            &original,
+            &store.current.read().await.clone().unwrap()
+        ));
+        assert!(store
+            .import_temporary_channel(
+                &catalog_headers("restricted"),
+                input(&view, "sub2api-two", "delete", vec![])
+            )
+            .await
+            .is_err());
     }
     fn catalog_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

@@ -78,13 +78,20 @@ def verify(binary):
                 assert add(revision=before)[0]==409
                 assert add()[0]==200 and len(state()['temporary_channels'])==1
                 assert change(action='reset',key=key,model='model-a')[0]==200;route('native');route('imported','new-model')
+                assert call('POST','/v1/temporary-channels',{'action':'replace','revision':state()['revision'],'api_key_id':key,'provider':'sub2api-fixture','models':['model-a'],'position':2})[0]==200
+                route('native')
+                assert call('POST','/v1/responses',{'model':'new-model','input':'hi'},'ordinary')[0]==404
+                assert change(order=['native','sub2api-fixture','compat'],disabled=['native'],key=key,model='model-a')[0]==200;route('imported')
+                assert call('POST','/v1/temporary-channels',{'action':'delete','revision':state()['revision'],'api_key_id':key,'provider':'sub2api-fixture'})[0]==200
+                route('compat');assert state()['temporary_channels']==[]
+                assert add()[0]==200
                 assert config_path.read_bytes()==original
                 old=state();stop(process);process=start(log)
                 new=state();assert new['rules']==[] and new['instance_id']!=old['instance_id'];assert new['expires_at'] is None
                 route('native');assert config_path.read_bytes()==original
                 assert new['temporary_channels']==[]
                 assert call('POST','/v1/responses',{'model':'new-model','input':'hi'},'ordinary')[0]==404
-                print('PASS controls: auth, ordering, scoped disable, conflict, reset, native/compat routing, restart clears, config unchanged')
+                print('PASS controls: auth, ordering, scoped disable, conflict, reset, native/compat routing, restart clears, config unchanged, exact replacement, scoped deletion')
             except Exception:
                 print((root/'log').read_text()[-8000:]);raise
             finally:stop(process);upstream.shutdown();upstream.server_close()
