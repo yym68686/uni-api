@@ -250,7 +250,13 @@ fn spawn_translation(
                 total: positive_duration(total_timeout_seconds),
             },
         };
-        let result = run_translation(
+        let result = tokio::select! {
+            () = tx.closed() => Ok(StreamOutcome {
+                usage: (0, 0, 0), fact_usage: Default::default(), success: false,
+                observational_only: false, status_code: 499,
+                detail: "downstream disconnected".into(), first_output_ms: None,
+            }),
+            result = run_translation(
             stream,
             protocol,
             output_protocol,
@@ -258,8 +264,8 @@ fn spawn_translation(
             &content_type,
             &tx,
             options,
-        )
-        .await;
+        ) => result,
+        };
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -453,7 +459,7 @@ async fn drain_final_sse_event(
     process_sse_event(&event, protocol, state, tx).await
 }
 
-fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     for index in 0..buffer.len().saturating_sub(1) {
         if buffer[index..].starts_with(b"\n\n") {
             return Some((index, 2));
@@ -1407,6 +1413,9 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        if !self.terminal && self.first_output_ms.is_none() {
+            return Err("upstream stream ended before real output or a terminal event".into());
+        }
         if self.output_protocol == OutputProtocol::Responses {
             for chunk in self.responses.finish() {
                 send_wire(tx, &chunk, self.output_protocol).await?;

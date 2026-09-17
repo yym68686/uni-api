@@ -1109,6 +1109,10 @@ By tuning `model_timeout` and `keepalive_interval` based on this matching behavi
 
 - How should I configure different timeouts for different endpoints or streaming modes?
 
+For Rust `/v1/chat/completions` streaming requests, `keepalive_interval` sends SSE comments (`: keepalive`) while waiting for upstream output, during failover, and between complete SSE events. The setting follows the same provider/global and model-name matching rules as `model_timeout`; nonpositive values disable heartbeats, and values greater than `model_timeout` are ignored. Heartbeats do not reset upstream timeouts or mark an attempt successful. Before real content, reasoning, tool output, or a finish reason, timeout and stream failures still retry and apply configured channel cooldown. Once real output is sent, failures end that stream and cool the channel without replaying the request. Streaming `model_timeout` is a first-output deadline; configure `timeout_policy.idle` and `timeout_policy.total` separately to limit pauses and the full stream lifetime.
+
+Before the first heartbeat, exhausted attempts return an HTTP error. After a heartbeat starts an HTTP 200 stream, exhausted attempts emit `data: {"error": {..., "status_code": 504}}` (with the actual failure status) and close without a success `[DONE]`. Clients must handle SSE errors as well as HTTP status codes. Heartbeats are never inserted into a partially received SSE event.
+
 Use `timeout_policy` when timeout depends on endpoint, stream mode, semantic request type, provider, engine, model, method, or role. `model_timeout` is still supported as the backward-compatible fallback; `timeout_policy` is the more precise rule system.
 
 ```yaml

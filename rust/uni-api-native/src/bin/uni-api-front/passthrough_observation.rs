@@ -4,22 +4,43 @@ use crate::provider_stream::{StreamOutcome, Translation};
 use axum::{body::Body, http::Response};
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::time::Instant;
+use std::io;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 const MAX_LINE: usize = 1 << 20;
 
-pub(crate) fn observe(response: reqwest::Response, started: Instant) -> Translation {
+pub(crate) fn observe(
+    response: reqwest::Response,
+    started: Instant,
+    control_routing: bool,
+    idle: Option<Duration>,
+) -> Translation {
     let status = response.status();
     let headers = crate::proxy::filtered_response_headers(response.headers());
     let (tx, rx) = oneshot::channel();
     let mut observer = Observer::new();
     observer.start = started;
+    observer.observational_only = !control_routing;
     observer.sender = Some(tx);
     let body = futures_util::stream::unfold(
         (response.bytes_stream(), observer),
-        |(mut upstream, mut observer)| async move {
-            match upstream.next().await {
+        move |(mut upstream, mut observer)| async move {
+            let next = if let Some(idle) = idle {
+                match tokio::time::timeout(idle, upstream.next()).await {
+                    Ok(next) => next.map(|chunk| chunk.map_err(io::Error::other)),
+                    Err(_) => Some(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream stream idle timeout exceeded",
+                    ))),
+                }
+            } else {
+                upstream
+                    .next()
+                    .await
+                    .map(|chunk| chunk.map_err(io::Error::other))
+            };
+            match next {
                 Some(result) => {
                     match &result {
                         Ok(bytes) => observer.feed(bytes),
@@ -47,6 +68,7 @@ pub(crate) fn observe(response: reqwest::Response, started: Instant) -> Translat
 }
 
 struct Observer {
+    observational_only: bool,
     line: Vec<u8>,
     overflow: bool,
     usage: FactUsage,
@@ -61,6 +83,7 @@ struct Observer {
 impl Observer {
     fn new() -> Self {
         Self {
+            observational_only: true,
             line: Vec::new(),
             overflow: false,
             usage: Default::default(),
@@ -165,7 +188,7 @@ impl Observer {
             fact_usage: self.usage.clone(),
             first_output_ms: self.first_output_ms,
             success,
-            observational_only: true,
+            observational_only: self.observational_only,
             status_code: if success {
                 200
             } else if !self.ended {
@@ -219,6 +242,8 @@ mod tests {
         } = observe(
             source,
             Instant::now() - std::time::Duration::from_millis(100),
+            false,
+            None,
         );
         assert_eq!(response.headers()["x-test"], "same");
         assert!(matches!(

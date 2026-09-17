@@ -16,8 +16,6 @@ use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 use crate::hedging::{
@@ -304,18 +302,14 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .native_responses_config
         .prices_for_model(&request_model)
         .await;
-    let use_precommit_stream = path == "/v1/chat/completions"
+    let use_chat_stream = path == "/v1/chat/completions"
         && input
             .payload
             .as_ref()
             .and_then(|payload| payload.get("stream"))
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        && resolved
-            .providers
-            .iter()
-            .any(|provider| provider_uses_responses_chat(provider));
-    let execution = AttemptLoop {
+            .unwrap_or(false);
+    let mut execution = AttemptLoop {
         state,
         started,
         arrival,
@@ -337,10 +331,12 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         image_reservations,
         prompt_price,
         completion_price,
-        precommit_comment_sent: use_precommit_stream,
+        keepalive_updates: None,
     };
-    if use_precommit_stream {
-        return precommit_chat_stream(execution);
+    if use_chat_stream {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        execution.keepalive_updates = Some(tx);
+        return crate::chat_stream::with_keepalive(run_attempt_loop(execution), rx).await;
     }
     if chat_nonstream_hedging_enabled(&execution.path, execution.input.payload.as_ref(), hedging) {
         return run_hedged_attempt_loop(execution, hedging).await;
@@ -370,7 +366,7 @@ struct AttemptLoop {
     image_reservations: Vec<MemoryReservation>,
     prompt_price: f64,
     completion_price: f64,
-    precommit_comment_sent: bool,
+    keepalive_updates: Option<crate::chat_stream::KeepaliveUpdates>,
 }
 
 fn chat_nonstream_hedging_enabled(
@@ -384,73 +380,6 @@ fn chat_nonstream_hedging_enabled(
             .and_then(Value::as_bool)
             .is_none_or(|stream| !stream)
         && hedging.active()
-}
-
-fn provider_uses_responses_chat(provider: &Provider) -> bool {
-    let engine = provider.engine.trim().to_ascii_lowercase();
-    engine == "codex"
-        || (matches!(
-            engine.as_str(),
-            "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
-        ) && provider
-            .base_url
-            .to_ascii_lowercase()
-            .contains("/responses"))
-}
-
-fn precommit_chat_stream(execution: AttemptLoop) -> Response<Body> {
-    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
-    tokio::spawn(async move {
-        if tx.send(Ok(Bytes::from_static(b":\n\n"))).await.is_err() {
-            return;
-        }
-        let response = run_attempt_loop(execution).await;
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let (parts, body) = response.into_parts();
-        if content_type.contains("text/event-stream") {
-            let mut body = body.into_data_stream();
-            while let Some(chunk) = body.next().await {
-                if tx.send(chunk.map_err(io::Error::other)).await.is_err() {
-                    return;
-                }
-            }
-            return;
-        }
-        let body = match to_bytes(body, UPSTREAM_ERROR_MAX_BYTES).await {
-            Ok(body) => body,
-            Err(error) => Bytes::from(
-                json!({"error":{"message":format!("read terminal provider response: {error}")}})
-                    .to_string(),
-            ),
-        };
-        let payload = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| {
-            json!({"error":{
-                "message":String::from_utf8_lossy(&body),
-                "status_code":parts.status.as_u16(),
-            }})
-        });
-        let _ = tx
-            .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
-            .await;
-    });
-    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        "cache-control",
-        HeaderValue::from_static("no-cache, no-transform"),
-    );
-    response
-        .headers_mut()
-        .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
-    response
 }
 
 #[derive(Clone)]
@@ -717,7 +646,7 @@ fn spawn_generic_hedge_attempt(
             plan.prepared,
             &incoming_headers,
             &endpoint,
-            false,
+            None,
             Some(&trigger),
         )
         .await
@@ -1013,11 +942,12 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         image_reservations: _image_reservations,
         prompt_price,
         completion_price,
-        precommit_comment_sent,
+        keepalive_updates,
     } = execution;
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
+    let mut upstream_failed = false;
 
     for attempt_index in 0..max_attempts {
         let provider = providers[attempt_index % providers.len()].clone();
@@ -1043,8 +973,10 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 continue;
             }
             ProviderKeySelection::ChannelCooling | ProviderKeySelection::AllKeysCooling => {
-                last_status = StatusCode::TOO_MANY_REQUESTS;
-                last_detail = "All matching provider routes are cooling down".into();
+                if !upstream_failed {
+                    last_status = StatusCode::TOO_MANY_REQUESTS;
+                    last_detail = "All matching provider routes are cooling down".into();
+                }
                 continue;
             }
         };
@@ -1130,7 +1062,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             prepared,
             &headers,
             &path,
-            precommit_comment_sent,
+            keepalive_updates.as_ref(),
             None,
         )
         .await
@@ -1236,7 +1168,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                     .await;
                             }
                             status.as_u16()
-                        } else if outcome.observational_only {
+                        } else if outcome.observational_only || outcome.status_code == 499 {
                             outcome.status_code
                         } else {
                             let policy = classify_provider_failure(
@@ -1331,6 +1263,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 return response;
             }
             Err(mut failure) => {
+                upstream_failed = true;
                 let policy = classify_provider_failure(
                     failure.status.as_u16(),
                     &failure.detail,
@@ -1641,7 +1574,7 @@ pub(crate) async fn run_moderation_preflight(
             prepared,
             headers,
             "/v1/moderations",
-            false,
+            None,
             None,
         )
         .await
@@ -2927,7 +2860,7 @@ async fn send_attempt(
     mut prepared: PreparedAttempt,
     incoming_headers: &HeaderMap,
     endpoint: &str,
-    precommit_comment_sent: bool,
+    keepalive_updates: Option<&crate::chat_stream::KeepaliveUpdates>,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
@@ -2945,6 +2878,13 @@ async fn send_attempt(
             prepared.method.as_str(),
         )
         .await;
+    if let Some(updates) = keepalive_updates {
+        let interval = state
+            .native_responses_config
+            .keepalive_interval(provider, &prepared.request_model, &prepared.original_model)
+            .await;
+        updates.send_replace(interval);
+    }
     let connect_timeout = positive_duration(timeouts.connect);
     let client = state
         .upstream_client(proxy, http1_only, connect_timeout)
@@ -2957,7 +2897,9 @@ async fn send_attempt(
         })?;
     let base_timeout = provider_timeout(provider, &prepared.original_model);
     let configured_total_timeout = positive_duration(timeouts.total);
-    let request_timeout = if hedge_trigger.is_some() {
+    let request_timeout = if hedge_trigger.is_some()
+        || (prepared.upstream_stream && endpoint == "/v1/chat/completions")
+    {
         configured_total_timeout
     } else {
         Some(configured_total_timeout.unwrap_or(base_timeout))
@@ -3138,13 +3080,35 @@ async fn send_attempt(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("text/event-stream"))
         {
-            // Preserve the existing routing reset at response-header success;
-            // the completion observer never changes routing/cooldown policy.
-            state
-                .native_responses_config
-                .reset_route_failure(provider, &prepared.original_model)
-                .await;
-            let mut translation = crate::passthrough_observation::observe(response, send_started);
+            let guarded_chat = endpoint == "/v1/chat/completions";
+            // Chat routing is finalized by the stream outcome, not HTTP headers.
+            if !guarded_chat {
+                state
+                    .native_responses_config
+                    .reset_route_failure(provider, &prepared.original_model)
+                    .await;
+            }
+            let mut translation = crate::passthrough_observation::observe(
+                response,
+                send_started,
+                guarded_chat,
+                positive_duration(timeouts.idle),
+            );
+            if guarded_chat {
+                translation = crate::chat_stream::preflight(
+                    translation,
+                    positive_duration(timeouts.first_byte)
+                        .map(|duration| tokio::time::Instant::from_std(send_started + duration)),
+                )
+                .await
+                .map_err(|failure| AttemptFailure {
+                    status: StatusCode::from_u16(failure.status_code)
+                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    detail: failure.detail,
+                    upstream_url: prepared.url.clone(),
+                    response: None,
+                })?;
+            }
             translation
                 .response
                 .headers_mut()
@@ -3203,10 +3167,14 @@ async fn send_attempt(
                 output_protocol,
                 prepared.request_model.clone(),
                 prepared.chat_stream_include_usage,
-                timeouts.first_byte,
+                timeouts.first_byte.map(|seconds| {
+                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
+                }),
                 timeouts.idle,
-                timeouts.total,
-                !precommit_comment_sent,
+                timeouts.total.map(|seconds| {
+                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
+                }),
+                false,
             )
             .await
             .map_err(|failure| AttemptFailure {
@@ -3224,9 +3192,28 @@ async fn send_attempt(
                 prepared.request_model.clone(),
                 prepared.chat_stream_include_usage,
                 timeouts.idle,
-                timeouts.total,
+                timeouts.total.map(|seconds| {
+                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
+                }),
             )
         };
+        if endpoint == "/v1/chat/completions"
+            && prepared.adapter != ResponseAdapter::ResponsesToChat
+        {
+            translation = crate::chat_stream::preflight(
+                translation,
+                positive_duration(timeouts.first_byte)
+                    .map(|duration| tokio::time::Instant::from_std(send_started + duration)),
+            )
+            .await
+            .map_err(|failure| AttemptFailure {
+                status: StatusCode::from_u16(failure.status_code)
+                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                detail: failure.detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+        }
         translation
             .response
             .headers_mut()

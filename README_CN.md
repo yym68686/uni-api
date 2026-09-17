@@ -1090,6 +1090,10 @@ api_keys:
 
 - 如何给不同端点、流式 / 非流式、不同模型设置不同超时？
 
+Rust 的 `/v1/chat/completions` 流式请求支持 `keepalive_interval`：等待上游输出、切换渠道期间以及完整 SSE 事件之间，发送 `: keepalive` 注释。配置按 `model_timeout` 相同的渠道/全局优先级及模型名规则匹配；非正数禁用心跳，大于 `model_timeout` 时忽略。心跳不会重置上游超时，也不会将请求尝试标记为成功。真实文本、推理内容、工具调用或结束原因到达之前，超时和流异常仍会触发重试及配置的渠道冷却。真实输出开始之后，失败会结束当前流并冷却渠道，不会重试导致内容重复。流式 `model_timeout` 限制首段真实输出时间；如需限制后续停顿或整条流的时长，请分别配置 `timeout_policy.idle` 和 `timeout_policy.total`。
+
+第一个心跳发送前，全部尝试失败会返回 HTTP 错误；心跳已经启动 HTTP 200 流之后，全部尝试失败会发送 `data: {"error": {..., "status_code": 504}}`（状态码取实际失败原因），并结束连接，不发送成功的 `[DONE]`。客户端需要同时处理 HTTP 状态和 SSE 错误。心跳不会插入尚未接收完整的 SSE 事件中。
+
 如果超时策略需要依赖端点、是否流式、语义请求类型、provider、engine、模型、HTTP method 或 role，请使用 `timeout_policy`。`model_timeout` 仍然保留，作为向后兼容的 fallback；`timeout_policy` 是更精确的规则系统。
 
 ```yaml

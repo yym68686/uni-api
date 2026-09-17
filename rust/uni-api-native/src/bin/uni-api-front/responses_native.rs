@@ -678,6 +678,31 @@ impl NativeConfigStore {
             .unwrap_or((0.3, 1.0))
     }
 
+    pub(crate) async fn keepalive_interval(
+        &self,
+        provider: &Provider,
+        request_model: &str,
+        original_model: &str,
+    ) -> Option<Duration> {
+        let snapshot = self.snapshot().await?;
+        let interval = model_preference(
+            provider,
+            &snapshot.preferences,
+            request_model,
+            original_model,
+            "keepalive_interval",
+        )
+        .unwrap_or(99999.0);
+        let timeout = model_timeout(
+            provider,
+            &snapshot.preferences,
+            request_model,
+            original_model,
+        );
+        (interval.is_finite() && interval > 0.0 && interval <= timeout)
+            .then(|| Duration::from_secs_f64(interval))
+    }
+
     pub(crate) async fn auto_retry_enabled(&self, headers: &HeaderMap) -> bool {
         self.auto_retry_budget(headers).await > 0
     }
@@ -3451,31 +3476,48 @@ fn model_timeout(
     request_model: &str,
     original_model: &str,
 ) -> f64 {
+    model_preference(
+        provider,
+        global,
+        request_model,
+        original_model,
+        "model_timeout",
+    )
+    .unwrap_or(100.0)
+}
+
+fn model_preference(
+    provider: &Provider,
+    global: &Map<String, Value>,
+    request_model: &str,
+    original_model: &str,
+    preference: &str,
+) -> Option<f64> {
     for preferences in [&provider.preferences, global] {
-        let Some(timeout) = preferences.get("model_timeout") else {
+        let Some(timeout) = preferences.get(preference) else {
             continue;
         };
         if let Some(value) = timeout.as_f64() {
-            return value;
+            return Some(value);
         }
         let Some(values) = timeout.as_object() else {
             continue;
         };
         if let Some(value) = model_timeout_value(values, request_model) {
-            return value;
+            return Some(value);
         }
         if let Some(value) = model_timeout_value(values, original_model) {
-            return value;
+            return Some(value);
         }
         if let Some(value) = values
             .iter()
             .find(|(key, value)| key.eq_ignore_ascii_case("default") && value.as_f64().is_some())
             .and_then(|(_, value)| value.as_f64())
         {
-            return value;
+            return Some(value);
         }
     }
-    100.0
+    None
 }
 
 fn model_timeout_value(values: &Map<String, Value>, model: &str) -> Option<f64> {
@@ -4669,6 +4711,36 @@ mod tests {
         assert_eq!(compaction.total, Some(3000.0));
         assert_eq!(regular.first_byte, Some(20.0));
         assert_eq!(regular.total, None);
+    }
+
+    #[test]
+    fn keepalive_matches_request_then_upstream_then_provider_default_then_global() {
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::from_iter([(
+            "keepalive_interval".into(),
+            json!({
+                "PUBLIC-MODEL": 1, "public": 2, "upstream": 3, "default": 4
+            }),
+        )]));
+        let global = Map::from_iter([(
+            "keepalive_interval".into(),
+            json!({"global": 5, "default": 6}),
+        )]);
+        let resolve = |p: &Provider, model, upstream| {
+            model_preference(p, &global, model, upstream, "keepalive_interval")
+        };
+        assert_eq!(resolve(&provider, "public-model", "upstream"), Some(1.0));
+        assert_eq!(resolve(&provider, "public-other", "upstream"), Some(2.0));
+        assert_eq!(resolve(&provider, "alias", "upstream-v2"), Some(3.0));
+        assert_eq!(resolve(&provider, "global", "unknown"), Some(4.0));
+        provider.preferences = Arc::new(Map::from_iter([(
+            "keepalive_interval".into(),
+            json!({"local": 7}),
+        )]));
+        assert_eq!(resolve(&provider, "global-v2", "unknown"), Some(5.0));
+        assert_eq!(resolve(&provider, "unknown", "unknown"), Some(6.0));
+        provider.preferences = Arc::new(Map::from_iter([("keepalive_interval".into(), json!(0))]));
+        assert_eq!(resolve(&provider, "global", "unknown"), Some(0.0));
     }
 
     #[test]
