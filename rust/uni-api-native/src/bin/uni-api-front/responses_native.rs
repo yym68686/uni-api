@@ -493,7 +493,8 @@ impl NativeConfigStore {
     }
 
     pub(crate) async fn snapshot(&self) -> Option<Arc<Snapshot>> {
-        self.current.read().await.clone()
+        let base = self.current.read().await.clone()?;
+        Some(self.channel_controls.read().await.overlay(base))
     }
 
     pub async fn is_ready(&self) -> bool {
@@ -507,7 +508,11 @@ impl NativeConfigStore {
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {
             if rule == "all" {
-                for provider in snapshot.providers.iter() {
+                for provider in snapshot
+                    .providers
+                    .iter()
+                    .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
+                {
                     models.extend(provider.models.keys().cloned());
                 }
                 continue;
@@ -517,6 +522,7 @@ impl NativeConfigStore {
                 if snapshot
                     .providers
                     .iter()
+                    .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
                     .any(|provider| provider.models.contains_key(&model))
                 {
                     models.insert(model);
@@ -524,7 +530,11 @@ impl NativeConfigStore {
                 continue;
             }
             if let Some((provider_name, model_rule)) = rule.split_once('/') {
-                if let Some(provider) = snapshot.providers_by_name.get(provider_name) {
+                if let Some(provider) = snapshot
+                    .providers_by_name
+                    .get(provider_name)
+                    .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
+                {
                     if model_rule == "*" {
                         models.extend(provider.models.keys().cloned());
                     } else if provider.models.contains_key(model_rule) {
@@ -536,6 +546,7 @@ impl NativeConfigStore {
             if snapshot
                 .providers
                 .iter()
+                .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
                 .any(|provider| provider.models.contains_key(rule))
             {
                 models.insert(rule.clone());
@@ -2614,6 +2625,7 @@ fn diagnostic_key(
     diagnostic.model_rules = Arc::new(vec![format!("{name}/*")]);
     let mut preferences = (*key.preferences).clone();
     preferences.remove("__route_graph");
+    preferences.insert("__diagnostic_provider".into(), json!(name));
     diagnostic.preferences = Arc::new(preferences);
     Ok(diagnostic)
 }
@@ -2692,11 +2704,13 @@ fn matching_providers(
     let mut seen = BTreeSet::new();
     matches.retain(|provider| seen.insert(provider.name.clone()));
     matches.retain(|provider| {
-        !provider.excluded_endpoints.iter().any(|excluded| {
-            excluded
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(endpoint)
-        }) && provider_accepts_body(provider, request_body_bytes)
+        crate::channel_controls::temporary_allowed(provider, api_key)
+            && !provider.excluded_endpoints.iter().any(|excluded| {
+                excluded
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case(endpoint)
+            })
+            && provider_accepts_body(provider, request_body_bytes)
             && provider_accepts_request_type(provider, request_type)
             && provider_accepts_request_rules(
                 provider,
@@ -4341,6 +4355,122 @@ mod tests {
             api_config: Arc::new(json!({})),
         }));
         store
+    }
+    #[tokio::test]
+    async fn temporary_channel_import_scopes_routing_and_resets_without_config_writes() {
+        let store = catalog_fixture().await;
+        let admin = catalog_headers("dashboard-first");
+        let key = crate::channel_catalog::key_id("restricted");
+        let original = store.current.read().await.clone().unwrap();
+        let initial = store.controls_view(&admin).await.unwrap();
+        let input = |revision: &Value, position| crate::channel_controls::ImportMutation {
+            revision: revision.as_str().unwrap().into(),
+            api_key_id: key.clone(),
+            provider: "sub2api-fixture".into(),
+            base_url: "https://example.com/v1/responses".into(),
+            api_key: "secret-import-key".into(),
+            models: vec!["shared".into(), "new-model".into()],
+            position,
+        };
+        assert!(store
+            .import_temporary_channel(
+                &catalog_headers("restricted"),
+                input(&initial["revision"], 1)
+            )
+            .await
+            .is_err());
+        assert!(store
+            .import_temporary_channel(&admin, input(&initial["revision"], 999))
+            .await
+            .is_err());
+        let changed = store
+            .import_temporary_channel(&admin, input(&initial["revision"], 1))
+            .await
+            .unwrap();
+        assert!(!changed.to_string().contains("secret-import-key"));
+        assert!(store
+            .import_temporary_channel(&admin, input(&initial["revision"], 1))
+            .await
+            .is_err());
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &store.snapshot().await.unwrap()));
+        for token in ["restricted", "parent", "admin-key", "mixed"] {
+            let api_key = &snapshot.api_keys[token];
+            let providers =
+                matching_providers(&snapshot, api_key, "shared", 0, None, None, "/v1/responses")
+                    .unwrap();
+            assert_eq!(
+                providers
+                    .iter()
+                    .any(|p| p.name.as_ref() == "sub2api-fixture"),
+                token == "restricted"
+            );
+            let ordered = store.schedule_providers(api_key, "shared", providers).await;
+            if token == "restricted" {
+                assert_eq!(ordered[0].name.as_ref(), "sub2api-fixture");
+            }
+            let rows = crate::channel_catalog::entries(
+                &snapshot,
+                &snapshot.api_keys["dashboard-first"],
+                Some(&crate::channel_catalog::key_id(token)),
+            )
+            .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .any(|(p, _)| p.name.as_ref() == "sub2api-fixture"),
+                token == "restricted"
+            );
+        }
+        assert!(!store
+            .models_for_headers(&catalog_headers("admin-key"))
+            .await
+            .unwrap()
+            .contains(&"new-model".to_string()));
+        assert!(store
+            .models_for_headers(&catalog_headers("restricted"))
+            .await
+            .unwrap()
+            .contains(&"new-model".to_string()));
+        assert!(!original.providers_by_name.contains_key("sub2api-fixture"));
+        assert!(Arc::ptr_eq(
+            &original,
+            &store.current.read().await.clone().unwrap()
+        ));
+        // Re-adding replaces this scoped provider, never creates a duplicate.
+        let changed = store
+            .import_temporary_channel(&admin, input(&changed["revision"], 1))
+            .await
+            .unwrap();
+        assert_eq!(changed["temporary_channels"].as_array().unwrap().len(), 1);
+        let reset = crate::channel_controls::Mutation {
+            revision: changed["revision"].as_str().unwrap().into(),
+            action: "reset".into(),
+            api_key_id: key,
+            model: "shared".into(),
+            order: vec![],
+            disabled: vec![],
+        };
+        let changed = store.mutate_controls(&admin, reset).await.unwrap();
+        assert!(
+            !store.snapshot().await.unwrap().providers_by_name["sub2api-fixture"]
+                .models
+                .contains_key("shared")
+        );
+        let reset = crate::channel_controls::Mutation {
+            revision: changed["revision"].as_str().unwrap().into(),
+            action: "reset_all".into(),
+            api_key_id: "".into(),
+            model: "".into(),
+            order: vec![],
+            disabled: vec![],
+        };
+        store.mutate_controls(&admin, reset).await.unwrap();
+        assert!(!store
+            .snapshot()
+            .await
+            .unwrap()
+            .providers_by_name
+            .contains_key("sub2api-fixture"));
     }
     fn catalog_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

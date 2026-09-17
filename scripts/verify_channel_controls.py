@@ -27,7 +27,7 @@ def verify(binary):
     threading.Thread(target=upstream.serve_forever,daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='uni-controls-') as directory:
         root=Path(directory);port=free_port()
-        config={'providers':[{'provider':name,'base_url':f'http://127.0.0.1:{upstream.server_port}/{name}/v1/{endpoint}','engine':'gpt','api':'test-upstream','model':['model-a','model-b']}for name,endpoint in [('native','responses'),('compat','chat/completions')]],'api_keys':[{'api':'first','model':['all']},{'api':'ordinary','model':['native/*','compat/*']}]}
+        config={'providers':[{'provider':name,'base_url':f'http://127.0.0.1:{upstream.server_port}/{name}/v1/{endpoint}','engine':'gpt','api':'test-upstream','model':['model-a','model-b']}for name,endpoint in [('native','responses'),('compat','chat/completions')]],'api_keys':[{'api':'first','model':['all']},{'api':'ordinary','model':['native/*','compat/*']},{'api':'other','model':['all']}]}
         config_path=root/'api.json';config_path.write_text(json.dumps(config));original=config_path.read_bytes()
         env=dict(os.environ,PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(config_path),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),NO_PROXY='127.0.0.1,localhost',RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0')
         env={k:v for k,v in env.items()if not k.startswith('FACTS_S3_')}
@@ -66,10 +66,24 @@ def verify(binary):
                 assert change(action='reset',key=key,model='model-a')[0]==200;route('compat')
                 assert change(disabled=['native','compat'])[0]==200
                 upstream.hits.clear();assert call('POST','/v1/responses',{'model':'model-a','input':'hi'},'ordinary')[0]==503;assert not upstream.hits
+                assert change(action='reset_all')[0]==200
+                def add(position=1,revision=None):
+                    return call('POST','/v1/temporary-channels',{'revision':revision or state()['revision'],'api_key_id':key,'provider':'sub2api-fixture','base_url':f'http://127.0.0.1:{upstream.server_port}/imported/v1/responses','api_key':'import-secret','models':['model-a','new-model'],'position':position})
+                assert call('POST','/v1/temporary-channels',{},key='ordinary')[0]==403
+                before=state()['revision'];code,added=add();assert code==200,(code,added)
+                assert 'import-secret' not in json.dumps(added)
+                route('imported');route('native','model-b');route('imported','new-model')
+                upstream.hits.clear();code,_=call('POST','/v1/responses',{'model':'new-model','input':'hi'},'other');assert code==404 and not upstream.hits
+                upstream.hits.clear();code,_=call('POST','/v1/responses',{'model':'model-a','input':'hi'},'other');assert code==200 and upstream.hits==['native']
+                assert add(revision=before)[0]==409
+                assert add()[0]==200 and len(state()['temporary_channels'])==1
+                assert change(action='reset',key=key,model='model-a')[0]==200;route('native');route('imported','new-model')
                 assert config_path.read_bytes()==original
                 old=state();stop(process);process=start(log)
                 new=state();assert new['rules']==[] and new['instance_id']!=old['instance_id'];assert new['expires_at'] is None
                 route('native');assert config_path.read_bytes()==original
+                assert new['temporary_channels']==[]
+                assert call('POST','/v1/responses',{'model':'new-model','input':'hi'},'ordinary')[0]==404
                 print('PASS controls: auth, ordering, scoped disable, conflict, reset, native/compat routing, restart clears, config unchanged')
             except Exception:
                 print((root/'log').read_text()[-8000:]);raise

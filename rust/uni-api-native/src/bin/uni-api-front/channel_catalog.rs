@@ -53,7 +53,10 @@ pub(crate) fn entries(
             .filter_map(|token| snapshot.api_keys.get(token))
             .find(|key| key_id(&key.token) == id)
             .ok_or(404u16)?;
-        return Ok(ordered_entries(snapshot, selected));
+        return Ok(ordered_entries(snapshot, selected)
+            .into_iter()
+            .filter(|(p, _)| crate::channel_controls::temporary_allowed(p, selected))
+            .collect());
     }
     Ok(snapshot
         .providers

@@ -62,3 +62,20 @@ Platform GET routes protected by this policy: `/v1/api-keys`, `/v1/model-channel
 `/v1/channel_key_rankings`, `/v1/api_keys_states`, `/v1/api_config`, and
 `/v1/generate-api-key`. Existing admin-only routes retain their additional checks.
 `/healthz` remains the unauthenticated deployment health probe.
+
+### Temporary imported channels
+
+`POST /v1/temporary-channels` accepts a current `/v1/channel-controls` revision,
+`api_key_id`, stable `provider` name (`sub2api-*`), `base_url` ending in
+`/v1/responses`, upstream `api_key`, `models`, and a one-based `position`.
+Only the first configured key or an administrator can call it. The mutation
+atomically installs a process-local provider and model-specific priority rules.
+Each selected model must have enough channels for the requested position.
+
+An imported provider is restricted to the exact destination API key. Wildcards
+and parent-key expansion do not grant other keys access; administrator-directed
+diagnostics can still inspect/test it. Repeating an import with a fresh revision
+updates the same provider rather than duplicating it. Secrets are never returned
+in the controls view or audit event. The configuration file and snapshot artifact
+are unchanged. Resetting the key/model control scope also removes imported models
+in that scope; reset-all and process restart remove every temporary provider.

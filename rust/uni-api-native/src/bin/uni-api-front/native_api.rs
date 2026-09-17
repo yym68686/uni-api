@@ -65,7 +65,7 @@ pub async fn handle(
                 StatusCode::OK,
                 json!({
                     "runtime": "rust",
-                    "capabilities": {"targeted_responses": true,"temporary_channel_controls":true},
+                    "capabilities": {"targeted_responses": true,"temporary_channel_controls":true,"temporary_channel_import":true},
                     "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),
@@ -370,14 +370,17 @@ pub fn supports_mutation(method: &Method, path: &str) -> bool {
     *method == Method::POST
         && matches!(
             path,
-            "/v1/api_config/update" | "/v1/add_credits" | "/v1/channel-controls"
+            "/v1/api_config/update"
+                | "/v1/add_credits"
+                | "/v1/channel-controls"
+                | "/v1/temporary-channels"
         )
 }
 
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
     let path = request.uri().path().trim_end_matches('/').to_owned();
     let headers = request.headers().clone();
-    if path == "/v1/channel-controls" {
+    if path == "/v1/channel-controls" || path == "/v1/temporary-channels" {
         if let Err(status) = state
             .native_responses_config
             .authorize_catalog(&headers)
@@ -394,6 +397,23 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
                 return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Control request too large")
             }
         };
+        if path == "/v1/temporary-channels" {
+            let input =
+                match serde_json::from_slice::<crate::channel_controls::ImportMutation>(&body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return json_error(StatusCode::BAD_REQUEST, "Invalid temporary channel")
+                    }
+                };
+            return match state
+                .native_responses_config
+                .import_temporary_channel(&headers, input)
+                .await
+            {
+                Ok(v) => json_response(StatusCode::OK, v),
+                Err((code, message)) => json_error(code, &message),
+            };
+        }
         let input = match serde_json::from_slice::<crate::channel_controls::Mutation>(&body) {
             Ok(input) => input,
             Err(_) => {
