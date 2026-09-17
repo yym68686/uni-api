@@ -1291,3 +1291,24 @@ models and unavailable providers return an error instead of choosing another
 provider. Check `GET /v1/observability/runtime` for
 `capabilities.targeted_responses: true` before using the header with an older
 release; older gateways may ignore unknown headers.
+
+### Temporary channel controls (no database)
+
+The first configured key and administrator keys can read or update
+`/v1/channel-controls`. All rules are process-local memory with **no expiry**.
+Restarting uni-api discards them and uses the configured routing policy again;
+configuration reloads do not persist or clear them. They are not shared between
+replicas. The console must not automatically replay rules after a restart.
+
+GET returns `revision`, `instance_id`, `config_revision`, and `rules`. POST takes
+`revision` plus `action` (`set`, `reset`, `reset_all`), `api_key_id` (opaque ID or
+empty for all keys), `model` (empty for all models), `order` (provider names in
+priority order), and `disabled` (provider names). `set` replaces exactly one
+scope; empty arrays remove that scope. Invalid scopes and stale revisions are
+rejected. This endpoint does not modify api.yaml or disclose keys.
+
+Custom ordering overrides the configured scheduling algorithm, preserving key
+permissions and provider admission rules. More specific order wins (key+model,
+key, model, global); all applicable disable lists are combined. Requests already
+in progress retain their selected candidates. New requests with every matching
+channel disabled return 503. Changes emit `channel_controls_changed` audit logs.

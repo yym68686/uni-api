@@ -15,7 +15,8 @@ pub(crate) fn key_id(token: &str) -> String {
 }
 
 // The first configured key is the dashboard connection credential. This grants
-// only catalog inspection, not configuration mutation or any other admin API.
+// catalog inspection, diagnostics and process-local routing controls. It does
+// not grant persistent configuration mutation or unrelated administrator APIs.
 pub(crate) fn can_inspect_all(snapshot: &Snapshot, caller: &ApiKey) -> bool {
     snapshot
         .api_key_order

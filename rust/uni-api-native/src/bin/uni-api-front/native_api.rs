@@ -23,6 +23,7 @@ pub async fn handle(
         && matches!(
             path,
             "/v1/observability/runtime"
+                | "/v1/channel-controls"
                 | "/v1/api-keys"
                 | "/v1/model-channels"
                 | "/v1/channel-metrics"
@@ -64,7 +65,7 @@ pub async fn handle(
                 StatusCode::OK,
                 json!({
                     "runtime": "rust",
-                    "capabilities": {"targeted_responses": true},
+                    "capabilities": {"targeted_responses": true,"temporary_channel_controls":true},
                     "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),
@@ -78,6 +79,15 @@ pub async fn handle(
                 }),
             ))
         }
+        (&Method::GET, "/v1/channel-controls") => Some(
+            match state.native_responses_config.controls_view(headers).await {
+                Ok(value) => json_response(StatusCode::OK, value),
+                Err(status) => json_error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                    "Channel controls unavailable",
+                ),
+            },
+        ),
         (&Method::GET, "/v1/models") => Some(models_response(state, uri, headers).await),
         (&Method::GET, "/v1/model-channels") => {
             Some(model_channels_response(state, uri, headers).await)
@@ -357,12 +367,48 @@ async fn channel_metrics_timeseries_response(
 }
 
 pub fn supports_mutation(method: &Method, path: &str) -> bool {
-    *method == Method::POST && matches!(path, "/v1/api_config/update" | "/v1/add_credits")
+    *method == Method::POST
+        && matches!(
+            path,
+            "/v1/api_config/update" | "/v1/add_credits" | "/v1/channel-controls"
+        )
 }
 
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
     let path = request.uri().path().trim_end_matches('/').to_owned();
     let headers = request.headers().clone();
+    if path == "/v1/channel-controls" {
+        if let Err(status) = state
+            .native_responses_config
+            .authorize_catalog(&headers)
+            .await
+        {
+            return json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                "Platform administrator key required",
+            );
+        }
+        let body = match to_bytes(request.into_body(), 64 * 1024).await {
+            Ok(body) => body,
+            Err(_) => {
+                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Control request too large")
+            }
+        };
+        let input = match serde_json::from_slice::<crate::channel_controls::Mutation>(&body) {
+            Ok(input) => input,
+            Err(_) => {
+                return json_error(StatusCode::BAD_REQUEST, "Invalid channel control request")
+            }
+        };
+        return match state
+            .native_responses_config
+            .mutate_controls(&headers, input)
+            .await
+        {
+            Ok(value) => json_response(StatusCode::OK, value),
+            Err((status, message)) => json_error(status, &message),
+        };
+    }
     if let Err(response) = require_admin(state, &headers).await {
         return response;
     }

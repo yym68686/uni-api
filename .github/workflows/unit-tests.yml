@@ -26,3 +26,4 @@ jobs:
           python3 scripts/verify_dispatch_timing.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_channel_targeting.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_chat_keepalive.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_channel_controls.py rust/uni-api-native/target/debug/uni-api-front

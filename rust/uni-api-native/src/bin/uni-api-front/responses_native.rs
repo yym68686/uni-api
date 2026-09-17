@@ -45,6 +45,7 @@ struct SnapshotStamp {
 
 #[derive(Clone)]
 pub struct NativeConfigStore {
+    pub(crate) channel_controls: Arc<RwLock<crate::channel_controls::Controls>>,
     path: Arc<PathBuf>,
     current: Arc<RwLock<Option<Arc<Snapshot>>>>,
     snapshot_stamp: Arc<Mutex<Option<SnapshotStamp>>>,
@@ -295,6 +296,7 @@ impl NativeConfigStore {
         let path = std::env::var("RUST_RESPONSES_CONFIG_SNAPSHOT_PATH")
             .unwrap_or_else(|_| "/tmp/uni-api-rust-responses-config-v1.json".into());
         Self {
+            channel_controls: Arc::new(RwLock::new(crate::channel_controls::Controls::default())),
             path: Arc::new(PathBuf::from(path)),
             current: Arc::new(RwLock::new(None)),
             snapshot_stamp: Arc::new(Mutex::new(None)),
@@ -614,17 +616,30 @@ impl NativeConfigStore {
         let entries = crate::channel_catalog::entries(&snapshot, caller, Some(selected_id))?;
         let cooldowns = self.channel_cooldowns.lock().await.clone();
         let now = tokio::time::Instant::now();
-        let rows = entries.into_iter().filter_map(|(provider, model)| {
+        let controls = self.channel_controls.read().await.clone();
+        let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
             if provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
             }
             let upstream = provider.models.get(&model)?;
             let route_cooling = cooldowns.get(&(provider.name.to_string(), upstream.clone())).is_some_and(|until| *until > now);
-            let (eligible, reason) = if provider.api_keys.is_empty() && provider.client_email.is_none() {
+            let (eligible, reason) = if controls.disabled(selected_id,&model,&provider.name) {
+                (false,"temporarily_disabled")
+            } else if provider.api_keys.is_empty() && provider.client_email.is_none() {
                 (false, "no_provider_key")
             } else if route_cooling { (false, "channel_cooldown") } else { (true, "eligible") };
             Some(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}))
         }).collect();
+        rows.sort_by_key(|row| {
+            controls
+                .order(selected_id, row["model"].as_str().unwrap_or_default())
+                .and_then(|order| {
+                    order
+                        .iter()
+                        .position(|p| Some(p.as_str()) == row["provider"].as_str())
+                })
+                .unwrap_or(usize::MAX)
+        });
         Ok((rows, snapshot.revision.to_string(), selected_id.to_owned()))
     }
 
@@ -924,6 +939,12 @@ impl NativeConfigStore {
         let providers = self
             .schedule_providers(&api_key, request_model, providers)
             .await;
+        if providers.is_empty() {
+            return Err(RouteResolutionError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "All matching channels are temporarily disabled".into(),
+            });
+        }
         let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) {
             HedgingConfig::default()
         } else {
@@ -969,6 +990,27 @@ impl NativeConfigStore {
     }
 
     pub(crate) async fn schedule_providers(
+        &self,
+        api_key: &ApiKey,
+        request_model: &str,
+        providers: Vec<Arc<Provider>>,
+    ) -> Vec<Arc<Provider>> {
+        let controls = self.channel_controls.read().await.clone();
+        let key = crate::channel_catalog::key_id(&api_key.token);
+        if controls.order(&key, request_model).is_some() {
+            return controls.apply(&key, request_model, providers);
+        }
+        let scheduled = self
+            .schedule_configured_providers(api_key, request_model, providers)
+            .await;
+        if controls.is_empty() {
+            scheduled
+        } else {
+            controls.apply(&key, request_model, scheduled)
+        }
+    }
+
+    async fn schedule_configured_providers(
         &self,
         api_key: &ApiKey,
         request_model: &str,
@@ -2351,6 +2393,12 @@ pub async fn prepare_native_request(
     let providers = store
         .schedule_providers(&api_key, &request_model, providers)
         .await;
+    if providers.is_empty() {
+        return NativePreparation::Response(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":"All matching channels are temporarily disabled"}),
+        ));
+    }
     if providers.iter().any(|provider| {
         !matches!(provider.engine.as_ref(), "gpt" | "codex")
             || provider.api_keys.is_empty()
@@ -4305,6 +4353,193 @@ mod tests {
             })
             .collect()
     }
+    #[tokio::test]
+    async fn temporary_controls_are_scoped_reversible_and_revision_guarded() {
+        use crate::channel_controls::Mutation;
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        let headers = catalog_headers("dashboard-first");
+        assert_eq!(
+            store
+                .controls_view(&catalog_headers("restricted"))
+                .await
+                .unwrap_err(),
+            403
+        );
+        let initial = store.controls_view(&headers).await.unwrap();
+        let input = |revision: &Value,
+                     action: &str,
+                     key: &str,
+                     model: &str,
+                     order: Vec<&str>,
+                     disabled: Vec<&str>| {
+            serde_json::from_value::<Mutation>(json!({"revision":revision,"action":action,"api_key_id":key,"model":model,"order":order,"disabled":disabled})).unwrap()
+        };
+        assert!(store
+            .mutate_controls(
+                &catalog_headers("restricted"),
+                input(&initial["revision"], "set", "", "", vec![], vec!["z-first"])
+            )
+            .await
+            .is_err());
+        assert!(store
+            .mutate_controls(
+                &headers,
+                input(&initial["revision"], "set", "", "", vec!["missing"], vec![])
+            )
+            .await
+            .is_err());
+        let changed = store
+            .mutate_controls(
+                &headers,
+                input(
+                    &initial["revision"],
+                    "set",
+                    "",
+                    "",
+                    vec!["m-third", "a-second", "z-first"],
+                    vec!["z-first"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .mutate_controls(
+                &headers,
+                input(&initial["revision"], "reset", "", "", vec![], vec![])
+            )
+            .await
+            .is_err());
+        let names = |providers: Vec<Arc<Provider>>| {
+            providers
+                .into_iter()
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let available = vec![
+            snapshot.providers_by_name["z-first"].clone(),
+            snapshot.providers_by_name["a-second"].clone(),
+            snapshot.providers_by_name["m-third"].clone(),
+        ];
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["admin-key"],
+                        "shared",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["m-third", "a-second"]
+        );
+        // No allow-list expansion: configured matches remain the sole candidates.
+        assert!(store
+            .schedule_providers(
+                &snapshot.api_keys["dashboard-first"],
+                "shared",
+                vec![snapshot.providers_by_name["z-first"].clone()]
+            )
+            .await
+            .is_empty());
+        let id = crate::channel_catalog::key_id("restricted");
+        let scoped = store
+            .mutate_controls(
+                &headers,
+                input(
+                    &changed["revision"],
+                    "set",
+                    &id,
+                    "shared",
+                    vec!["a-second", "m-third"],
+                    vec!["m-third"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["restricted"],
+                        "shared",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["a-second"]
+        );
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["restricted"],
+                        "extra",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["m-third", "a-second"]
+        );
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["admin-key"],
+                        "shared",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["m-third", "a-second"]
+        );
+        let (rows, _, _) = store
+            .channel_catalog(&headers, "/v1/responses", false, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r["provider"] == "m-third" && r["model"] == "shared")
+                .unwrap()["reason"],
+            "temporarily_disabled"
+        );
+        let reset = store
+            .mutate_controls(
+                &headers,
+                input(&scoped["revision"], "reset", &id, "shared", vec![], vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset["rules"].as_array().unwrap().len(), 1);
+        let cleared = store
+            .mutate_controls(
+                &headers,
+                input(&reset["revision"], "reset_all", "", "", vec![], vec![]),
+            )
+            .await
+            .unwrap();
+        assert!(cleared["rules"].as_array().unwrap().is_empty());
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(&snapshot.api_keys["admin-key"], "shared", available)
+                    .await
+            ),
+            vec!["z-first", "a-second", "m-third"]
+        );
+        let restarted = catalog_fixture().await;
+        let fresh = restarted.controls_view(&headers).await.unwrap();
+        assert_ne!(initial["instance_id"], fresh["instance_id"]);
+        assert!(fresh["rules"].as_array().unwrap().is_empty());
+        assert!(restarted
+            .mutate_controls(
+                &headers,
+                input(&cleared["revision"], "set", "", "", vec![], vec!["z-first"])
+            )
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn diagnostic_routing_is_admin_only_and_never_falls_back() {
         let store = catalog_fixture().await;
