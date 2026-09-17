@@ -38,13 +38,15 @@ pub(crate) struct Mutation {
     #[serde(default)]
     pub disabled: Vec<String>,
 }
+type OverlayCache = Arc<Mutex<Option<(String, u64, Arc<Snapshot>)>>>;
+
 #[derive(Clone)]
 pub(crate) struct Controls {
     instance: String,
     sequence: u64,
     rules: BTreeMap<(String, String), Rule>,
     temporary: BTreeMap<String, Arc<Provider>>,
-    overlay_cache: Arc<Mutex<Option<(String, u64, Arc<Snapshot>)>>>,
+    overlay_cache: OverlayCache,
 }
 impl Default for Controls {
     fn default() -> Self {
