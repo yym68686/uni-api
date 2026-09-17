@@ -876,9 +876,10 @@ impl NativeConfigStore {
                 message: "Too many requests".into(),
             });
         }
+        let route_key = diagnostic_key(&snapshot, &api_key, headers, endpoint)?;
         let providers = matching_providers(
             &snapshot,
-            &api_key,
+            &route_key,
             request_model,
             request_body_bytes,
             request_type,
@@ -898,7 +899,11 @@ impl NativeConfigStore {
         let providers = self
             .schedule_providers(&api_key, request_model, providers)
             .await;
-        let hedging = parse_hedging(&snapshot.preferences);
+        let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) {
+            HedgingConfig::default()
+        } else {
+            parse_hedging(&snapshot.preferences)
+        };
         Ok(ResolvedRoute { providers, hedging })
     }
 
@@ -2279,9 +2284,18 @@ pub async fn prepare_native_request(
             .expect("checked JSON object")
             .insert("stream".into(), Value::Bool(stream));
     }
+    let route_key = match diagnostic_key(&snapshot, &api_key, &parts.headers, normalized_endpoint) {
+        Ok(key) => key,
+        Err(error) => {
+            return NativePreparation::Response(json_response(
+                error.status,
+                json!({"error":error.message}),
+            ))
+        }
+    };
     let providers = match matching_providers(
         &snapshot,
-        &api_key,
+        &route_key,
         &request_model,
         observation.body_bytes,
         request_type,
@@ -2379,9 +2393,14 @@ pub async fn prepare_native_request(
             json!({"error": "Too many requests"}),
         ));
     }
-    let retry_count = compute_retry_count(&providers)
-        .max(api_key_retry_budget(&api_key, providers.len()))
-        .min(100);
+    let targeted = parts.headers.contains_key(TARGET_PROVIDER_HEADER);
+    let retry_count = if targeted {
+        1
+    } else {
+        compute_retry_count(&providers)
+            .max(api_key_retry_budget(&api_key, providers.len()))
+            .min(100)
+    };
     NativePreparation::Ready(NativeRoute {
         store: store.clone(),
         codex_oauth,
@@ -2400,7 +2419,11 @@ pub async fn prepare_native_request(
         request_body_bytes: observation.body_bytes,
         cursor: 0,
         max_attempts: retry_count,
-        hedging: parse_hedging(&snapshot.preferences),
+        hedging: if targeted {
+            HedgingConfig::default()
+        } else {
+            parse_hedging(&snapshot.preferences)
+        },
         attempt_contexts: HashMap::new(),
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
@@ -2467,6 +2490,59 @@ fn nested_keys_for_model(snapshot: &Snapshot, key: &ApiKey, model: &str) -> Vec<
         &mut std::collections::BTreeSet::new(),
     );
     out
+}
+
+// Explicit administrator-only diagnostic routing. The temporary key is never
+// written to the snapshot; normal traffic retains its configured routing graph.
+pub(crate) const TARGET_PROVIDER_HEADER: &str = "x-uni-api-provider";
+
+fn diagnostic_key(
+    snapshot: &Snapshot,
+    key: &ApiKey,
+    headers: &HeaderMap,
+    endpoint: &str,
+) -> Result<ApiKey, RouteResolutionError> {
+    let Some(value) = headers.get(TARGET_PROVIDER_HEADER) else {
+        return Ok(key.clone());
+    };
+    if !crate::channel_catalog::can_inspect_all(snapshot, key) {
+        return Err(RouteResolutionError {
+            status: StatusCode::FORBIDDEN,
+            message: "Targeted requests require a platform administrator key".into(),
+        });
+    }
+    if endpoint.trim_end_matches('/') != "/v1/responses" {
+        return Err(RouteResolutionError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Targeted requests require /v1/responses".into(),
+        });
+    }
+    let name = value
+        .to_str()
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| RouteResolutionError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid target provider".into(),
+        })?;
+    if name.contains('/') || snapshot.api_keys.contains_key(name) {
+        return Err(RouteResolutionError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Ambiguous target provider name".into(),
+        });
+    }
+    if !snapshot.providers_by_name.contains_key(name) {
+        return Err(RouteResolutionError {
+            status: StatusCode::NOT_FOUND,
+            message: "Target provider not found".into(),
+        });
+    }
+    let mut diagnostic = key.clone();
+    diagnostic.model_rules = Arc::new(vec![format!("{name}/*")]);
+    let mut preferences = (*key.preferences).clone();
+    preferences.remove("__route_graph");
+    diagnostic.preferences = Arc::new(preferences);
+    Ok(diagnostic)
 }
 
 fn matching_providers(
@@ -4187,6 +4263,79 @@ mod tests {
             })
             .collect()
     }
+    #[tokio::test]
+    async fn diagnostic_routing_is_admin_only_and_never_falls_back() {
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        for token in ["dashboard-first", "admin-key"] {
+            let key = &snapshot.api_keys[token];
+            let mut headers = catalog_headers(token);
+            headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("m-third"));
+            let targeted = diagnostic_key(&snapshot, key, &headers, "/v1/responses")
+                .ok()
+                .unwrap();
+            let providers = matching_providers(
+                &snapshot,
+                &targeted,
+                "shared",
+                100,
+                None,
+                None,
+                "/v1/responses",
+            )
+            .unwrap();
+            assert_eq!(
+                providers
+                    .iter()
+                    .map(|p| p.name.as_ref())
+                    .collect::<Vec<_>>(),
+                vec!["m-third"]
+            );
+            assert!(matching_providers(
+                &snapshot,
+                &targeted,
+                "missing",
+                100,
+                None,
+                None,
+                "/v1/responses"
+            )
+            .unwrap()
+            .is_empty());
+            assert!(diagnostic_key(&snapshot, key, &headers, "/v1/chat/completions").is_err());
+            headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("missing"));
+            assert!(diagnostic_key(&snapshot, key, &headers, "/v1/responses").is_err());
+            headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("excluded"));
+            let excluded = diagnostic_key(&snapshot, key, &headers, "/v1/responses")
+                .ok()
+                .unwrap();
+            assert!(matching_providers(
+                &snapshot,
+                &excluded,
+                "shared",
+                100,
+                None,
+                None,
+                "/v1/responses"
+            )
+            .unwrap()
+            .is_empty());
+        }
+        let mut headers = catalog_headers("restricted");
+        headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("m-third"));
+        assert!(diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["restricted"],
+            &headers,
+            "/v1/responses"
+        )
+        .is_err());
+        assert_eq!(
+            snapshot.api_keys["dashboard-first"].preferences["__route_graph"],
+            json!(["z-first/shared"])
+        );
+    }
+
     #[tokio::test]
     async fn fixed_priority_preserves_key_graph_order_when_deduplicating_matches() {
         let store = catalog_fixture().await;

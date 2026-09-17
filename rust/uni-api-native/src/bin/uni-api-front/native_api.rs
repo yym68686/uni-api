@@ -64,6 +64,7 @@ pub async fn handle(
                 StatusCode::OK,
                 json!({
                     "runtime": "rust",
+                    "capabilities": {"targeted_responses": true},
                     "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),

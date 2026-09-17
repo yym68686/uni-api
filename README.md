@@ -1275,3 +1275,15 @@ Licensed under the Apache License, Version 2.0. See `LICENSE`.
 <a href="https://github.com/yym68686/uni-api/stargazers">
         <img width="500" alt="Star History Chart" src="https://api.star-history.com/svg?repos=yym68686/uni-api&type=Date">
 </a>
+
+### Administrator channel diagnostics
+
+`POST /v1/responses` accepts `X-Uni-API-Provider: <configured provider name>`
+only with the first configured key or an administrator key. This sends at most
+one upstream attempt to that provider, retaining model mappings and provider
+policy while disabling fallback, retries, and hedging for that request. Ordinary
+requests without this header keep their configured routing behavior. Unsupported
+models and unavailable providers return an error instead of choosing another
+provider. Check `GET /v1/observability/runtime` for
+`capabilities.targeted_responses: true` before using the header with an older
+release; older gateways may ignore unknown headers.

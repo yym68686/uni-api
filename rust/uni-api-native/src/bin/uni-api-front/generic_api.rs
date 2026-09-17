@@ -282,7 +282,9 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .native_responses_config
         .auto_retry_budget(&headers)
         .await;
-    let max_attempts = if retry_budget == 0 {
+    let max_attempts = if headers.contains_key(crate::responses_native::TARGET_PROVIDER_HEADER)
+        || retry_budget == 0
+    {
         1
     } else {
         compute_retry_count(&resolved.providers)
