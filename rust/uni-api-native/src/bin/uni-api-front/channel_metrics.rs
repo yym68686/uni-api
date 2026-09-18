@@ -132,6 +132,7 @@ struct Bucket {
     first_output: Distribution,
     request_to_dispatch: Distribution,
     first_text: Distribution,
+    response_created: Distribution,
     duration: Distribution,
     last_success: Option<u64>,
     last_failure: Option<u64>,
@@ -148,13 +149,14 @@ impl Bucket {
         self.first_output.merge(&other.first_output);
         self.request_to_dispatch.merge(&other.request_to_dispatch);
         self.first_text.merge(&other.first_text);
+        self.response_created.merge(&other.response_created);
         self.duration.merge(&other.duration);
         self.last_success = self.last_success.max(other.last_success);
         self.last_failure = self.last_failure.max(other.last_failure);
     }
     fn json(&self) -> Value {
         let denominator = self.success + self.failed;
-        json!({"started":self.started,"success":self.success,"failed":self.failed,"client_cancelled":self.client_cancelled,"hedge_cancelled":self.hedge_cancelled,"cancelled_unknown":self.cancelled_unknown,"skipped":self.skipped,"success_rate_denominator":denominator,"success_rate":(denominator>0).then(||self.success as f64/denominator as f64),"request_to_dispatch":self.request_to_dispatch.json(),"first_output":self.first_output.json(),"first_text":self.first_text.json(),"duration":self.duration.json(),"last_success_at":self.last_success,"last_failure_at":self.last_failure,"quality":if denominator == 0 {"no_samples"} else if denominator < 10 {"low_samples"} else {"sufficient"}})
+        json!({"started":self.started,"success":self.success,"failed":self.failed,"client_cancelled":self.client_cancelled,"hedge_cancelled":self.hedge_cancelled,"cancelled_unknown":self.cancelled_unknown,"skipped":self.skipped,"success_rate_denominator":denominator,"success_rate":(denominator>0).then(||self.success as f64/denominator as f64),"request_to_dispatch":self.request_to_dispatch.json(),"first_output":self.first_output.json(),"first_text":self.first_text.json(),"response_created":self.response_created.json(),"duration":self.duration.json(),"last_success_at":self.last_success,"last_failure_at":self.last_failure,"quality":if denominator == 0 {"no_samples"} else if denominator < 10 {"low_samples"} else {"sufficient"}})
     }
 }
 #[derive(Debug, Default)]
@@ -287,6 +289,28 @@ impl ChannelMetrics {
             }
             if let Some(v) = first_output_ms {
                 b.first_output.observe(now, v)
+            }
+        });
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn response_timings(
+        &self,
+        provider: &str,
+        model: &str,
+        upstream_model: &str,
+        endpoint: &str,
+        stream: bool,
+        created_ms: Option<f64>,
+        text_ms: Option<f64>,
+    ) {
+        let key = MetricKey::new(provider, model, upstream_model, endpoint, stream);
+        self.mutate(&key, |series, now| {
+            let bucket = series.bucket(now / 60);
+            if let Some(value) = created_ms {
+                bucket.response_created.observe(now, value);
+            }
+            if let Some(value) = text_ms {
+                bucket.first_text.observe(now, value);
             }
         });
     }

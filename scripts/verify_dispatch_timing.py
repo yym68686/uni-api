@@ -65,10 +65,15 @@ class Upstream(BaseHTTPRequestHandler):
                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
             stream_body = b'data: {"id":"chat_fixture","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}\n\ndata: {"id":"chat_fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
         body = stream_body if payload.get("stream") else json.dumps(response).encode()
+        created = b'data: {"type":"response.created","response":{"status":"in_progress","output":[]}}\n\n' if payload.get("stream") and self.path.endswith("/responses") else b""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream" if payload.get("stream") else "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(created) + len(body)))
         self.end_headers()
+        if created:
+            self.wfile.write(created)
+            self.wfile.flush()
+            time.sleep(0.06)
         self.wfile.write(body)
 
 
@@ -160,6 +165,11 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                 stats = {row["provider"]: row["stats"] for row in after["data"]}
                 assert stats["z-first"]["started"] == stats["a-second"]["started"] == 1, stats
                 assert stats["a-second"]["success"] == 1, stats
+                if streaming and endpoint == "/v1/responses":
+                    created = stats["a-second"]["response_created"]
+                    text = stats["a-second"]["first_text"]
+                    assert created["sample_count"] == text["sample_count"] == 1, stats
+                    assert text["last_ms"] - created["last_ms"] >= 40, stats
                 if not hedging or endpoint == "/v1/chat/completions":
                     assert stats["z-first"]["failed"] + stats["z-first"]["hedge_cancelled"] == 1, stats
                 other = get_json(port, "/v1/channel-metrics?" + urlencode({"endpoint": endpoint, "stream": str(not streaming).lower(), "window": "15m", "model": "m"}))

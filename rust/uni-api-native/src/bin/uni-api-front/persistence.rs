@@ -29,6 +29,8 @@ pub struct RequestStat {
     pub upstream_model: String,
     pub status: u16,
     pub first_output_ms: Option<f64>,
+    pub response_created_ms: Option<f64>,
+    pub first_text_ms: Option<f64>,
     pub request_id: String,
     pub trace_id: String,
     pub endpoint: String,
@@ -52,6 +54,8 @@ pub struct RequestStat {
 pub struct ChannelStat {
     pub duration_ms: Option<f64>,
     pub first_output_ms: Option<f64>,
+    pub response_created_ms: Option<f64>,
+    pub first_text_ms: Option<f64>,
     pub request_id: String,
     pub attempt_id: String,
     pub provider: String,

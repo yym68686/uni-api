@@ -1825,6 +1825,15 @@ impl NativeRoute {
             Some(duration_ms as f64),
             outcome.get("first_output_ms").and_then(Value::as_f64),
         );
+        crate::channel_metrics::global().response_timings(
+            &attempt.provider,
+            &attempt.request_model,
+            &attempt.actual_model,
+            &self.endpoint,
+            attempt.stream,
+            outcome.get("response_created_ms").and_then(Value::as_f64),
+            outcome.get("first_text_ms").and_then(Value::as_f64),
+        );
         self.upstream_duration_ms = self.upstream_duration_ms.saturating_add(duration_ms);
         let attempt_outcome = outcome
             .get("kind")
@@ -1961,6 +1970,8 @@ impl NativeRoute {
             upstream_model: final_actual_model.unwrap_or_default().to_owned(),
             status,
             first_output_ms: outcome.get("first_output_ms").and_then(Value::as_f64),
+            response_created_ms: outcome.get("response_created_ms").and_then(Value::as_f64),
+            first_text_ms: outcome.get("first_text_ms").and_then(Value::as_f64),
             request_id: self.request_id.clone(),
             trace_id: trace_id(&self.request_headers, &self.request_id),
             endpoint: self.endpoint.clone(),
@@ -2042,6 +2053,8 @@ impl NativeRoute {
                 .as_ref()
                 .map(|a| a.started_at.elapsed().as_secs_f64() * 1000.0),
             first_output_ms: outcome.get("first_output_ms").and_then(Value::as_f64),
+            response_created_ms: outcome.get("response_created_ms").and_then(Value::as_f64),
+            first_text_ms: outcome.get("first_text_ms").and_then(Value::as_f64),
             request_id: self.request_id.clone(),
             attempt_id: self
                 .last_attempt

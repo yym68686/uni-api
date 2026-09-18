@@ -73,6 +73,8 @@ struct Observer {
     overflow: bool,
     usage: FactUsage,
     first_output_ms: Option<f64>,
+    response_created_ms: Option<f64>,
+    first_text_ms: Option<f64>,
     start: Instant,
     terminal: bool,
     failed: bool,
@@ -88,6 +90,8 @@ impl Observer {
             overflow: false,
             usage: Default::default(),
             first_output_ms: None,
+            response_created_ms: None,
+            first_text_ms: None,
             start: Instant::now(),
             terminal: false,
             failed: false,
@@ -135,6 +139,20 @@ impl Observer {
                 .or_else(|| value.pointer("/response/usage")),
         ));
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let elapsed = self.start.elapsed().as_secs_f64() * 1000.0;
+        if kind == "response.created" && self.response_created_ms.is_none() {
+            self.response_created_ms = Some(elapsed);
+        }
+        if kind == "response.output_text.delta"
+            && self.first_text_ms.is_none()
+            && value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            self.first_text_ms = Some(elapsed);
+        }
+
         if kind == "error"
             || kind == "response.failed"
             || value.get("error").is_some_and(|v| !v.is_null())
@@ -187,6 +205,8 @@ impl Observer {
             usage: (0, 0, 0),
             fact_usage: self.usage.clone(),
             first_output_ms: self.first_output_ms,
+            response_created_ms: self.response_created_ms,
+            first_text_ms: self.first_text_ms,
             success,
             observational_only: self.observational_only,
             status_code: if success {

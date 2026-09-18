@@ -317,7 +317,7 @@ pub fn global() -> Option<FactWriter> {
 pub fn request_event(s: &crate::persistence::RequestStat) -> Value {
     let key = hex_sha(&s.api_key);
     let at = now_ms();
-    json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
+    json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
 }
 pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     let at = now_ms();
@@ -326,7 +326,7 @@ pub fn attempt_event(s: &crate::persistence::ChannelStat) -> Value {
     } else {
         s.attempt_id.clone()
     };
-    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"first_output_ms":s.first_output_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
+    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
 }
 
 pub fn dispatch_event(

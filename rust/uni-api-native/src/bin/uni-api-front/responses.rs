@@ -143,6 +143,8 @@ struct StreamStats {
     wire_hash: Option<Sha256>,
     started_at: tokio::time::Instant,
     first_output_ms: Option<f64>,
+    response_created_ms: Option<f64>,
+    first_text_ms: Option<f64>,
 }
 
 impl StreamStats {
@@ -164,6 +166,8 @@ impl StreamStats {
             wire_hash: sampled.then(Sha256::new),
             started_at: tokio::time::Instant::now(),
             first_output_ms: None,
+            response_created_ms: None,
+            first_text_ms: None,
         }
     }
 
@@ -185,10 +189,25 @@ impl StreamStats {
             "wire_hash_sampled": self.wire_hash.is_some(),
             "stream_mode": self.stream_mode,
             "first_output_ms": self.first_output_ms,
+            "response_created_ms": self.response_created_ms,
+            "first_text_ms": self.first_text_ms,
         })
     }
 
     fn observe_semantic_output(&mut self, event_type: &str, payload: &Value) {
+        let elapsed = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        if event_type == "response.created" && self.response_created_ms.is_none() {
+            self.response_created_ms = Some(elapsed);
+        }
+        if event_type == "response.output_text.delta"
+            && self.first_text_ms.is_none()
+            && payload
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            self.first_text_ms = Some(elapsed);
+        }
         if self.first_output_ms.is_none()
             && (has_real_output(event_type, payload)
                 || matches!(event_type, "response.completed" | "response.incomplete")
@@ -2702,7 +2721,7 @@ fn inspect_terminal_frame(
     stats: &mut StreamStats,
 ) -> Result<Option<Terminal>, String> {
     observe_light_frame(stats, frame);
-    if stats.first_output_ms.is_none() {
+    if stats.first_output_ms.is_none() || stats.first_text_ms.is_none() {
         // Observation is best-effort and cannot reject or rewrite raw traffic.
         if let Ok(parsed) = parse_sse_frame(frame) {
             if let Some(data) = parsed.data {
@@ -3314,17 +3333,27 @@ mod tests {
         let (wire, _) = raw_terminal_prefix(decoder.feed(keepalive).unwrap(), &mut stats).unwrap();
         assert_eq!(wire.as_ref(), keepalive);
         assert!(stats.first_output_ms.is_none());
+        let created = stats.response_created_ms.unwrap();
+        assert!(created >= 400.0);
+        assert!(stats.first_text_ms.is_none());
+        stats.started_at = tokio::time::Instant::now() - Duration::from_millis(800);
         let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n";
         let (wire, _) = raw_terminal_prefix(decoder.feed(delta).unwrap(), &mut stats).unwrap();
         assert_eq!(wire.as_ref(), delta);
         let first = stats.first_output_ms.unwrap();
-        assert!(first >= 400.0);
+        assert!(first >= 800.0);
+        let first_text = stats.first_text_ms.unwrap();
+        assert!(first_text >= 800.0 && first_text <= first);
+        assert_eq!(stats.response_created_ms, Some(created));
         raw_terminal_prefix(decoder.feed(delta).unwrap(), &mut stats).unwrap();
         assert_eq!(stats.first_output_ms, Some(first));
+        assert_eq!(stats.first_text_ms, Some(first_text));
         let mut failed = StreamStats::new("failure");
         let body=b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n";
         raw_terminal_prefix(decoder.feed(body).unwrap(), &mut failed).unwrap();
         assert!(failed.first_output_ms.is_none());
+        assert!(failed.response_created_ms.is_none());
+        assert!(failed.first_text_ms.is_none());
     }
     #[test]
     fn decoder_preserves_fragmented_canonical_frames() {

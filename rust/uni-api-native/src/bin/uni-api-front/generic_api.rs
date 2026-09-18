@@ -730,6 +730,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                 execution.state.persistence.record_channel(ChannelStat {
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: execution.request_id.clone(),
                     attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
@@ -828,6 +830,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                 execution.state.persistence.record_channel(ChannelStat {
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: execution.request_id.clone(),
                     attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
@@ -1128,6 +1132,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 status_code: 502,
                                 detail: "provider stream outcome was canceled".into(),
                                 first_output_ms: None,
+                                response_created_ms: None,
+                                first_text_ms: None,
                             }
                         });
                         let mut request_stat = request_stat;
@@ -1137,6 +1143,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.total_tokens = outcome.usage.2;
                         request_stat.fact_usage = outcome.fact_usage.clone();
                         request_stat.first_output_ms = outcome.first_output_ms;
+                        request_stat.response_created_ms = outcome.response_created_ms;
+                        request_stat.first_text_ms = outcome.first_text_ms;
                         request_stat.status = outcome.status_code;
                         request_stat.is_flagged = !outcome.success;
                         request_stat.timing_spans = json!({
@@ -1151,6 +1159,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         outcome_state.persistence.record_channel(ChannelStat {
                             duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                             first_output_ms: outcome.first_output_ms,
+                            response_created_ms: outcome.response_created_ms,
+                            first_text_ms: outcome.first_text_ms,
                             request_id: outcome_request_id.clone(),
                             attempt_id: format!("{}-r{}", outcome_request_id, attempt_index + 1),
                             provider: outcome_provider.name.to_string(),
@@ -1205,6 +1215,15 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             policy.status
                         };
                         outcome_state.persistence.record_request(request_stat);
+                        crate::channel_metrics::global().response_timings(
+                            &outcome_provider.name,
+                            &outcome_model,
+                            &outcome_original_model,
+                            &outcome_path,
+                            downstream_stream,
+                            outcome.response_created_ms,
+                            outcome.first_text_ms,
+                        );
                         emit_attempt_with_first_output(
                             &outcome_request_id,
                             &outcome_trace_id,
@@ -1231,6 +1250,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 state.persistence.record_channel(ChannelStat {
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: request_id.clone(),
                     attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
@@ -1292,6 +1313,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 state.persistence.record_channel(ChannelStat {
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: request_id.clone(),
                     attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),

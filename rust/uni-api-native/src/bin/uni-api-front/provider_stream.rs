@@ -48,6 +48,8 @@ pub struct StreamOutcome {
     pub status_code: u16,
     pub detail: String,
     pub first_output_ms: Option<f64>,
+    pub response_created_ms: Option<f64>,
+    pub first_text_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,7 +256,7 @@ fn spawn_translation(
             () = tx.closed() => Ok(StreamOutcome {
                 usage: (0, 0, 0), fact_usage: Default::default(), success: false,
                 observational_only: false, status_code: 499,
-                detail: "downstream disconnected".into(), first_output_ms: None,
+                detail: "downstream disconnected".into(), first_output_ms: None, response_created_ms: None, first_text_ms: None,
             }),
             result = run_translation(
             stream,
@@ -288,6 +290,8 @@ fn spawn_translation(
                     status_code: 502,
                     detail: error,
                     first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                 }
             }
         };
@@ -731,6 +735,25 @@ async fn process_json_bytes(
     }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
+    if protocol == Protocol::Responses {
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let elapsed = state.started_at.elapsed().as_secs_f64() * 1000.0;
+        if kind == "response.created" && state.response_created_ms.is_none() {
+            state.response_created_ms = Some(elapsed);
+        }
+        if kind == "response.output_text.delta"
+            && state.first_text_ms.is_none()
+            && value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            state.first_text_ms = Some(elapsed);
+        }
+    }
     let chunks = state.convert(protocol, &value);
     if state.first_output_ms.is_none() && semantic_output_value(protocol, &value) {
         state.first_output_ms = Some(state.started_at.elapsed().as_secs_f64() * 1000.0);
@@ -877,6 +900,8 @@ struct StreamState {
     responses: ResponsesOutputState,
     started_at: tokio::time::Instant,
     first_output_ms: Option<f64>,
+    response_created_ms: Option<f64>,
+    first_text_ms: Option<f64>,
 }
 
 impl StreamState {
@@ -903,6 +928,8 @@ impl StreamState {
             responses: ResponsesOutputState::new(model, created),
             started_at: tokio::time::Instant::now(),
             first_output_ms: None,
+            response_created_ms: None,
+            first_text_ms: None,
         }
     }
 
@@ -1396,6 +1423,8 @@ impl StreamState {
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
                 first_output_ms: self.first_output_ms,
+                response_created_ms: self.response_created_ms,
+                first_text_ms: self.first_text_ms,
             },
             None => StreamOutcome {
                 observational_only: false,
@@ -1405,6 +1434,8 @@ impl StreamState {
                 status_code: 200,
                 detail: String::new(),
                 first_output_ms: self.first_output_ms,
+                response_created_ms: self.response_created_ms,
+                first_text_ms: self.first_text_ms,
             },
         }
     }
