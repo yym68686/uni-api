@@ -3854,7 +3854,9 @@ fn remap_provider_status(status: u16, detail: &str) -> u16 {
     }
     if detail.contains("<center><h1>400 Bad Request</h1></center>")
         || detail.contains("Provider API error: bad response status code 400")
-        || status == 400 && is_model_pricing_unconfigured(detail)
+        || status == 400
+            && (is_model_pricing_unconfigured(detail)
+                || is_provider_minimum_input_restriction(detail))
     {
         return 502;
     }
@@ -3983,6 +3985,50 @@ fn is_model_pricing_unconfigured(detail: &str) -> bool {
             .split_whitespace()
             .collect::<String>()
             .contains("价格尚未由管理员配置")
+}
+
+fn is_provider_minimum_input_restriction(detail: &str) -> bool {
+    // A channel key's minimum-input policy is not a malformed client request.
+    // Read only error messages (including JSON-escaped/wrapped messages), never
+    // echoed request fields. Neither the provider nor the numeric limit matters.
+    let mut candidate = detail.to_owned();
+    for _ in 0..3 {
+        let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        let message = match parsed.as_ref() {
+            Some(payload) => payload
+                .pointer("/error/message")
+                .or_else(|| payload.pointer("/detail/message"))
+                .or_else(|| payload.get("message"))
+                .or_else(|| payload.get("error"))
+                .or_else(|| payload.get("detail"))
+                .unwrap_or(payload)
+                .as_str(),
+            None => Some(candidate.as_str()),
+        };
+        let Some(message) = message else {
+            return false;
+        };
+        if message.trim_start().starts_with('{') {
+            candidate = message.to_owned();
+            continue;
+        }
+        let compact = message
+            .split_whitespace()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        return [
+            ("该令牌不接受输入少于", "token的请求"),
+            ("thiskeydoesnotacceptrequestswithfewerthan", "inputtokens"),
+        ]
+        .iter()
+        .any(|(prefix, suffix)| {
+            compact.split_once(prefix).is_some_and(|(_, tail)| {
+                let after_number = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+                after_number.len() < tail.len() && after_number.starts_with(suffix)
+            })
+        });
+    }
+    false
 }
 
 fn is_missing_persisted_item_error(detail: &str) -> bool {
@@ -5628,6 +5674,64 @@ mod tests {
         );
         assert_eq!(terminal_error_sha256(true, "earlier attempt failed"), None);
         assert!(terminal_error_sha256(false, "terminal failure").is_some());
+    }
+
+    #[test]
+    fn minimum_input_key_restrictions_are_retryable_gateway_errors() {
+        let chinese = "该令牌不接受输入少于 2000 token 的请求(按请求体大小判定)。";
+        let english = "This key does not accept requests with fewer than 2000 input tokens (judged by request body size).";
+        for message in [
+            format!("{chinese}{english}"),
+            chinese.into(),
+            english.into(),
+            english.replace("2000", "8192").to_uppercase(),
+        ] {
+            let body =
+                json!({"error": {"type": "invalid_request_error", "message": message}}).to_string();
+            for detail in [
+                message,
+                body.clone(),
+                json!({"error": {"message": body}}).to_string(),
+            ] {
+                for endpoint in [
+                    "/v1/responses",
+                    "/v1/responses/compact",
+                    "/v1/chat/completions",
+                ] {
+                    let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                    assert_eq!(policy.status, 502, "{detail}");
+                    assert!(policy.retryable);
+                    assert!(!policy.request_scoped);
+                    assert!(!policy.provider_model_unavailable);
+                    assert!(!policy.force_quota_cooldown);
+                    assert!(
+                        !classify_provider_failure(400, &detail, None, endpoint, false).retryable
+                    );
+                }
+            }
+        }
+        let escaped = r#"{"error":{"message":"\u8be5\u4ee4\u724c\u4e0d\u63a5\u53d7\u8f93\u5165\u5c11\u4e8e 4096 token \u7684\u8bf7\u6c42"}}"#;
+        assert_eq!(remap_provider_status(400, escaped), 502);
+        assert_eq!(remap_provider_status(413, escaped), 413);
+    }
+
+    #[test]
+    fn minimum_input_detection_preserves_client_validation_errors() {
+        for detail in [
+            r#"{"error":{"type":"invalid_request_error","message":"Missing required parameter: input"}}"#,
+            "Input must contain at least 1 token.",
+            "This model requires at least 2000 input tokens.",
+            "This key does not accept requests with fewer than two input tokens.",
+            "This key does not accept requests with fewer than 2000 output tokens.",
+            "该令牌不接受输入少于 token 的请求",
+            r#"{"error":{"message":"Invalid input"},"input":"该令牌不接受输入少于 2000 token 的请求"}"#,
+            r#"{"error":{"message":"Invalid input"},"debug":{"message":"This key does not accept requests with fewer than 2000 input tokens"}}"#,
+        ] {
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+        }
     }
 
     #[test]
