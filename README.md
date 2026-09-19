@@ -1314,3 +1314,22 @@ permissions and provider admission rules. More specific order wins (key+model,
 key, model, global); all applicable disable lists are combined. Requests already
 in progress retain their selected candidates. New requests with every matching
 channel disabled return 503. Changes emit `channel_controls_changed` audit logs.
+
+### Upstream receipt correlation facts
+
+When the existing S3 fact exporter is enabled, each actually dispatched model
+attempt also emits an independent `billing` fact. It records the direct upstream
+response's `X-Client-Request-ID` as `billing_request_ids: ["client:<id>"]`, a
+normalized upstream site, SHA-256 of the credential actually sent, caller key
+fingerprint, channel/model/endpoint, and request/attempt IDs. Header capture occurs
+before status/body processing, including failed retries and cancelled hedges. No
+API key, prompt or response body is exported. Missing headers remain unknown;
+an outgoing or echoed `X-Request-ID` is not accepted as a sub2api receipt.
+
+This is asynchronous observation only: routing, responses and charging are
+unchanged. Consumers must support the additive `billing` fact kind before this
+release is deployed, and exclude it from request/attempt/token rollups. The
+console matches site/key ownership and exact receipt IDs to split shared upstream
+keys by caller. Old facts without identifiers cannot be retroactively attributed.
+`/v1/observability/runtime` exposes `billing_receipt_correlation`, the native build
+version and source commit for deployment verification.

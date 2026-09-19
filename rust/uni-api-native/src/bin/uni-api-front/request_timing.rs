@@ -21,12 +21,20 @@ impl RequestArrival {
         attempt_id: String,
         api_key: &str,
     ) -> AttemptDispatch {
+        let key_id = crate::channel_catalog::key_id(api_key);
+        let billing = Arc::new(crate::billing_observation::BillingAttempt::new(
+            key.clone(),
+            request_id.clone(),
+            attempt_id.clone(),
+            key_id.clone(),
+        ));
         AttemptDispatch {
             arrival: self,
             key,
             request_id,
             attempt_id,
-            key_id: crate::channel_catalog::key_id(api_key),
+            key_id,
+            billing,
             recorded: Arc::new(OnceLock::new()),
         }
     }
@@ -40,12 +48,14 @@ pub(crate) struct AttemptDispatch {
     attempt_id: String,
     key_id: String,
     recorded: Arc<OnceLock<f64>>,
+    pub(crate) billing: Arc<crate::billing_observation::BillingAttempt>,
 }
 
 impl AttemptDispatch {
     /// Call immediately before the model HTTP send. Shared clones record once,
     /// even for hedged plans; merely preparing/skipping a plan records nothing.
     pub(crate) fn record(&self, metrics: &ChannelMetrics) -> f64 {
+        self.billing.start();
         *self.recorded.get_or_init(|| {
             let elapsed = self.arrival.0.elapsed().as_secs_f64() * 1000.0;
             metrics.observe_dispatch(&self.key, elapsed);

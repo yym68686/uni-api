@@ -3034,7 +3034,9 @@ async fn send_attempt(
         }
         AttemptBody::Empty => request,
     };
+    let billing_secret = crate::billing_observation::request_key(&prepared.headers, &prepared.url);
     if let Some(dispatch) = &prepared.dispatch {
+        dispatch.billing.target(&prepared.url, &billing_secret);
         dispatch.record(&state.channel_metrics);
     }
     let send_started = Instant::now();
@@ -3075,6 +3077,13 @@ async fn send_attempt(
         upstream_url: prepared.url.clone(),
         response: None,
     })?;
+    if let Some(dispatch) = &prepared.dispatch {
+        dispatch.billing.headers(
+            response.headers(),
+            response.status().as_u16(),
+            &billing_secret,
+        );
+    }
     let status = response.status();
     if !status.is_success() {
         let headers = filtered_response_headers(response.headers());

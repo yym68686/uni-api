@@ -1,5 +1,6 @@
 """Offline regression: arrival-to-send timing across body upload, retries and hedges."""
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -23,12 +24,19 @@ class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.facts.extend(json.loads(line) for line in body.splitlines() if line)
+        self.send_response(200)
+        self.end_headers()
+
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.hits.append(self.path)
         if self.path.startswith("/first/"):
             time.sleep(0.45)
             self.send_response(503)
+            self.send_header("X-Client-Request-ID", "receipt-first")
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             try:
@@ -67,6 +75,7 @@ class Upstream(BaseHTTPRequestHandler):
         body = stream_body if payload.get("stream") else json.dumps(response).encode()
         created = b'data: {"type":"response.created","response":{"status":"in_progress","output":[]}}\n\n' if payload.get("stream") and self.path.endswith("/responses") else b""
         self.send_response(200)
+        self.send_header("X-Client-Request-ID", "receipt-second")
         self.send_header("Content-Type", "text/event-stream" if payload.get("stream") else "application/json")
         self.send_header("Content-Length", str(len(created) + len(body)))
         self.end_headers()
@@ -91,6 +100,7 @@ def get_json(port, path):
 def verify(binary, endpoint, streaming, hedging, idempotent=False):
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     upstream.hits = []
+    upstream.facts = []
     upstream.second_started = threading.Event()
     upstream.release_second = threading.Event()
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
@@ -115,6 +125,8 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                    UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "memory-ledger"),
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"),
                    RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0", RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0")
+        env.update(FACTS_S3_ENDPOINT=f"http://127.0.0.1:{upstream.server_port}", FACTS_S3_BUCKET="fixture",
+                   FACTS_S3_ACCESS_KEY_ID="fixture-access",FACTS_S3_SECRET_ACCESS_KEY="fixture-secret",FACTS_S3_SPOOL_DIR=str(root/"facts"))
         with (root / "log").open("w+") as log:
             process = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
             try:
@@ -183,6 +195,18 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                     assert sum(point["request_to_dispatch"]["sample_count"] for point in row["points"]) == 1
                     assert sum(point["started"] for point in row["points"]) == 1
                     assert sum(point["success"] for point in row["points"]) == stats[row["provider"]]["success"]
+                for _ in range(100):
+                    bills={event["event_id"]:event for event in upstream.facts if event.get("kind")=="billing"}
+                    if len(bills)==2: break
+                    time.sleep(.05)
+                assert len(bills)==2, ("each sent attempt needs one receipt fact",list(bills.values()))
+                by_provider={event["provider"]:event for event in bills.values()}
+                assert by_provider["a-second"]["billing_request_ids"]==["client:receipt-second"],by_provider
+                if not hedging: assert by_provider["z-first"]["billing_request_ids"]==["client:receipt-first"],by_provider
+                assert all(event["key_id"]=="key-"+hashlib.sha256(b"fixture-key").hexdigest() for event in bills.values())
+                assert all(event["upstream_key_hash"]==hashlib.sha256(b"fixture-upstream-key").hexdigest() for event in bills.values())
+                assert all(event["request_id"]==request_id and event["model"]=="m" and event["endpoint"]==endpoint for event in bills.values())
+                assert "fixture-upstream-key" not in json.dumps(list(bills.values()))
                 log.flush()
                 events = [json.loads(line) for line in (root / "log").read_text().splitlines() if line.startswith('{"')]
                 dispatched = [event for event in events if event.get("event") == "channel_dispatch"]

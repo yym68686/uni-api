@@ -1,3 +1,4 @@
+mod billing_observation;
 mod channel_balances;
 mod channel_catalog;
 mod channel_controls;

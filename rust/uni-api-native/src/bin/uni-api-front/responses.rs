@@ -670,11 +670,13 @@ async fn send_native_nonstream_attempt(
         plan.first_byte_timeout_seconds,
         plan.total_timeout_seconds,
     ]);
+    let billing_secret = crate::billing_observation::request_key(&headers, &plan.url);
     let request = client
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
     if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.target(&plan.url, &billing_secret);
         dispatch.record(&state.channel_metrics);
     }
     let observation_started = tokio::time::Instant::now();
@@ -689,6 +691,13 @@ async fn send_native_nonstream_attempt(
             .await
             .map_err(|error| format!("upstream non-streaming request failed: {error}"))?
     };
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.headers(
+            response.headers(),
+            response.status().as_u16(),
+            &billing_secret,
+        );
+    }
     let status = response.status();
     let headers = filtered_response_headers(response.headers());
     let body = response
@@ -863,11 +872,13 @@ async fn preflight_attempt_with_trigger(
         earlier_deadline(first_deadline, total_deadline),
         send_stage_deadline,
     );
+    let billing_secret = crate::billing_observation::request_key(&headers, &plan.url);
     let request = client
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
     if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.target(&plan.url, &billing_secret);
         dispatch.record(&state.channel_metrics);
     }
     let mut request_future = Box::pin(request.send());
@@ -905,6 +916,13 @@ async fn preflight_attempt_with_trigger(
             .map_err(|error| format!("upstream response headers failed: {error}"))?
             .map_err(|error| format!("upstream response headers failed: {error}"))?
     };
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.headers(
+            response.headers(),
+            response.status().as_u16(),
+            &billing_secret,
+        );
+    }
     let status = response.status();
     let unsupported_encoding = response
         .headers()
