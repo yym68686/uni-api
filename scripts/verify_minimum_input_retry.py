@@ -1,4 +1,4 @@
-"""Offline HTTP regression for response-body-based channel minimum-input failover."""
+"""Offline HTTP regression for channel minimum-input and model-unavailable failover."""
 import http.client
 import json
 import os
@@ -16,6 +16,7 @@ from verify_dispatch_timing import free_port
 CHINESE = "该令牌不接受输入少于 2000 token 的请求(按请求体大小判定)。"
 ENGLISH = ("This key does not accept requests with fewer than 2000 input tokens "
            "(judged by request body size).")
+MODEL_UNAVAILABLE = "This model is not available."
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -102,6 +103,9 @@ def verify(binary, endpoint, hedging):
                    UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "ledger"),
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"),
                    RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0", RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0",
+                   # Keep repeated fixture cases independent of the accumulated
+                   # model circuit breaker; route cooldown has its own Rust test.
+                   PROVIDER_MODEL_CIRCUIT_FAILURE_THRESHOLD="1000",
                    NO_PROXY="127.0.0.1,localhost")
 
         def request(path, payload=None, key="retry"):
@@ -138,6 +142,16 @@ def verify(binary, endpoint, hedging):
                     # Existing two-channel retry budget is six total attempts.
                     ("exhausted", CHINESE + ENGLISH, "exhausted", False, 502,
                      ["limited", "also-limited"] * 3),
+                    ("model-unavailable", MODEL_UNAVAILABLE, "retry", False,
+                     200, ["limited", "fallback"]),
+                    ("wrapped-model-unavailable", json.dumps({"error": {
+                        "type": "invalid_request_error", "message": MODEL_UNAVAILABLE}}),
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("model-no-retry", MODEL_UNAVAILABLE, "no-retry", False, 503, ["limited"]),
+                    ("model-exhausted", MODEL_UNAVAILABLE, "exhausted", False, 503,
+                     ["limited", "also-limited"] * 3),
+                    ("quoted-model-message", f"Invalid input: expected '{MODEL_UNAVAILABLE}'",
+                     "retry", False, 400, ["limited"]),
                 ]
                 checked = 0
                 for streaming in ([False] if endpoint.endswith("/compact") else [False, True]):
@@ -157,11 +171,13 @@ def verify(binary, endpoint, hedging):
                             assert b"test" in raw and b"invalid_request_error" not in raw, context
                             if streaming:
                                 assert "text/event-stream" in content_type, context
+                        elif status == 503:
+                            assert b"All configured providers failed for model test-model" in raw, context
                         else:
                             assert b"invalid_request_error" in raw, context
                         checked += 1
                 assert config_path.read_bytes() == original
-                print(f"PASS minimum-input failover {endpoint} hedge={hedging}: {checked} HTTP cases")
+                print(f"PASS provider failure failover {endpoint} hedge={hedging}: {checked} HTTP cases")
             except Exception:
                 print((root / "log").read_text()[-8000:])
                 raise

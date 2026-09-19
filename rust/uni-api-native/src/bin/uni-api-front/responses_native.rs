@@ -3956,7 +3956,11 @@ fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
         }
         if message.is_some_and(|value| {
             let lower = value.to_ascii_lowercase();
-            MARKERS.iter().any(|marker| lower.contains(marker))
+            // Some providers report model availability as invalid_request_error
+            // without a model-specific code. Match the whole message so echoed
+            // input in an ordinary validation error does not trigger failover.
+            lower.trim() == "this model is not available."
+                || MARKERS.iter().any(|marker| lower.contains(marker))
         }) {
             return true;
         }
@@ -5687,6 +5691,72 @@ mod tests {
         );
         assert_eq!(terminal_error_sha256(true, "earlier attempt failed"), None);
         assert!(terminal_error_sha256(false, "terminal failure").is_some());
+    }
+
+    #[test]
+    fn unavailable_model_message_is_a_retryable_channel_failure() {
+        let body = r#"{"error":{"message":"This model is not available.","type":"invalid_request_error"}}"#;
+        for detail in [
+            body.to_owned(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": "  THIS MODEL IS NOT AVAILABLE.  "}}).to_string(),
+            "This model is not available.".to_owned(),
+        ] {
+            for endpoint in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/chat/completions",
+            ] {
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                assert_eq!(policy.status, 503, "{detail}");
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(policy.provider_model_unavailable);
+                assert!(!policy.force_quota_cooldown);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                assert_eq!(disabled.status, 503);
+                assert!(!disabled.retryable);
+            }
+        }
+        for detail in [
+            r#"{"error":{"type":"invalid_request_error","message":"Missing required parameter: input"}}"#,
+            r#"{"error":{"message":"Invalid input"},"input":"This model is not available."}"#,
+            r#"{"error":{"message":"Invalid input"},"debug":{"message":"This model is not available."}}"#,
+            r#"{"error":{"message":"Invalid input: expected 'This model is not available.'"}}"#,
+        ] {
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+            assert!(!policy.provider_model_unavailable);
+        }
+        assert_eq!(remap_provider_status(413, body), 413);
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_retries_next_channel_and_preserves_upstream_status() {
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let first_plan = route.next_plan().await.unwrap().unwrap();
+        assert!(route
+            .record_failure_for(&first_plan, &json!({
+                "kind": "http_error",
+                "status_code": 400,
+                "body": r#"{"error":{"message":"This model is not available.","type":"invalid_request_error"}}"#,
+            }))
+            .await);
+        assert_eq!(route.last_status(), 503);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.upstream_ledger[0]["provider_model_unavailable"], true);
+        assert_eq!(route.routing_ledger[0]["status_code"], 503);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+        // The failed provider/model is cooling, so a later turn skips it.
+        assert!(route.next_plan().await.unwrap().is_none());
+        assert_eq!(route.routing_skips, 1);
+        assert_eq!(route.last_status(), 503);
     }
 
     #[test]
