@@ -15,6 +15,7 @@ struct Receipt {
     key_hash: String,
     ids: Vec<String>,
     status: u16,
+    error_sha256: String,
 }
 
 #[derive(Debug)]
@@ -63,6 +64,17 @@ impl BillingAttempt {
             }
         }
     }
+    // Observe already-buffered HTTP errors without changing reads, retries or
+    // charging decisions. The digest retains evidence without response content.
+    pub(crate) fn error_body(&self, status: u16, body: &[u8]) {
+        if (400..600).contains(&status) && !body.is_empty() {
+            if let Ok(mut r) = self.receipt.lock() {
+                if r.status == status {
+                    r.error_sha256 = hex::encode(Sha256::digest(body));
+                }
+            }
+        }
+    }
     fn event(&self) -> Option<Value> {
         let started = self.started.get()?;
         let r = self.receipt.lock().ok()?;
@@ -79,6 +91,7 @@ impl BillingAttempt {
         event["upstream_key_hash"] = json!(r.key_hash);
         event["billing_request_ids"] = json!(r.ids);
         event["status"] = json!(r.status);
+        event["upstream_error_sha256"] = json!(r.error_sha256);
         event.as_object_mut()?.remove("dispatch_ms");
         Some(event)
     }
@@ -232,6 +245,27 @@ mod tests {
         second.start();
         assert_eq!(second.event().unwrap()["billing_request_ids"], json!([]));
         assert_eq!(second.event().unwrap()["status"], 0);
+    }
+    #[test]
+    fn error_evidence_requires_matching_http_failure_and_retains_no_body() {
+        let a = attempt();
+        a.start();
+        let h = HeaderMap::new();
+        a.headers(&h, 403, "secret");
+        let body = br#"{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance"}"#;
+        a.error_body(403, body);
+        let e = a.event().unwrap();
+        assert_eq!(
+            e["upstream_error_sha256"],
+            "7650844e093da022f530f60d448c6e401ca17d5efd97d38978acf34e43cdcb71"
+        );
+        assert!(!e.to_string().contains("INSUFFICIENT_BALANCE"));
+        let b = attempt();
+        b.start();
+        b.headers(&h, 200, "secret");
+        b.error_body(200, body);
+        b.error_body(403, body);
+        assert_eq!(b.event().unwrap()["upstream_error_sha256"], "");
     }
     #[test]
     fn rejects_ambiguous_and_secret_response_identifiers() {

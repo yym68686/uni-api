@@ -3090,6 +3090,9 @@ async fn send_attempt(
         let body = read_limited_upstream_body(response, UPSTREAM_ERROR_MAX_BYTES)
             .await
             .unwrap_or_else(|error| Bytes::from(format!("read upstream error response: {error}")));
+        if let Some(dispatch) = &prepared.dispatch {
+            dispatch.billing.error_body(status.as_u16(), &body);
+        }
         let detail = String::from_utf8_lossy(&body).into_owned();
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;

@@ -67,7 +67,7 @@ pub async fn handle(
                     "runtime": "rust",
                     "native_version": env!("CARGO_PKG_VERSION"),
                     "source_commit": std::env::var("SOURCE_COMMIT").unwrap_or_else(|_| "unknown".into()),
-                    "capabilities": {"targeted_responses": true,"billing_receipt_correlation":true,"temporary_channel_controls":true,"temporary_channel_import":true},
+                    "capabilities": {"targeted_responses": true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
                     "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),

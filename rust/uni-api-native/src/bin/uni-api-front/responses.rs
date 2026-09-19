@@ -705,6 +705,9 @@ async fn send_native_nonstream_attempt(
         .await
         .map_err(|error| format!("read upstream non-streaming body: {error}"))?
         .to_vec();
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.error_body(status.as_u16(), &body);
+    }
     Ok((
         status,
         headers,
@@ -932,6 +935,11 @@ async fn preflight_attempt_with_trigger(
     let response_headers = filtered_response_headers(response.headers());
     if !status.is_success() {
         let body = read_limited_body(response, total_deadline).await;
+        if let Some(dispatch) = &plan.dispatch {
+            dispatch
+                .billing
+                .error_body(status.as_u16(), body.as_bytes());
+        }
         return Ok(PreflightResult::Retry(json!({
             "kind": "http_error",
             "status_code": status.as_u16(),

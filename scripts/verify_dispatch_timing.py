@@ -35,12 +35,12 @@ class Upstream(BaseHTTPRequestHandler):
         self.server.hits.append(self.path)
         if self.path.startswith("/first/"):
             time.sleep(0.45)
-            self.send_response(503)
+            self.send_response(403)
             self.send_header("X-Client-Request-ID", "receipt-first")
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             try:
-                self.wfile.write(b'{"error":{"message":"fixture temporarily unavailable"}}')
+                self.wfile.write(b'{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance"}')
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
@@ -202,7 +202,10 @@ def verify(binary, endpoint, streaming, hedging, idempotent=False):
                 assert len(bills)==2, ("each sent attempt needs one receipt fact",list(bills.values()))
                 by_provider={event["provider"]:event for event in bills.values()}
                 assert by_provider["a-second"]["billing_request_ids"]==["client:receipt-second"],by_provider
-                if not hedging: assert by_provider["z-first"]["billing_request_ids"]==["client:receipt-first"],by_provider
+                if not hedging:
+                    assert by_provider["z-first"]["billing_request_ids"]==["client:receipt-first"],by_provider
+                    assert by_provider["z-first"]["upstream_error_sha256"]=="7650844e093da022f530f60d448c6e401ca17d5efd97d38978acf34e43cdcb71",by_provider
+                assert by_provider["a-second"]["upstream_error_sha256"]=="",by_provider
                 assert all(event["key_id"]=="key-"+hashlib.sha256(b"fixture-key").hexdigest() for event in bills.values())
                 assert all(event["upstream_key_hash"]==hashlib.sha256(b"fixture-upstream-key").hexdigest() for event in bills.values())
                 assert all(event["request_id"]==request_id and event["model"]=="m" and event["endpoint"]==endpoint for event in bills.values())

@@ -1331,5 +1331,10 @@ unchanged. Consumers must support the additive `billing` fact kind before this
 release is deployed, and exclude it from request/attempt/token rollups. The
 console matches site/key ownership and exact receipt IDs to split shared upstream
 keys by caller. Old facts without identifiers cannot be retroactively attributed.
-`/v1/observability/runtime` exposes `billing_receipt_correlation`, the native build
+`billing` facts also retain `upstream_error_sha256` for buffered HTTP error
+responses. This is evidence for downstream reconciliation, not a billing decision;
+raw error bodies are never exported. Successful, cancelled and unread responses
+have no error digest.
+
+`/v1/observability/runtime` exposes `billing_error_evidence`, `billing_receipt_correlation`, the native build
 version and source commit for deployment verification.
