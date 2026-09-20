@@ -831,7 +831,10 @@ impl NativeConfigStore {
                 || p.models.is_empty()
                 || p.models.len() > if p.definition.is_some() { 1024 } else { 32 }
                 || p.models.iter().any(|m| {
-                    m.is_empty() || m.len() > 256 || m.contains('/') || m.contains(['\r', '\n'])
+                    m.is_empty()
+                        || m.len() > 256
+                        || (p.definition.is_none() && m.contains('/'))
+                        || m.contains(['\r', '\n'])
                 })
                 || p.models.iter().collect::<BTreeSet<_>>().len() != p.models.len()
             {

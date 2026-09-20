@@ -415,7 +415,8 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
             v.as_str()
                 .is_some_and(|s| !s.is_empty() && s.len() <= 16384 && !s.contains(['\r', '\n']))
         };
-        if !(valid(api)
+        if !(api.is_null()
+            || valid(api)
             || api
                 .as_array()
                 .is_some_and(|a| !a.is_empty() && a.len() <= 1024 && a.iter().all(valid)))
@@ -1032,7 +1033,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
     async fn fixture() -> NativeConfigStore {
-        let raw = json!({"provider":"one","base_url":"https://example.com/v1/responses","engine":"gpt","api":["secret-a","secret-b"],"model":["public",{"upstream":"alias"}],"preferences":{"cooldown_period":30,"headers":{"x-private":"secret-header"}},"unknown_extension":{"keep":true}});
+        let raw = json!({"provider":"one","base_url":"https://example.com/v1/responses","engine":"gpt","api":["secret-a","secret-b"],"model":["public",{"upstream":"alias"},{"vendor/model":"vendor/public"}],"preferences":{"cooldown_period":30,"headers":{"x-private":"secret-header"}},"unknown_extension":{"keep":true}});
         let item: RawProvider =
             serde_json::from_value(crate::config::compile_provider(&raw).unwrap()).unwrap();
         let p = crate::responses_native::runtime_provider(item, Arc::new(AtomicUsize::new(0)));
@@ -1196,7 +1197,7 @@ mod tests {
                             api_key_id: crate::channel_catalog::key_id("caller-a"),
                             base_url: raw["base_url"].as_str().unwrap().into(),
                             api_key: "secret-a".into(),
-                            models: vec!["public".into(), "alias".into()],
+                            models: vec!["public".into(), "alias".into(), "vendor/public".into()],
                             definition: Some(raw),
                         }],
                     },
