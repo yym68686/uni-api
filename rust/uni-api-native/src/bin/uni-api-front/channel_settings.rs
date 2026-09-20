@@ -638,13 +638,20 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
     Ok(Arc::new(next))
 }
 fn affected(snapshot: &Snapshot, provider: &str) -> Vec<Value> {
+    let Some(inspector) = snapshot
+        .api_keys
+        .values()
+        .find(|key| crate::channel_catalog::can_inspect_all(snapshot, key))
+    else {
+        return Vec::new();
+    };
     snapshot
         .api_key_order
         .iter()
         .filter_map(|token| {
-            let key = snapshot.api_keys.get(token)?;
+            snapshot.api_keys.get(token)?;
             let id = crate::channel_catalog::key_id(token);
-            let entries = crate::channel_catalog::entries(snapshot, key, Some(&id)).ok()?;
+            let entries = crate::channel_catalog::entries(snapshot, inspector, Some(&id)).ok()?;
             let models: BTreeSet<_> = entries
                 .into_iter()
                 .filter(|(p, _)| p.name.as_ref() == provider)
@@ -1081,6 +1088,11 @@ mod tests {
         let view = store.settings_view("one").await.unwrap();
         let original = store.snapshot().await.unwrap();
         let rev = view["revision"].as_str().unwrap();
+        assert_eq!(
+            view["affected_keys"].as_array().unwrap().len(),
+            3,
+            "ordinary calling keys must appear in the impact preview"
+        );
         assert!(!view.to_string().contains("secret-a"));
         assert!(!view.to_string().contains("secret-header"));
         let input = change(
@@ -1162,6 +1174,14 @@ mod tests {
         );
         input.changes[0].copy_to_key = crate::channel_catalog::key_id("caller-a");
         let result = store.settings_change(input, true).await.unwrap();
+        assert_eq!(
+            result["previews"][0]["affected_keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "a copy must only affect its destination caller"
+        );
         let name = result["previews"][0]["provider"].as_str().unwrap();
         let snapshot = store.snapshot().await.unwrap();
         let provider = &snapshot.providers_by_name[name];
