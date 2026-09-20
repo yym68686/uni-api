@@ -3,6 +3,7 @@ mod channel_balances;
 mod channel_catalog;
 mod channel_controls;
 mod channel_metrics;
+mod channel_settings;
 mod chat_stream;
 mod codex_oauth;
 mod config;

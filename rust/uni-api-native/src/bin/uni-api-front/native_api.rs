@@ -19,6 +19,37 @@ pub async fn handle(
 ) -> Option<Response<Body>> {
     let path = request_path.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
+    if *method == Method::GET && path.starts_with("/v1/channel-settings") {
+        if let Err(response) = require_admin(state, headers).await {
+            return Some(response);
+        }
+        let result = match path {
+            "/v1/channel-settings/schema" => Ok(crate::channel_settings::schema()),
+            "/v1/channel-settings" => {
+                state
+                    .native_responses_config
+                    .settings_view(&query_value(uri, "provider").unwrap_or_default())
+                    .await
+            }
+            "/v1/channel-settings/providers" => {
+                state.native_responses_config.settings_providers().await
+            }
+            "/v1/channel-settings/export" => state.native_responses_config.settings_export().await,
+            _ => {
+                state
+                    .native_responses_config
+                    .settings_operation(
+                        path.strip_prefix("/v1/channel-settings/operations/")
+                            .unwrap_or(""),
+                    )
+                    .await
+            }
+        };
+        return Some(match result {
+            Ok(v) => json_response(StatusCode::OK, v),
+            Err((status, message)) => json_error(status, &message),
+        });
+    }
     if *method == Method::GET
         && matches!(
             path,
@@ -369,20 +400,57 @@ async fn channel_metrics_timeseries_response(
 }
 
 pub fn supports_mutation(method: &Method, path: &str) -> bool {
-    *method == Method::POST
+    ((*method == Method::PATCH || *method == Method::POST)
         && matches!(
             path,
-            "/v1/api_config/update"
-                | "/v1/add_credits"
-                | "/v1/channel-controls"
-                | "/v1/channel-controls/restore"
-                | "/v1/temporary-channels"
-        )
+            "/v1/channel-settings"
+                | "/v1/channel-settings/validate"
+                | "/v1/channel-settings/discover"
+        ))
+        || *method == Method::POST
+            && matches!(
+                path,
+                "/v1/api_config/update"
+                    | "/v1/add_credits"
+                    | "/v1/channel-controls"
+                    | "/v1/channel-controls/restore"
+                    | "/v1/temporary-channels"
+            )
 }
 
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
     let path = request.uri().path().trim_end_matches('/').to_owned();
     let headers = request.headers().clone();
+    if path == "/v1/channel-settings"
+        || path == "/v1/channel-settings/validate"
+        || path == "/v1/channel-settings/discover"
+    {
+        if let Err(response) = require_admin(state, &headers).await {
+            return response;
+        }
+        let raw = match to_bytes(request.into_body(), 2 * 1024 * 1024).await {
+            Ok(v) => v,
+            Err(_) => {
+                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Settings request too large")
+            }
+        };
+        let input = match serde_json::from_slice::<crate::channel_settings::Mutation>(&raw) {
+            Ok(v) => v,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid settings request"),
+        };
+        let result = if path == "/v1/channel-settings/discover" {
+            state.native_responses_config.settings_discover(input).await
+        } else {
+            state
+                .native_responses_config
+                .settings_change(input, path == "/v1/channel-settings")
+                .await
+        };
+        return match result {
+            Ok(v) => json_response(StatusCode::OK, v),
+            Err((status, message)) => json_error(status, &message),
+        };
+    }
     if path == "/v1/channel-controls"
         || path == "/v1/temporary-channels"
         || path == "/v1/channel-controls/restore"
@@ -419,6 +487,17 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
                         )
                     }
                 };
+            if !input.snapshot.channel_settings.is_empty()
+                || input
+                    .snapshot
+                    .temporary_channels
+                    .iter()
+                    .any(|p| p.definition.is_some())
+            {
+                if let Err(response) = require_admin(state, &headers).await {
+                    return response;
+                }
+            }
             return match state
                 .native_responses_config
                 .restore_controls(&headers, input)

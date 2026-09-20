@@ -47,7 +47,7 @@ struct SnapshotStamp {
 pub struct NativeConfigStore {
     pub(crate) channel_controls: Arc<RwLock<crate::channel_controls::Controls>>,
     path: Arc<PathBuf>,
-    current: Arc<RwLock<Option<Arc<Snapshot>>>>,
+    pub(crate) current: Arc<RwLock<Option<Arc<Snapshot>>>>,
     snapshot_stamp: Arc<Mutex<Option<SnapshotStamp>>>,
     provider_cursors: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     key_cooldowns: Arc<Mutex<HashMap<(String, String), tokio::time::Instant>>>,
@@ -86,7 +86,7 @@ struct RawApiKey {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawProvider {
+pub(crate) struct RawProvider {
     name: String,
     base_url: String,
     engine: Option<String>,
@@ -163,6 +163,56 @@ pub(crate) struct Provider {
     pub(crate) excluded_request_types: Arc<Vec<String>>,
     pub(crate) excluded_request_rules: Arc<Vec<Value>>,
     pub(crate) cursor: Arc<AtomicUsize>,
+}
+
+pub(crate) fn runtime_provider(item: RawProvider, cursor: Arc<AtomicUsize>) -> Arc<Provider> {
+    let name = item.name.trim().to_owned();
+    Arc::new(Provider {
+        name: name.clone().into(),
+        base_url: item.base_url.trim().to_owned().into(),
+        engine: item.engine.unwrap_or_else(|| "gpt".into()).into(),
+        api_keys: Arc::new(provider_api_keys(&item.api)),
+        project_id: item
+            .project_id
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        private_key: item
+            .private_key
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        client_email: item
+            .client_email
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        aws_access_key: item
+            .aws_access_key
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        aws_secret_key: item
+            .aws_secret_key
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        aws_session_token: item
+            .aws_session_token
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        cf_account_id: item
+            .cf_account_id
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        region: item
+            .region
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "global".into())
+            .into(),
+        models: Arc::new(item.models),
+        preferences: Arc::new(item.preferences),
+        excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
+        only_request_types: Arc::new(request_type_values(&item.only_request_types)),
+        excluded_request_types: Arc::new(request_type_values(&item.exclude_request_types)),
+        excluded_request_rules: Arc::new(request_rule_values(&item.exclude_request_rules)),
+        cursor,
+    })
 }
 
 pub(crate) struct FailedRoute<'a> {
@@ -386,52 +436,7 @@ impl NativeConfigStore {
                 .entry(name.clone())
                 .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
                 .clone();
-            let provider = Arc::new(Provider {
-                name: name.clone().into(),
-                base_url: item.base_url.trim().to_owned().into(),
-                engine: item.engine.unwrap_or_else(|| "gpt".into()).into(),
-                api_keys: Arc::new(provider_api_keys(&item.api)),
-                project_id: item
-                    .project_id
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                private_key: item
-                    .private_key
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                client_email: item
-                    .client_email
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                aws_access_key: item
-                    .aws_access_key
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                aws_secret_key: item
-                    .aws_secret_key
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                aws_session_token: item
-                    .aws_session_token
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                cf_account_id: item
-                    .cf_account_id
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                region: item
-                    .region
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "global".into())
-                    .into(),
-                models: Arc::new(item.models),
-                preferences: Arc::new(item.preferences),
-                excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
-                only_request_types: Arc::new(request_type_values(&item.only_request_types)),
-                excluded_request_types: Arc::new(request_type_values(&item.exclude_request_types)),
-                excluded_request_rules: Arc::new(request_rule_values(&item.exclude_request_rules)),
-                cursor,
-            });
+            let provider = runtime_provider(item, cursor);
             providers_by_name.insert(name, provider.clone());
             providers.push(provider);
         }
@@ -2982,7 +2987,10 @@ fn detect_request_type(payload: &Map<String, Value>) -> Option<&'static str> {
     is_compaction.then_some("compaction")
 }
 
-fn provider_accepts_request_type(provider: &Provider, request_type: Option<&str>) -> bool {
+pub(crate) fn provider_accepts_request_type(
+    provider: &Provider,
+    request_type: Option<&str>,
+) -> bool {
     if !provider.only_request_types.is_empty()
         && !request_type.is_some_and(|value| {
             provider
@@ -3032,7 +3040,7 @@ fn request_reasoning_effort(payload: &Map<String, Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn provider_accepts_request_rules(
+pub(crate) fn provider_accepts_request_rules(
     provider: &Provider,
     endpoint: &str,
     request_model: &str,
@@ -3491,7 +3499,7 @@ fn header_or(headers: &HeaderMap, name: &str, default: &str) -> String {
         .to_owned()
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct Timeouts {
     pub(crate) connect: Option<f64>,
     pub(crate) write: Option<f64>,
@@ -3502,7 +3510,7 @@ pub(crate) struct Timeouts {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_timeouts(
+pub(crate) fn resolve_timeouts(
     snapshot: &Snapshot,
     provider: &Provider,
     request_model: &str,
@@ -4111,7 +4119,10 @@ fn tpr_exceeded(rules: &[(usize, u64)], estimated_tokens: usize) -> bool {
         .any(|(limit, seconds)| *seconds == 0 && estimated_tokens > *limit)
 }
 
-fn parse_rate_limits(value: Option<&Value>, model: Option<&str>) -> Option<Vec<(usize, u64)>> {
+pub(crate) fn parse_rate_limits(
+    value: Option<&Value>,
+    model: Option<&str>,
+) -> Option<Vec<(usize, u64)>> {
     let raw = match value {
         None | Some(Value::Null) => "999999/min",
         Some(Value::String(value)) => value.trim(),
@@ -4640,6 +4651,7 @@ mod tests {
         let admin = catalog_headers("dashboard-first");
         let key = crate::channel_catalog::key_id("restricted");
         let snapshot = RetainedSnapshot {
+            channel_settings: std::collections::BTreeMap::new(),
             version: 1,
             rules: vec![Rule {
                 api_key_id: key.clone(),
@@ -4652,6 +4664,7 @@ mod tests {
                 api_key_id: key,
                 base_url: "https://example.com/v1/responses".into(),
                 api_key: "restore-secret".into(),
+                definition: None,
                 models: vec!["shared".into()],
             }],
         };

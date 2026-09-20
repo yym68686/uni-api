@@ -333,7 +333,7 @@ fn discovery_cache_key(provider: &Value) -> String {
     format!("{:x}", Sha256::digest(provider.to_string().as_bytes()))
 }
 
-async fn discover_provider_models(
+pub(crate) async fn discover_provider_models(
     client: &reqwest::Client,
     provider: &Value,
 ) -> Result<Vec<String>, String> {
@@ -679,7 +679,7 @@ fn compile_video_provider(value: &Value) -> Option<Value> {
     )
 }
 
-fn compile_provider(value: &Value) -> Option<Value> {
+pub(crate) fn compile_provider(value: &Value) -> Option<Value> {
     let item = value.as_object()?;
     let name = scalar_string(item.get("provider")?).trim().to_owned();
     if name.is_empty() {

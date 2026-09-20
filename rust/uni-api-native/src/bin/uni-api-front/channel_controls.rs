@@ -40,13 +40,30 @@ pub(crate) struct Mutation {
 }
 type OverlayCache = Arc<Mutex<Option<(String, u64, Arc<Snapshot>)>>>;
 
-#[derive(Clone)]
 pub(crate) struct Controls {
     instance: String,
-    sequence: u64,
+    pub(crate) sequence: u64,
     rules: BTreeMap<(String, String), Rule>,
-    temporary: BTreeMap<String, Arc<Provider>>,
+    pub(crate) temporary: BTreeMap<String, Arc<Provider>>,
     overlay_cache: OverlayCache,
+    pub(crate) settings: BTreeMap<String, crate::channel_settings::ProviderSettings>,
+    pub(crate) temporary_documents: BTreeMap<String, Value>,
+    pub(crate) settings_operations: BTreeMap<String, (String, Value)>,
+}
+// A validation candidate must never poison the serving snapshot cache.
+impl Clone for Controls {
+    fn clone(&self) -> Self {
+        Self {
+            instance: self.instance.clone(),
+            sequence: self.sequence,
+            rules: self.rules.clone(),
+            temporary: self.temporary.clone(),
+            settings: self.settings.clone(),
+            temporary_documents: self.temporary_documents.clone(),
+            settings_operations: self.settings_operations.clone(),
+            overlay_cache: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 impl Default for Controls {
     fn default() -> Self {
@@ -60,6 +77,9 @@ impl Default for Controls {
                     .as_nanos()
             ),
             sequence: 0,
+            settings: BTreeMap::new(),
+            temporary_documents: BTreeMap::new(),
+            settings_operations: BTreeMap::new(),
             rules: BTreeMap::new(),
             temporary: BTreeMap::new(),
             overlay_cache: Arc::new(Mutex::new(None)),
@@ -67,14 +87,14 @@ impl Default for Controls {
     }
 }
 impl Controls {
-    fn revision(&self, snapshot: &Snapshot) -> String {
+    pub(crate) fn revision(&self, snapshot: &Snapshot) -> String {
         format!("{}:{}:{}", self.instance, self.sequence, snapshot.revision)
     }
-    fn view(&self, snapshot: &Snapshot) -> Value {
-        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
+    pub(crate) fn view(&self, snapshot: &Snapshot) -> Value {
+        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","channel_definitions":!self.temporary_documents.is_empty(),"channel_definitions_digest":crate::channel_settings::digest(&self.temporary_documents),"channel_settings":true,"channel_settings_digest":crate::channel_settings::digest(&self.settings),"temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"identity_changed":self.settings.get(p.name.as_ref()).is_some_and(crate::channel_settings::identity_changed),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
     }
     pub fn overlay(&self, base: Arc<Snapshot>) -> Arc<Snapshot> {
-        if self.temporary.is_empty() {
+        if self.temporary.is_empty() && self.settings.is_empty() {
             return base;
         }
         let mut cache = self.overlay_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -121,12 +141,46 @@ impl Controls {
             providers.push(provider.clone());
             by_name.insert(provider.name.to_string(), provider.clone());
         }
+        for provider in &mut providers {
+            if let Some(settings) = self.settings.get(provider.name.as_ref()) {
+                let raw = self
+                    .temporary_documents
+                    .get(provider.name.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| crate::channel_settings::document(&base, provider));
+                let effective =
+                    crate::channel_settings::merge(&raw, &settings.set, &settings.remove);
+                let next =
+                    crate::channel_settings::compile(&effective, provider).unwrap_or_else(|_| {
+                        settings
+                            .compiled
+                            .clone()
+                            .unwrap_or_else(|| provider.clone())
+                    });
+                by_name.insert(provider.name.to_string(), next.clone());
+                *provider = next;
+            }
+        }
         snapshot.providers = Arc::new(providers);
         snapshot.providers_by_name = Arc::new(by_name);
         snapshot.api_keys = Arc::new(keys);
         let snapshot = Arc::new(snapshot);
         *cache = Some((base.revision.to_string(), self.sequence, snapshot.clone()));
         snapshot
+    }
+    pub(crate) fn remove_settings_copy(&mut self, name: &str) -> bool {
+        if !name.starts_with("sub2api-copy-") || !self.temporary_documents.contains_key(name) {
+            return false;
+        }
+        self.temporary.remove(name);
+        self.temporary_documents.remove(name);
+        self.settings.remove(name);
+        self.rules.retain(|_, r| {
+            r.order.retain(|p| p != name);
+            r.disabled.retain(|p| p != name);
+            !r.order.is_empty() || !r.disabled.is_empty()
+        });
+        true
     }
     fn reset_temporary(&mut self, key: &str, model: &str) {
         self.temporary.retain(|_, provider| {
@@ -148,6 +202,10 @@ impl Controls {
             *provider = Arc::new(p);
             !provider.models.is_empty()
         });
+        self.settings
+            .retain(|name, _| !name.starts_with("sub2api-") || self.temporary.contains_key(name));
+        self.temporary_documents
+            .retain(|name, _| self.temporary.contains_key(name));
     }
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
@@ -600,13 +658,33 @@ impl NativeConfigStore {
         });
         if input.action == "delete" {
             state.temporary.remove(&input.provider);
+            state.settings.remove(&input.provider);
+            state.temporary_documents.remove(&input.provider);
         } else {
+            // Model management changes only model intent, preserving credentials,
+            // aliases for retained models, and unrelated advanced overrides.
+            if let Some(settings) = state.settings.get_mut(&input.provider) {
+                settings.set.remove("/model");
+                settings.remove.retain(|p| p != "/model");
+            }
+            if let Some(raw) = state.temporary_documents.get_mut(&input.provider) {
+                raw["model"] = json!(input
+                    .models
+                    .iter()
+                    .map(|m| json!({existing.models.get(m).unwrap_or(m):m}))
+                    .collect::<Vec<_>>());
+            }
             let mut provider = (*existing).clone();
             provider.models = Arc::new(
                 input
                     .models
                     .iter()
-                    .map(|m| (m.clone(), m.clone()))
+                    .map(|m| {
+                        (
+                            m.clone(),
+                            existing.models.get(m).cloned().unwrap_or_else(|| m.clone()),
+                        )
+                    })
                     .collect(),
             );
             state
@@ -641,6 +719,8 @@ pub(crate) struct RetainedChannel {
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Value>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -650,6 +730,8 @@ pub(crate) struct RetainedSnapshot {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub temporary_channels: Vec<RetainedChannel>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channel_settings: BTreeMap<String, crate::channel_settings::ProviderSettings>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -674,7 +756,7 @@ impl NativeConfigStore {
             "Configuration unavailable".into(),
         ))?;
         let bad = |s: &str| (StatusCode::BAD_REQUEST, s.to_string());
-        if input.snapshot.version != 1
+        if ![1, 2].contains(&input.snapshot.version)
             || input.snapshot.rules.len() > 128
             || input.snapshot.temporary_channels.len() > 128
         {
@@ -706,7 +788,7 @@ impl NativeConfigStore {
                 || p.api_key.len() > 8192
                 || p.api_key.contains(['\r', '\n'])
                 || p.models.is_empty()
-                || p.models.len() > 32
+                || p.models.len() > if p.definition.is_some() { 1024 } else { 32 }
                 || p.models.iter().any(|m| {
                     m.is_empty() || m.len() > 256 || m.contains('/') || m.contains(['\r', '\n'])
                 })
@@ -726,9 +808,9 @@ impl NativeConfigStore {
                 || url.host_str().is_none()
                 || !url.username().is_empty()
                 || url.password().is_some()
-                || url.query().is_some()
+                || (p.definition.is_none() && url.query().is_some())
                 || url.fragment().is_some()
-                || !url.path().ends_with("/v1/responses")
+                || (p.definition.is_none() && !url.path().ends_with("/v1/responses"))
             {
                 return Err(bad("Invalid retained address"));
             }
@@ -756,7 +838,40 @@ impl NativeConfigStore {
                 excluded_request_rules: Arc::new(Vec::new()),
                 cursor: Arc::new(AtomicUsize::new(0)),
             });
+            let provider = if let Some(raw) = p.definition {
+                let built =
+                    crate::channel_settings::compile(&raw, &provider).map_err(|e| bad(&e))?;
+                candidate
+                    .temporary_documents
+                    .insert(p.provider.clone(), raw);
+                built
+            } else {
+                provider
+            };
             candidate.temporary.insert(p.provider, provider);
+        }
+        if input.snapshot.channel_settings.len() > 1024 {
+            return Err(bad("Too many channel settings"));
+        }
+        for (name, mut setting) in input.snapshot.channel_settings {
+            let provider = candidate
+                .temporary
+                .get(&name)
+                .or_else(|| base.providers_by_name.get(&name))
+                .ok_or(bad("Configured channel no longer exists"))?;
+            let raw = candidate
+                .temporary_documents
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| crate::channel_settings::document(&base, provider));
+            setting.compiled = Some(
+                crate::channel_settings::compile(
+                    &crate::channel_settings::merge(&raw, &setting.set, &setting.remove),
+                    provider,
+                )
+                .map_err(|e| bad(&e))?,
+            );
+            candidate.settings.insert(name, setting);
         }
         let overlay = candidate.overlay(base.clone());
         let caller = overlay
@@ -846,6 +961,7 @@ impl NativeConfigStore {
             let attempt = async {
                 let response = client
                     .get(&url)
+                    .header("X-Uni-Channel-Settings-Version", "1")
                     .bearer_auth(&token)
                     .send()
                     .await

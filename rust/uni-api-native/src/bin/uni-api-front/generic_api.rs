@@ -2102,6 +2102,48 @@ async fn prepare_input(
     })
 }
 
+// Pure request preparation for the administrator preview. No send, OAuth
+// refresh, key scheduling or model invocation occurs here.
+pub(crate) fn preview_channel_request(
+    provider: &Provider,
+    model: &str,
+    upstream: &str,
+    endpoint: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    let uri: Uri = endpoint
+        .parse()
+        .map_err(|_| "invalid preview endpoint".to_owned())?;
+    let input = PreparedInput {
+        payload: Some(payload),
+        replay: None,
+        observation: SpoolObservation::default(),
+        default_model: String::new(),
+        content_type: "application/json".into(),
+    };
+    let attempt = build_attempt(
+        provider,
+        "preview-key",
+        model,
+        upstream,
+        &Method::POST,
+        &uri,
+        endpoint,
+        &HeaderMap::new(),
+        &input,
+        "preview",
+    )?;
+    let body = match attempt.body {
+        AttemptBody::Json(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let mut url = Url::parse(&attempt.url).map_err(|_| "invalid prepared endpoint".to_owned())?;
+    url.set_query(None);
+    Ok(
+        json!({"url":url.to_string(),"method":attempt.method.as_str(),"header_names":attempt.headers.keys().map(|h|h.as_str()).collect::<Vec<_>>(),"body":body,"stream":attempt.upstream_stream}),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_attempt(
     provider: &Provider,
