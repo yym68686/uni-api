@@ -48,7 +48,7 @@ pub(crate) struct Controls {
     overlay_cache: OverlayCache,
     pub(crate) settings: BTreeMap<String, crate::channel_settings::ProviderSettings>,
     pub(crate) temporary_documents: BTreeMap<String, Value>,
-    pub(crate) settings_operations: BTreeMap<String, (String, Value)>,
+    pub(crate) settings_operations: BTreeMap<String, (String, Arc<Value>)>,
 }
 // A validation candidate must never poison the serving snapshot cache.
 impl Clone for Controls {
@@ -87,11 +87,52 @@ impl Default for Controls {
     }
 }
 impl Controls {
+    // Scheduling only needs routing rules, never full provider intent or audit
+    // payloads. Keep request-path work independent of settings history size.
+    pub(crate) fn routing_rules(&self) -> Self {
+        Self {
+            instance: self.instance.clone(),
+            sequence: self.sequence,
+            rules: self.rules.clone(),
+            temporary: BTreeMap::new(),
+            settings: BTreeMap::new(),
+            temporary_documents: BTreeMap::new(),
+            settings_operations: BTreeMap::new(),
+            overlay_cache: self.overlay_cache.clone(),
+        }
+    }
     pub(crate) fn revision(&self, snapshot: &Snapshot) -> String {
         format!("{}:{}:{}", self.instance, self.sequence, snapshot.revision)
     }
+    pub(crate) fn settings_definitions(&self, base: &Snapshot) -> BTreeMap<String, Value> {
+        let mut definitions = self.temporary_documents.clone();
+        for name in self.settings.keys() {
+            if let Some(p) = self.temporary.get(name) {
+                definitions
+                    .entry(name.clone())
+                    .or_insert_with(|| crate::channel_settings::document(base, p));
+            }
+        }
+        definitions
+    }
+    fn effective_temporary(&self, p: &Arc<Provider>, base: &Snapshot) -> Arc<Provider> {
+        if let Some(setting) = self.settings.get(p.name.as_ref()) {
+            let raw = self
+                .temporary_documents
+                .get(p.name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| crate::channel_settings::document(base, p));
+            crate::channel_settings::compile(
+                &crate::channel_settings::merge(&raw, &setting.set, &setting.remove),
+                p,
+            )
+            .unwrap_or_else(|_| setting.compiled.clone().unwrap_or_else(|| p.clone()))
+        } else {
+            p.clone()
+        }
+    }
     pub(crate) fn view(&self, snapshot: &Snapshot) -> Value {
-        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","channel_definitions":!self.temporary_documents.is_empty(),"channel_definitions_digest":crate::channel_settings::digest(&self.temporary_documents),"channel_settings":true,"channel_settings_digest":crate::channel_settings::digest(&self.settings),"temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"identity_changed":self.settings.get(p.name.as_ref()).is_some_and(crate::channel_settings::identity_changed),"api_key_id":p.preferences.get("__temporary_key_id"),"models":p.models.keys().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
+        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","channel_definitions":!self.temporary_documents.is_empty(),"channel_definitions_digest":crate::channel_settings::digest(&self.settings_definitions(snapshot)),"channel_settings":true,"channel_settings_digest":crate::channel_settings::digest(&self.settings),"temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"identity_changed":self.settings.get(p.name.as_ref()).is_some_and(crate::channel_settings::identity_changed),"api_key_id":p.preferences.get("__temporary_key_id"),"models":self.effective_temporary(p,snapshot).models.keys().cloned().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
     }
     pub fn overlay(&self, base: Arc<Snapshot>) -> Arc<Snapshot> {
         if self.temporary.is_empty() && self.settings.is_empty() {

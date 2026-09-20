@@ -774,7 +774,7 @@ impl NativeConfigStore {
             "Configuration unavailable".into(),
         ))?;
         Ok(
-            json!({"revision":state.revision(&base),"channel_settings":state.settings,"digest":digest(&state.settings),"temporary_definitions":state.temporary_documents}),
+            json!({"revision":state.revision(&base),"channel_settings":state.settings,"digest":digest(&state.settings),"temporary_definitions":state.settings_definitions(&base)}),
         )
     }
     pub(crate) async fn settings_operation(&self, id: &str) -> Result<Value, Failure> {
@@ -783,7 +783,7 @@ impl NativeConfigStore {
             .await
             .settings_operations
             .get(id)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| v.as_ref().clone())
             .ok_or((
                 StatusCode::NOT_FOUND,
                 "Operation not found in this instance; reconcile persisted intent".into(),
@@ -806,7 +806,7 @@ impl NativeConfigStore {
         if apply {
             if let Some((old, result)) = state.settings_operations.get(&input.operation_id) {
                 return if old == &hash {
-                    Ok(result.clone())
+                    Ok(result.as_ref().clone())
                 } else {
                     Err((
                         StatusCode::CONFLICT,
@@ -1008,11 +1008,11 @@ impl NativeConfigStore {
             p["affected_keys"] = json!(affected(&effective, &name));
         }
         let mut result = json!({"operation_id":input.operation_id,"status":if apply{"applied"}else{"validated"},"revision":if apply{candidate.revision(&base)}else{state.revision(&base)},"previews":previews,"settings_digest":digest(&candidate.settings)});
-        result["intent"] = json!({"settings":candidate.settings,"temporary_definitions":candidate.temporary_documents});
+        result["intent"] = json!({"settings":candidate.settings,"temporary_definitions":candidate.settings_definitions(&base)});
         if apply {
             candidate
                 .settings_operations
-                .insert(input.operation_id, (hash, result.clone()));
+                .insert(input.operation_id, (hash, Arc::new(result.clone())));
             if candidate.settings_operations.len() > 256 {
                 if let Some(k) = candidate.settings_operations.keys().next().cloned() {
                     candidate.settings_operations.remove(&k);

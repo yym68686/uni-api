@@ -636,7 +636,7 @@ impl NativeConfigStore {
         let entries = crate::channel_catalog::entries(&snapshot, caller, Some(selected_id))?;
         let cooldowns = self.channel_cooldowns.lock().await.clone();
         let now = tokio::time::Instant::now();
-        let controls = self.channel_controls.read().await.clone();
+        let controls = self.channel_controls.read().await.routing_rules();
         let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
             if provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
@@ -1015,7 +1015,7 @@ impl NativeConfigStore {
         request_model: &str,
         providers: Vec<Arc<Provider>>,
     ) -> Vec<Arc<Provider>> {
-        let controls = self.channel_controls.read().await.clone();
+        let controls = self.channel_controls.read().await.routing_rules();
         let key = crate::channel_catalog::key_id(&api_key.token);
         if controls.order(&key, request_model).is_some() {
             return controls.apply(&key, request_model, providers);
