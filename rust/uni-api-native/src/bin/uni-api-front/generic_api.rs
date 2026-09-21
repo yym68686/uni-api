@@ -43,6 +43,7 @@ const DEFAULT_UPSTREAM_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const UPSTREAM_ERROR_MAX_BYTES: usize = 1024 * 1024;
 
 const PUBLIC_JSON_ROUTES: &[&str] = &[
+    "/v1/systemone",
     "/v1/chat/completions",
     "/v1/messages",
     "/v1/images/generations",
@@ -1401,6 +1402,11 @@ fn missing_required_field(path: &str, payload: &Value) -> Option<&'static str> {
         })
     };
     match path {
+        "/v1/systemone" if !root.get("model").is_some_and(Value::is_string) => Some("model"),
+        "/v1/systemone" if !root.contains_key("state") => Some("state"),
+        "/v1/systemone" if !root.get("questions").is_some_and(Value::is_object) => {
+            Some("questions")
+        }
         "/v1/chat/completions" | "/v1/messages" if missing("messages") => Some("messages"),
         "/v1/images/generations" if missing("prompt") => Some("prompt"),
         "/v1/embeddings" if missing("input") => Some("input"),
@@ -2158,7 +2164,11 @@ fn build_attempt(
     request_id: &str,
 ) -> Result<PreparedAttempt, String> {
     let is_alpha_search = path == ALPHA_SEARCH_ENDPOINT;
+    let is_systemone = path == "/v1/systemone";
     let engine = provider.engine.trim().to_ascii_lowercase();
+    if !crate::responses_native::provider_accepts_endpoint(provider, path) {
+        return Err("Provider does not support this endpoint".into());
+    }
     let native_responses_wire = matches!(path, "/v1/responses" | "/v1/responses/compact")
         && (engine == "codex"
             || (engine == "gpt"
@@ -2172,6 +2182,7 @@ fn build_attempt(
         DownstreamProtocol::Native
     };
     let downstream_stream = !is_alpha_search
+        && !is_systemone
         && input
             .payload
             .as_ref()
@@ -2276,6 +2287,14 @@ fn build_attempt(
         .then(|| estimate_video_tokens(&payload))
         .flatten();
     let (url, adapter, upstream_stream) = match engine.as_str() {
+        "typesafe" => {
+            set_model(&mut payload, original_model)?;
+            (
+                typesafe_endpoint_url(provider.base_url.as_ref())?,
+                ResponseAdapter::Passthrough,
+                false,
+            )
+        }
         "codex" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_responses(&payload, original_model)?;
             (
@@ -2532,6 +2551,7 @@ fn build_attempt(
             | ResponseAdapter::CallxyqVideo
     ) && engine != "vertex-claude"
         && !is_alpha_search
+        && !is_systemone
     {
         if let Some(root) = payload.as_object_mut() {
             root.insert("stream".into(), Value::Bool(upstream_stream));
@@ -5548,6 +5568,22 @@ fn filtered_lingjing_query(query: Option<&str>) -> Option<String> {
     retained.then(|| output.finish())
 }
 
+fn typesafe_endpoint_url(base: &str) -> Result<String, String> {
+    let mut url = Url::parse(base).map_err(|_| "Invalid TypeSafe base URL".to_owned())?;
+    let mut path = url.path().trim_end_matches('/').to_owned();
+    for suffix in ["/systemone", "/models"] {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    if !path.ends_with("/v1") {
+        path.push_str("/v1");
+    }
+    url.set_path(&format!("{path}/systemone"));
+    Ok(url.to_string())
+}
+
 fn replace_known_endpoint(base: &str, endpoint: &str) -> Result<String, String> {
     let mut url =
         Url::parse(base).map_err(|error| format!("invalid provider base URL: {error}"))?;
@@ -5562,6 +5598,7 @@ fn replace_known_endpoint(base: &str, endpoint: &str) -> Result<String, String> 
         "/responses/compact",
         "/responses",
         "/messages",
+        "/systemone",
     ];
     let mut path = url.path().trim_end_matches('/').to_owned();
     for suffix in known {

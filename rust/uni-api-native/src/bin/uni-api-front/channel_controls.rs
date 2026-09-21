@@ -210,7 +210,9 @@ impl Controls {
         snapshot
     }
     pub(crate) fn remove_settings_copy(&mut self, name: &str) -> bool {
-        if !name.starts_with("sub2api-copy-") || !self.temporary_documents.contains_key(name) {
+        if !(name.starts_with("sub2api-copy-") || name.starts_with("typesafe-"))
+            || !self.temporary_documents.contains_key(name)
+        {
             return false;
         }
         self.temporary.remove(name);
@@ -243,8 +245,10 @@ impl Controls {
             *provider = Arc::new(p);
             !provider.models.is_empty()
         });
-        self.settings
-            .retain(|name, _| !name.starts_with("sub2api-") || self.temporary.contains_key(name));
+        self.settings.retain(|name, _| {
+            !(name.starts_with("sub2api-") || name.starts_with("typesafe-"))
+                || self.temporary.contains_key(name)
+        });
         self.temporary_documents
             .retain(|name, _| self.temporary.contains_key(name));
     }
@@ -817,7 +821,8 @@ impl NativeConfigStore {
             ..Controls::default()
         };
         for p in input.snapshot.temporary_channels {
-            if !p.provider.starts_with("sub2api-")
+            if !(p.provider.starts_with("sub2api-")
+                || (p.provider.starts_with("typesafe-") && p.definition.is_some()))
                 || p.provider.len() > 100
                 || !p
                     .provider

@@ -44,6 +44,8 @@ pub(crate) struct Change {
     pub reset: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub copy_to_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub create_to_key: String,
     #[serde(default)]
     pub delete_copy: bool,
 }
@@ -355,7 +357,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
     ]
 }
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"supported":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
+    json!({"version":1,"supported":true,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
 }
 fn validate_paths(c: &Change) -> Result<(), Failure> {
     let roots: BTreeSet<String> = supported_paths()
@@ -884,6 +886,56 @@ impl NativeConfigStore {
         let mut previews = Vec::new();
         let mut seen = BTreeSet::new();
         for original_change in &input.changes {
+            if !original_change.create_to_key.is_empty() {
+                let name = &original_change.provider;
+                if !original_change.copy_to_key.is_empty()
+                    || original_change.delete_copy
+                    || original_change.reset
+                    || !original_change.remove.is_empty()
+                    || !name.starts_with("typesafe-")
+                    || name.len() > 100
+                    || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                    || base.providers_by_name.contains_key(name)
+                    || candidate.temporary.contains_key(name)
+                {
+                    return Err(bad(
+                        "Invalid channel setting: new TypeSafe channel identity",
+                    ));
+                }
+                if candidate.temporary.len() >= 128 {
+                    return Err(bad("Too many temporary channels"));
+                }
+                if !base.api_key_order.iter().any(|token| {
+                    crate::channel_catalog::key_id(token) == original_change.create_to_key
+                }) {
+                    return Err(bad("Destination API key not found"));
+                }
+                validate_paths(original_change)?;
+                let raw = merge(&json!({"provider":name}), &original_change.set, &[]);
+                if raw["engine"] != "typesafe" {
+                    return Err(bad(
+                        "Invalid channel setting: new channel must use typesafe",
+                    ));
+                }
+                let compiled = crate::config::compile_provider(&raw)
+                    .ok_or(bad("Invalid channel setting: /model"))?;
+                let parsed = serde_json::from_value(compiled)
+                    .map_err(|_| bad("Invalid channel setting: definition"))?;
+                let mut prototype =
+                    (*crate::responses_native::runtime_provider(parsed, Arc::default())).clone();
+                let mut prefs = (*prototype.preferences).clone();
+                prefs.insert(
+                    "__temporary_key_id".into(),
+                    json!(original_change.create_to_key),
+                );
+                prototype.preferences = Arc::new(prefs);
+                let built = compile(&raw, &Arc::new(prototype)).map_err(bad)?;
+                if built.api_keys.is_empty() {
+                    return Err(bad("Invalid channel setting: /api"));
+                }
+                candidate.temporary_documents.insert(name.clone(), raw);
+                candidate.temporary.insert(name.clone(), built);
+            }
             let mut copied_change;
             let c = if !original_change.copy_to_key.is_empty() {
                 if !base
@@ -1026,7 +1078,9 @@ impl NativeConfigStore {
             let mut body=input.sample.get("body").cloned().unwrap_or(json!({"model":request_model,"input":"Preview","messages":[{"role":"user","content":"Preview"}]}));
             if let Some(o) = body.as_object_mut() {
                 o.insert("model".into(), json!(request_model));
-                o.insert("stream".into(), json!(stream));
+                if endpoint != "/v1/systemone" {
+                    o.insert("stream".into(), json!(stream));
+                }
             }
             let prepared = crate::generic_api::preview_channel_request(
                 &compiled,
@@ -1052,7 +1106,7 @@ impl NativeConfigStore {
             }
             // Payload may contain configured secrets. Only the field names leave
             // the gateway preview; unredacted headers/body never enter logs.
-            previews.push(json!({"provider":c.provider,"created":!original_change.copy_to_key.is_empty(),"before":redact_at(&current,""),"after":redact_at(&merged,""),"sample":{"model":request_model,"upstream_model":upstream,"endpoint":endpoint,"timeouts":timeout,"excluded_endpoint":compiled.excluded_endpoints.iter().any(|e|e==endpoint),"excluded_request_type":!crate::responses_native::provider_accepts_request_type(&compiled,input.sample.get("request_type").and_then(Value::as_str)),"engine":compiled.engine.as_ref(),"base_url":compiled.base_url.as_ref(),"wire_request":wire,"excluded_rule":!crate::responses_native::provider_accepts_request_rules(&compiled,endpoint,request_model,input.sample.get("reasoning_effort").and_then(Value::as_str),input.sample.get("request_type").and_then(Value::as_str)),"body":redact_at(&json!({"preferences":{"post_body_parameter_overrides":body}}),"")["preferences"]["post_body_parameter_overrides"]}}));
+            previews.push(json!({"provider":c.provider,"created":!original_change.copy_to_key.is_empty() || !original_change.create_to_key.is_empty(),"before":redact_at(&current,""),"after":redact_at(&merged,""),"sample":{"model":request_model,"upstream_model":upstream,"endpoint":endpoint,"timeouts":timeout,"excluded_endpoint":compiled.excluded_endpoints.iter().any(|e|e==endpoint),"excluded_request_type":!crate::responses_native::provider_accepts_request_type(&compiled,input.sample.get("request_type").and_then(Value::as_str)),"engine":compiled.engine.as_ref(),"base_url":compiled.base_url.as_ref(),"wire_request":wire,"excluded_rule":!crate::responses_native::provider_accepts_request_rules(&compiled,endpoint,request_model,input.sample.get("reasoning_effort").and_then(Value::as_str),input.sample.get("request_type").and_then(Value::as_str)),"body":redact_at(&json!({"preferences":{"post_body_parameter_overrides":body}}),"")["preferences"]["post_body_parameter_overrides"]}}));
         }
         let effective = candidate.overlay(base.clone());
         for p in &mut previews {
@@ -1084,6 +1138,100 @@ mod tests {
     use axum::http::HeaderMap;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
+    #[tokio::test]
+    async fn typesafe_creation_is_scoped_atomic_restorable_and_reversible() {
+        let store = fixture().await;
+        let revision = store.settings_view("one").await.unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let create = |revision: &str, operation: &str, key: &str| {
+            serde_json::from_value::<Mutation>(json!({
+            "revision":revision,"operation_id":operation,
+            "changes":[{"provider":"typesafe-jev","create_to_key":key,"set":{
+                "/engine":"typesafe","/base_url":"https://api.typesafe.ai/v1/systemone",
+                "/api":"jev-secret","/model":["jev-latest","jev-1.13.0"]
+            }}],
+            "sample":{"endpoint":"/v1/systemone","stream":false,"body":{"state":["a",{"b":true}],"questions":{"q":{"type":"noul","instructions":"Is b true?"}}}}
+        })).unwrap()
+        };
+        let owner = crate::channel_catalog::key_id("caller-a");
+        assert!(store
+            .settings_change(create(&revision, "invalid", "missing"), true)
+            .await
+            .is_err());
+        assert_eq!(
+            store.settings_view("one").await.unwrap()["revision"],
+            revision
+        );
+        let preview = store
+            .settings_change(create(&revision, "create", &owner), false)
+            .await
+            .unwrap();
+        assert_eq!(preview["previews"][0]["created"], true);
+        assert!(preview["previews"][0]["sample"]["wire_request"]["body"]
+            .get("stream")
+            .is_none());
+        assert!(store.settings_view("typesafe-jev").await.is_err());
+        let applied = store
+            .settings_change(create(&revision, "create", &owner), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            store
+                .settings_change(create(&revision, "create", &owner), true)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            applied["previews"][0]["affected_keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let snapshot = store.snapshot().await.unwrap();
+        let provider = &snapshot.providers_by_name["typesafe-jev"];
+        assert_eq!(provider.engine.as_ref(), "typesafe");
+        assert!(crate::channel_controls::temporary_allowed(
+            provider,
+            &snapshot.api_keys["caller-a"]
+        ));
+        assert!(!crate::channel_controls::temporary_allowed(
+            provider,
+            &snapshot.api_keys["caller-b"]
+        ));
+        let exported = store.settings_export().await.unwrap();
+        let restored = fixture().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer admin-token".parse().unwrap());
+        let restore_revision = restored.controls_view(&headers).await.unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        restored.restore_controls(&headers, serde_json::from_value(json!({
+            "revision":restore_revision,"snapshot":{"version":2,"rules":[],"temporary_channels":[{
+                "provider":"typesafe-jev","api_key_id":owner,"base_url":"https://api.typesafe.ai/v1/systemone",
+                "api_key":"jev-secret","models":["jev-latest","jev-1.13.0"],
+                "definition":exported["temporary_definitions"]["typesafe-jev"]
+            }]}
+        })).unwrap()).await.unwrap();
+        assert_eq!(
+            restored.snapshot().await.unwrap().providers_by_name["typesafe-jev"]
+                .engine
+                .as_ref(),
+            "typesafe"
+        );
+        let next_revision = applied["revision"].as_str().unwrap();
+        assert!(store
+            .settings_change(create(next_revision, "duplicate", &owner), true)
+            .await
+            .is_err());
+        store.settings_change(serde_json::from_value(json!({"revision":next_revision,"operation_id":"rollback","changes":[{"provider":"typesafe-jev","delete_copy":true}]})).unwrap(),true).await.unwrap();
+        assert!(store.settings_view("typesafe-jev").await.is_err());
+        assert_eq!(store.snapshot().await.unwrap().providers.len(), 1);
+    }
     async fn fixture() -> NativeConfigStore {
         let raw = json!({"provider":"one","base_url":"https://example.com/v1/responses","engine":"gpt","api":["secret-a","secret-b"],"model":["public",{"upstream":"alias"},{"vendor/model":"vendor/public"}],"preferences":{"cooldown_period":30,"headers":{"x-private":"secret-header"}},"unknown_extension":{"keep":true}});
         let item: RawProvider =
@@ -1195,6 +1343,7 @@ mod tests {
             reset: false,
             copy_to_key: String::new(),
             delete_copy: false,
+            create_to_key: String::new(),
         });
         assert!(store.settings_change(input, true).await.is_err());
         assert_eq!(store.settings_view("one").await.unwrap()["revision"], rev);

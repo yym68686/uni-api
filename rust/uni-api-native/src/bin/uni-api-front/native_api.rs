@@ -215,7 +215,7 @@ async fn model_channels_response(
     let model = query_value(uri, "model");
     let endpoint = query_value(uri, "endpoint").unwrap_or_else(|| "/v1/responses".into());
     let stream = query_value(uri, "stream")
-        .map(|v| v != "false")
+        .map(|v| v != "false" && v != "all")
         .unwrap_or(true);
     let selected_key = query_value(uri, "api_key_id");
     let (rows, revision, selected_key_id) = match state
@@ -328,7 +328,7 @@ async fn channel_metrics_response_inner(
 ) -> Response<Body> {
     let endpoint = query_value(uri, "endpoint").unwrap_or_else(|| "/v1/responses".into());
     let stream = query_value(uri, "stream")
-        .map(|v| v != "false")
+        .map(|v| v != "false" && v != "all")
         .unwrap_or(true);
     let model = query_value(uri, "model");
     let window = crate::channel_metrics::parse_window(
@@ -656,6 +656,11 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         StatusCode::OK,
         json!({
             "object": "list",
+            // The TypeSafe SDK reads `models`; OpenAI clients continue reading
+            // `data`. These are configured names, not fabricated release dates.
+            "models": models.iter().map(|model| json!({
+                "name": model, "description": "Configured uni-api model", "release_date": ""
+            })).collect::<Vec<_>>(),
             "data": models.into_iter().map(|model| {
                 let mut item = json!({
                     "id": model.clone(),
@@ -836,6 +841,7 @@ fn openapi_document() -> Value {
         ("post", "/v1/responses"),
         ("post", "/v1/responses/compact"),
         ("post", "/v1/messages"),
+        ("post", "/v1/systemone"),
         ("get", "/v1/models"),
         ("get", "/v1/model-channels"),
         ("get", "/v1/api-keys"),

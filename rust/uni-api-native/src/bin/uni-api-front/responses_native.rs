@@ -638,7 +638,7 @@ impl NativeConfigStore {
         let now = tokio::time::Instant::now();
         let controls = self.channel_controls.read().await.routing_rules();
         let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
-            if provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
+            if !provider_accepts_endpoint(&provider, endpoint) || (provider.engine.eq_ignore_ascii_case("typesafe") && stream) || provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
             }
             let upstream = provider.models.get(&model)?;
@@ -2653,6 +2653,15 @@ fn diagnostic_key(
     Ok(diagnostic)
 }
 
+pub(crate) fn provider_accepts_endpoint(provider: &Provider, endpoint: &str) -> bool {
+    let endpoint = endpoint.trim_end_matches('/');
+    if endpoint == "all" {
+        return true;
+    }
+    let typesafe = provider.engine.trim().eq_ignore_ascii_case("typesafe");
+    typesafe == (endpoint == "/v1/systemone")
+}
+
 fn matching_providers(
     snapshot: &Snapshot,
     api_key: &ApiKey,
@@ -2728,6 +2737,7 @@ fn matching_providers(
     matches.retain(|provider| seen.insert(provider.name.clone()));
     matches.retain(|provider| {
         crate::channel_controls::temporary_allowed(provider, api_key)
+            && provider_accepts_endpoint(provider, endpoint)
             && !provider.excluded_endpoints.iter().any(|excluded| {
                 excluded
                     .trim_end_matches('/')
