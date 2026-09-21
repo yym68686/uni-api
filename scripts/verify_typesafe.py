@@ -123,6 +123,11 @@ def verify(binary):
                 assert ids == {"jev-latest", "jev-1.13.0", "decision-alias"}, ids
                 assert {m["name"] for m in models["models"]} == ids
                 assert all(isinstance(m["release_date"], str) for m in models["models"])
+                status, _, admin_models = call("GET", "/v1/models", key="admin")
+                assert status == 200 and "chat-model" in {m["id"] for m in admin_models["data"]}
+                assert "chat-model" not in {m["name"] for m in admin_models["models"]}
+                status, _, chat_models = call("GET", "/v1/models", key="other")
+                assert status == 200 and chat_models["models"] == []
                 for state in ["服务全部中断", {"report": "All requests fail"}, ["Outage", {"all_users": True}]]:
                     for model in ["jev-latest", "jev-1.13.0", "decision-alias"]:
                         body = {"model": model, "state": state, "questions": QUESTIONS}

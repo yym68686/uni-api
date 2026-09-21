@@ -511,17 +511,25 @@ impl NativeConfigStore {
     }
 
     pub async fn models_for_headers(&self, headers: &HeaderMap) -> Result<Vec<String>, u16> {
+        self.models_for_endpoint(headers, "all").await
+    }
+
+    pub(crate) async fn models_for_endpoint(
+        &self,
+        headers: &HeaderMap,
+        endpoint: &str,
+    ) -> Result<Vec<String>, u16> {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let snapshot = self.snapshot().await.ok_or(503u16)?;
         let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let allowed = |p: &Arc<Provider>| {
+            crate::channel_controls::temporary_allowed(p, api_key)
+                && provider_accepts_endpoint(p, endpoint)
+        };
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {
             if rule == "all" {
-                for provider in snapshot
-                    .providers
-                    .iter()
-                    .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
-                {
+                for provider in snapshot.providers.iter().filter(|p| allowed(p)) {
                     models.extend(provider.models.keys().cloned());
                 }
                 continue;
@@ -531,7 +539,7 @@ impl NativeConfigStore {
                 if snapshot
                     .providers
                     .iter()
-                    .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
+                    .filter(|p| allowed(p))
                     .any(|provider| provider.models.contains_key(&model))
                 {
                     models.insert(model);
@@ -542,7 +550,7 @@ impl NativeConfigStore {
                 if let Some(provider) = snapshot
                     .providers_by_name
                     .get(provider_name)
-                    .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
+                    .filter(|p| allowed(p))
                 {
                     if model_rule == "*" {
                         models.extend(provider.models.keys().cloned());
@@ -555,7 +563,7 @@ impl NativeConfigStore {
             if snapshot
                 .providers
                 .iter()
-                .filter(|p| crate::channel_controls::temporary_allowed(p, api_key))
+                .filter(|p| allowed(p))
                 .any(|provider| provider.models.contains_key(rule))
             {
                 models.insert(rule.clone());

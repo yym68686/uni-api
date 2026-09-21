@@ -652,13 +652,27 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         );
         return response;
     }
+    let systemone_models = match state
+        .native_responses_config
+        .models_for_endpoint(headers, "/v1/systemone")
+        .await
+    {
+        Ok(models) => models,
+        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
     json_response(
         StatusCode::OK,
         json!({
             "object": "list",
             // The TypeSafe SDK reads `models`; OpenAI clients continue reading
             // `data`. These are configured names, not fabricated release dates.
-            "models": models.iter().map(|model| json!({
+            "models": systemone_models.iter().map(|model| json!({
                 "name": model, "description": "Configured uni-api model", "release_date": ""
             })).collect::<Vec<_>>(),
             "data": models.into_iter().map(|model| {
