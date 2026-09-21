@@ -210,9 +210,7 @@ impl Controls {
         snapshot
     }
     pub(crate) fn remove_settings_copy(&mut self, name: &str) -> bool {
-        if !(name.starts_with("sub2api-copy-") || name.starts_with("typesafe-"))
-            || !self.temporary_documents.contains_key(name)
-        {
+        if !self.temporary.contains_key(name) || !self.temporary_documents.contains_key(name) {
             return false;
         }
         self.temporary.remove(name);
@@ -226,6 +224,7 @@ impl Controls {
         true
     }
     fn reset_temporary(&mut self, key: &str, model: &str) {
+        let previous_names: BTreeSet<_> = self.temporary.keys().cloned().collect();
         self.temporary.retain(|_, provider| {
             let owner = provider
                 .preferences
@@ -245,10 +244,8 @@ impl Controls {
             *provider = Arc::new(p);
             !provider.models.is_empty()
         });
-        self.settings.retain(|name, _| {
-            !(name.starts_with("sub2api-") || name.starts_with("typesafe-"))
-                || self.temporary.contains_key(name)
-        });
+        self.settings
+            .retain(|name, _| !previous_names.contains(name) || self.temporary.contains_key(name));
         self.temporary_documents
             .retain(|name, _| self.temporary.contains_key(name));
     }
@@ -821,17 +818,12 @@ impl NativeConfigStore {
             ..Controls::default()
         };
         for p in input.snapshot.temporary_channels {
-            if !(p.provider.starts_with("sub2api-")
-                || (p.provider.starts_with("typesafe-") && p.definition.is_some()))
-                || p.provider.len() > 100
-                || !p
-                    .provider
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            if !(p.provider.starts_with("sub2api-") || p.definition.is_some())
+                || !crate::channel_settings::valid_created_name(&p.provider)
                 || base.providers_by_name.contains_key(&p.provider)
                 || candidate.temporary.contains_key(&p.provider)
                 || p.api_key.is_empty()
-                || p.api_key.len() > 8192
+                || p.api_key.len() > if p.definition.is_some() { 16384 } else { 8192 }
                 || p.api_key.contains(['\r', '\n'])
                 || p.models.is_empty()
                 || p.models.len() > if p.definition.is_some() { 1024 } else { 32 }
