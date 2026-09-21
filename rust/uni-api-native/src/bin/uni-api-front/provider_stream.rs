@@ -1475,6 +1475,7 @@ struct ResponsesOutputState {
     tools: HashMap<usize, ResponsesToolItem>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    settlement_receipt: Option<Value>,
     completed: bool,
 }
 
@@ -1518,6 +1519,7 @@ impl ResponsesOutputState {
             tools: HashMap::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            settlement_receipt: None,
             completed: false,
         }
     }
@@ -1551,6 +1553,9 @@ impl ResponsesOutputState {
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
             self.prompt_tokens = number(usage.get("prompt_tokens"));
             self.completion_tokens = number(usage.get("completion_tokens"));
+            if let Some(receipt) = usage.get("oaix_settlement_receipt") {
+                self.settlement_receipt = Some(receipt.clone());
+            }
         }
 
         let mut output = Vec::new();
@@ -1838,7 +1843,7 @@ impl ResponsesOutputState {
     }
 
     fn response(&self, status: &str, output: Vec<Value>, include_usage: bool) -> Value {
-        json!({
+        let mut response = json!({
             "id":self.id,
             "object":"response",
             "created_at":self.created,
@@ -1855,7 +1860,13 @@ impl ResponsesOutputState {
             })),
             "error":Value::Null,
             "incomplete_details":Value::Null,
-        })
+        });
+        if include_usage {
+            if let Some(receipt) = &self.settlement_receipt {
+                response["usage"]["oaix_settlement_receipt"] = receipt.clone();
+            }
+        }
+        response
     }
 
     fn completed_output(&self) -> Vec<Value> {
@@ -2055,7 +2066,7 @@ pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
             .get("completion_tokens_details")
             .or_else(|| value.get("output_tokens_details"))
     });
-    json!({
+    let mut mapped = json!({
         "prompt_tokens":prompt_tokens,
         "completion_tokens":completion_tokens,
         "total_tokens":total_tokens,
@@ -2070,7 +2081,11 @@ pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
             "accepted_prediction_tokens":number(completion_details.and_then(|value| value.get("accepted_prediction_tokens"))),
             "rejected_prediction_tokens":number(completion_details.and_then(|value| value.get("rejected_prediction_tokens"))),
         },
-    })
+    });
+    if let Some(receipt) = usage.and_then(|v| v.get("oaix_settlement_receipt")) {
+        mapped["oaix_settlement_receipt"] = receipt.clone();
+    }
+    mapped
 }
 
 fn trim_ascii(mut value: &[u8]) -> &[u8] {

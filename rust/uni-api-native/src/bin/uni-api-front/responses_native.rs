@@ -3562,6 +3562,12 @@ fn build_headers(
             headers.insert(name, value.to_owned());
         }
     }
+    if let Some(value) = incoming
+        .get("x-oaix-settlement-nonce")
+        .and_then(|v| v.to_str().ok())
+    {
+        headers.insert("X-OAIX-Settlement-Nonce".into(), value.to_owned());
+    }
     if provider
         .preferences
         .get("oaix_routing_attempt_id")

@@ -2570,6 +2570,19 @@ fn build_attempt(
             }
         }
     }
+    // OpenAI-compatible overrides may explicitly disable upstream streaming.
+    // Decode the wire format we actually requested before adapting the result.
+    let upstream_stream = if matches!(
+        adapter,
+        ResponseAdapter::ResponsesToChat | ResponseAdapter::Passthrough
+    ) {
+        payload
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(upstream_stream)
+    } else {
+        upstream_stream
+    };
     let mut headers = provider_headers(
         provider,
         provider_key,
@@ -2934,6 +2947,16 @@ struct AttemptSuccess {
     upstream_url: String,
 }
 
+// Only attribution headers survive a protocol conversion. Forwarding content
+// type/length or other representation headers would describe the wrong body.
+fn copy_oaix_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for (name, value) in source {
+        if name.as_str().starts_with("x-oaix-") {
+            target.append(name.clone(), value.clone());
+        }
+    }
+}
+
 struct AttemptFailure {
     status: StatusCode,
     detail: String,
@@ -3147,6 +3170,7 @@ async fn send_attempt(
         );
     }
     let status = response.status();
+    let attribution_headers = response.headers().clone();
     if !status.is_success() {
         let headers = filtered_response_headers(response.headers());
         let body = read_limited_upstream_body(response, UPSTREAM_ERROR_MAX_BYTES)
@@ -3313,6 +3337,7 @@ async fn send_attempt(
                 response: None,
             })?;
         }
+        copy_oaix_headers(&attribution_headers, translation.response.headers_mut());
         translation
             .response
             .headers_mut()
@@ -3443,6 +3468,7 @@ async fn send_attempt(
     } else {
         json_response(StatusCode::OK, normalized)
     };
+    copy_oaix_headers(&attribution_headers, output.headers_mut());
     output
         .headers_mut()
         .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
@@ -3609,6 +3635,9 @@ fn provider_headers(
         ) {
             headers.insert(header_name, value);
         }
+    }
+    if let Some(value) = incoming.get("x-oaix-settlement-nonce") {
+        headers.insert("x-oaix-settlement-nonce", value.clone());
     }
     Ok(headers)
 }
@@ -5088,7 +5117,7 @@ fn chat_to_responses_response(value: &Value, model: &str) -> Value {
         .get("completion_tokens")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    json!({
+    let mut response = json!({
         "id":format!("resp_{}", unix_seconds()),
         "object":"response",
         "created_at":unix_seconds(),
@@ -5105,7 +5134,11 @@ fn chat_to_responses_response(value: &Value, model: &str) -> Value {
         },
         "error":Value::Null,
         "incomplete_details":Value::Null,
-    })
+    });
+    if let Some(receipt) = chat_usage.get("oaix_settlement_receipt") {
+        response["usage"]["oaix_settlement_receipt"] = receipt.clone();
+    }
+    response
 }
 
 fn normalize_search_response(url: &str, value: &Value) -> Value {
