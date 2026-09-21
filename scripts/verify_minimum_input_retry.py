@@ -17,6 +17,7 @@ CHINESE = "该令牌不接受输入少于 2000 token 的请求(按请求体大�
 ENGLISH = ("This key does not accept requests with fewer than 2000 input tokens "
            "(judged by request body size).")
 MODEL_UNAVAILABLE = "This model is not available."
+UPSTREAM_PROCESSING_FAILURE = "The upstream service could not process this request."
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -151,6 +152,18 @@ def verify(binary, endpoint, hedging):
                     ("model-exhausted", MODEL_UNAVAILABLE, "exhausted", False, 503,
                      ["limited", "also-limited"] * 3),
                     ("quoted-model-message", f"Invalid input: expected '{MODEL_UNAVAILABLE}'",
+                     "retry", False, 400, ["limited"]),
+                    ("upstream-processing-failure", UPSTREAM_PROCESSING_FAILURE, "retry", False,
+                     200, ["limited", "fallback"]),
+                    ("wrapped-upstream-processing-failure", json.dumps({"error": {
+                        "type": "invalid_request_error", "message": UPSTREAM_PROCESSING_FAILURE}}),
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("upstream-processing-no-retry", UPSTREAM_PROCESSING_FAILURE, "no-retry", False,
+                     502, ["limited"]),
+                    ("upstream-processing-exhausted", UPSTREAM_PROCESSING_FAILURE, "exhausted", False,
+                     502, ["limited", "also-limited"] * 3),
+                    ("quoted-upstream-processing-message",
+                     f"Invalid input: expected '{UPSTREAM_PROCESSING_FAILURE}'",
                      "retry", False, 400, ["limited"]),
                 ]
                 checked = 0

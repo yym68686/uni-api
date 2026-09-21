@@ -3973,6 +3973,9 @@ fn remap_provider_status(status: u16, detail: &str) -> u16 {
     if is_provider_model_unavailable(status, detail) {
         return 503;
     }
+    if is_provider_request_processing_failure(status, detail) {
+        return 502;
+    }
     if detail.contains("<center><h1>400 Bad Request</h1></center>")
         || detail.contains("Provider API error: bad response status code 400")
         || status == 400
@@ -4077,6 +4080,39 @@ fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
             break;
         };
         candidate = nested.to_owned();
+    }
+    false
+}
+
+fn is_provider_request_processing_failure(status: u16, detail: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+
+    let mut candidate = detail.to_owned();
+    for _ in 0..3 {
+        let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        let message = match parsed.as_ref() {
+            Some(payload) => payload
+                .pointer("/error/message")
+                .or_else(|| payload.pointer("/detail/message"))
+                .or_else(|| payload.get("message"))
+                .or_else(|| payload.get("error"))
+                .or_else(|| payload.get("detail"))
+                .unwrap_or(payload)
+                .as_str(),
+            None => Some(candidate.as_str()),
+        };
+        let Some(message) = message else {
+            return false;
+        };
+        if message.trim_start().starts_with('{') {
+            candidate = message.to_owned();
+            continue;
+        }
+        return message
+            .trim()
+            .eq_ignore_ascii_case("The upstream service could not process this request.");
     }
     false
 }
@@ -5917,6 +5953,66 @@ mod tests {
             assert!(!policy.provider_model_unavailable);
         }
         assert_eq!(remap_provider_status(413, body), 413);
+    }
+
+    #[test]
+    fn upstream_processing_failure_is_a_retryable_gateway_error() {
+        let body = r#"{"error":{"message":"The upstream service could not process this request.","type":"invalid_request_error"}}"#;
+        for detail in [
+            body.to_owned(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": " THE UPSTREAM SERVICE COULD NOT PROCESS THIS REQUEST. "}})
+                .to_string(),
+            "The upstream service could not process this request.".to_owned(),
+        ] {
+            for endpoint in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/chat/completions",
+            ] {
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                assert_eq!(policy.status, 502, "{detail}");
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(!policy.provider_model_unavailable);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                assert_eq!(disabled.status, 502);
+                assert!(!disabled.retryable);
+            }
+        }
+        for detail in [
+            r#"{"error":{"message":"Invalid input"},"input":"The upstream service could not process this request."}"#,
+            r#"{"error":{"message":"Invalid input"},"debug":{"message":"The upstream service could not process this request."}}"#,
+            r#"{"error":{"message":"Invalid input: expected 'The upstream service could not process this request.'"}}"#,
+        ] {
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+        }
+        assert!(!is_provider_request_processing_failure(401, body));
+        assert!(!is_provider_request_processing_failure(502, body));
+    }
+
+    #[tokio::test]
+    async fn upstream_processing_failure_retries_next_channel() {
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let first_plan = route.next_plan().await.unwrap().unwrap();
+        assert!(route
+            .record_plan_failure(first_plan, &json!({
+                "kind": "http_error",
+                "status_code": 400,
+                "body": r#"{"error":{"message":"The upstream service could not process this request.","type":"invalid_request_error"}}"#,
+            }))
+            .await);
+        assert_eq!(route.last_status(), 502);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.routing_ledger[0]["status_code"], 502);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
     }
 
     #[tokio::test]
