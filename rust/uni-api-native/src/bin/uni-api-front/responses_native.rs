@@ -318,6 +318,8 @@ pub struct NativeRoute {
     max_attempts: usize,
     hedging: HedgingConfig,
     attempt_contexts: HashMap<String, NativeAttemptObservation>,
+    heartbeat_repair_attempted: bool,
+    pending_heartbeat_repair: Option<Plan>,
     hedge_trigger_count: usize,
     hedge_cancelled_attempt_count: usize,
     last_provider: Option<Arc<Provider>>,
@@ -1361,9 +1363,72 @@ impl NativeRoute {
         }
     }
 
-    pub(crate) async fn record_failure_for(&mut self, plan: &Plan, outcome: &Value) -> bool {
-        self.set_current_plan(plan);
-        self.record_failure(outcome).await
+    pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
+        self.set_current_plan(&plan);
+        let retryable = self.record_failure(outcome).await;
+        if self.heartbeat_repair_attempted
+            || !self.auto_retry()
+            || self.request_headers.contains_key(TARGET_PROVIDER_HEADER)
+            || self.endpoint != "/v1/responses"
+        {
+            return retryable;
+        }
+        let Some((body, changed)) = crate::responses_heartbeat::repair(&plan.body, outcome) else {
+            return retryable;
+        };
+        let Some(mut observation) = self.last_attempt.clone() else {
+            return retryable;
+        };
+        self.heartbeat_repair_attempted = true;
+        let original_attempt_id = plan.attempt_id.clone();
+        plan.body = body;
+        plan.attempt_id = native_attempt_id(&self.request_id, self.routing_attempts);
+        for (name, value) in &mut plan.headers {
+            if name.eq_ignore_ascii_case("x-oaix-routing-attempt-id") {
+                *value = plan.attempt_id.clone();
+            }
+        }
+        self.routing_attempts = self.routing_attempts.saturating_add(1);
+        self.upstream_attempts = self.upstream_attempts.saturating_add(1);
+        observation.attempt_id = plan.attempt_id.clone();
+        observation.attempt_index = self.routing_attempts;
+        observation.started_at = tokio::time::Instant::now();
+        self.attempt_contexts
+            .insert(plan.attempt_id.clone(), observation.clone());
+        plan.dispatch = self.arrival.map(|arrival| {
+            arrival.attempt(
+                crate::channel_metrics::MetricKey::new(
+                    &observation.provider,
+                    &self.request_model,
+                    &observation.actual_model,
+                    &self.endpoint,
+                    self.stream,
+                ),
+                self.request_id.clone(),
+                plan.attempt_id.clone(),
+                &self.api_key.token,
+            )
+        });
+        crate::channel_metrics::global().start(
+            &observation.provider,
+            &self.request_model,
+            &observation.actual_model,
+            &self.endpoint,
+            self.stream,
+        );
+        eprintln!(
+            "{}",
+            json!({
+                "kind":"log", "event":"responses_heartbeat_repair",
+                "event_type":"responses_heartbeat_repair", "severity":"info",
+                "source":"uni-api-ember", "fugue_table":"app_events",
+                "request_id":self.request_id, "original_attempt_id":original_attempt_id,
+                "attempt_id":plan.attempt_id, "provider":observation.provider,
+                "model":self.request_model, "heartbeat_items_converted":changed,
+            })
+        );
+        self.pending_heartbeat_repair = Some(plan);
+        true
     }
 
     pub fn request_id(&self) -> &str {
@@ -1390,9 +1455,13 @@ impl NativeRoute {
     }
 
     pub async fn next_plan(&mut self) -> Result<Option<Plan>, String> {
+        if let Some(plan) = self.pending_heartbeat_repair.take() {
+            self.set_current_plan(&plan);
+            return Ok(Some(plan));
+        }
         while self.cursor < self.max_attempts {
-            let attempt_number = self.cursor;
-            let provider = self.providers[attempt_number % self.providers.len()].clone();
+            let attempt_number = self.routing_attempts;
+            let provider = self.providers[self.cursor % self.providers.len()].clone();
             self.cursor += 1;
             self.routing_attempts = self.routing_attempts.saturating_add(1);
             let original_model = provider
@@ -2540,6 +2609,8 @@ pub async fn prepare_native_request(
             parse_hedging(&snapshot.preferences)
         },
         attempt_contexts: HashMap::new(),
+        heartbeat_repair_attempted: false,
+        pending_heartbeat_repair: None,
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
         last_provider: None,
@@ -4359,6 +4430,8 @@ mod tests {
             max_attempts,
             hedging: HedgingConfig::default(),
             attempt_contexts: HashMap::new(),
+            heartbeat_repair_attempted: false,
+            pending_heartbeat_repair: None,
             hedge_trigger_count: 0,
             hedge_cancelled_attempt_count: 0,
             last_provider: None,
@@ -5772,7 +5845,7 @@ mod tests {
         route.providers.insert(1, named_provider("fallback"));
         let first_plan = route.next_plan().await.unwrap().unwrap();
         assert!(route
-            .record_failure_for(&first_plan, &json!({
+            .record_plan_failure(first_plan, &json!({
                 "kind": "http_error",
                 "status_code": 400,
                 "body": r#"{"error":{"message":"This model is not available.","type":"invalid_request_error"}}"#,

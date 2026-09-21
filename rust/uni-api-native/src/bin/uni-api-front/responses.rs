@@ -278,6 +278,7 @@ struct ActiveAttempt {
 
 enum PreflightResult {
     Retry(Value),
+    HttpError(Box<Plan>, Value),
     Started(ActiveAttempt),
 }
 
@@ -306,42 +307,47 @@ impl Coordinator {
         }
     }
 
-    async fn retry(
-        &mut self,
-        state: &AppState,
-        mut outcome: Value,
-    ) -> Result<RetryResolution, String> {
+    async fn retry(&mut self, state: &AppState, outcome: Value) -> Result<RetryResolution, String> {
         match self {
             Self::Python { session_id } => {
                 retry_after_public_start_python(state, session_id, outcome).await
             }
-            Self::Native { route } => loop {
-                if !route.record_failure(&outcome).await {
-                    return Ok(RetryResolution::Final(route.final_message()));
+            Self::Native { route } => {
+                let mut retryable = route.record_failure(&outcome).await;
+                loop {
+                    if !retryable {
+                        return Ok(RetryResolution::Final(route.final_message()));
+                    }
+                    let plan = match route.next_plan().await {
+                        Ok(Some(plan)) => plan,
+                        Ok(None) => return Ok(RetryResolution::Final(route.final_message())),
+                        Err(error) => {
+                            route.emit_internal_failure(502, "native_retry_plan_error", &error);
+                            return Err(error);
+                        }
+                    };
+                    match preflight_attempt(state, plan, true).await {
+                        Ok(PreflightResult::Started(active)) => {
+                            return Ok(RetryResolution::Active(active));
+                        }
+                        Ok(PreflightResult::Retry(next)) => {
+                            retryable = route.record_failure(&next).await;
+                        }
+                        Ok(PreflightResult::HttpError(plan, next)) => {
+                            retryable = route.record_plan_failure(*plan, &next).await;
+                        }
+                        Err(error) => {
+                            let outcome = json!({
+                                "kind": "protocol_error",
+                                "status_code": 502,
+                                "detail": error,
+                                "committed": false,
+                            });
+                            retryable = route.record_failure(&outcome).await;
+                        }
+                    }
                 }
-                let plan = match route.next_plan().await {
-                    Ok(Some(plan)) => plan,
-                    Ok(None) => return Ok(RetryResolution::Final(route.final_message())),
-                    Err(error) => {
-                        route.emit_internal_failure(502, "native_retry_plan_error", &error);
-                        return Err(error);
-                    }
-                };
-                match preflight_attempt(state, plan, true).await {
-                    Ok(PreflightResult::Started(active)) => {
-                        return Ok(RetryResolution::Active(active));
-                    }
-                    Ok(PreflightResult::Retry(next)) => outcome = next,
-                    Err(error) => {
-                        outcome = json!({
-                            "kind": "protocol_error",
-                            "status_code": 502,
-                            "detail": error,
-                            "committed": false,
-                        });
-                    }
-                }
-            },
+            }
         }
     }
 }
@@ -356,6 +362,7 @@ fn spawn_hedge_attempt(
         match preflight_attempt_with_trigger(&state, plan.clone(), false, Some(&trigger)).await {
             Ok(PreflightResult::Started(active)) => Ok((plan, active)),
             Ok(PreflightResult::Retry(outcome)) => Err((plan, outcome)),
+            Ok(PreflightResult::HttpError(plan, outcome)) => Err((*plan, outcome)),
             Err(error) => Err((
                 plan,
                 json!({
@@ -403,7 +410,7 @@ async fn preflight_native_hedged(
                 key: _,
                 failure: (plan, outcome),
             } => {
-                let retryable = route.record_failure_for(&plan, &outcome).await;
+                let retryable = route.record_plan_failure(plan, &outcome).await;
                 if retryable && scheduler.has_capacity() {
                     if let Some(next) = route.next_plan().await? {
                         spawn_hedge_attempt(&mut scheduler, state.clone(), next);
@@ -496,6 +503,15 @@ pub async fn serve_native(
             }
             Ok(PreflightResult::Retry(outcome)) => {
                 if !route.record_failure(&outcome).await {
+                    let status = StatusCode::from_u16(route.last_status())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    route.emit_final_response(status.as_u16(), "failed_before_commit");
+                    release_owner(&mut idempotency_owner).await;
+                    return json_error(status, &route.response_detail());
+                }
+            }
+            Ok(PreflightResult::HttpError(plan, outcome)) => {
+                if !route.record_plan_failure(*plan, &outcome).await {
                     let status = StatusCode::from_u16(route.last_status())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(status.as_u16(), "failed_before_commit");
@@ -617,7 +633,7 @@ async fn serve_native_nonstream(
                     "body": detail,
                     "committed": false,
                 });
-                if !route.record_failure(&outcome).await {
+                if !route.record_plan_failure(plan, &outcome).await {
                     let final_status = StatusCode::from_u16(route.last_status())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(final_status.as_u16(), "failed_before_commit");
@@ -753,7 +769,9 @@ pub async fn serve_session(
             }
         };
         match preflight_attempt(&state, plan, false).await {
-            Ok(PreflightResult::Retry(mut outcome)) => {
+            Ok(
+                PreflightResult::Retry(mut outcome) | PreflightResult::HttpError(_, mut outcome),
+            ) => {
                 outcome["attempt_id"] = Value::String(
                     message
                         .get("attempt_id")
@@ -940,13 +958,16 @@ async fn preflight_attempt_with_trigger(
                 .billing
                 .error_body(status.as_u16(), body.as_bytes());
         }
-        return Ok(PreflightResult::Retry(json!({
-            "kind": "http_error",
-            "status_code": status.as_u16(),
-            "upstream_status_code": status.as_u16(),
-            "body": body,
-            "committed": false,
-        })));
+        return Ok(PreflightResult::HttpError(
+            Box::new(plan),
+            json!({
+                "kind": "http_error",
+                "status_code": status.as_u16(),
+                "upstream_status_code": status.as_u16(),
+                "body": body,
+                "committed": false,
+            }),
+        ));
     }
     if unsupported_encoding {
         return Ok(PreflightResult::Retry(json!({
@@ -2242,7 +2263,10 @@ async fn retry_after_public_start_python(
                 control_commit(state, session_id, &observation).await?;
                 return Ok(RetryResolution::Active(active));
             }
-            Ok(PreflightResult::Retry(mut next_outcome)) => {
+            Ok(
+                PreflightResult::Retry(mut next_outcome)
+                | PreflightResult::HttpError(_, mut next_outcome),
+            ) => {
                 next_outcome["attempt_id"] = Value::String(plan.attempt_id);
                 outcome = next_outcome;
             }
