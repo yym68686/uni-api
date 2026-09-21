@@ -666,6 +666,51 @@ fn affected(snapshot: &Snapshot, provider: &str) -> Vec<Value> {
         .collect()
 }
 impl NativeConfigStore {
+    // Separate, explicitly requested projection. Resolve by opaque reference so
+    // reordering/deleting a draft row cannot reveal a different row's key.
+    pub(crate) async fn settings_secrets(
+        &self,
+        provider: &str,
+        revision: &str,
+    ) -> Result<Value, Failure> {
+        let state = self.channel_controls.read().await;
+        let base = self.base_snapshot().await.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable".into(),
+        ))?;
+        if revision.is_empty() || state.revision(&base) != revision {
+            return Err((
+                StatusCode::CONFLICT,
+                "Configuration changed; refresh before revealing keys".into(),
+            ));
+        }
+        let original = state
+            .temporary
+            .get(provider)
+            .or_else(|| base.providers_by_name.get(provider))
+            .ok_or((StatusCode::NOT_FOUND, "Channel not found".into()))?;
+        let raw = state
+            .temporary_documents
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| document(&base, original));
+        let setting = state.settings.get(provider).cloned().unwrap_or_default();
+        let merged = merge(&raw, &setting.set, &setting.remove);
+        let mut references = BTreeMap::new();
+        // Only API keys from this provider's base and active intent, never other
+        // credentials or another provider. Base refs also support reset drafts.
+        for document in [&raw, &merged] {
+            if let Some(api) = document.get("api") {
+                secrets(api, "/api", &mut references);
+            }
+        }
+        references.retain(|reference, _| {
+            reference.starts_with("/api:") || reference.starts_with("/api/")
+        });
+        references.retain(|_, value| value.is_string());
+        Ok(json!({"provider":provider,"revision":revision,"keys":references}))
+    }
+
     pub(crate) async fn settings_view(&self, provider: &str) -> Result<Value, Failure> {
         let state = self.channel_controls.read().await;
         let base = self.base_snapshot().await.ok_or((
@@ -1332,5 +1377,62 @@ mod tests {
             digest(&value),
             digest(&json!({"remove":[],"set":{"/api":"<secret>"}}))
         );
+    }
+    #[tokio::test]
+    async fn reveal_api_refs_is_read_only_scoped_and_revision_checked() {
+        let store = fixture().await;
+        let before = store.settings_view("one").await.unwrap();
+        let revision = before["revision"].as_str().unwrap();
+        let result = store.settings_secrets("one", revision).await.unwrap();
+        assert_eq!(result["keys"].as_object().unwrap().len(), 2);
+        for (i, expected) in ["secret-a", "secret-b"].iter().enumerate() {
+            assert_eq!(
+                result["keys"][before["effective"]["api"][i]["$secret"].as_str().unwrap()],
+                *expected
+            );
+        }
+        assert!(!result.to_string().contains("secret-header"));
+        assert_eq!(store.settings_view("one").await.unwrap(), before);
+        assert_eq!(
+            store
+                .settings_secrets("missing", revision)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            store.settings_secrets("one", "").await.unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        let applied = store
+            .settings_change(
+                change(revision, "new-key", json!({"/api":"replacement-key"})),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.settings_secrets("one", revision).await.unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        let current = store.settings_view("one").await.unwrap();
+        let result = store
+            .settings_secrets("one", applied["revision"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            result["keys"][current["effective"]["api"]["$secret"].as_str().unwrap()],
+            "replacement-key"
+        );
+        assert_eq!(
+            result["keys"][before["base"]["api"][0]["$secret"].as_str().unwrap()],
+            "secret-a"
+        );
+        assert!(!current.to_string().contains("replacement-key"));
+        let operation = store.settings_operation("new-key").await.unwrap();
+        assert!(!operation["previews"]
+            .to_string()
+            .contains("replacement-key"));
     }
 }

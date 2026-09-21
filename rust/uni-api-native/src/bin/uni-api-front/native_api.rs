@@ -25,6 +25,15 @@ pub async fn handle(
         }
         let result = match path {
             "/v1/channel-settings/schema" => Ok(crate::channel_settings::schema()),
+            "/v1/channel-settings/secrets" => {
+                state
+                    .native_responses_config
+                    .settings_secrets(
+                        &query_value(uri, "provider").unwrap_or_default(),
+                        &query_value(uri, "revision").unwrap_or_default(),
+                    )
+                    .await
+            }
             "/v1/channel-settings" => {
                 state
                     .native_responses_config
@@ -45,10 +54,14 @@ pub async fn handle(
                     .await
             }
         };
-        return Some(match result {
+        let mut response = match result {
             Ok(v) => json_response(StatusCode::OK, v),
             Err((status, message)) => json_error(status, &message),
-        });
+        };
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+        return Some(response);
     }
     if *method == Method::GET
         && matches!(
