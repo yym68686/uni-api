@@ -3648,6 +3648,17 @@ pub(crate) fn resolve_timeouts(
         first_byte: values
             .get("first_byte")
             .and_then(Value::as_f64)
+            // Non-streaming providers may withhold headers until generation is
+            // complete. Preserve the legacy total-only policy instead of
+            // silently shortening it with the model's streaming fallback.
+            // An explicitly configured first_byte (including zero) still wins.
+            .or_else(|| {
+                if stream {
+                    None
+                } else {
+                    values.get("total").and_then(Value::as_f64)
+                }
+            })
             .or(Some(base)),
         idle: values.get("idle").and_then(Value::as_f64),
         total: values.get("total").and_then(Value::as_f64),
@@ -5442,6 +5453,77 @@ mod tests {
             json!({"enabled": true, "winner_policy": "unknown"}),
         )]));
         assert_eq!(invalid, HedgingConfig::default());
+    }
+
+    #[test]
+    fn nonstream_total_policy_replaces_only_the_implicit_first_byte_fallback() {
+        let mut provider = provider();
+        let mut snapshot = Snapshot {
+            revision: Arc::from("0".repeat(64)),
+            preferences: Arc::new(Map::from_iter([("model_timeout".into(), json!(20))])),
+            api_keys: Arc::new(HashMap::new()),
+            api_key_order: Arc::new(Vec::new()),
+            providers: Arc::new(Vec::new()),
+            providers_by_name: Arc::new(HashMap::new()),
+            api_config: Arc::new(json!({})),
+        };
+        for (stream, policy, expected_first, expected_total) in [
+            (false, json!({}), 20.0, None),
+            (false, json!({"total":100}), 100.0, Some(100.0)),
+            (false, json!({"total":3000}), 3000.0, Some(3000.0)),
+            (
+                false,
+                json!({"first_byte":10,"total":100}),
+                10.0,
+                Some(100.0),
+            ),
+            (false, json!({"first_byte":0,"total":100}), 0.0, Some(100.0)),
+            (false, json!({"total":0}), 0.0, Some(0.0)),
+            (true, json!({"total":100}), 20.0, Some(100.0)),
+        ] {
+            provider.preferences = Arc::new(Map::from_iter([(
+                "timeout_policy".into(),
+                json!({"default":policy}),
+            )]));
+            let actual = resolve_timeouts(
+                &snapshot,
+                &provider,
+                "gpt-public",
+                "gpt-upstream",
+                "codex",
+                stream,
+                None,
+                "user",
+                "/v1/responses",
+                "POST",
+            );
+            assert_eq!(
+                actual.first_byte,
+                Some(expected_first),
+                "stream={stream} policy={policy}"
+            );
+            assert_eq!(actual.total, expected_total);
+        }
+        // A configured global first_byte is explicit even if a provider adds
+        // only total. Keep that limit rather than mistaking it for the fallback.
+        Arc::make_mut(&mut snapshot.preferences).insert(
+            "timeout_policy".into(),
+            json!({"default":{"first_byte":30}}),
+        );
+        let actual = resolve_timeouts(
+            &snapshot,
+            &provider,
+            "gpt-public",
+            "gpt-upstream",
+            "codex",
+            false,
+            None,
+            "user",
+            "/v1/responses",
+            "POST",
+        );
+        assert_eq!(actual.first_byte, Some(30.0));
+        assert_eq!(actual.total, Some(100.0));
     }
 
     #[test]

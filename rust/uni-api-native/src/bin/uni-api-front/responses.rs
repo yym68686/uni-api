@@ -687,10 +687,15 @@ async fn send_native_nonstream_attempt(
         plan.total_timeout_seconds,
     ]);
     let billing_secret = crate::billing_observation::request_key(&headers, &plan.url);
-    let request = client
+    let mut request = client
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
+    // RequestBuilder::timeout covers both headers and the complete body. A
+    // timeout around send() alone stops protecting the request after headers.
+    if let Some(total) = positive_duration(plan.total_timeout_seconds) {
+        request = request.timeout(total);
+    }
     if let Some(dispatch) = &plan.dispatch {
         dispatch.billing.target(&plan.url, &billing_secret);
         dispatch.record(&state.channel_metrics);
@@ -716,11 +721,20 @@ async fn send_native_nonstream_attempt(
     }
     let status = response.status();
     let headers = filtered_response_headers(response.headers());
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| format!("read upstream non-streaming body: {error}"))?
-        .to_vec();
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    loop {
+        let next = if let Some(idle) = positive_duration(plan.idle_timeout_seconds) {
+            tokio::time::timeout(idle, stream.next())
+                .await
+                .map_err(|_| "upstream non-streaming body idle timed out".to_owned())?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|error| format!("read upstream non-streaming body: {error}"))?;
+        body.extend_from_slice(&chunk);
+    }
     if let Some(dispatch) = &plan.dispatch {
         dispatch.billing.error_body(status.as_u16(), &body);
     }

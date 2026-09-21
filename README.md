@@ -1170,6 +1170,8 @@ Supported `match` keys are `endpoint`, `stream`, `request_type`, `method`, `engi
 
 Supported timeout keys are `connect`, `write`, `pool`, `first_byte`, `idle`, and `total`. For `/v1/responses` streaming calls, each key has one responsibility: `first_byte` limits the time until upstream headers or the first upstream stream event; `idle` is the only field that becomes an httpx read timeout between upstream chunks; `total` limits the full upstream stream lifetime. If `first_byte` is not set, uni-api uses provider/global `model_timeout`, then `TIMEOUT`, as the first-byte fallback. uni-api does not install a default streaming idle timeout unless `idle` is explicitly configured.
 
+For non-streaming requests, a policy that sets only `total` also supplies the response-header wait budget, preserving compatibility with total-only endpoint rules. For example, `stream: false` with `total: 100` waits up to 100 seconds even when `model_timeout` is 20 seconds. An explicitly configured `first_byte` still applies independently, including a value of zero to disable that limit. Native non-streaming Responses enforce `total` from dispatch through the complete body and `idle` between body chunks; receiving headers or another chunk does not restart the total budget. Rules for streaming requests keep their separate first-byte fallback.
+
 Resolution order is: global `timeout_policy.default` → provider `timeout_policy.default` → most specific global `timeout_policy.rules` match → most specific provider `timeout_policy.rules` match. If no timeout policy sets a value, uni-api falls back to provider/global `model_timeout`, then `TIMEOUT`.
 
 - How does api_key_rate_limit work? How do I set the same rate limit for multiple models?
