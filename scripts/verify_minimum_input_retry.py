@@ -1,4 +1,4 @@
-"""Offline HTTP regression for channel minimum-input and model-unavailable failover."""
+"""Offline HTTP regression for provider failures reported as client errors."""
 import http.client
 import json
 import os
@@ -18,6 +18,9 @@ ENGLISH = ("This key does not accept requests with fewer than 2000 input tokens 
            "(judged by request body size).")
 MODEL_UNAVAILABLE = "This model is not available."
 UPSTREAM_PROCESSING_FAILURE = "The upstream service could not process this request."
+GENERIC_UPSTREAM_ERROR = {"error": {
+    "code": "upstream_error", "message": "Upstream request failed", "type": "upstream_error",
+}}
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -165,12 +168,30 @@ def verify(binary, endpoint, hedging):
                     ("quoted-upstream-processing-message",
                      f"Invalid input: expected '{UPSTREAM_PROCESSING_FAILURE}'",
                      "retry", False, 400, ["limited"]),
+                    ("generic-upstream", GENERIC_UPSTREAM_ERROR, "retry", False,
+                     200, ["limited", "fallback"]),
+                    ("generic-upstream-wrapped", {"error": {"message": json.dumps(GENERIC_UPSTREAM_ERROR)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("generic-upstream-no-retry", GENERIC_UPSTREAM_ERROR, "no-retry", False,
+                     502, ["limited"]),
+                    ("generic-upstream-exhausted", GENERIC_UPSTREAM_ERROR, "exhausted", False,
+                     502, ["limited", "also-limited"] * 3),
+                    ("generic-upstream-client-type", {"error": {
+                        "type": "invalid_request_error", "message": "Upstream request failed"}},
+                     "retry", False, 400, ["limited"]),
+                    ("generic-upstream-validation-code", {"error": {
+                        **GENERIC_UPSTREAM_ERROR["error"], "code": "invalid_type"}},
+                     "retry", False, 400, ["limited"]),
+                    ("generic-upstream-echo", {"error": {"type": "invalid_request_error",
+                        "message": "Invalid input"}, "input": GENERIC_UPSTREAM_ERROR},
+                     "retry", False, 400, ["limited"]),
                 ]
                 checked = 0
                 for streaming in ([False] if endpoint.endswith("/compact") else [False, True]):
                     for label, message, key, escape, expected_status, expected_hits in cases:
                         server.hits.clear()
-                        server.error = {"error": {"type": "invalid_request_error", "message": message}}
+                        server.error = (message if isinstance(message, dict) else
+                                        {"error": {"type": "invalid_request_error", "message": message}})
                         server.escape = escape
                         payload = {"model": "test-model", "stream": streaming}
                         payload.update({"messages": [{"role": "user", "content": "say test"}]}
@@ -182,10 +203,13 @@ def verify(binary, endpoint, hedging):
                         assert server.hits == expected_hits, context
                         if status == 200:
                             assert b"test" in raw and b"invalid_request_error" not in raw, context
+                            assert b"Upstream request failed" not in raw, context
                             if streaming:
                                 assert "text/event-stream" in content_type, context
                         elif status == 503:
                             assert b"All configured providers failed for model test-model" in raw, context
+                        elif label.startswith("generic-upstream"):
+                            assert b"Upstream request failed" in raw, context
                         else:
                             assert b"invalid_request_error" in raw, context
                         checked += 1

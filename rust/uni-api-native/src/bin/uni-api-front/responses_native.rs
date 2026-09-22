@@ -4098,6 +4098,30 @@ fn is_provider_request_processing_failure(status: u16, detail: &str) -> bool {
     let mut candidate = detail.to_owned();
     for _ in 0..3 {
         let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        if let Some(error) = parsed.as_ref().and_then(|payload| {
+            payload
+                .get("error")
+                .filter(|value| value.is_object())
+                .or_else(|| payload.get("detail").filter(|value| value.is_object()))
+        }) {
+            // Some gateways hide the original failure behind this generic 400.
+            // Require the explicit upstream type and whole message; a specific
+            // validation code or echoed input must keep its client-error policy.
+            let matches = |field: &str, expected: &str| {
+                error
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+            };
+            let generic_code =
+                error.get("code").is_none_or(Value::is_null) || matches("code", "upstream_error");
+            if matches("type", "upstream_error")
+                && matches("message", "Upstream request failed")
+                && generic_code
+            {
+                return true;
+            }
+        }
         let message = match parsed.as_ref() {
             Some(payload) => payload
                 .pointer("/error/message")
@@ -5998,6 +6022,76 @@ mod tests {
         }
         assert!(!is_provider_request_processing_failure(401, body));
         assert!(!is_provider_request_processing_failure(502, body));
+    }
+
+    #[tokio::test]
+    async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
+        let body = r#"{"error":{"code":"upstream_error","message":"Upstream request failed","type":"upstream_error"}}"#;
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let first_plan = route.next_plan().await.unwrap().unwrap();
+        assert!(
+            route
+                .record_plan_failure(
+                    first_plan,
+                    &json!({
+                        "kind": "http_error", "status_code": 400, "body": body,
+                    })
+                )
+                .await
+        );
+        assert_eq!(route.last_status(), 502);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.upstream_ledger[0]["error_sha256"], sha256_hex(body));
+        assert_eq!(route.routing_ledger[0]["status_code"], 502);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+        assert!(route.next_plan().await.unwrap().is_none());
+        assert_eq!(route.routing_skips, 1);
+        assert_eq!(route.last_status(), 502);
+    }
+
+    #[test]
+    fn generic_upstream_error_requires_the_gateway_error_envelope() {
+        let body = r#"{"error":{"code":"upstream_error","message":"Upstream request failed","type":"upstream_error"}}"#;
+        for detail in [
+            body.to_owned(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": body}}).to_string(),
+            json!({"error": {"type": "upstream_error", "message": "Upstream request failed"}}).to_string(),
+            json!({"error": {"type": " UPSTREAM_ERROR ", "code": null, "message": " UPSTREAM REQUEST FAILED "}}).to_string(),
+        ] {
+            for endpoint in ["/v1/responses", "/v1/responses/compact", "/v1/chat/completions"] {
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                assert_eq!(policy.status, 502, "{detail}");
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(!policy.provider_model_unavailable);
+                assert!(!policy.force_quota_cooldown);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                assert_eq!(disabled.status, 502);
+                assert!(!disabled.retryable);
+            }
+        }
+        for detail in [
+            "Upstream request failed".to_owned(),
+            json!({"error": {"message": "Upstream request failed", "type": "invalid_request_error"}}).to_string(),
+            json!({"error": {"message": "Upstream request failed", "type": "upstream_error", "code": "invalid_type"}}).to_string(),
+            json!({"error": {"message": "Missing required parameter: input", "type": "upstream_error"}}).to_string(),
+            json!({"error": {"message": "Invalid input: expected 'Upstream request failed'", "type": "upstream_error"}}).to_string(),
+            json!({"error": {"message": "Invalid input"}, "input": body}).to_string(),
+            json!({"error": {"message": "Invalid input"}, "debug": serde_json::from_str::<Value>(body).unwrap()}).to_string(),
+        ] {
+            let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+        }
+        for status in [401, 403, 404, 413, 429, 500, 503] {
+            assert_eq!(remap_provider_status(status, body), status);
+        }
     }
 
     #[tokio::test]
