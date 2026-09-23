@@ -322,6 +322,7 @@ pub struct NativeRoute {
     history_repair_attempted: bool,
     pending_history_repair: Option<Plan>,
     empty_name_repair_attempt_id: Option<String>,
+    missing_item_repair_attempt_id: Option<String>,
     hedge_trigger_count: usize,
     hedge_cancelled_attempt_count: usize,
     last_provider: Option<Arc<Provider>>,
@@ -1382,7 +1383,14 @@ impl NativeRoute {
         {
             return self.has_attempts_remaining();
         }
+        if self.missing_item_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+            && (crate::responses_missing_item::is_uncommitted_404(outcome)
+                || crate::responses_empty_name::is_uncommitted_400(outcome))
+        {
+            return self.has_attempts_remaining();
+        }
         let empty_name = crate::responses_empty_name::repair(&plan.body, outcome);
+        let missing_item = crate::responses_missing_item::repair(&plan.body, outcome);
         if self.history_repair_attempted {
             // Later channels still get their own compilation of the original
             // input. Recognize the same confirmed bad history, without another
@@ -1390,11 +1398,16 @@ impl NativeRoute {
             return retryable
                 || (self.empty_name_repair_attempt_id.is_some()
                     && empty_name.is_some()
+                    && self.has_attempts_remaining())
+                || (self.missing_item_repair_attempt_id.is_some()
+                    && missing_item.is_some()
                     && self.has_attempts_remaining());
         }
         let is_empty_name = empty_name.is_some();
-        let Some((body, changed)) =
-            empty_name.or_else(|| crate::responses_heartbeat::repair(&plan.body, outcome))
+        let is_missing_item = missing_item.is_some();
+        let Some((body, changed)) = empty_name
+            .or(missing_item)
+            .or_else(|| crate::responses_heartbeat::repair(&plan.body, outcome))
         else {
             return retryable;
         };
@@ -1407,6 +1420,9 @@ impl NativeRoute {
         plan.attempt_id = native_attempt_id(&self.request_id, self.routing_attempts);
         if is_empty_name {
             self.empty_name_repair_attempt_id = Some(plan.attempt_id.clone());
+        }
+        if is_missing_item {
+            self.missing_item_repair_attempt_id = Some(plan.attempt_id.clone());
         }
         for (name, value) in &mut plan.headers {
             if name.eq_ignore_ascii_case("x-oaix-routing-attempt-id") {
@@ -1443,6 +1459,8 @@ impl NativeRoute {
         );
         let event = if is_empty_name {
             "responses_empty_name_repair"
+        } else if is_missing_item {
+            "responses_missing_item_repair"
         } else {
             "responses_heartbeat_repair"
         };
@@ -1455,6 +1473,8 @@ impl NativeRoute {
         });
         log[if is_empty_name {
             "tool_pairs_converted"
+        } else if is_missing_item {
+            "reasoning_items_converted"
         } else {
             "heartbeat_items_converted"
         }] = json!(changed);
@@ -2651,6 +2671,7 @@ pub async fn prepare_native_request(
         history_repair_attempted: false,
         pending_history_repair: None,
         empty_name_repair_attempt_id: None,
+        missing_item_repair_attempt_id: None,
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
         last_provider: None,
@@ -4657,6 +4678,7 @@ mod tests {
             history_repair_attempted: false,
             pending_history_repair: None,
             empty_name_repair_attempt_id: None,
+            missing_item_repair_attempt_id: None,
             hedge_trigger_count: 0,
             hedge_cancelled_attempt_count: 0,
             last_provider: None,

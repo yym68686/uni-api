@@ -26,6 +26,7 @@ mod responses;
 mod responses_empty_name;
 mod responses_heartbeat;
 mod responses_item_ids;
+mod responses_missing_item;
 mod responses_native;
 mod telemetry;
 
