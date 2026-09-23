@@ -2681,6 +2681,7 @@ fn nested_keys_for_model(snapshot: &Snapshot, key: &ApiKey, model: &str) -> Vec<
 // Explicit administrator-only diagnostic routing. The temporary key is never
 // written to the snapshot; normal traffic retains its configured routing graph.
 pub(crate) const TARGET_PROVIDER_HEADER: &str = "x-uni-api-provider";
+pub(crate) const PROBE_UNCONFIGURED_MODEL_HEADER: &str = "x-uni-api-probe-unconfigured-model";
 
 fn diagnostic_key(
     snapshot: &Snapshot,
@@ -2689,6 +2690,12 @@ fn diagnostic_key(
     endpoint: &str,
 ) -> Result<ApiKey, RouteResolutionError> {
     let Some(value) = headers.get(TARGET_PROVIDER_HEADER) else {
+        if headers.contains_key(PROBE_UNCONFIGURED_MODEL_HEADER) {
+            return Err(RouteResolutionError {
+                status: StatusCode::BAD_REQUEST,
+                message: "Unconfigured model probes require a target provider".into(),
+            });
+        }
         return Ok(key.clone());
     };
     if !crate::channel_catalog::can_inspect_all(snapshot, key) {
@@ -2728,6 +2735,15 @@ fn diagnostic_key(
     let mut preferences = (*key.preferences).clone();
     preferences.remove("__route_graph");
     preferences.insert("__diagnostic_provider".into(), json!(name));
+    if let Some(value) = headers.get(PROBE_UNCONFIGURED_MODEL_HEADER) {
+        if value != "true" {
+            return Err(RouteResolutionError {
+                status: StatusCode::BAD_REQUEST,
+                message: "Invalid unconfigured model probe flag".into(),
+            });
+        }
+        preferences.insert("__diagnostic_unconfigured_model".into(), json!(true));
+    }
     diagnostic.preferences = Arc::new(preferences);
     Ok(diagnostic)
 }
@@ -2810,6 +2826,22 @@ fn matching_providers(
         &mut matches,
         &mut std::collections::BTreeSet::new(),
     );
+    // Only an authenticated diagnostic key can opt in. Extend a request-local
+    // provider clone; preserve configured aliases and every other provider rule.
+    // The live snapshot, caller model lists and future requests are untouched.
+    if matches.is_empty()
+        && api_key.preferences.get("__diagnostic_unconfigured_model").and_then(Value::as_bool) == Some(true)
+    {
+        if let Some(provider) = api_key.preferences.get("__diagnostic_provider")
+            .and_then(Value::as_str).and_then(|name| snapshot.providers_by_name.get(name))
+        {
+            if !request_model.is_empty() && request_model.len() <= 256 && !request_model.chars().any(char::is_control) {
+                let mut probe = (**provider).clone();
+                Arc::make_mut(&mut probe.models).entry(request_model.to_owned()).or_insert_with(|| request_model.to_owned());
+                matches.push(Arc::new(probe));
+            }
+        }
+    }
     // First occurrence defines priority, including nested key and wildcard rules.
     // Sorting to deduplicate silently changes fixed_priority into name order.
     let mut seen = BTreeSet::new();
@@ -5106,6 +5138,31 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_model_probe_is_opt_in_and_does_not_mutate_snapshot() {
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        let mut headers = catalog_headers("admin-key");
+        headers.insert(PROBE_UNCONFIGURED_MODEL_HEADER, HeaderValue::from_static("true"));
+        assert!(diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").is_err());
+        headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("m-third"));
+        assert!(diagnostic_key(&snapshot, &snapshot.api_keys["restricted"], &headers, "/v1/responses").is_err());
+        let key = diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").ok().unwrap();
+        let probes = matching_providers(&snapshot, &key, "new-model", 100, None, None, "/v1/responses").unwrap();
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].name.as_ref(), "m-third");
+        assert_eq!(probes[0].models["new-model"], "new-model");
+        assert!(!snapshot.providers_by_name["m-third"].models.contains_key("new-model"));
+        assert!(!snapshot.api_keys["admin-key"].preferences.contains_key("__diagnostic_unconfigured_model"));
+        headers.remove(PROBE_UNCONFIGURED_MODEL_HEADER);
+        let regular = diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").ok().unwrap();
+        assert!(matching_providers(&snapshot, &regular, "new-model", 100, None, None, "/v1/responses").unwrap().is_empty());
+        headers.insert(PROBE_UNCONFIGURED_MODEL_HEADER, HeaderValue::from_static("true"));
+        headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("excluded"));
+        let excluded = diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").ok().unwrap();
+        assert!(matching_providers(&snapshot, &excluded, "new-model", 100, None, None, "/v1/responses").unwrap().is_empty());
     }
 
     #[tokio::test]
