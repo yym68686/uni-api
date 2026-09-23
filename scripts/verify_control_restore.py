@@ -22,7 +22,16 @@ with tempfile.TemporaryDirectory(prefix='uni-restore-')as path:
      try:
       c=http.client.HTTPConnection('127.0.0.1',port,timeout=3);c.request('GET','/v1/channel-controls',headers={'Authorization':'Bearer '+key});r=c.getresponse();d=json.loads(r.read());c.close();assert r.status==200;break
      except OSError:time.sleep(.05)
-    assert d['rules']==snapshot['rules'];assert d['temporary_channels']==[{k:v for k,v in snapshot['temporary_channels'][0].items()if k not in ['base_url','api_key']}];observed.append(d['instance_id'])
+    assert d['rules']==snapshot['rules']
+    expected={k:v for k,v in snapshot['temporary_channels'][0].items()if k not in ['base_url','api_key']}
+    expected['identity_changed']=False
+    assert d['temporary_channels']==[expected]
+    assert 'fixture-upstream' not in json.dumps(d)
+    c=http.client.HTTPConnection('127.0.0.1',port,timeout=3)
+    c.request('GET','/v1/models?client_version=any',headers={'Authorization':'Bearer '+key})
+    r=c.getresponse();models=json.loads(r.read());c.close()
+    assert r.status==200 and [m['slug']for m in models['models']]==['m']
+    observed.append(d['instance_id'])
    finally:p.terminate();p.wait(timeout=5)
  assert observed[0]!=observed[1]
  print('PASS: two real process boots restore channels/order/disabled rules before first accepted HTTP request; different instance ids; raw credentials absent from public controls')

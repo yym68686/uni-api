@@ -29,6 +29,8 @@ jobs:
           python3 scripts/verify_channel_controls.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_settings_reveal.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_codex_defaults.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_codex_models.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_control_restore.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_minimum_input_retry.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_heartbeat_retry.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_empty_name_retry.py rust/uni-api-native/target/debug/uni-api-front

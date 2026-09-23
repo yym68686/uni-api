@@ -519,6 +519,39 @@ impl NativeConfigStore {
         self.models_for_endpoint(headers, "all").await
     }
 
+    // Read-only projection of the caller's configured conversational routes.
+    // Do not schedule requests or consult transient cooldowns/usage here.
+    pub(crate) async fn codex_models_for_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Vec<String>, u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let base = self.base_snapshot().await.ok_or(503u16)?;
+        let controls = self.channel_controls.read().await;
+        let snapshot = controls.overlay(base);
+        let key = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let key_id = crate::channel_catalog::key_id(&token);
+        let models = crate::channel_catalog::ordered_entries(&snapshot, key)
+            .into_iter()
+            .filter(|(provider, model)| {
+                crate::channel_controls::temporary_allowed(provider, key)
+                    && provider_accepts_endpoint(provider, "/v1/responses")
+                    && !provider.excluded_endpoints.iter().any(|endpoint| {
+                        endpoint
+                            .trim_end_matches('/')
+                            .eq_ignore_ascii_case("/v1/responses")
+                    })
+                    && !controls.disabled(&key_id, model, &provider.name)
+                    && crate::codex_models::is_conversational_model(model)
+                    && provider.models.get(model).is_some_and(|upstream| {
+                        crate::codex_models::is_conversational_model(upstream)
+                    })
+            })
+            .map(|(_, model)| model)
+            .collect::<BTreeSet<_>>();
+        Ok(models.into_iter().collect())
+    }
+
     pub(crate) async fn models_for_endpoint(
         &self,
         headers: &HeaderMap,

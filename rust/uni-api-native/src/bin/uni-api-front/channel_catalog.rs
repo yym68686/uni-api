@@ -146,7 +146,7 @@ impl Expansion {
         }
     }
 }
-fn ordered_entries(snapshot: &Snapshot, key: &ApiKey) -> Vec<Entry> {
+pub(crate) fn ordered_entries(snapshot: &Snapshot, key: &ApiKey) -> Vec<Entry> {
     let mut expansion = Expansion::default();
     expansion.walk(snapshot, key, None);
     expansion.entries
