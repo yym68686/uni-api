@@ -8,7 +8,7 @@ class Handler(BaseHTTPRequestHandler):
  def log_message(self,*args):pass
  def do_GET(self):
   assert self.headers['Authorization']=='Bearer '+key
-  body=json.dumps({'enabled':True,'snapshot':snapshot}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+  body=json.dumps({'enabled':True,'snapshot_id':'a'*64,'snapshot':snapshot}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=server.serve_forever,daemon=True).start()
 with tempfile.TemporaryDirectory(prefix='uni-restore-')as path:
  root=pathlib.Path(path);port=free_port();(root/'api.json').write_text(json.dumps({'providers':[{'provider':'configured','engine':'gpt','base_url':'https://fixture.example/v1/responses','api':'fixture','model':['m']}],'api_keys':[{'api':key,'model':['all']}]}))
@@ -27,12 +27,28 @@ with tempfile.TemporaryDirectory(prefix='uni-restore-')as path:
     expected['identity_changed']=False
     assert d['temporary_channels']==[expected]
     assert 'fixture-upstream' not in json.dumps(d)
+    receipt={'snapshot_id':'a'*64,'applied_revision':d['revision'],'unchanged':True}
+    assert d['bootstrap_restore']==receipt
     c=http.client.HTTPConnection('127.0.0.1',port,timeout=3)
     c.request('GET','/v1/models?client_version=any',headers={'Authorization':'Bearer '+key})
     r=c.getresponse();models=json.loads(r.read());c.close()
     assert r.status==200 and [m['slug']for m in models['models']]==['m']
     observed.append(d['instance_id'])
+    def mutate(path,payload,status=200):
+     c=http.client.HTTPConnection('127.0.0.1',port,timeout=3)
+     c.request('POST',path,json.dumps(payload),{'Authorization':'Bearer '+key,'Content-Type':'application/json'})
+     r=c.getresponse();raw=r.read();c.close();assert r.status==status,(r.status,raw)
+     return json.loads(raw) if status==200 else None
+    # Runtime clients cannot mint a fresh bootstrap receipt.
+    mutate('/v1/channel-controls/restore',{'revision':d['revision'],'snapshot':snapshot,'snapshot_id':'b'*64},400)
+    edited=mutate('/v1/channel-controls',{'revision':d['revision'],'action':'set','api_key_id':kid,'model':'m','order':['configured','sub2api-saved'],'disabled':[]})
+    receipt['unchanged']=False
+    assert edited['bootstrap_restore']==receipt
+    restored=mutate('/v1/channel-controls/restore',{'revision':edited['revision'],'snapshot':snapshot})
+    assert restored['bootstrap_restore']==receipt
+    reset=mutate('/v1/channel-controls',{'revision':restored['revision'],'action':'reset_all'})
+    assert reset['bootstrap_restore']==receipt
    finally:p.terminate();p.wait(timeout=5)
  assert observed[0]!=observed[1]
- print('PASS: two real process boots restore channels/order/disabled rules before first accepted HTTP request; different instance ids; raw credentials absent from public controls')
+ print('PASS: boot receipt precedes first request; edits, runtime restore and reset cannot renew it; forged receipt rejected; two independent boots; secrets remain redacted')
 server.shutdown();server.server_close()
