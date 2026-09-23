@@ -87,6 +87,7 @@ struct PreparedAttempt {
     upstream_stream: bool,
     request_model: String,
     original_model: String,
+    wire_model: Option<String>,
     downstream_protocol: DownstreamProtocol,
     chat_stream_include_usage: bool,
     provider_key: String,
@@ -389,6 +390,7 @@ struct GenericHedgeContext {
     attempt_started: Instant,
     provider: Arc<Provider>,
     original_model: String,
+    wire_model: Option<String>,
     provider_key: String,
     upstream_url: String,
     downstream_stream: bool,
@@ -586,6 +588,7 @@ async fn next_generic_hedge_plan(
                 attempt_started,
                 provider,
                 original_model,
+                wire_model: prepared.wire_model.clone(),
                 provider_key: provider_key_raw,
                 upstream_url,
                 downstream_stream: prepared.downstream_stream,
@@ -809,6 +812,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     Some(&context.provider),
                     &execution.path,
                     execution.auto_retry,
+                    context.wire_model.as_deref(),
                 );
                 failure.status =
                     StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1048,6 +1052,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             )
         });
         let downstream_stream = prepared.downstream_stream;
+        let wire_model = prepared.wire_model.clone();
         emit_attempt(
             &request_id,
             &trace_id,
@@ -1190,6 +1195,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 Some(&outcome_provider),
                                 &outcome_path,
                                 auto_retry,
+                                wire_model.as_deref(),
                             );
                             if !policy.request_scoped || policy.force_quota_cooldown {
                                 outcome_state
@@ -1294,6 +1300,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     Some(&provider),
                     &path,
                     auto_retry,
+                    wire_model.as_deref(),
                 );
                 failure.status =
                     StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -2267,6 +2274,7 @@ fn build_attempt(
             upstream_stream: false,
             request_model: request_model.to_owned(),
             original_model: original_model.to_owned(),
+            wire_model: None,
             downstream_protocol,
             chat_stream_include_usage,
             provider_key: provider_key.to_owned(),
@@ -2628,6 +2636,10 @@ fn build_attempt(
         upstream_stream,
         request_model: request_model.to_owned(),
         original_model: original_model.to_owned(),
+        wire_model: payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         downstream_protocol,
         chat_stream_include_usage,
         provider_key: provider_key.to_owned(),

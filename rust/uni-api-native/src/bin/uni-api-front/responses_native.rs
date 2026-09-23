@@ -243,6 +243,7 @@ struct NativeAttemptObservation {
     provider: String,
     request_model: String,
     actual_model: String,
+    wire_model: Option<String>,
     upstream_host: String,
     stream: bool,
     snapshot_revision: String,
@@ -1573,6 +1574,10 @@ impl NativeRoute {
                 provider: provider.name.to_string(),
                 request_model: self.request_model.clone(),
                 actual_model: original_model.clone(),
+                wire_model: payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 upstream_host: upstream_host(&provider.base_url),
                 stream: self.stream,
                 snapshot_revision: self.snapshot.revision.to_string(),
@@ -1659,6 +1664,9 @@ impl NativeRoute {
             self.last_provider.as_deref(),
             &self.endpoint,
             self.auto_retry(),
+            self.last_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.wire_model.as_deref()),
         );
         let status = policy.status;
         self.last_status = status;
@@ -2830,14 +2838,26 @@ fn matching_providers(
     // provider clone; preserve configured aliases and every other provider rule.
     // The live snapshot, caller model lists and future requests are untouched.
     if matches.is_empty()
-        && api_key.preferences.get("__diagnostic_unconfigured_model").and_then(Value::as_bool) == Some(true)
+        && api_key
+            .preferences
+            .get("__diagnostic_unconfigured_model")
+            .and_then(Value::as_bool)
+            == Some(true)
     {
-        if let Some(provider) = api_key.preferences.get("__diagnostic_provider")
-            .and_then(Value::as_str).and_then(|name| snapshot.providers_by_name.get(name))
+        if let Some(provider) = api_key
+            .preferences
+            .get("__diagnostic_provider")
+            .and_then(Value::as_str)
+            .and_then(|name| snapshot.providers_by_name.get(name))
         {
-            if !request_model.is_empty() && request_model.len() <= 256 && !request_model.chars().any(char::is_control) {
+            if !request_model.is_empty()
+                && request_model.len() <= 256
+                && !request_model.chars().any(char::is_control)
+            {
                 let mut probe = (**provider).clone();
-                Arc::make_mut(&mut probe.models).entry(request_model.to_owned()).or_insert_with(|| request_model.to_owned());
+                Arc::make_mut(&mut probe.models)
+                    .entry(request_model.to_owned())
+                    .or_insert_with(|| request_model.to_owned());
                 matches.push(Arc::new(probe));
             }
         }
@@ -4039,9 +4059,16 @@ pub(crate) fn classify_provider_failure(
     provider: Option<&Provider>,
     endpoint: &str,
     auto_retry: bool,
+    upstream_model: Option<&str>,
 ) -> ProviderFailurePolicy {
     let provider_model_unavailable = is_provider_model_unavailable(original_status, detail);
-    let status = remap_provider_status(original_status, detail);
+    let status = if original_status == 400
+        && upstream_model.is_some_and(|model| is_provider_error_model_mismatch(detail, model))
+    {
+        502
+    } else {
+        remap_provider_status(original_status, detail)
+    };
     let codex_model_unsupported = status == 400
         && matches!(endpoint, "/v1/responses" | "/v1/responses/compact")
         && provider.is_some_and(|provider| provider.engine.eq_ignore_ascii_case("codex"))
@@ -4059,6 +4086,62 @@ pub(crate) fn classify_provider_failure(
         provider_model_unavailable,
         force_quota_cooldown: codex_model_unsupported,
     }
+}
+
+fn is_provider_error_model_mismatch(detail: &str, upstream_model: &str) -> bool {
+    let upstream_model = upstream_model.trim();
+    if upstream_model.is_empty() {
+        return false;
+    }
+    let mut candidate = detail.to_owned();
+    for _ in 0..3 {
+        let Ok(payload) = serde_json::from_str::<Value>(&candidate) else {
+            return false;
+        };
+        let Some(error) = payload
+            .get("error")
+            .or_else(|| payload.get("detail"))
+            .filter(|error| error.is_object())
+        else {
+            return false;
+        };
+        let Some(message) = error.get("message").and_then(Value::as_str) else {
+            return false;
+        };
+        if message.trim_start().starts_with('{') {
+            candidate = message.to_owned();
+            continue;
+        }
+        if error.get("code").and_then(Value::as_str) != Some("unsupported_value")
+            || error.get("type").and_then(Value::as_str) != Some("invalid_request_error")
+            || error
+                .get("param")
+                .and_then(Value::as_str)
+                .is_none_or(|param| param.trim().is_empty())
+        {
+            return false;
+        }
+        // Only this explicit model-specific validation message identifies a
+        // mismatched backend. Never search echoed input or arbitrary prose.
+        let Some(rest) = message.strip_prefix("Unsupported value: '") else {
+            return false;
+        };
+        let Some((value, rest)) = rest.split_once("' is not supported with the '") else {
+            return false;
+        };
+        let Some((model, supported)) = rest.split_once("' model. Supported values are: ") else {
+            return false;
+        };
+        return !value.is_empty()
+            && !model.is_empty()
+            && model
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.:/".contains(&c))
+            && supported.starts_with('\'')
+            && supported.ends_with("'.")
+            && !model.eq_ignore_ascii_case(upstream_model);
+    }
+    false
 }
 
 fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
@@ -5145,24 +5228,96 @@ mod tests {
         let store = catalog_fixture().await;
         let snapshot = store.snapshot().await.unwrap();
         let mut headers = catalog_headers("admin-key");
-        headers.insert(PROBE_UNCONFIGURED_MODEL_HEADER, HeaderValue::from_static("true"));
-        assert!(diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").is_err());
+        headers.insert(
+            PROBE_UNCONFIGURED_MODEL_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        assert!(diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["admin-key"],
+            &headers,
+            "/v1/responses"
+        )
+        .is_err());
         headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("m-third"));
-        assert!(diagnostic_key(&snapshot, &snapshot.api_keys["restricted"], &headers, "/v1/responses").is_err());
-        let key = diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").ok().unwrap();
-        let probes = matching_providers(&snapshot, &key, "new-model", 100, None, None, "/v1/responses").unwrap();
+        assert!(diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["restricted"],
+            &headers,
+            "/v1/responses"
+        )
+        .is_err());
+        let key = diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["admin-key"],
+            &headers,
+            "/v1/responses",
+        )
+        .ok()
+        .unwrap();
+        let probes = matching_providers(
+            &snapshot,
+            &key,
+            "new-model",
+            100,
+            None,
+            None,
+            "/v1/responses",
+        )
+        .unwrap();
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].name.as_ref(), "m-third");
         assert_eq!(probes[0].models["new-model"], "new-model");
-        assert!(!snapshot.providers_by_name["m-third"].models.contains_key("new-model"));
-        assert!(!snapshot.api_keys["admin-key"].preferences.contains_key("__diagnostic_unconfigured_model"));
+        assert!(!snapshot.providers_by_name["m-third"]
+            .models
+            .contains_key("new-model"));
+        assert!(!snapshot.api_keys["admin-key"]
+            .preferences
+            .contains_key("__diagnostic_unconfigured_model"));
         headers.remove(PROBE_UNCONFIGURED_MODEL_HEADER);
-        let regular = diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").ok().unwrap();
-        assert!(matching_providers(&snapshot, &regular, "new-model", 100, None, None, "/v1/responses").unwrap().is_empty());
-        headers.insert(PROBE_UNCONFIGURED_MODEL_HEADER, HeaderValue::from_static("true"));
+        let regular = diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["admin-key"],
+            &headers,
+            "/v1/responses",
+        )
+        .ok()
+        .unwrap();
+        assert!(matching_providers(
+            &snapshot,
+            &regular,
+            "new-model",
+            100,
+            None,
+            None,
+            "/v1/responses"
+        )
+        .unwrap()
+        .is_empty());
+        headers.insert(
+            PROBE_UNCONFIGURED_MODEL_HEADER,
+            HeaderValue::from_static("true"),
+        );
         headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("excluded"));
-        let excluded = diagnostic_key(&snapshot, &snapshot.api_keys["admin-key"], &headers, "/v1/responses").ok().unwrap();
-        assert!(matching_providers(&snapshot, &excluded, "new-model", 100, None, None, "/v1/responses").unwrap().is_empty());
+        let excluded = diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["admin-key"],
+            &headers,
+            "/v1/responses",
+        )
+        .ok()
+        .unwrap();
+        assert!(matching_providers(
+            &snapshot,
+            &excluded,
+            "new-model",
+            100,
+            None,
+            None,
+            "/v1/responses"
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[tokio::test]
@@ -6016,13 +6171,13 @@ mod tests {
                 "/v1/responses/compact",
                 "/v1/chat/completions",
             ] {
-                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true, None);
                 assert_eq!(policy.status, 503, "{detail}");
                 assert!(policy.retryable);
                 assert!(!policy.request_scoped);
                 assert!(policy.provider_model_unavailable);
                 assert!(!policy.force_quota_cooldown);
-                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false, None);
                 assert_eq!(disabled.status, 503);
                 assert!(!disabled.retryable);
             }
@@ -6033,7 +6188,7 @@ mod tests {
             r#"{"error":{"message":"Invalid input"},"debug":{"message":"This model is not available."}}"#,
             r#"{"error":{"message":"Invalid input: expected 'This model is not available.'"}}"#,
         ] {
-            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true, None);
             assert_eq!(policy.status, 400, "{detail}");
             assert!(policy.request_scoped);
             assert!(!policy.retryable);
@@ -6057,12 +6212,12 @@ mod tests {
                 "/v1/responses/compact",
                 "/v1/chat/completions",
             ] {
-                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true, None);
                 assert_eq!(policy.status, 502, "{detail}");
                 assert!(policy.retryable);
                 assert!(!policy.request_scoped);
                 assert!(!policy.provider_model_unavailable);
-                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false, None);
                 assert_eq!(disabled.status, 502);
                 assert!(!disabled.retryable);
             }
@@ -6072,7 +6227,7 @@ mod tests {
             r#"{"error":{"message":"Invalid input"},"debug":{"message":"The upstream service could not process this request."}}"#,
             r#"{"error":{"message":"Invalid input: expected 'The upstream service could not process this request.'"}}"#,
         ] {
-            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true, None);
             assert_eq!(policy.status, 400, "{detail}");
             assert!(policy.request_scoped);
             assert!(!policy.retryable);
@@ -6121,13 +6276,13 @@ mod tests {
             json!({"error": {"type": " UPSTREAM_ERROR ", "code": null, "message": " UPSTREAM REQUEST FAILED "}}).to_string(),
         ] {
             for endpoint in ["/v1/responses", "/v1/responses/compact", "/v1/chat/completions"] {
-                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true, None);
                 assert_eq!(policy.status, 502, "{detail}");
                 assert!(policy.retryable);
                 assert!(!policy.request_scoped);
                 assert!(!policy.provider_model_unavailable);
                 assert!(!policy.force_quota_cooldown);
-                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false, None);
                 assert_eq!(disabled.status, 502);
                 assert!(!disabled.retryable);
             }
@@ -6141,7 +6296,7 @@ mod tests {
             json!({"error": {"message": "Invalid input"}, "input": body}).to_string(),
             json!({"error": {"message": "Invalid input"}, "debug": serde_json::from_str::<Value>(body).unwrap()}).to_string(),
         ] {
-            let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true);
+            let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true, None);
             assert_eq!(policy.status, 400, "{detail}");
             assert!(policy.request_scoped);
             assert!(!policy.retryable);
@@ -6198,6 +6353,169 @@ mod tests {
         assert_eq!(route.last_status(), 503);
     }
 
+    fn model_mismatch_error(model: &str) -> Value {
+        json!({"error": {
+            "code": "unsupported_value",
+            "message": format!("Unsupported value: 'max' is not supported with the '{model}' model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'."),
+            "param": "reasoning.effort",
+            "type": "invalid_request_error",
+        }})
+    }
+
+    #[test]
+    fn mismatched_model_validation_is_a_retryable_gateway_error() {
+        let body = model_mismatch_error("gpt-5.5").to_string();
+        assert_eq!(
+            sha256_hex(&body),
+            "a64a8cb7fea16f8b54289a847e80ad3c7ef1b2f85626af3ad7cbc75e215ca03f"
+        );
+        for detail in [
+            body.clone(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": json!({"error": {"message": body}}).to_string()}})
+                .to_string(),
+        ] {
+            for endpoint in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/chat/completions",
+            ] {
+                let policy = classify_provider_failure(
+                    400,
+                    &detail,
+                    None,
+                    endpoint,
+                    true,
+                    Some("gpt-6-sol"),
+                );
+                assert_eq!(policy.status, 502);
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(!policy.provider_model_unavailable);
+                assert!(!policy.force_quota_cooldown);
+                let disabled = classify_provider_failure(
+                    400,
+                    &detail,
+                    None,
+                    endpoint,
+                    false,
+                    Some("gpt-6-sol"),
+                );
+                assert_eq!(disabled.status, 502);
+                assert!(!disabled.retryable);
+            }
+        }
+        for status in [401, 403, 404, 413, 429, 500, 503] {
+            assert_eq!(
+                classify_provider_failure(
+                    status,
+                    &body,
+                    None,
+                    "/v1/responses",
+                    true,
+                    Some("gpt-6-sol")
+                )
+                .status,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn model_mismatch_detection_preserves_client_errors_and_ignores_echoes() {
+        let body = model_mismatch_error("gpt-5.5");
+        for expected in [None, Some(""), Some("gpt-5.5"), Some(" GPT-5.5 ")] {
+            let policy = classify_provider_failure(
+                400,
+                &body.to_string(),
+                None,
+                "/v1/responses",
+                true,
+                expected,
+            );
+            assert_eq!(policy.status, 400);
+            assert!(!policy.retryable);
+            assert!(policy.request_scoped);
+        }
+        let mut invalid_code = body.clone();
+        invalid_code["error"]["code"] = json!("invalid_type");
+        let mut invalid_type = body.clone();
+        invalid_type["error"]["type"] = json!("upstream_error");
+        let mut no_param = body.clone();
+        no_param["error"]["param"] = Value::Null;
+        let mut quoted_message = body.clone();
+        quoted_message["error"]["message"] = json!(format!(
+            "Invalid input: expected {}",
+            body["error"]["message"]
+        ));
+        for detail in [
+            invalid_code.to_string(),
+            invalid_type.to_string(),
+            no_param.to_string(),
+            quoted_message.to_string(),
+            body["error"]["message"].as_str().unwrap().to_owned(),
+            json!({"error": {"message": "Invalid input"}, "input": body}).to_string(),
+            json!({"error": {"message": "Invalid input"}, "debug": body}).to_string(),
+            model_mismatch_error("").to_string(),
+            model_mismatch_error("gpt-5.5' or 'gpt-6-sol").to_string(),
+        ] {
+            let policy = classify_provider_failure(
+                400,
+                &detail,
+                None,
+                "/v1/responses",
+                true,
+                Some("gpt-6-sol"),
+            );
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(!policy.retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_model_retries_and_cools_only_the_failed_route() {
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let plan = route.next_plan().await.unwrap().unwrap();
+        assert!(route.record_plan_failure(plan, &json!({
+            "kind": "http_error", "status_code": 400, "body": model_mismatch_error("gpt-5.5").to_string(),
+        })).await);
+        assert_eq!(route.last_status(), 502);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.routing_ledger[0]["status_code"], 502);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+        assert!(route.next_plan().await.unwrap().is_none());
+        assert_eq!(route.routing_skips, 1);
+    }
+
+    #[tokio::test]
+    async fn model_validation_uses_the_final_wire_model() {
+        for override_model in [None, Some("gpt-5.5")] {
+            let mut first = provider();
+            if let Some(model) = override_model {
+                first.preferences = Arc::new(Map::from_iter([(
+                    "post_body_parameter_overrides".into(),
+                    json!({"model": model}),
+                )]));
+            }
+            let mut route = native_route_for_test(Arc::new(first), 2).await;
+            let plan = route.next_plan().await.unwrap().unwrap();
+            let expected = override_model.unwrap_or("gpt-upstream");
+            assert_eq!(
+                serde_json::from_str::<Value>(&plan.body).unwrap()["model"],
+                expected
+            );
+            assert!(!route.record_plan_failure(plan, &json!({
+                "kind": "http_error", "status_code": 400, "body": model_mismatch_error(expected).to_string(),
+            })).await);
+            assert_eq!(route.last_status(), 400);
+            assert!(route.store.route_failures.lock().await.is_empty());
+        }
+    }
+
     #[test]
     fn minimum_input_key_restrictions_are_retryable_gateway_errors() {
         let chinese = "该令牌不接受输入少于 2000 token 的请求(按请求体大小判定)。";
@@ -6220,14 +6538,16 @@ mod tests {
                     "/v1/responses/compact",
                     "/v1/chat/completions",
                 ] {
-                    let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                    let policy =
+                        classify_provider_failure(400, &detail, None, endpoint, true, None);
                     assert_eq!(policy.status, 502, "{detail}");
                     assert!(policy.retryable);
                     assert!(!policy.request_scoped);
                     assert!(!policy.provider_model_unavailable);
                     assert!(!policy.force_quota_cooldown);
                     assert!(
-                        !classify_provider_failure(400, &detail, None, endpoint, false).retryable
+                        !classify_provider_failure(400, &detail, None, endpoint, false, None)
+                            .retryable
                     );
                 }
             }
@@ -6249,7 +6569,7 @@ mod tests {
             r#"{"error":{"message":"Invalid input"},"input":"该令牌不接受输入少于 2000 token 的请求"}"#,
             r#"{"error":{"message":"Invalid input"},"debug":{"message":"This key does not accept requests with fewer than 2000 input tokens"}}"#,
         ] {
-            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true, None);
             assert_eq!(policy.status, 400, "{detail}");
             assert!(policy.request_scoped);
             assert!(!policy.retryable);
@@ -6266,6 +6586,7 @@ mod tests {
                 Some(&base_provider),
                 "/v1/chat/completions",
                 true,
+                None,
             );
             assert!(policy.retryable, "status {status} should fail over");
             assert!(
@@ -6280,7 +6601,8 @@ mod tests {
                 "invalid request",
                 Some(&base_provider),
                 "/v1/chat/completions",
-                true
+                true,
+                None
             )
             .retryable
         );
@@ -6290,7 +6612,8 @@ mod tests {
                 "payload too large",
                 Some(&base_provider),
                 "/v1/chat/completions",
-                true
+                true,
+                None
             )
             .retryable
         );
@@ -6300,7 +6623,8 @@ mod tests {
                 "upstream failure",
                 Some(&base_provider),
                 "/v1/chat/completions",
-                false
+                false,
+                None
             )
             .retryable
         );
@@ -6309,7 +6633,7 @@ mod tests {
             "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Item with id 'rs_1' not found. Items are not persisted when store is false.\"}}",
             Some(&base_provider),
             "/v1/responses",
-            true,
+            true, None,
         ).retryable);
 
         let pricing = classify_provider_failure(
@@ -6318,6 +6642,7 @@ mod tests {
             Some(&base_provider),
             "/v1/chat/completions",
             true,
+            None,
         );
         assert_eq!(pricing.status, 502);
         assert!(pricing.retryable);
@@ -6328,6 +6653,7 @@ mod tests {
             Some(&base_provider),
             "/v1/responses",
             true,
+            None,
         );
         assert_eq!(model_unavailable.status, 503);
         assert!(model_unavailable.retryable);
@@ -6340,6 +6666,7 @@ mod tests {
             Some(&base_provider),
             "/v1/responses",
             true,
+            None,
         );
         assert_eq!(wrapped_model_unavailable.status, 503);
         assert!(wrapped_model_unavailable.retryable);
@@ -6350,6 +6677,7 @@ mod tests {
             Some(&base_provider),
             "/v1/responses",
             true,
+            None,
         );
         assert_eq!(ordinary_bad_request.status, 400);
         assert!(!ordinary_bad_request.retryable);
@@ -6361,6 +6689,7 @@ mod tests {
             Some(&base_provider),
             "/v1/responses",
             true,
+            None,
         );
         assert!(codex.retryable);
         assert!(codex.force_quota_cooldown);
@@ -6371,6 +6700,7 @@ mod tests {
                 Some(&base_provider),
                 "/v1/chat/completions",
                 true,
+                None,
             )
             .retryable
         );
@@ -6384,7 +6714,8 @@ mod tests {
                 "provider validation",
                 Some(&azure),
                 "/v1/chat/completions",
-                true
+                true,
+                None
             )
             .retryable
         );
@@ -6394,7 +6725,8 @@ mod tests {
                 "provider validation",
                 Some(&azure),
                 "/v1/chat/completions",
-                true
+                true,
+                None
             )
             .retryable
         );

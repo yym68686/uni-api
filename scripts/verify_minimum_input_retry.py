@@ -21,6 +21,12 @@ UPSTREAM_PROCESSING_FAILURE = "The upstream service could not process this reque
 GENERIC_UPSTREAM_ERROR = {"error": {
     "code": "upstream_error", "message": "Upstream request failed", "type": "upstream_error",
 }}
+MODEL_MISMATCH = {"error": {
+    "code": "unsupported_value",
+    "message": "Unsupported value: 'max' is not supported with the 'gpt-5.5' model. "
+               "Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.",
+    "param": "reasoning.effort", "type": "invalid_request_error",
+}}
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -31,6 +37,7 @@ class Upstream(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         channel = self.path.split("/")[1]
         self.server.hits.append(channel)
+        self.server.payloads.append(payload)
         if channel != "fallback":
             raw = json.dumps(self.server.error, ensure_ascii=self.server.escape).encode()
             status, content_type = 400, "application/json"
@@ -77,6 +84,7 @@ class Upstream(BaseHTTPRequestHandler):
 def verify(binary, endpoint, hedging):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     server.hits = []
+    server.payloads = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix="uni-minimum-input-") as directory:
         root, port = Path(directory), free_port()
@@ -87,12 +95,22 @@ def verify(binary, endpoint, hedging):
                 "base_url": f"http://127.0.0.1:{server.server_port}/{name}{upstream_endpoint}",
                 "api": "fixture-upstream", "model": ["test-model"],
                 "preferences": {"cooldown_period": 0},
-            } for name in ["limited", "fallback", "also-limited"]],
+            } for name in ["limited", "fallback", "also-limited"]] + [
+                {"provider": "mapped", "engine": "gpt", "api": "fixture-upstream",
+                 "base_url": f"http://127.0.0.1:{server.server_port}/mapped{upstream_endpoint}",
+                 "model": [{"gpt-5.5": "test-model"}], "preferences": {"cooldown_period": 0}},
+                {"provider": "overridden", "engine": "gpt", "api": "fixture-upstream",
+                 "base_url": f"http://127.0.0.1:{server.server_port}/overridden{upstream_endpoint}",
+                 "model": ["test-model"], "preferences": {"cooldown_period": 0,
+                 "post_body_parameter_overrides": {"model": "gpt-5.5"}}},
+            ],
             "api_keys": [
                 {"api": "retry", "model": ["limited/*", "fallback/*"]},
                 {"api": "no-retry", "model": ["limited/*", "fallback/*"],
                  "preferences": {"AUTO_RETRY": False}},
                 {"api": "exhausted", "model": ["limited/*", "also-limited/*"]},
+                {"api": "mapped-key", "model": ["mapped/*", "fallback/*"]},
+                {"api": "overridden-key", "model": ["overridden/*", "fallback/*"]},
             ],
             "preferences": {"hedging": {"enabled": hedging, "max_inflight_attempts": 2}},
         }
@@ -185,15 +203,31 @@ def verify(binary, endpoint, hedging):
                     ("generic-upstream-echo", {"error": {"type": "invalid_request_error",
                         "message": "Invalid input"}, "input": GENERIC_UPSTREAM_ERROR},
                      "retry", False, 400, ["limited"]),
+                    ("model-mismatch", MODEL_MISMATCH, "retry", False, 200, ["limited", "fallback"]),
+                    ("model-mismatch-wrapped", {"error": {"message": json.dumps(MODEL_MISMATCH)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("model-mismatch-no-retry", MODEL_MISMATCH, "no-retry", False, 502, ["limited"]),
+                    ("model-mismatch-exhausted", MODEL_MISMATCH, "exhausted", False, 502,
+                     ["limited", "also-limited"] * 3),
+                    ("model-mismatch-mapped", MODEL_MISMATCH, "mapped-key", False, 400, ["mapped"]),
+                    ("model-mismatch-overridden", MODEL_MISMATCH, "overridden-key", False, 400, ["overridden"]),
+                    ("model-mismatch-same", {"error": {**MODEL_MISMATCH["error"],
+                        "message": MODEL_MISMATCH["error"]["message"].replace("gpt-5.5", "test-model")}},
+                     "retry", False, 400, ["limited"]),
+                    ("model-mismatch-echo", {"error": {"message": "Invalid input"}, "input": MODEL_MISMATCH},
+                     "retry", False, 400, ["limited"]),
                 ]
                 checked = 0
                 for streaming in ([False] if endpoint.endswith("/compact") else [False, True]):
                     for label, message, key, escape, expected_status, expected_hits in cases:
                         server.hits.clear()
+                        server.payloads.clear()
                         server.error = (message if isinstance(message, dict) else
                                         {"error": {"type": "invalid_request_error", "message": message}})
                         server.escape = escape
                         payload = {"model": "test-model", "stream": streaming}
+                        if label.startswith("model-mismatch"):
+                            payload["reasoning"] = {"effort": "max"}
                         payload.update({"messages": [{"role": "user", "content": "say test"}]}
                                        if endpoint.endswith("/completions") else
                                        {"input": [{"role": "user", "content": "say test"}]})
@@ -201,6 +235,11 @@ def verify(binary, endpoint, hedging):
                         context = (endpoint, hedging, streaming, label, status, raw, server.hits)
                         assert status == expected_status, context
                         assert server.hits == expected_hits, context
+                        if label.startswith("model-mismatch"):
+                            for sent in server.payloads:
+                                assert sent.get("reasoning", {}).get("effort") == "max" or sent.get("reasoning_effort") == "max", context
+                            if key in ("mapped-key", "overridden-key"):
+                                assert server.payloads[0]["model"] == "gpt-5.5", context
                         if status == 200:
                             assert b"test" in raw and b"invalid_request_error" not in raw, context
                             assert b"Upstream request failed" not in raw, context
@@ -208,6 +247,8 @@ def verify(binary, endpoint, hedging):
                                 assert "text/event-stream" in content_type, context
                         elif status == 503:
                             assert b"All configured providers failed for model test-model" in raw, context
+                        elif label.startswith("model-mismatch"):
+                            assert b"Unsupported value" in raw or b"Invalid input" in raw, context
                         elif label.startswith("generic-upstream"):
                             assert b"Upstream request failed" in raw, context
                         else:
