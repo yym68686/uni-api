@@ -31,6 +31,7 @@ jobs:
           python3 scripts/verify_codex_defaults.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_minimum_input_retry.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_heartbeat_retry.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_empty_name_retry.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_nonstream_timeouts.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_settlement_attribution.py rust/uni-api-native/target/debug/uni-api-front
           python3 scripts/verify_typesafe.py rust/uni-api-native/target/debug/uni-api-front

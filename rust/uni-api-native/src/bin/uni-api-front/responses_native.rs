@@ -319,8 +319,9 @@ pub struct NativeRoute {
     max_attempts: usize,
     hedging: HedgingConfig,
     attempt_contexts: HashMap<String, NativeAttemptObservation>,
-    heartbeat_repair_attempted: bool,
-    pending_heartbeat_repair: Option<Plan>,
+    history_repair_attempted: bool,
+    pending_history_repair: Option<Plan>,
+    empty_name_repair_attempt_id: Option<String>,
     hedge_trigger_count: usize,
     hedge_cancelled_attempt_count: usize,
     last_provider: Option<Arc<Provider>>,
@@ -1367,23 +1368,46 @@ impl NativeRoute {
     pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
         self.set_current_plan(&plan);
         let retryable = self.record_failure(outcome).await;
-        if self.heartbeat_repair_attempted
-            || !self.auto_retry()
+        if !self.auto_retry()
             || self.request_headers.contains_key(TARGET_PROVIDER_HEADER)
             || self.endpoint != "/v1/responses"
         {
             return retryable;
         }
-        let Some((body, changed)) = crate::responses_heartbeat::repair(&plan.body, outcome) else {
+        // The repaired request was already tried on this exact channel/key.
+        // A second HTTP 400 must not suppress the user's configured fallback
+        // chain. Preserve the original failure status and normal retry budget.
+        if self.empty_name_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+            && crate::responses_empty_name::is_uncommitted_400(outcome)
+        {
+            return self.has_attempts_remaining();
+        }
+        let empty_name = crate::responses_empty_name::repair(&plan.body, outcome);
+        if self.history_repair_attempted {
+            // Later channels still get their own compilation of the original
+            // input. Recognize the same confirmed bad history, without another
+            // repair resend or an unbounded loop.
+            return retryable
+                || (self.empty_name_repair_attempt_id.is_some()
+                    && empty_name.is_some()
+                    && self.has_attempts_remaining());
+        }
+        let is_empty_name = empty_name.is_some();
+        let Some((body, changed)) =
+            empty_name.or_else(|| crate::responses_heartbeat::repair(&plan.body, outcome))
+        else {
             return retryable;
         };
         let Some(mut observation) = self.last_attempt.clone() else {
             return retryable;
         };
-        self.heartbeat_repair_attempted = true;
+        self.history_repair_attempted = true;
         let original_attempt_id = plan.attempt_id.clone();
         plan.body = body;
         plan.attempt_id = native_attempt_id(&self.request_id, self.routing_attempts);
+        if is_empty_name {
+            self.empty_name_repair_attempt_id = Some(plan.attempt_id.clone());
+        }
         for (name, value) in &mut plan.headers {
             if name.eq_ignore_ascii_case("x-oaix-routing-attempt-id") {
                 *value = plan.attempt_id.clone();
@@ -1417,18 +1441,25 @@ impl NativeRoute {
             &self.endpoint,
             self.stream,
         );
-        eprintln!(
-            "{}",
-            json!({
-                "kind":"log", "event":"responses_heartbeat_repair",
-                "event_type":"responses_heartbeat_repair", "severity":"info",
-                "source":"uni-api-ember", "fugue_table":"app_events",
-                "request_id":self.request_id, "original_attempt_id":original_attempt_id,
-                "attempt_id":plan.attempt_id, "provider":observation.provider,
-                "model":self.request_model, "heartbeat_items_converted":changed,
-            })
-        );
-        self.pending_heartbeat_repair = Some(plan);
+        let event = if is_empty_name {
+            "responses_empty_name_repair"
+        } else {
+            "responses_heartbeat_repair"
+        };
+        let mut log = json!({
+            "kind":"log", "event":event, "event_type":event, "severity":"info",
+            "source":"uni-api-ember", "fugue_table":"app_events",
+            "request_id":self.request_id, "original_attempt_id":original_attempt_id,
+            "attempt_id":plan.attempt_id, "provider":observation.provider,
+            "model":self.request_model,
+        });
+        log[if is_empty_name {
+            "tool_pairs_converted"
+        } else {
+            "heartbeat_items_converted"
+        }] = json!(changed);
+        eprintln!("{log}");
+        self.pending_history_repair = Some(plan);
         true
     }
 
@@ -1456,7 +1487,7 @@ impl NativeRoute {
     }
 
     pub async fn next_plan(&mut self) -> Result<Option<Plan>, String> {
-        if let Some(plan) = self.pending_heartbeat_repair.take() {
+        if let Some(plan) = self.pending_history_repair.take() {
             self.set_current_plan(&plan);
             return Ok(Some(plan));
         }
@@ -2617,8 +2648,9 @@ pub async fn prepare_native_request(
             parse_hedging(&snapshot.preferences)
         },
         attempt_contexts: HashMap::new(),
-        heartbeat_repair_attempted: false,
-        pending_heartbeat_repair: None,
+        history_repair_attempted: false,
+        pending_history_repair: None,
+        empty_name_repair_attempt_id: None,
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
         last_provider: None,
@@ -4622,8 +4654,9 @@ mod tests {
             max_attempts,
             hedging: HedgingConfig::default(),
             attempt_contexts: HashMap::new(),
-            heartbeat_repair_attempted: false,
-            pending_heartbeat_repair: None,
+            history_repair_attempted: false,
+            pending_history_repair: None,
+            empty_name_repair_attempt_id: None,
             hedge_trigger_count: 0,
             hedge_cancelled_attempt_count: 0,
             last_provider: None,
