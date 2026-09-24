@@ -50,7 +50,8 @@ repaired.
 The resend preserves the exact URL, upstream key, model, proxy and request
 options. It has its own attempt ID, dispatch measurement and upstream result.
 There is at most one historical-context repair resend per incoming request,
-shared with heartbeat and [missing reasoning-item repair](responses-missing-item-repair.md),
+shared with heartbeat, [missing reasoning-item repair](responses-missing-item-repair.md)
+and [rejected encrypted-envelope repair](responses-encrypted-content-repair.md),
 including under hedging.
 
 If the empty-name repair resend still returns HTTP 400 before commitment, the

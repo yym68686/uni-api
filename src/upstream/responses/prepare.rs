@@ -424,6 +424,7 @@ pub async fn prepare_request(
         pending_history_repair: None,
         empty_name_repair_attempt_id: None,
         missing_item_repair_attempt_id: None,
+        encrypted_content_repair_attempt_id: None,
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
         last_provider: None,

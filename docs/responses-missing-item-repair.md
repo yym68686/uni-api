@@ -52,7 +52,9 @@ only in the summary; conversion to an assistant message preserved that marker.
 
 The repair resend retains the same provider, URL, key, model, proxy and options,
 with a new attempt ID. It shares the **one historical repair resend per incoming
-request** limit with heartbeat and empty-name repair, including under hedging.
+request** limit with heartbeat, empty-name and
+[rejected encrypted-envelope repair](responses-encrypted-content-repair.md),
+including under hedging.
 It does not consume an ordinary provider-selection slot.
 
 If the repair resend fails with an uncommitted HTTP 404 or 400, ordinary channel

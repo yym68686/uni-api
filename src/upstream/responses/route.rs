@@ -90,6 +90,7 @@ pub struct ResponsesRoute {
     pub(crate) pending_history_repair: Option<Plan>,
     pub(crate) empty_name_repair_attempt_id: Option<String>,
     pub(crate) missing_item_repair_attempt_id: Option<String>,
+    pub(crate) encrypted_content_repair_attempt_id: Option<String>,
     pub(crate) hedge_trigger_count: usize,
     pub(crate) hedge_cancelled_attempt_count: usize,
     pub(crate) last_provider: Option<Arc<Provider>>,
@@ -172,7 +173,9 @@ impl ResponsesRoute {
         {
             return self.has_attempts_remaining();
         }
-        if self.missing_item_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+        if (self.missing_item_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+            || self.encrypted_content_repair_attempt_id.as_deref()
+                == Some(plan.attempt_id.as_str()))
             && (crate::protocols::responses::missing_item::is_uncommitted_404(outcome)
                 || crate::protocols::responses::empty_name::is_uncommitted_400(outcome))
         {
@@ -180,6 +183,8 @@ impl ResponsesRoute {
         }
         let empty_name = crate::protocols::responses::empty_name::repair(&plan.body, outcome);
         let missing_item = crate::protocols::responses::missing_item::repair(&plan.body, outcome);
+        let encrypted_content =
+            crate::protocols::responses::encrypted_content::repair(&plan.body, outcome);
         if self.history_repair_attempted {
             // Later channels still get their own compilation of the original
             // input. Recognize the same confirmed bad history, without another
@@ -190,12 +195,17 @@ impl ResponsesRoute {
                     && self.has_attempts_remaining())
                 || (self.missing_item_repair_attempt_id.is_some()
                     && missing_item.is_some()
+                    && self.has_attempts_remaining())
+                || (self.encrypted_content_repair_attempt_id.is_some()
+                    && encrypted_content.is_some()
                     && self.has_attempts_remaining());
         }
         let is_empty_name = empty_name.is_some();
         let is_missing_item = missing_item.is_some();
+        let is_encrypted_content = encrypted_content.is_some();
         let Some((body, changed)) = empty_name
             .or(missing_item)
+            .or(encrypted_content)
             .or_else(|| crate::protocols::responses::heartbeat::repair(&plan.body, outcome))
         else {
             return retryable;
@@ -212,6 +222,9 @@ impl ResponsesRoute {
         }
         if is_missing_item {
             self.missing_item_repair_attempt_id = Some(plan.attempt_id.clone());
+        }
+        if is_encrypted_content {
+            self.encrypted_content_repair_attempt_id = Some(plan.attempt_id.clone());
         }
         for (name, value) in &mut plan.headers {
             if name.eq_ignore_ascii_case("x-oaix-routing-attempt-id") {
@@ -250,6 +263,8 @@ impl ResponsesRoute {
             "responses_empty_name_repair"
         } else if is_missing_item {
             "responses_missing_item_repair"
+        } else if is_encrypted_content {
+            "responses_encrypted_content_repair"
         } else {
             "responses_heartbeat_repair"
         };
@@ -262,7 +277,7 @@ impl ResponsesRoute {
         });
         log[if is_empty_name {
             "tool_pairs_converted"
-        } else if is_missing_item {
+        } else if is_missing_item || is_encrypted_content {
             "reasoning_items_converted"
         } else {
             "heartbeat_items_converted"

@@ -26,8 +26,9 @@ fields stay intact. The number of notifications is not hard-coded to 16.
 The resend retains the channel URL, upstream key, model mapping, proxy, and
 request options. It gets a separate attempt ID, dispatch measurement, and
 upstream outcome. There is at most one historical-context repair resend per
-incoming request, shared with [empty tool-name repair](responses-empty-name-repair.md)
-and [missing reasoning-item repair](responses-missing-item-repair.md),
+incoming request, shared with [empty tool-name repair](responses-empty-name-repair.md),
+[missing reasoning-item repair](responses-missing-item-repair.md),
+and [rejected encrypted-envelope repair](responses-encrypted-content-repair.md),
 including when hedging is enabled. After that attempt fails, existing failure
 classification applies. Its modified body is local to that attempt; channel
 configuration and the bodies sent to other channels are unchanged.
