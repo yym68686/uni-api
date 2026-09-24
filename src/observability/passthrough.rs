@@ -6,7 +6,6 @@ use crate::protocols::provider_stream::Translation;
 use axum::{body::Body, http::Response};
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::io;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -26,27 +25,18 @@ pub(crate) fn observe(
     observer.observational_only = !control_routing;
     observer.sender = Some(tx);
     let body = futures_util::stream::unfold(
-        (response.bytes_stream(), observer),
+        (
+            Box::pin(crate::transport::body::upstream_chunks(response, idle)),
+            observer,
+        ),
         move |(mut upstream, mut observer)| async move {
-            let next = if let Some(idle) = idle {
-                match tokio::time::timeout(idle, upstream.next()).await {
-                    Ok(next) => next.map(|chunk| chunk.map_err(io::Error::other)),
-                    Err(_) => Some(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "upstream stream idle timeout exceeded",
-                    ))),
-                }
-            } else {
-                upstream
-                    .next()
-                    .await
-                    .map(|chunk| chunk.map_err(io::Error::other))
-            };
+            let next = upstream.next().await;
             match next {
                 Some(result) => {
                     match &result {
                         Ok(bytes) => observer.feed(bytes),
-                        Err(_) => {
+                        Err(error) => {
+                            observer.failure_detail = Some(error.to_string());
                             observer.failed = true;
                             observer.ended = true;
                         }
@@ -80,6 +70,7 @@ struct Observer {
     start: Instant,
     terminal: bool,
     failed: bool,
+    failure_detail: Option<String>,
     ended: bool,
     sender: Option<oneshot::Sender<StreamOutcome>>,
 }
@@ -97,6 +88,7 @@ impl Observer {
             start: Instant::now(),
             terminal: false,
             failed: false,
+            failure_detail: None,
             ended: false,
             sender: None,
         }
@@ -223,7 +215,9 @@ impl Observer {
             } else if !self.ended {
                 "downstream disconnected".into()
             } else {
-                "passthrough stream failed or ended without a terminal event".into()
+                self.failure_detail.clone().unwrap_or_else(|| {
+                    "passthrough stream failed or ended without a terminal event".into()
+                })
             },
         }
     }

@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 pub(crate) struct StreamStats {
+    pub(crate) transport_failed: bool,
     pub(crate) stream_mode: &'static str,
     pub(crate) upstream_bytes: u64,
     pub(crate) upstream_chunks: u64,
@@ -30,6 +31,7 @@ impl StreamStats {
         attempt_id.hash(&mut sampler);
         let sampled = sample_bps >= 10_000 || sampler.finish() % 10_000 < sample_bps;
         Self {
+            transport_failed: false,
             stream_mode: "unknown",
             upstream_bytes: 0,
             upstream_chunks: 0,

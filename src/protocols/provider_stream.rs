@@ -1,3 +1,4 @@
+use crate::routing::timeouts::positive_duration;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -166,7 +167,10 @@ pub async fn translate_responses_to_chat(
                         model,
                         include_usage,
                         idle_timeout_seconds,
-                        total_timeout_seconds,
+                        crate::routing::timeouts::remaining_timeout(
+                            total_timeout_seconds,
+                            started.elapsed(),
+                        ),
                         emit_precommit_comment,
                     ));
                 }
@@ -207,7 +211,10 @@ pub async fn translate_responses_to_chat(
                                 model,
                                 include_usage,
                                 idle_timeout_seconds,
-                                total_timeout_seconds,
+                                crate::routing::timeouts::remaining_timeout(
+                                    total_timeout_seconds,
+                                    started.elapsed(),
+                                ),
                                 emit_precommit_comment,
                             ));
                         }
@@ -400,12 +407,6 @@ async fn run_translation(
     }
     state.finish_if_needed(tx).await?;
     Ok(state.outcome())
-}
-
-fn positive_duration(value: Option<f64>) -> Option<Duration> {
-    value
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(Duration::from_secs_f64)
 }
 
 async fn next_upstream_chunk<S>(

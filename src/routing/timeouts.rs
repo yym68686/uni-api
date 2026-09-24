@@ -2,6 +2,31 @@ use crate::config::snapshot::Provider;
 use crate::config::snapshot::Snapshot;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Every transport and protocol adapter uses the same disabled-value semantics.
+/// In particular, an explicit zero must never acquire a fallback deadline.
+pub(crate) fn positive_duration(seconds: Option<f64>) -> Option<Duration> {
+    seconds
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .map(|duration| duration.max(Duration::from_nanos(1)))
+}
+
+pub(crate) fn earliest_timeout(values: &[Option<f64>]) -> Option<Duration> {
+    values.iter().copied().filter_map(positive_duration).min()
+}
+
+/// Preserve disabled timeouts when crossing a protocol adapter. Only an enabled
+/// deadline that has actually expired becomes an immediate deadline.
+pub(crate) fn remaining_timeout(seconds: Option<f64>, elapsed: Duration) -> Option<f64> {
+    positive_duration(seconds).map(|duration| {
+        duration
+            .saturating_sub(elapsed)
+            .max(Duration::from_nanos(1))
+            .as_secs_f64()
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct Timeouts {
@@ -220,4 +245,36 @@ pub(crate) fn timeout_value_matches(expected: &Value, actual: &str) -> bool {
                 .to_ascii_lowercase()
                 .starts_with(&prefix.to_ascii_lowercase())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_and_invalid_values_cannot_turn_into_deadlines() {
+        for value in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::INFINITY),
+            Some(f64::NAN),
+            Some(f64::MAX),
+        ] {
+            assert_eq!(positive_duration(value), None);
+            assert_eq!(remaining_timeout(value, Duration::from_secs(1)), None);
+        }
+        assert_eq!(
+            earliest_timeout(&[Some(0.0), None, Some(2.0), Some(1.0)]),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            remaining_timeout(Some(2.0), Duration::from_secs(1)),
+            Some(1.0)
+        );
+        assert_eq!(
+            remaining_timeout(Some(2.0), Duration::from_secs(3)),
+            Some(1e-9)
+        );
+    }
 }

@@ -16,6 +16,7 @@ pub(crate) mod prepare;
 pub(crate) mod route;
 
 use crate::protocols::responses::item_ids::ResponsesItemIdNormalizer;
+use crate::routing::timeouts::{earliest_timeout, positive_duration};
 use crate::runtime::context::AppState;
 use crate::runtime::idempotency;
 use crate::transport::http::filtered_response_headers;
@@ -855,7 +856,12 @@ async fn preflight_attempt_with_trigger(
         .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
     let response_headers = filtered_response_headers(response.headers());
     if !status.is_success() {
-        let body = read_limited_body(response, total_deadline).await;
+        let body = read_limited_body(
+            response,
+            total_deadline,
+            positive_duration(plan.idle_timeout_seconds),
+        )
+        .await;
         if let Some(dispatch) = &plan.dispatch {
             dispatch
                 .billing
@@ -913,10 +919,15 @@ async fn preflight_attempt_with_trigger(
         active.business_committed = true;
         return Ok(PreflightResult::Started(active));
     }
+    let mut idle_deadline = deadline(
+        tokio::time::Instant::now(),
+        active.plan.idle_timeout_seconds,
+    );
     loop {
+        let hard_deadline = earlier_deadline(idle_deadline, active.total_deadline);
         let next_deadline = earlier_deadline(
             (!hedge_triggered).then_some(first_deadline).flatten(),
-            active.total_deadline,
+            hard_deadline,
         );
         let chunk = match await_deadline(active.stream.next(), next_deadline).await {
             Ok(Some(Ok(chunk))) => chunk,
@@ -946,7 +957,8 @@ async fn preflight_attempt_with_trigger(
             }
             Err(error) => {
                 if trigger.is_some()
-                    && first_deadline.is_some()
+                    && first_deadline
+                        .is_some_and(|first| hard_deadline.is_none_or(|hard| first < hard))
                     && !hedge_triggered
                     && error == "upstream deadline exceeded"
                 {
@@ -965,6 +977,10 @@ async fn preflight_attempt_with_trigger(
                 })));
             }
         };
+        idle_deadline = deadline(
+            tokio::time::Instant::now(),
+            active.plan.idle_timeout_seconds,
+        );
         active.stats.observe_upstream(&chunk);
         let frames = active.decoder.feed(&chunk)?;
         if let Some(result) = process_preflight_frames(&mut active, frames)? {
@@ -1224,7 +1240,19 @@ impl OutputSink {
         Ok(())
     }
 
-    async fn finish(mut self, cacheable: bool) {
+    async fn finish(mut self, cacheable: bool, transport_failed: bool) {
+        // A transport timeout must not look like a clean HTTP EOF. Preserve the
+        // existing semantic-failure protocol and do not invent frames or replay.
+        if transport_failed && self.downstream_open && !self.cancellation.is_cancelled() {
+            let _ = tokio::time::timeout(
+                downstream_write_timeout(),
+                self.sender.send(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "upstream stream ended without a successful terminal event",
+                ))),
+            )
+            .await;
+        }
         let Some(capture) = self.capture.take() else {
             return;
         };
@@ -1561,7 +1589,9 @@ async fn run_active_attempt(
     if let Some(task) = control_drain.take() {
         task.abort();
     }
-    output.finish(cacheable).await;
+    output
+        .finish(cacheable, active.stats.transport_failed)
+        .await;
 }
 
 async fn run_raw_committed(
@@ -2263,6 +2293,7 @@ async fn complete_failure(
     kind: &str,
     detail: &str,
 ) {
+    stats.transport_failed = kind == "transport_error";
     let mut outcome = stats.report();
     outcome["attempt_id"] = Value::String(attempt_id);
     outcome["kind"] = Value::String(kind.into());
@@ -2468,11 +2499,13 @@ fn public_control_headers(headers: &HeaderMap) -> HeaderMap {
 async fn read_limited_body(
     response: reqwest::Response,
     deadline: Option<tokio::time::Instant>,
+    idle: Option<Duration>,
 ) -> String {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while body.len() < MAX_ERROR_BODY_BYTES {
-        match await_deadline(stream.next(), deadline).await {
+        let idle_deadline = idle.and_then(|idle| tokio::time::Instant::now().checked_add(idle));
+        match await_deadline(stream.next(), earlier_deadline(idle_deadline, deadline)).await {
             Ok(Some(Ok(chunk))) => {
                 let remaining = MAX_ERROR_BODY_BYTES - body.len();
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
@@ -2484,25 +2517,7 @@ async fn read_limited_body(
 }
 
 fn deadline(started: tokio::time::Instant, seconds: Option<f64>) -> Option<tokio::time::Instant> {
-    seconds
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| started + Duration::from_secs_f64(value))
-}
-
-fn positive_duration(seconds: Option<f64>) -> Option<Duration> {
-    seconds
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(Duration::from_secs_f64)
-}
-
-fn earliest_timeout(values: &[Option<f64>]) -> Option<Duration> {
-    values
-        .iter()
-        .copied()
-        .flatten()
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .min_by(f64::total_cmp)
-        .map(Duration::from_secs_f64)
+    crate::upstream::hedging::deadline(started, seconds)
 }
 
 fn earlier_deadline(

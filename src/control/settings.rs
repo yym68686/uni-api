@@ -577,7 +577,7 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
                     m.iter().all(|(k, v)| {
                         ["connect", "write", "pool", "first_byte", "idle", "total"]
                             .contains(&k.as_str())
-                            && v.as_f64().is_some_and(|n| n > 0.0 && n.is_finite())
+                            && v.as_f64().is_some_and(|n| n >= 0.0 && n.is_finite())
                     })
                 })
             };

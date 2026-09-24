@@ -3,6 +3,7 @@ use crate::transport::spool::{RequestSpool, SpoolFailure, SpoolManager};
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
+use std::io;
 use std::time::Duration;
 
 pub(crate) enum RequestBodySpoolError {
@@ -53,6 +54,57 @@ pub(crate) async fn read_limited_upstream_body(
     response: reqwest::Response,
     maximum: usize,
 ) -> Result<Bytes, String> {
+    read_limited_upstream_body_with_idle(response, maximum, None).await
+}
+
+pub(crate) fn upstream_chunks(
+    response: reqwest::Response,
+    idle: Option<Duration>,
+) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> + Send {
+    futures_util::stream::unfold(
+        (response.bytes_stream(), false),
+        move |(mut stream, ended)| async move {
+            if ended {
+                return None;
+            }
+            let next = if let Some(idle) = idle {
+                match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(next) => next.map(|chunk| chunk.map_err(upstream_body_error)),
+                    Err(_) => Some(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream body idle timeout exceeded",
+                    ))),
+                }
+            } else {
+                stream
+                    .next()
+                    .await
+                    .map(|chunk| chunk.map_err(upstream_body_error))
+            };
+            next.map(|chunk| {
+                let ended = chunk.is_err();
+                (chunk, (stream, ended))
+            })
+        },
+    )
+}
+
+fn upstream_body_error(error: reqwest::Error) -> io::Error {
+    if error.is_timeout() {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "upstream body total timeout exceeded",
+        )
+    } else {
+        io::Error::other(error)
+    }
+}
+
+pub(crate) async fn read_limited_upstream_body_with_idle(
+    response: reqwest::Response,
+    maximum: usize,
+    idle: Option<Duration>,
+) -> Result<Bytes, String> {
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
@@ -62,7 +114,8 @@ pub(crate) async fn read_limited_upstream_body(
         ));
     }
     let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
+    let stream = upstream_chunks(response, idle);
+    futures_util::pin_mut!(stream);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         if body.len().saturating_add(chunk.len()) > maximum {

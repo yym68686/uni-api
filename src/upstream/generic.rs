@@ -23,13 +23,15 @@ use crate::providers::video::normalize_lingjing_video_response;
 use crate::providers::video::remember_video_task;
 use crate::providers::video::VideoTaskRoute;
 use crate::routing::failure::classify_provider_failure;
+use crate::routing::timeouts::{earliest_timeout, positive_duration, remaining_timeout};
 use crate::routing::types::FailedRoute;
 use crate::runtime::context::AppState;
 use crate::runtime::resources::MemoryReservation;
 use crate::runtime::scheduling::ProviderKeySelection;
 use crate::storage::database::ChannelStat;
 use crate::storage::database::RequestStat;
-use crate::transport::body::read_limited_upstream_body;
+use crate::transport::body::read_limited_upstream_body_with_idle;
+use crate::transport::body::upstream_chunks;
 use crate::transport::body::upstream_response_max_bytes;
 use crate::transport::body::UPSTREAM_ERROR_MAX_BYTES;
 use crate::transport::http::filtered_response_headers;
@@ -49,7 +51,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use url::Url;
 
 pub(crate) struct AttemptLoop {
@@ -1176,27 +1178,9 @@ pub(crate) async fn send_attempt(
             upstream_url: prepared.url.clone(),
             response: None,
         })?;
-    let base_timeout = provider_timeout(provider, &prepared.original_model);
-    let configured_total_timeout = positive_duration(timeouts.total);
-    let request_timeout = if hedge_trigger.is_some()
-        || (prepared.upstream_stream && endpoint == "/v1/chat/completions")
-    {
-        configured_total_timeout
-    } else {
-        Some(configured_total_timeout.unwrap_or(base_timeout))
-    };
-    let send_timeout = [
-        timeouts.first_byte,
-        timeouts.write,
-        timeouts.pool,
-        timeouts.total,
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|value| value.is_finite() && *value > 0.0)
-    .min_by(f64::total_cmp)
-    .map(Duration::from_secs_f64)
-    .unwrap_or(base_timeout);
+    // The resolved policy is also returned by the control-plane preview. Never
+    // infer a second, hidden total timeout from model_timeout or the endpoint.
+    let request_timeout = positive_duration(timeouts.total);
     if matches!(
         provider.engine.to_ascii_lowercase().as_str(),
         "vertex" | "vertex-gemini" | "vertex-claude"
@@ -1297,37 +1281,22 @@ pub(crate) async fn send_attempt(
         dispatch.record(&state.channel_metrics);
     }
     let send_started = Instant::now();
-    let response = if let Some(trigger) = hedge_trigger {
-        let started = tokio::time::Instant::now();
-        let hard_timeout = [timeouts.write, timeouts.pool, timeouts.total]
-            .into_iter()
-            .flatten()
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .min_by(f64::total_cmp);
-        await_with_hedge(
-            request.send(),
-            Some(started + positive_duration(timeouts.first_byte).unwrap_or(base_timeout)),
-            hedge_deadline(started, hard_timeout),
-            Some(trigger),
-        )
-        .await
-        .map_err(|_| AttemptFailure {
-            status: StatusCode::GATEWAY_TIMEOUT,
-            detail: "Upstream response headers timed out".into(),
-            upstream_url: prepared.url.clone(),
-            response: None,
-        })?
-        .output
-    } else {
-        tokio::time::timeout(send_timeout, request.send())
-            .await
-            .map_err(|_| AttemptFailure {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                detail: "Upstream response headers timed out".into(),
-                upstream_url: prepared.url.clone(),
-                response: None,
-            })?
-    }
+    let started = tokio::time::Instant::from_std(send_started);
+    let response = await_with_hedge(
+        request.send(),
+        hedge_deadline(started, timeouts.first_byte),
+        earliest_timeout(&[timeouts.write, timeouts.pool, timeouts.total])
+            .map(|timeout| started + timeout),
+        hedge_trigger,
+    )
+    .await
+    .map_err(|_| AttemptFailure {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        detail: "Upstream response headers timed out".into(),
+        upstream_url: prepared.url.clone(),
+        response: None,
+    })?
+    .output
     .map_err(|error| AttemptFailure {
         status: StatusCode::BAD_GATEWAY,
         detail: format!("Upstream transport error: {error}"),
@@ -1345,9 +1314,13 @@ pub(crate) async fn send_attempt(
     let attribution_headers = response.headers().clone();
     if !status.is_success() {
         let headers = filtered_response_headers(response.headers());
-        let body = read_limited_upstream_body(response, UPSTREAM_ERROR_MAX_BYTES)
-            .await
-            .unwrap_or_else(|error| Bytes::from(format!("read upstream error response: {error}")));
+        let body = read_limited_upstream_body_with_idle(
+            response,
+            UPSTREAM_ERROR_MAX_BYTES,
+            positive_duration(timeouts.idle),
+        )
+        .await
+        .unwrap_or_else(|error| Bytes::from(format!("read upstream error response: {error}")));
         if let Some(dispatch) = &prepared.dispatch {
             dispatch.billing.error_body(status.as_u16(), &body);
         }
@@ -1418,7 +1391,10 @@ pub(crate) async fn send_attempt(
             });
         }
         let headers = filtered_response_headers(response.headers());
-        let mut output = Response::new(Body::from_stream(response.bytes_stream()));
+        let mut output = Response::new(Body::from_stream(upstream_chunks(
+            response,
+            positive_duration(timeouts.idle),
+        )));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
         output
@@ -1462,13 +1438,9 @@ pub(crate) async fn send_attempt(
                 output_protocol,
                 prepared.request_model.clone(),
                 prepared.chat_stream_include_usage,
-                timeouts.first_byte.map(|seconds| {
-                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
-                }),
+                remaining_timeout(timeouts.first_byte, send_started.elapsed()),
                 timeouts.idle,
-                timeouts.total.map(|seconds| {
-                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
-                }),
+                remaining_timeout(timeouts.total, send_started.elapsed()),
                 false,
             )
             .await
@@ -1487,9 +1459,7 @@ pub(crate) async fn send_attempt(
                 prepared.request_model.clone(),
                 prepared.chat_stream_include_usage,
                 timeouts.idle,
-                timeouts.total.map(|seconds| {
-                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
-                }),
+                remaining_timeout(timeouts.total, send_started.elapsed()),
             )
         };
         if endpoint == "/v1/chat/completions"
@@ -1527,14 +1497,18 @@ pub(crate) async fn send_attempt(
         && prepared.downstream_protocol == DownstreamProtocol::Native
     {
         let headers = filtered_response_headers(response.headers());
-        let body = read_limited_upstream_body(response, upstream_response_max_bytes())
-            .await
-            .map_err(|error| AttemptFailure {
-                status: StatusCode::BAD_GATEWAY,
-                detail: format!("Read upstream response failed: {error}"),
-                upstream_url: prepared.url.clone(),
-                response: None,
-            })?;
+        let body = read_limited_upstream_body_with_idle(
+            response,
+            upstream_response_max_bytes(),
+            positive_duration(timeouts.idle),
+        )
+        .await
+        .map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Read upstream response failed: {error}"),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
         let parsed = serde_json::from_slice::<Value>(&body).ok();
         let fact_usage = crate::observability::usage::FactUsage::from_usage(
             parsed.as_ref().and_then(|v| v.get("usage")),
@@ -1556,25 +1530,33 @@ pub(crate) async fn send_attempt(
         });
     }
     let upstream = if prepared.adapter == ResponseAdapter::Search {
-        let bytes = read_limited_upstream_body(response, upstream_response_max_bytes())
-            .await
-            .map_err(|error| AttemptFailure {
-                status: StatusCode::BAD_GATEWAY,
-                detail: format!("Read upstream response failed: {error}"),
-                upstream_url: prepared.url.clone(),
-                response: None,
-            })?;
+        let bytes = read_limited_upstream_body_with_idle(
+            response,
+            upstream_response_max_bytes(),
+            positive_duration(timeouts.idle),
+        )
+        .await
+        .map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Read upstream response failed: {error}"),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
         serde_json::from_slice::<Value>(&bytes)
             .unwrap_or_else(|_| json!({"text":String::from_utf8_lossy(&bytes)}))
     } else {
-        let bytes = read_limited_upstream_body(response, upstream_response_max_bytes())
-            .await
-            .map_err(|error| AttemptFailure {
-                status: StatusCode::BAD_GATEWAY,
-                detail: format!("Read upstream response failed: {error}"),
-                upstream_url: prepared.url.clone(),
-                response: None,
-            })?;
+        let bytes = read_limited_upstream_body_with_idle(
+            response,
+            upstream_response_max_bytes(),
+            positive_duration(timeouts.idle),
+        )
+        .await
+        .map_err(|error| AttemptFailure {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Read upstream response failed: {error}"),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
         serde_json::from_slice::<Value>(&bytes).map_err(|error| AttemptFailure {
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Decode upstream response failed: {error}"),
@@ -1653,27 +1635,6 @@ pub(crate) async fn send_attempt(
         stream_outcome: None,
         upstream_url: prepared.url,
     })
-}
-
-pub(crate) fn provider_timeout(provider: &Provider, model: &str) -> Duration {
-    let raw = provider.preferences.get("model_timeout");
-    let seconds = match raw {
-        Some(Value::Number(value)) => value.as_f64(),
-        Some(Value::Object(values)) => values
-            .get(model)
-            .or_else(|| values.get("default"))
-            .and_then(Value::as_f64),
-        _ => None,
-    }
-    .filter(|value| value.is_finite() && *value > 0.0)
-    .unwrap_or(200.0);
-    Duration::from_secs_f64(seconds)
-}
-
-pub(crate) fn positive_duration(value: Option<f64>) -> Option<Duration> {
-    value
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(Duration::from_secs_f64)
 }
 
 pub(crate) fn usage(value: &Value) -> (i64, i64, i64) {

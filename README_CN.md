@@ -1124,9 +1124,13 @@ providers:
 
 支持的 `match` 字段包括：`endpoint`、`stream`、`request_type`、`method`、`engine`、`provider`、`model`、`request_model`、`upstream_model`、`role`。其中 `request_type: compaction` 会匹配 `input` 中包含 `{ "type": "compaction_trigger" }` 的 Responses 请求；`model` 会同时匹配请求模型名和真实上游模型名；`*` 匹配任意值；以 `*` 结尾的字符串表示前缀匹配。
 
-支持的 timeout 字段包括：`connect`、`write`、`pool`、`first_byte`、`idle`、`total`。对于 `/v1/responses` 流式调用，每个字段只承担自己的职责：`first_byte` 限制从发起上游请求到收到上游 headers 或第一个上游 stream event 的时间；`idle` 是唯一会映射成 httpx read timeout、限制上游 chunk 间隔的字段；`total` 限制整条上游流的总生命周期。如果没有配置 `first_byte`，uni-api 会使用 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`，作为首字 fallback。除非显式配置 `idle`，uni-api 不会默认设置流式 idle timeout。
+支持的 timeout 字段包括：`connect`、`write`、`pool`、`first_byte`、`idle`、`total`，单位为秒。Rust 执行路径与渠道设置预览使用同一份解析策略。`model_timeout` 仅提供首字回退值，依次使用渠道、全局、100 秒默认值，不会额外产生整请求截止时间。原生 `/v1/messages` 的首字预算用于等待响应头；Chat 和 Responses 保留各自提交输出前的协议检查。`idle` 限制相邻上游正文 chunk 的等待，`total` 从该次 attempt 发送开始覆盖完整响应正文。原生流和协议转换流都遵守这些规则，不再存在隐含的 200 秒总上限，也没有默认 idle 上限。
 
-解析顺序是：全局 `timeout_policy.default` → provider `timeout_policy.default` → 命中维度最多的全局 `timeout_policy.rules` → 命中维度最多的 provider `timeout_policy.rules`。如果没有任何 timeout policy 设置有效值，uni-api 会继续回退到 provider / global `model_timeout`，最后回退到环境变量 `TIMEOUT`。
+显式 `0` 禁用对应时限，并覆盖继承的正数值：未配置 `total` 或 `total: 0` 都表示没有总时限，`idle: 0` 表示没有空闲时限。渠道设置接口允许并保留零值。响应头、心跳数据、协议转换均不会重置已启用的 total 截止时间。已经输出内容后的超时会明确结束失败流，不会重放请求。
+
+非流式请求仅设置 `total` 时，仍将该值用于响应头等待预算，以兼容已有配置；显式 `first_byte`（包括 0）优先。非流式正文同样执行 total 与 idle，首字预算不会变成正文总时限。
+
+解析顺序是：全局 `timeout_policy.default` → 命中维度最多的全局 `timeout_policy.rules` → provider `timeout_policy.default` → 命中维度最多的 provider `timeout_policy.rules`。后层仅覆盖显式填写的字段（包括 0），缺省字段保留前层值。仅首字回退使用 provider / global `model_timeout`。
 
 - 如何开启请求的延迟对冲？
 

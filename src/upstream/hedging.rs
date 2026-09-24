@@ -4,7 +4,6 @@ use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,9 +190,8 @@ pub(crate) fn deadline(
     started: tokio::time::Instant,
     seconds: Option<f64>,
 ) -> Option<tokio::time::Instant> {
-    seconds
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| started + Duration::from_secs_f64(value))
+    crate::routing::timeouts::positive_duration(seconds)
+        .and_then(|duration| started.checked_add(duration))
 }
 
 pub(crate) fn earlier_deadline(
@@ -257,6 +255,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use serde_json::json;
 
