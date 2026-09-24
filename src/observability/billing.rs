@@ -60,10 +60,14 @@ impl BillingAttempt {
     pub(crate) fn headers(&self, headers: &HeaderMap, status: u16, secret: &str) {
         if let Ok(mut r) = self.receipt.lock() {
             r.status = status;
-            // The direct sub2api server's identifier takes precedence over any
-            // upstream/echoed ID. Do not associate one attempt with both bills.
+            // Preserve typed receipt candidates. The console selects the
+            // namespace matching the bound site adapter, never both bills.
+            r.ids.clear();
             if let Some(id) = safe_header(headers, "x-client-request-id", secret) {
                 r.ids = vec![format!("client:{id}")];
+            }
+            if let Some(id) = safe_header(headers, "x-oneapi-request-id", secret) {
+                r.ids.push(format!("newapi:{id}"));
             }
         }
     }
@@ -234,6 +238,30 @@ mod tests {
         assert!(!e.to_string().contains("secret"));
         assert!(e.get("dispatch_ms").is_none());
         assert_eq!(e["attempt_id"], "req-r1");
+    }
+    #[test]
+    fn new_api_receipt_has_distinct_namespace_for_site_adapter_selection() {
+        let a = attempt();
+        a.start();
+        let mut h = HeaderMap::new();
+        h.insert("x-oneapi-request-id", "20260924-test".parse().unwrap());
+        a.headers(&h, 200, "secret");
+        assert_eq!(
+            a.event().unwrap()["billing_request_ids"],
+            json!(["newapi:20260924-test"])
+        );
+        h.insert("x-client-request-id", "direct-site".parse().unwrap());
+        a.headers(&h, 200, "secret");
+        assert_eq!(
+            a.event().unwrap()["billing_request_ids"],
+            json!(["client:direct-site", "newapi:20260924-test"])
+        );
+        let b = attempt();
+        b.start();
+        h.remove("x-client-request-id");
+        h.append("x-oneapi-request-id", "ambiguous".parse().unwrap());
+        b.headers(&h, 200, "secret");
+        assert_eq!(b.event().unwrap()["billing_request_ids"], json!([]));
     }
     #[test]
     fn independent_attempts_and_cancelled_attempts_do_not_reuse_ids() {
