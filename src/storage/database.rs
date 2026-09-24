@@ -51,6 +51,7 @@ pub struct RequestStat {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStat {
+    pub transport_timing: Option<crate::observability::stream::TransportTiming>,
     pub duration_ms: Option<f64>,
     pub first_output_ms: Option<f64>,
     pub response_created_ms: Option<f64>,

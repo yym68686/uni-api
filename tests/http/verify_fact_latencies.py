@@ -18,7 +18,7 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=serv
 with tempfile.TemporaryDirectory(prefix='uni-latency-repro-') as path:
  root=pathlib.Path(path);port=free_port();providers=[('gpt-imported','gpt'),('codex-stream','codex'),('codex-buffered','codex')]
  cfg={'providers':[{'provider':name,'engine':engine,'base_url':f'http://127.0.0.1:{server.server_port}/{name}/v1/responses','api':'fixture-upstream','model':['m']}for name,engine in providers],'api_keys':[{'api':'fixture-admin','model':['all']}]};(root/'api.json').write_text(json.dumps(cfg))
- env={k:v for k,v in os.environ.items()if not k.startswith(('FACTS_S3_','AWS_'))};env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'api.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'body-spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',NO_PROXY='127.0.0.1,localhost',FACTS_S3_ENDPOINT=f'http://127.0.0.1:{server.server_port}',FACTS_S3_BUCKET='fixture',FACTS_S3_ACCESS_KEY_ID='fixture',FACTS_S3_SECRET_ACCESS_KEY='fixture',FACTS_S3_SPOOL_DIR=str(root/'facts-spool'))
+ env={k:v for k,v in os.environ.items()if k in ('PATH','HOME','TMPDIR','LANG','DYLD_LIBRARY_PATH')};env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'api.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'body-spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',NO_PROXY='127.0.0.1,localhost',FACTS_S3_ENDPOINT=f'http://127.0.0.1:{server.server_port}',FACTS_S3_BUCKET='fixture',FACTS_S3_ACCESS_KEY_ID='fixture',FACTS_S3_SECRET_ACCESS_KEY='fixture',FACTS_S3_SPOOL_DIR=str(root/'facts-spool'))
  def call(method,path,payload=None,provider=None):
   c=http.client.HTTPConnection('127.0.0.1',port,timeout=5);headers={'Authorization':'Bearer fixture-admin','Content-Type':'application/json'}
   if provider:headers['x-uni-api-provider']=provider
@@ -39,6 +39,14 @@ with tempfile.TemporaryDirectory(prefix='uni-latency-repro-') as path:
     name=measurement['provider'];attempt=next(f for f in facts if f['kind']=='attempt'and f['provider']==name);dispatch=next(f for f in facts if f['kind']=='dispatch'and f['provider']==name)
     assert attempt.get('first_output_ms') is not None and attempt['first_output_ms'] >= measurement['send_to_first_text_ms'] - 25
     assert attempt.get('key_id') == dispatch.get('key_id') and dispatch.get('key_id')
-    print(json.dumps(measurement|{'success':attempt['outcome'],'recorded_first_output_ms':attempt.get('first_output_ms'),'attempt_has_key_id':bool(attempt.get('key_id')),'dispatch_has_key_id':bool(dispatch.get('key_id')),'dispatch_ms':dispatch.get('dispatch_ms')}))
+    stages=attempt['transport_timing'];assert stages['schema']==1 and stages['network_write_measured'] is False
+    assert stages['headers_received_ms']>=375,stages
+    assert stages['first_upstream_chunk_ms']>=stages['headers_received_ms'],stages
+    if name!='codex-buffered':assert stages['first_upstream_chunk_ms']-stages['headers_received_ms']>=200,stages
+    # Opaque passthrough can expose headers before the first body chunk.
+    assert stages['public_stream_ready_ms']>=stages['headers_received_ms'],stages
+    assert stages['first_wire_prepared_ms']>=stages['first_upstream_chunk_ms'],stages
+    assert stages['preflight_decode_ms']>=0,stages
+    print(json.dumps(measurement|{'success':attempt['outcome'],'recorded_first_output_ms':attempt.get('first_output_ms'),'attempt_has_key_id':bool(attempt.get('key_id')),'dispatch_has_key_id':bool(dispatch.get('key_id')),'dispatch_ms':dispatch.get('dispatch_ms'),'transport_timing':stages}))
   finally:p.terminate();p.wait(timeout=5)
 server.shutdown();server.server_close()

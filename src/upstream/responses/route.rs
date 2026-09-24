@@ -797,6 +797,9 @@ impl ResponsesRoute {
                 "provider_model_unavailable": provider_model_unavailable,
                 "error_sha256": error_sha256,
                 "duration_ms": duration_ms,
+                "transport_timing": outcome.get("transport_timing"),
+                "response_created_ms": outcome.get("response_created_ms"),
+                "first_text_ms": outcome.get("first_text_ms"),
             }));
         }
         eprintln!(
@@ -831,6 +834,9 @@ impl ResponsesRoute {
                 "status_origin": failure_origin(outcome),
                 "error_sha256": error_sha256,
                 "duration_ms": duration_ms,
+                "transport_timing": outcome.get("transport_timing"),
+                "response_created_ms": outcome.get("response_created_ms"),
+                "first_text_ms": outcome.get("first_text_ms"),
                 "upstream_host": attempt.upstream_host,
                 "streaming": attempt.stream,
                 "snapshot_revision": attempt.snapshot_revision,
@@ -993,6 +999,10 @@ impl ResponsesRoute {
             return;
         };
         self.persistence.record_channel(ChannelStat {
+            transport_timing: outcome
+                .get("transport_timing")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
             duration_ms: self
                 .last_attempt
                 .as_ref()

@@ -344,7 +344,7 @@ pub fn attempt_event(s: &crate::storage::database::ChannelStat) -> Value {
     } else {
         s.attempt_id.clone()
     };
-    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
+    json!({"schema":1,"kind":"attempt","event_id":new_event_id("attempt"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"attempt_id":attempt_id,"transport_timing":s.transport_timing,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"duration_ms":s.duration_ms,"key_id":format!("key-{}",hex_sha(&s.api_key)),"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"endpoint":s.endpoint,"stream":s.stream,"outcome":if s.success{"success"}else{"failed"}})
 }
 
 pub fn dispatch_event(

@@ -841,6 +841,7 @@ async fn preflight_attempt_with_trigger(
             .map_err(|error| format!("upstream response headers failed: {error}"))?
             .map_err(|error| format!("upstream response headers failed: {error}"))?
     };
+    let headers_received_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     if let Some(dispatch) = &plan.dispatch {
         dispatch.billing.headers(
             response.headers(),
@@ -892,6 +893,7 @@ async fn preflight_attempt_with_trigger(
     let mut stats = StreamStats::new(&plan.attempt_id);
     stats.stream_mode = mode.as_str();
     stats.started_at = started_at;
+    stats.headers_received_ms = Some(headers_received_ms);
     let stream = Box::pin(response.bytes_stream());
     let mut active = ActiveAttempt {
         decoder: SseDecoder::new(plan.max_event_bytes),
@@ -982,7 +984,9 @@ async fn preflight_attempt_with_trigger(
             active.plan.idle_timeout_seconds,
         );
         active.stats.observe_upstream(&chunk);
+        let processing_started = tokio::time::Instant::now();
         let frames = active.decoder.feed(&chunk)?;
+        active.stats.preflight_decode_ms += processing_started.elapsed().as_secs_f64() * 1000.0;
         if let Some(result) = process_preflight_frames(&mut active, frames)? {
             return Ok(result);
         }
@@ -1106,11 +1110,13 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
 fn start_public_stream(
     state: AppState,
     coordinator: Coordinator,
-    active: ActiveAttempt,
+    mut active: ActiveAttempt,
     control_headers: HeaderMap,
     control_drain: Option<tokio::task::JoinHandle<()>>,
     idempotency_owner: Option<idempotency::Owner>,
 ) -> Response<Body> {
+    active.stats.public_stream_ready_ms =
+        Some(active.stats.started_at.elapsed().as_secs_f64() * 1000.0);
     let status = active.status;
     let mut headers = active.headers.clone();
     for (name, value) in &control_headers {
