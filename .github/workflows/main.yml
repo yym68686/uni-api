@@ -5,10 +5,14 @@ on:
     branches:
       - main
     paths:
-      - static/**
+      - assets/**
       - Dockerfile
       - .dockerignore
-      - rust/**
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - README.md
       - docker-compose.yml
       - .github/workflows/main.yml
       - .gitmodules
@@ -54,18 +58,18 @@ jobs:
           git rebase origin/main
           git submodule update --init --recursive
 
-          VERSION=$(grep '^version = ' rust/uni-api-native/Cargo.toml | awk -F'"' '{print $2}')
+          VERSION=$(grep '^version = ' Cargo.toml | awk -F'"' '{print $2}')
           IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
           PATCH=$((VERSION_PARTS[2] + 1))
           NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
-          sed -i 's/^version = .*/version = "'$NEW_VERSION'"/' rust/uni-api-native/Cargo.toml
+          sed -i 's/^version = .*/version = "'$NEW_VERSION'"/' Cargo.toml
           # Keep the lockfile package metadata in sync with the release bump;
           # Docker builds intentionally use --locked.
-          cargo update --manifest-path rust/uni-api-native/Cargo.toml --workspace
+          cargo update --manifest-path Cargo.toml --workspace
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add rust/uni-api-native/Cargo.toml rust/uni-api-native/Cargo.lock
+          git add Cargo.toml Cargo.lock
           git commit -m "📖 Bump version to $NEW_VERSION [skip ci]"
           git push origin HEAD:main
 

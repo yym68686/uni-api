@@ -2,17 +2,20 @@ api.json
 *.yaml
 .env
 __pycache__
+.venv/
+.ruff_cache/
+.DS_Store
 .vscode
 node_modules
 .wrangler
 .pytest_cache
-rust/**/target/
-uni_api/_uni_api_native*.so
-uni_api/_uni_api_native*.dylib
+/target/
 *.jpg
 *.json
 !vercel.json
-!uni_api/api/codex_models_pro_0_144_0.json
+!assets/codex/*.json
+!tests/fixtures/**/*.json
+!tests/fixtures/**/*.yaml
 # *.png
 *.db
 .aider*

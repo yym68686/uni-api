@@ -40,8 +40,8 @@ upstream snapshot ETag and fixed client-version headers are removed.
 ## Validation
 
 Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test
---locked and cargo build --locked with manifest rust/uni-api-native/Cargo.toml.
-Then run python3 scripts/verify_codex_models.py with the built uni-api-front
+--locked and cargo build --locked with manifest Cargo.toml.
+Then run python3 tests/http/verify_codex_models.py with the built uni-api-front
 binary as its argument.
 
 The HTTP fixture verifies per-key/nested grants, upstream aliases, all version

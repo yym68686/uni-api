@@ -74,7 +74,7 @@ repair attempt IDs, provider/model and `reasoning_items_converted: 1`. It does
 not log the source summary, full input, missing item ID or credentials.
 
 Tests live in `responses_missing_item.rs` and
-`scripts/verify_missing_item_retry.py`. The HTTP suite covers strict matching,
+`tests/http/verify_missing_item_retry.py`. The HTTP suite covers strict matching,
 same-key preservation, one-item replacement, negative eligibility cases,
 streaming/nonstreaming, retry after repair, exhaustion, no cross-repair loops,
 postcommit behavior and a hedge race. Existing heartbeat/empty-name regressions

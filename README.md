@@ -519,59 +519,35 @@ There are two ways to let Koyeb read the configuration file, choose one of them:
 
 Then click the Deploy button.
 
-## Ubuntu deployment
+## Local development and builds
 
-
-```bash
-```
-
-## Serv00 Remote Deployment (FreeBSD 14.0)
-
-First, log in to the panel, in Additional services click on the tab Run your own applications to enable the option to run your own programs, then go to the panel Port reservation to randomly open a port.
-
-If you don't have your own domain name, go to the panel WWW websites and delete the default domain name provided. Then create a new domain with the Domain being the one you just deleted. After clicking Advanced settings, set the Website type to Proxy domain, and the Proxy port should point to the port you just opened. Do not select Use HTTPS.
-
-ssh login to the serv00 server, execute the following command:
+The service is a single Rust crate at the repository root. The executable is
+still named `uni-api-front`. See [architecture](docs/architecture.md) for module
+ownership and configuration boundaries.
 
 ```bash
-git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
-cd uni-api
-source uni-api/bin/activate
+cargo build --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+python3 scripts/verify-http.py
 ```
 
-From the start of installation to the completion of installation, it will take about 10 minutes. After the installation is complete, execute the following command:
+Supply external configuration through `UNI_API_CONFIG_PATH` or `CONFIG_URL`,
+and set the listening port with `PORT`. Production configuration and credentials
+are not image build inputs.
 
 ```bash
-tmux new -A -s uni-api
-source uni-api/bin/activate
-export CONFIG_URL=http://file_url/api.yaml
-export DISABLE_DATABASE=true
-# Modify the port, xxx is the port, modify it yourself, corresponding to the port opened in the panel Port reservation
-sed -i '' 's/port=8000/port=xxx/' main.py
-sed -i '' 's/reload=True/reload=False/' main.py
+UNI_API_CONFIG_PATH=/path/to/api.yaml DISABLE_DATABASE=true PORT=8000 ./target/debug/uni-api-front
 ```
 
-Use ctrl+b d to exit tmux, allowing the program to run in the background. At this point, you can use uni-api in other chat clients. curl test script:
-
-```bash
-curl -X POST https://xxx.serv00.net/v1/chat/completions \
--H 'Content-Type: application/json' \
--H 'Authorization: Bearer sk-xxx' \
--d '{"model": "gpt-5.2","messages": [{"role": "user","content": "Hello"}]}'
-```
-
-Reference document:
-
-
-https://linux.do/t/topic/201181
-
-https://linux.do/t/topic/218738
+The old Python/Serv00 installation steps no longer apply. These instructions do
+not establish FreeBSD deployment support; use the Docker build below for Linux.
 
 ## Docker local deployment
 
-The default image runs the complete API in the Rust runtime and does not start
-`docker build --target legacy-runtime ...`; that target sets
-`UNI_API_RUNTIME=rust`.
+The default image runs the complete API as the Rust `uni-api-front` binary.
+Build it from the repository root with `docker build -t uni-api:local .`.
 
 Start the container
 
@@ -1243,28 +1219,22 @@ proxy_set_header X-Real-IP $remote_addr;
 
 ```
 
-## Load Testing
+## Offline HTTP regressions
 
-Load testing tool: [locust](https://locust.io/)
-
-Load testing script: [test/locustfile.py](test/locustfile.py)
-
-mock_server: [test/mock_server.go](test/mock_server.go)
-
-Start load testing:
+`tests/http/` contains Python black-box regressions using isolated local upstreams
+and temporary data directories. They cover configuration restoration, channel
+controls, protocol conversion, retries and usage facts.
 
 ```bash
-go run test/mock_server.go
-# 100 10 120s
-locust -f test/locustfile.py
+cargo build --locked
+python3 scripts/verify-http.py
+# Or run an individual regression:
+python3 tests/http/verify_control_restore.py target/debug/uni-api-front
 ```
 
-Load testing result:
-
-| Type | Name | 50% | 66% | 75% | 80% | 90% | 95% | 98% | 99% | 99.9% | 99.99% | 100% | # reqs |
-|------|------|-----|-----|-----|-----|-----|-----|-----|-----|--------|---------|------|--------|
-| POST | /v1/chat/completions (stream) | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
-| | Aggregated | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
+The manual mock server is `tests/support/mock_server.go`. The old Locust script
+is not present in this repository; historical load-test figures are not validation
+of this directory refactor.
 
 ## Security
 

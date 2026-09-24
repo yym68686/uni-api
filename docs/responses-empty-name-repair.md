@@ -76,7 +76,7 @@ text or credentials. Existing heartbeat log fields are unchanged.
 
 Unit tests cover strict recognition, known wrappers, negative matches, pair
 identity, original-item preservation and idempotence. The isolated HTTP suite
-`scripts/verify_empty_name_retry.py` covers successful repair, same-key retention
+`tests/http/verify_empty_name_retry.py` covers successful repair, same-key retention
 with rotating keys, retry after repeated/other 400 and 503, multi-channel
 exhaustion, normal-request preservation, opt-outs, postcommit errors and a hedge
-race. `scripts/verify_heartbeat_retry.py` checks the existing repair behavior.
+race. `tests/http/verify_heartbeat_retry.py` checks the existing repair behavior.

@@ -502,53 +502,28 @@ CLI 的 `--limit-concurrency` 在非 legacy 模式也会被拒绝，避免旧部
 
 最后点击 Deploy 部署按钮。
 
-## Ubuntu 部署
+## 本地开发与构建
 
-
-```bash
-```
-
-## serv00 远程部署（FreeBSD 14.0）
-
-首先登录面板，Additional services 里面点击选项卡 Run your own applications 开启允许运行自己的程序，然后到面板 Port reservation 去随便开一个端口。
-
-如果没有自己的域名，去面板 WWW websites 删掉默认给的域名，再新建一个域名 Domain 为刚才删掉的域名，点击 Advanced settings 后设置 Website type 为 Proxy 域名，Proxy port 指向你刚才开的端口，不要选中 Use HTTPS。
-
-ssh 登陆到 serv00 服务器，执行下面的命令：
+当前服务是仓库根目录的 Rust 单 crate，运行二进制仍叫 `uni-api-front`。
+目录职责及配置边界见 [架构说明](docs/architecture.md)。
 
 ```bash
-git clone --depth 1 -b main --quiet https://github.com/yym68686/uni-api.git
-cd uni-api
-source uni-api/bin/activate
+cargo build --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+python3 scripts/verify-http.py
 ```
 
-从开始安装到安装完成需要等待10分钟，安装完成后执行下面的命令：
+运行时通过 `UNI_API_CONFIG_PATH` 指定外部配置文件，或使用 `CONFIG_URL`；
+`PORT` 设置监听端口。生产配置和凭据不属于镜像构建输入。
 
 ```bash
-tmux new -A -s uni-api
-source uni-api/bin/activate
-export CONFIG_URL=http://file_url/api.yaml
-export DISABLE_DATABASE=true
-# 修改端口，xxx 为端口，自行修改，对应刚刚在面板 Port reservation 开的端口
-sed -i '' 's/port=8000/port=xxx/' main.py
-sed -i '' 's/reload=True/reload=False/' main.py
+UNI_API_CONFIG_PATH=/path/to/api.yaml DISABLE_DATABASE=true PORT=8000 ./target/debug/uni-api-front
 ```
 
-使用 ctrl+b d 退出 tmux，即可让程序后台运行。此时就可以在其他聊天客户端使用 uni-api 了。curl 测试脚本：
-
-```bash
-curl -X POST https://xxx.serv00.net/v1/chat/completions \
--H 'Content-Type: application/json' \
--H 'Authorization: Bearer sk-xxx' \
--d '{"model": "gpt-5.2","messages": [{"role": "user","content": "你好"}]}'
-```
-
-参考文档：
-
-
-https://linux.do/t/topic/201181
-
-https://linux.do/t/topic/218738
+原 Python/Serv00 安装步骤已不适用于当前 Rust 服务。此处构建命令不代表
+已经验证 FreeBSD 部署；Linux 容器以以下 Docker 构建为准。
 
 ## Docker 本地部署
 
@@ -1235,28 +1210,20 @@ proxy_set_header X-Real-IP $remote_addr;
 
 ```
 
-## 压测
+## 离线 HTTP 回归
 
-压测工具：[locust](https://locust.io/)
-
-压测脚本：[test/locustfile.py](test/locustfile.py)
-
-mock_server：[test/mock_server.go](test/mock_server.go)
-
-启动压测：
+`tests/http/` 保留 Python 黑盒回归，使用隔离的本地上游及临时数据目录，
+覆盖配置恢复、渠道控制、协议转换、重试和用量事实。
 
 ```bash
-go run test/mock_server.go
-# 100 10 120s
-locust -f test/locustfile.py
+cargo build --locked
+python3 scripts/verify-http.py
+# 也可单独运行：
+python3 tests/http/verify_control_restore.py target/debug/uni-api-front
 ```
 
-压测结果：
-
-| Type | Name | 50% | 66% | 75% | 80% | 90% | 95% | 98% | 99% | 99.9% | 99.99% | 100% | # reqs |
-|------|------|-----|-----|-----|-----|-----|-----|-----|-----|--------|---------|------|--------|
-| POST | /v1/chat/completions (stream) | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
-| | Aggregated | 18 | 23 | 29 | 35 | 83 | 120 | 140 | 160 | 220 | 270 | 270 | 6948 |
+手工 mock server 位于 `tests/support/mock_server.go`。旧 Locust 脚本不在
+当前仓库中；历史压测数字不作为此次目录重构的性能验收。
 
 ## 安全
 

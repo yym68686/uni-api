@@ -42,9 +42,9 @@ timeouts, retries or cooldowns are changed by this instrumentation.
 Verification:
 
 ```sh
-cargo test --manifest-path rust/uni-api-native/Cargo.toml --locked
-cargo build --manifest-path rust/uni-api-native/Cargo.toml --locked
-python3 scripts/verify_dispatch_timing.py rust/uni-api-native/target/debug/uni-api-front
+cargo test --manifest-path Cargo.toml --locked
+cargo build --manifest-path Cargo.toml --locked
+python3 tests/http/verify_dispatch_timing.py target/debug/uni-api-front
 ```
 
 The offline integration test launches only local fake upstreams and isolated

@@ -41,6 +41,6 @@ repair attempt IDs and records `heartbeat_items_converted`. It contains no
 request text or credentials. Original upstream failures remain visible as 400;
 the final request summary records the actual result after repair.
 
-Offline HTTP coverage lives in `scripts/verify_heartbeat_retry.py`, including
+Offline HTTP coverage lives in `tests/http/verify_heartbeat_retry.py`, including
 same-key preservation with rotating keys, one-resend limits, ordinary failures,
 streaming and nonstreaming requests, and a hedging race.
