@@ -194,7 +194,7 @@ pub async fn handle(
         _ => None,
     };
     if let Some(response) = response.as_mut() {
-        if path.starts_with("/v1/") {
+        if path.starts_with("/v1/") && !response.headers().contains_key("cache-control") {
             response
                 .headers_mut()
                 .insert("cache-control", HeaderValue::from_static("no-store"));
@@ -618,11 +618,21 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
 }
 
 async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Response<Body> {
-    let models = match state
-        .native_responses_config
-        .models_for_headers(headers)
-        .await
-    {
+    // Presence selects the rich response shape; the version value never selects
+    // a different model set or metadata, including an explicitly empty value.
+    let codex_request = query_value(uri, "client_version").is_some();
+    let result = if codex_request {
+        state
+            .native_responses_config
+            .codex_models_for_headers(headers)
+            .await
+    } else {
+        state
+            .native_responses_config
+            .models_for_headers(headers)
+            .await
+    };
+    let models = match result {
         Ok(models) => models,
         Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
         Err(_) => {
@@ -632,25 +642,8 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             )
         }
     };
-    if query_value(uri, "client_version").is_some() {
-        let catalog: Value = serde_json::from_str(include_str!(
-            "../../../../../uni_api/api/codex_models_pro_0_153_2.json"
-        ))
-        .unwrap_or_else(|_| json!({"models":[]}));
-        let mut response = json_response(StatusCode::OK, catalog);
-        response.headers_mut().insert(
-            "x-uni-api-models-source",
-            HeaderValue::from_static("codex-pro-snapshot"),
-        );
-        response.headers_mut().insert(
-            "x-uni-api-models-snapshot-client-version",
-            HeaderValue::from_static("0.153.2"),
-        );
-        response.headers_mut().insert(
-            "x-uni-api-models-upstream-etag",
-            HeaderValue::from_static("W/\"568f1e5faa711c9a79e1426428e2ea34\""),
-        );
-        return response;
+    if codex_request {
+        return crate::codex_models::response(&models, headers);
     }
     let systemone_models = match state
         .native_responses_config

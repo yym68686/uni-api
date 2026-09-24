@@ -5,6 +5,7 @@ mod channel_controls;
 mod channel_metrics;
 mod channel_settings;
 mod chat_stream;
+mod codex_models;
 mod codex_oauth;
 mod config;
 mod cors;
@@ -23,8 +24,10 @@ mod request_spool;
 mod request_timing;
 mod resources;
 mod responses;
+mod responses_empty_name;
 mod responses_heartbeat;
 mod responses_item_ids;
+mod responses_missing_item;
 mod responses_native;
 mod telemetry;
 

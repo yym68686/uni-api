@@ -40,6 +40,12 @@ pub(crate) struct Mutation {
 }
 type OverlayCache = Arc<Mutex<Option<(String, u64, Arc<Snapshot>)>>>;
 
+#[derive(Clone)]
+struct BootstrapReceipt {
+    snapshot_id: String,
+    applied_revision: String,
+}
+
 pub(crate) struct Controls {
     instance: String,
     pub(crate) sequence: u64,
@@ -49,6 +55,7 @@ pub(crate) struct Controls {
     pub(crate) settings: BTreeMap<String, crate::channel_settings::ProviderSettings>,
     pub(crate) temporary_documents: BTreeMap<String, Value>,
     pub(crate) settings_operations: BTreeMap<String, (String, Arc<Value>)>,
+    bootstrap_restore: Option<BootstrapReceipt>,
 }
 // A validation candidate must never poison the serving snapshot cache.
 impl Clone for Controls {
@@ -61,6 +68,7 @@ impl Clone for Controls {
             settings: self.settings.clone(),
             temporary_documents: self.temporary_documents.clone(),
             settings_operations: self.settings_operations.clone(),
+            bootstrap_restore: self.bootstrap_restore.clone(),
             overlay_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -80,6 +88,7 @@ impl Default for Controls {
             settings: BTreeMap::new(),
             temporary_documents: BTreeMap::new(),
             settings_operations: BTreeMap::new(),
+            bootstrap_restore: None,
             rules: BTreeMap::new(),
             temporary: BTreeMap::new(),
             overlay_cache: Arc::new(Mutex::new(None)),
@@ -99,6 +108,7 @@ impl Controls {
             temporary_documents: BTreeMap::new(),
             settings_operations: BTreeMap::new(),
             overlay_cache: self.overlay_cache.clone(),
+            bootstrap_restore: None,
         }
     }
     pub(crate) fn revision(&self, snapshot: &Snapshot) -> String {
@@ -132,7 +142,10 @@ impl Controls {
         }
     }
     pub(crate) fn view(&self, snapshot: &Snapshot) -> Value {
-        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"storage":"process_memory","channel_definitions":!self.temporary_documents.is_empty(),"channel_definitions_digest":crate::channel_settings::digest(&self.settings_definitions(snapshot)),"channel_settings":true,"channel_settings_digest":crate::channel_settings::digest(&self.settings),"temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"identity_changed":self.settings.get(p.name.as_ref()).is_some_and(crate::channel_settings::identity_changed),"api_key_id":p.preferences.get("__temporary_key_id"),"models":self.effective_temporary(p,snapshot).models.keys().cloned().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
+        let bootstrap = self.bootstrap_restore.as_ref().map(|b| {
+            json!({"snapshot_id":b.snapshot_id,"applied_revision":b.applied_revision,"unchanged":b.applied_revision == self.revision(snapshot)})
+        });
+        json!({"revision":self.revision(snapshot),"instance_id":self.instance,"config_revision":snapshot.revision.as_ref(),"bootstrap_restore":bootstrap,"storage":"process_memory","channel_definitions":!self.temporary_documents.is_empty(),"channel_definitions_digest":crate::channel_settings::digest(&self.settings_definitions(snapshot)),"channel_settings":true,"channel_settings_digest":crate::channel_settings::digest(&self.settings),"temporary_channel_import":true,"temporary_channel_management":true,"temporary_channel_restore":true,"reset_on_restart":true,"expires_at":null,"rules":self.rules.values().collect::<Vec<_>>(),"temporary_channels":self.temporary.values().map(|p|json!({"provider":p.name.as_ref(),"identity_changed":self.settings.get(p.name.as_ref()).is_some_and(crate::channel_settings::identity_changed),"api_key_id":p.preferences.get("__temporary_key_id"),"models":self.effective_temporary(p,snapshot).models.keys().cloned().collect::<BTreeSet<_>>()})).collect::<Vec<_>>()})
     }
     pub fn overlay(&self, base: Arc<Snapshot>) -> Arc<Snapshot> {
         if self.temporary.is_empty() && self.settings.is_empty() {
@@ -815,6 +828,7 @@ impl NativeConfigStore {
         let mut candidate = Controls {
             instance: state.instance.clone(),
             sequence: state.sequence + 1,
+            bootstrap_restore: state.bootstrap_restore.clone(),
             ..Controls::default()
         };
         for p in input.snapshot.temporary_channels {
@@ -1024,6 +1038,7 @@ impl NativeConfigStore {
                 struct Bootstrap {
                     enabled: bool,
                     snapshot: Option<RetainedSnapshot>,
+                    snapshot_id: Option<String>,
                 }
                 let payload: Bootstrap =
                     serde_json::from_slice(&bytes).map_err(|_| "Invalid restore response")?;
@@ -1031,11 +1046,16 @@ impl NativeConfigStore {
                     return Ok(());
                 }
                 let snapshot = payload.snapshot.ok_or("Restore snapshot missing")?;
+                // Only the authenticated startup response can supply a receipt;
+                // runtime restoration must never reset the unchanged fence.
+                let snapshot_id = payload.snapshot_id.filter(|id| {
+                    id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit())
+                });
                 let view = self
                     .controls_view(&headers)
                     .await
                     .map_err(|_| "Restore authentication failed")?;
-                self.restore_controls(
+                let restored = self.restore_controls(
                     &headers,
                     RestoreMutation {
                         revision: view["revision"].as_str().unwrap_or_default().into(),
@@ -1044,6 +1064,13 @@ impl NativeConfigStore {
                 )
                 .await
                 .map_err(|_| "Retained configuration validation failed")?;
+                if let Some(snapshot_id) = snapshot_id {
+                    let applied_revision = restored["revision"].as_str().unwrap_or_default().to_string();
+                    self.channel_controls.write().await.bootstrap_restore = Some(BootstrapReceipt {
+                        snapshot_id: snapshot_id.clone(), applied_revision: applied_revision.clone(),
+                    });
+                    eprintln!("{}", json!({"event_type":"channel_controls_bootstrapped","snapshot_id":snapshot_id,"applied_revision":applied_revision}));
+                }
                 Ok(())
             }
             .await;
