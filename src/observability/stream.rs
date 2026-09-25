@@ -31,6 +31,8 @@ pub(crate) struct StreamStats {
     pub(crate) preflight_read_calls: u64,
     pub(crate) preflight_process_ms: f64,
     pub(crate) error_body_read_ms: Option<f64>,
+    pub(crate) upstream_http_version: Option<String>,
+    pub(crate) connection: Option<UpstreamConnection>,
     pub(crate) raw_stream: Option<Box<RawStreamTiming>>,
 }
 
@@ -53,7 +55,18 @@ pub struct TransportTiming {
     pub error_body_read_ms: Option<f64>,
     #[serde(default)]
     pub raw_stream: Option<Box<RawStreamTiming>>,
+    #[serde(default)]
+    pub upstream_http_version: Option<String>,
+    #[serde(default)]
+    pub connection: Option<UpstreamConnection>,
     pub network_write_measured: bool,
+}
+
+/// Physical outbound connection only; never the caller's address or HTTP headers.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct UpstreamConnection {
+    pub local_addr: String,
+    pub remote_addr: String,
 }
 
 /// Fixed-size metadata only; checkpoints are taken after parsing one received chunk.
@@ -110,6 +123,8 @@ impl StreamStats {
             preflight_read_calls: 0,
             preflight_process_ms: 0.0,
             error_body_read_ms: None,
+            upstream_http_version: None,
+            connection: None,
             raw_stream: None,
         }
     }
@@ -188,6 +203,17 @@ impl StreamStats {
         }
     }
 
+    pub(crate) fn observe_response_connection(&mut self, response: &reqwest::Response) {
+        self.upstream_http_version = Some(format!("{:?}", response.version()));
+        self.connection = response
+            .extensions()
+            .get::<hyper_util::client::legacy::connect::HttpInfo>()
+            .map(|info| UpstreamConnection {
+                local_addr: info.local_addr().to_string(),
+                remote_addr: info.remote_addr().to_string(),
+            });
+    }
+
     pub(crate) fn begin_raw_observation(&mut self) {
         if self.raw_stream.is_none() {
             self.raw_stream = Some(Box::new(RawStreamTiming {
@@ -253,6 +279,8 @@ impl StreamStats {
             preflight_read_calls: Some(self.preflight_read_calls),
             preflight_process_ms: Some(self.preflight_process_ms),
             error_body_read_ms: self.error_body_read_ms,
+            upstream_http_version: self.upstream_http_version.clone(),
+            connection: self.connection.clone(),
             raw_stream: self.raw_stream.clone(),
             network_write_measured: false,
         }

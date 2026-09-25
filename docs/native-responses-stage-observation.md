@@ -62,3 +62,21 @@ Only scalar metadata and at most three fixed-size milestone snapshots are kept;
 there are no per-frame logs or payload samples. No forwarding, frame parsing,
 terminal filtering, queue size, timeout or retry decisions change. A latency
 partition localizes a wait boundary; it does not by itself prove a software bug.
+
+
+### Correlating the physical outbound socket
+
+`upstream_http_version` reports the response protocol. Optional `connection`
+contains only `local_addr` and `remote_addr` from the HTTP client's existing
+transport metadata. The local address belongs to the gateway's outbound socket,
+not the caller. Neither URI, authorization, request/response headers nor body
+contents are included. A proxy can make the physical peer different from the
+ultimate origin; the tuple must not be described as a verified provider host.
+A connector without metadata reports null, including failures before headers.
+
+The tuple is an observation after headers, not a connect or write timestamp.
+Join it with bounded, read-only socket counters in the same network namespace
+and the attempt interval. HTTP/1 keepalive can reuse the tuple across sequential
+requests. HTTP/2 can multiplex attempts; tuple counters alone then cannot be
+attributed to one request. No DNS, TLS, proxy, protocol selection, pooling or
+retry behavior changes to obtain this metadata.

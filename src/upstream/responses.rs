@@ -845,6 +845,7 @@ async fn preflight_attempt_with_trigger(
     let mut stats = StreamStats::new(&plan.attempt_id);
     stats.started_at = started_at;
     stats.headers_received_ms = Some(headers_received_ms);
+    stats.observe_response_connection(&response);
     if let Some(dispatch) = &plan.dispatch {
         dispatch.billing.headers(
             response.headers(),

@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from verify_dispatch_timing import free_port
 
 facts = []
+observed_peers = []
 heartbeat = b': keepalive\n\n'
 created = b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_fixture","output":[]}}\n\n'
 delta = b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"PRIVATE_FIXTURE_TEXT"}\n\n'
@@ -29,6 +30,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        observed_peers.append(self.client_address)
         self.rfile.read(int(self.headers['Content-Length']))
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -77,6 +79,9 @@ try:
                 while time.monotonic()<deadline and not any(f['kind']=='attempt' for f in facts):time.sleep(.1)
                 attempt=next(f for f in facts if f['kind']=='attempt')
                 t=attempt['transport_timing'];raw=t['raw_stream'];snapshot=raw['at_response_created']
+                assert t['upstream_http_version'] == 'HTTP/1.0', t
+                assert t['connection']['remote_addr'] == f'127.0.0.1:{server.server_port}', t
+                assert t['connection']['local_addr'] == f'{observed_peers[0][0]}:{observed_peers[0][1]}', t
                 assert attempt['response_created_ms']>=450, attempt
                 assert snapshot['upstream_read_wait_ms']>=450, snapshot
                 assert snapshot['output_send_ms']<snapshot['upstream_read_wait_ms'], snapshot
