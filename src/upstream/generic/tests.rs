@@ -738,6 +738,24 @@ fn provider_headers_use_protocol_specific_authentication() {
         "https://github.com/yym68686/uni-api"
     );
     assert_eq!(headers["x-title"], "Uni API");
+
+    let requesty = test_provider("requesty", "https://router.requesty.ai/v1/chat/completions");
+    let headers = provider_headers(
+        &requesty,
+        "key",
+        &request_headers,
+        "request-a",
+        "requesty",
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(headers["authorization"], "Bearer key");
+    assert_eq!(
+        headers["http-referer"],
+        "https://github.com/yym68686/uni-api"
+    );
+    assert_eq!(headers["x-title"], "Uni API");
 }
 
 #[test]
