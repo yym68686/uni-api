@@ -332,7 +332,7 @@ pub(crate) fn build_attempt(
                 provider_stream,
             )
         }
-        "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
+        "gpt" | "openrouter" | "requesty" | "azure" | "azure-databricks" | "cloudflare"
             if wire_path == "/v1/chat/completions"
                 && provider
                     .base_url
@@ -904,6 +904,13 @@ pub(crate) fn provider_headers(
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
     }
     if engine == "openrouter" && provider.base_url.contains("openrouter.ai") {
+        headers.insert(
+            "http-referer",
+            HeaderValue::from_static("https://github.com/yym68686/uni-api"),
+        );
+        headers.insert("x-title", HeaderValue::from_static("Uni API"));
+    }
+    if engine == "requesty" && provider.base_url.contains("requesty.ai") {
         headers.insert(
             "http-referer",
             HeaderValue::from_static("https://github.com/yym68686/uni-api"),
