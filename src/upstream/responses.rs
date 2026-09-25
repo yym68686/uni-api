@@ -842,6 +842,9 @@ async fn preflight_attempt_with_trigger(
             .map_err(|error| format!("upstream response headers failed: {error}"))?
     };
     let headers_received_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    let mut stats = StreamStats::new(&plan.attempt_id);
+    stats.started_at = started_at;
+    stats.headers_received_ms = Some(headers_received_ms);
     if let Some(dispatch) = &plan.dispatch {
         dispatch.billing.headers(
             response.headers(),
@@ -857,12 +860,14 @@ async fn preflight_attempt_with_trigger(
         .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
     let response_headers = filtered_response_headers(response.headers());
     if !status.is_success() {
+        let error_read_started = tokio::time::Instant::now();
         let body = read_limited_body(
             response,
             total_deadline,
             positive_duration(plan.idle_timeout_seconds),
         )
         .await;
+        stats.error_body_read_ms = Some(error_read_started.elapsed().as_secs_f64() * 1000.0);
         if let Some(dispatch) = &plan.dispatch {
             dispatch
                 .billing
@@ -875,6 +880,7 @@ async fn preflight_attempt_with_trigger(
                 "status_code": status.as_u16(),
                 "upstream_status_code": status.as_u16(),
                 "body": body,
+                "transport_timing": stats.transport_timing(),
                 "committed": false,
             }),
         ));
@@ -885,15 +891,13 @@ async fn preflight_attempt_with_trigger(
             "status_code": 502,
             "upstream_status_code": status.as_u16(),
             "detail": "Responses upstream ignored Accept-Encoding: identity",
+            "transport_timing": stats.transport_timing(),
             "committed": false,
         })));
     }
 
     let mode = StreamMode::for_plan(&plan);
-    let mut stats = StreamStats::new(&plan.attempt_id);
     stats.stream_mode = mode.as_str();
-    stats.started_at = started_at;
-    stats.headers_received_ms = Some(headers_received_ms);
     let stream = Box::pin(response.bytes_stream());
     let mut active = ActiveAttempt {
         decoder: SseDecoder::new(plan.max_event_bytes),
@@ -931,7 +935,11 @@ async fn preflight_attempt_with_trigger(
             (!hedge_triggered).then_some(first_deadline).flatten(),
             hard_deadline,
         );
-        let chunk = match await_deadline(active.stream.next(), next_deadline).await {
+        let read_started = tokio::time::Instant::now();
+        let read_result = await_deadline(active.stream.next(), next_deadline).await;
+        active.stats.preflight_read_wait_ms += read_started.elapsed().as_secs_f64() * 1000.0;
+        active.stats.preflight_read_calls = active.stats.preflight_read_calls.saturating_add(1);
+        let chunk = match read_result {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(error))) => {
                 return Ok(PreflightResult::Retry(json!({
@@ -939,6 +947,7 @@ async fn preflight_attempt_with_trigger(
                     "status_code": 502,
                     "upstream_status_code": status.as_u16(),
                     "detail": format!("upstream stream read failed: {error}"),
+                    "transport_timing": active.stats.transport_timing(),
                     "committed": false,
                 })))
             }
@@ -954,6 +963,7 @@ async fn preflight_attempt_with_trigger(
                     "status_code": 502,
                     "upstream_status_code": status.as_u16(),
                     "detail": "Responses upstream closed before substantive output",
+                    "transport_timing": active.stats.transport_timing(),
                     "committed": false,
                 })));
             }
@@ -975,6 +985,7 @@ async fn preflight_attempt_with_trigger(
                     "status_code": 504,
                     "upstream_status_code": status.as_u16(),
                     "detail": error,
+                    "transport_timing": active.stats.transport_timing(),
                     "committed": false,
                 })));
             }
@@ -994,6 +1005,24 @@ async fn preflight_attempt_with_trigger(
 }
 
 fn process_preflight_frames(
+    active: &mut ActiveAttempt,
+    frames: Vec<SseFrame>,
+) -> Result<Option<PreflightResult>, String> {
+    let started = tokio::time::Instant::now();
+    let mut result = process_preflight_frames_inner(active, frames);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match &mut result {
+        Ok(Some(PreflightResult::Started(next))) => next.stats.preflight_process_ms += elapsed_ms,
+        Ok(Some(PreflightResult::Retry(outcome))) => {
+            active.stats.preflight_process_ms += elapsed_ms;
+            outcome["transport_timing"] = json!(active.stats.transport_timing());
+        }
+        _ => active.stats.preflight_process_ms += elapsed_ms,
+    }
+    result
+}
+
+fn process_preflight_frames_inner(
     active: &mut ActiveAttempt,
     frames: Vec<SseFrame>,
 ) -> Result<Option<PreflightResult>, String> {

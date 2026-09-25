@@ -27,6 +27,10 @@ pub(crate) struct StreamStats {
     pub(crate) public_stream_ready_ms: Option<f64>,
     pub(crate) first_wire_prepared_ms: Option<f64>,
     pub(crate) preflight_decode_ms: f64,
+    pub(crate) preflight_read_wait_ms: f64,
+    pub(crate) preflight_read_calls: u64,
+    pub(crate) preflight_process_ms: f64,
+    pub(crate) error_body_read_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -38,6 +42,14 @@ pub struct TransportTiming {
     pub public_stream_ready_ms: Option<f64>,
     pub first_wire_prepared_ms: Option<f64>,
     pub preflight_decode_ms: f64,
+    #[serde(default)]
+    pub preflight_read_wait_ms: Option<f64>,
+    #[serde(default)]
+    pub preflight_read_calls: Option<u64>,
+    #[serde(default)]
+    pub preflight_process_ms: Option<f64>,
+    #[serde(default)]
+    pub error_body_read_ms: Option<f64>,
     pub network_write_measured: bool,
 }
 
@@ -68,6 +80,10 @@ impl StreamStats {
             public_stream_ready_ms: None,
             first_wire_prepared_ms: None,
             preflight_decode_ms: 0.0,
+            preflight_read_wait_ms: 0.0,
+            preflight_read_calls: 0,
+            preflight_process_ms: 0.0,
+            error_body_read_ms: None,
         }
     }
 
@@ -149,6 +165,10 @@ impl StreamStats {
             public_stream_ready_ms: self.public_stream_ready_ms,
             first_wire_prepared_ms: self.first_wire_prepared_ms,
             preflight_decode_ms: self.preflight_decode_ms,
+            preflight_read_wait_ms: Some(self.preflight_read_wait_ms),
+            preflight_read_calls: Some(self.preflight_read_calls),
+            preflight_process_ms: Some(self.preflight_process_ms),
+            error_body_read_ms: self.error_body_read_ms,
             network_write_measured: false,
         }
     }
