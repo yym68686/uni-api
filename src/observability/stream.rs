@@ -31,6 +31,7 @@ pub(crate) struct StreamStats {
     pub(crate) preflight_read_calls: u64,
     pub(crate) preflight_process_ms: f64,
     pub(crate) error_body_read_ms: Option<f64>,
+    pub(crate) raw_stream: Option<Box<RawStreamTiming>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -50,7 +51,32 @@ pub struct TransportTiming {
     pub preflight_process_ms: Option<f64>,
     #[serde(default)]
     pub error_body_read_ms: Option<f64>,
+    #[serde(default)]
+    pub raw_stream: Option<Box<RawStreamTiming>>,
     pub network_write_measured: bool,
+}
+
+/// Fixed-size metadata only; checkpoints are taken after parsing one received chunk.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct RawStageTotals {
+    pub upstream_read_wait_ms: f64,
+    pub upstream_read_calls: u64,
+    pub process_ms: f64,
+    pub output_send_ms: f64,
+    pub output_calls: u64,
+    pub frames: u64,
+    pub comment_frames: u64,
+    pub max_pending_frame_bytes: usize,
+    pub last_chunk_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RawStreamTiming {
+    pub entered_ms: f64,
+    pub totals: RawStageTotals,
+    pub at_response_created: Option<RawStageTotals>,
+    pub at_first_output: Option<RawStageTotals>,
+    pub at_first_text: Option<RawStageTotals>,
 }
 
 impl StreamStats {
@@ -84,6 +110,7 @@ impl StreamStats {
             preflight_read_calls: 0,
             preflight_process_ms: 0.0,
             error_body_read_ms: None,
+            raw_stream: None,
         }
     }
 
@@ -138,6 +165,11 @@ impl StreamStats {
     }
 
     pub(crate) fn observe_upstream(&mut self, chunk: &[u8]) {
+        if !chunk.is_empty() {
+            if let Some(raw) = self.raw_stream.as_mut() {
+                raw.totals.last_chunk_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
         if !chunk.is_empty() && self.first_upstream_chunk_ms.is_none() {
             self.first_upstream_chunk_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
         }
@@ -156,6 +188,58 @@ impl StreamStats {
         }
     }
 
+    pub(crate) fn begin_raw_observation(&mut self) {
+        if self.raw_stream.is_none() {
+            self.raw_stream = Some(Box::new(RawStreamTiming {
+                entered_ms: self.started_at.elapsed().as_secs_f64() * 1000.0,
+                totals: RawStageTotals::default(),
+                at_response_created: None,
+                at_first_output: None,
+                at_first_text: None,
+            }));
+        }
+    }
+
+    pub(crate) fn raw_read_wait(&mut self, elapsed_ms: f64) {
+        if let Some(raw) = self.raw_stream.as_mut() {
+            raw.totals.upstream_read_wait_ms += elapsed_ms;
+            raw.totals.upstream_read_calls = raw.totals.upstream_read_calls.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn raw_processed(&mut self, elapsed_ms: f64, pending_bytes: usize) {
+        if let Some(raw) = self.raw_stream.as_mut() {
+            raw.totals.process_ms += elapsed_ms;
+            raw.totals.max_pending_frame_bytes =
+                raw.totals.max_pending_frame_bytes.max(pending_bytes);
+            // A milestone already seen during preflight is outside this observation.
+            if self
+                .response_created_ms
+                .is_some_and(|ms| ms >= raw.entered_ms)
+                && raw.at_response_created.is_none()
+            {
+                raw.at_response_created = Some(raw.totals.clone());
+            }
+            if self.first_output_ms.is_some_and(|ms| ms >= raw.entered_ms)
+                && raw.at_first_output.is_none()
+            {
+                raw.at_first_output = Some(raw.totals.clone());
+            }
+            if self.first_text_ms.is_some_and(|ms| ms >= raw.entered_ms)
+                && raw.at_first_text.is_none()
+            {
+                raw.at_first_text = Some(raw.totals.clone());
+            }
+        }
+    }
+
+    pub(crate) fn raw_output_wait(&mut self, elapsed_ms: f64) {
+        if let Some(raw) = self.raw_stream.as_mut() {
+            raw.totals.output_send_ms += elapsed_ms;
+            raw.totals.output_calls = raw.totals.output_calls.saturating_add(1);
+        }
+    }
+
     pub(crate) fn transport_timing(&self) -> TransportTiming {
         TransportTiming {
             schema: 1,
@@ -169,6 +253,7 @@ impl StreamStats {
             preflight_read_calls: Some(self.preflight_read_calls),
             preflight_process_ms: Some(self.preflight_process_ms),
             error_body_read_ms: self.error_body_read_ms,
+            raw_stream: self.raw_stream.clone(),
             network_write_measured: false,
         }
     }
@@ -194,6 +279,35 @@ pub(crate) fn wire_hash_sample_bps() -> u64 {
 #[cfg(test)]
 mod stage_tests {
     use super::*;
+
+    #[test]
+    fn raw_milestones_are_one_shot_metadata_and_do_not_reuse_preflight_events() {
+        let mut stats = StreamStats::new("metadata");
+        assert!(stats.transport_timing().raw_stream.is_none());
+        stats.response_created_ms = Some(0.0);
+        stats.begin_raw_observation();
+        stats.raw_read_wait(300.0);
+        stats.raw_output_wait(25.0);
+        stats.observe_semantic_output(
+            "response.output_text.delta",
+            &json!({"delta":"PRIVATE_BODY"}),
+        );
+        stats.raw_processed(0.2, 100);
+        stats.raw_read_wait(500.0);
+        stats.raw_processed(0.1, 10);
+        let raw = stats.raw_stream.as_ref().unwrap();
+        assert!(raw.at_response_created.is_none());
+        assert_eq!(
+            raw.at_first_text.as_ref().unwrap().upstream_read_wait_ms,
+            300.0
+        );
+        assert_eq!(raw.at_first_text.as_ref().unwrap().output_send_ms, 25.0);
+        assert_eq!(raw.totals.upstream_read_wait_ms, 800.0);
+        assert_eq!(raw.totals.max_pending_frame_bytes, 100);
+        assert!(!serde_json::to_string(&stats.transport_timing())
+            .unwrap()
+            .contains("PRIVATE_BODY"));
+    }
 
     #[test]
     fn missing_stages_are_null_and_empty_chunks_do_not_create_samples() {

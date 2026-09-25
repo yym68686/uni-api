@@ -1636,12 +1636,14 @@ async fn run_raw_committed(
     output: &mut OutputSink,
     cancellation: &CancellationToken,
 ) -> bool {
+    active.stats.begin_raw_observation();
     loop {
         let idle_deadline = deadline(
             tokio::time::Instant::now(),
             active.plan.idle_timeout_seconds,
         );
         let next_deadline = earlier_deadline(idle_deadline, active.total_deadline);
+        let read_started = tokio::time::Instant::now();
         let next = tokio::select! {
             _ = cancellation.cancelled(), if output.capture.is_none() => {
                 complete_disconnect(
@@ -1656,19 +1658,31 @@ async fn run_raw_committed(
             }
             result = await_deadline(active.stream.next(), next_deadline) => result,
         };
+        active
+            .stats
+            .raw_read_wait(read_started.elapsed().as_secs_f64() * 1000.0);
         match next {
             Ok(Some(Ok(chunk))) => {
                 active.stats.observe_upstream(&chunk);
+                let process_started = tokio::time::Instant::now();
                 let inspection = match active.decoder.feed(&chunk) {
                     Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
                     Err(error) => Err(error),
                 };
+                active.stats.raw_processed(
+                    process_started.elapsed().as_secs_f64() * 1000.0,
+                    active.decoder.buffer.len(),
+                );
                 match inspection {
                     Ok((prefix, terminal)) => {
                         if !prefix.is_empty() {
                             active.stats.observe_wire(&prefix);
                         }
-                        if !prefix.is_empty() && output.send_wire(prefix).await.is_err() {
+                        if !prefix.is_empty()
+                            && send_raw_wire(output, prefix, &mut active.stats)
+                                .await
+                                .is_err()
+                        {
                             complete_disconnect(
                                 state,
                                 coordinator,
@@ -1701,16 +1715,25 @@ async fn run_raw_committed(
                 }
             }
             Ok(None) => {
+                let process_started = tokio::time::Instant::now();
                 let inspection = match active.decoder.finish() {
                     Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
                     Err(error) => Err(error),
                 };
+                active.stats.raw_processed(
+                    process_started.elapsed().as_secs_f64() * 1000.0,
+                    active.decoder.buffer.len(),
+                );
                 match inspection {
                     Ok((prefix, terminal)) => {
                         if !prefix.is_empty() {
                             active.stats.observe_wire(&prefix);
                         }
-                        if !prefix.is_empty() && output.send_wire(prefix).await.is_err() {
+                        if !prefix.is_empty()
+                            && send_raw_wire(output, prefix, &mut active.stats)
+                                .await
+                                .is_err()
+                        {
                             complete_disconnect(
                                 state,
                                 coordinator,
@@ -1782,6 +1805,17 @@ async fn run_raw_committed(
     }
 }
 
+async fn send_raw_wire(
+    output: &mut OutputSink,
+    wire: Bytes,
+    stats: &mut StreamStats,
+) -> Result<(), ()> {
+    let started = tokio::time::Instant::now();
+    let result = output.send_wire(wire).await;
+    stats.raw_output_wait(started.elapsed().as_secs_f64() * 1000.0);
+    result
+}
+
 /// Return only the safe wire prefix before the first terminal event.
 ///
 /// Upstream providers sometimes append heartbeats or unrelated bytes after
@@ -1795,6 +1829,12 @@ fn raw_terminal_prefix(
 ) -> Result<(Bytes, Option<Terminal>), String> {
     let mut prefix = BytesMut::new();
     for frame in frames {
+        if let Some(raw) = stats.raw_stream.as_mut() {
+            raw.totals.frames = raw.totals.frames.saturating_add(1);
+            if frame_is_comment_only(frame.raw()) {
+                raw.totals.comment_frames = raw.totals.comment_frames.saturating_add(1);
+            }
+        }
         let wire = frame.wire.clone();
         let terminal = inspect_terminal_frame(&frame, stats)?;
         if let Some(terminal) = terminal {
@@ -2631,6 +2671,32 @@ mod tests {
             precommit_keepalive_sent: false,
             business_committed: false,
         }
+    }
+
+    #[tokio::test]
+    async fn raw_stage_observation_distinguishes_output_queue_wait() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(Bytes::from_static(b"occupied")))
+            .await
+            .unwrap();
+        let mut output = OutputSink::new(sender, CancellationToken::new(), None);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), "occupied");
+            receiver.recv().await.unwrap().unwrap()
+        });
+        let mut stats = StreamStats::new("queue-wait");
+        stats.begin_raw_observation();
+        send_raw_wire(&mut output, Bytes::from_static(b"unchanged"), &mut stats)
+            .await
+            .unwrap();
+        assert_eq!(release.await.unwrap(), "unchanged");
+        let raw = stats.raw_stream.unwrap();
+        assert!(raw.totals.output_send_ms >= 40.0);
+        assert_eq!(raw.totals.output_calls, 1);
+        assert_eq!(raw.totals.upstream_read_wait_ms, 0.0);
+        assert!(raw.at_response_created.is_none());
     }
 
     #[test]

@@ -36,3 +36,29 @@ unmatched request distributions is not causal evidence of a gateway bug.
 SSE read errors, EOF, deadline outcomes and semantic preflight retries preserve
 available stage data. Failures before response headers and decoder exceptions
 can still lack it. Never infer that a missing measurement is zero.
+
+
+### Raw committed stream checkpoints
+
+`raw_stream` is null for paths that have not entered the raw committed loop.
+For that loop it contains an entry timestamp, fixed-size totals, and one-shot
+snapshots at the first observed `response.created`, substantive output and text.
+Snapshots are taken after parsing the received chunk that contains the event;
+coalesced frames in that chunk can be included. Events seen in preflight do not
+create misleading raw-stage checkpoints. Missing and legacy checkpoints are null.
+
+- `upstream_read_wait_ms` and `upstream_read_calls` count awaited body reads.
+  This includes executor scheduling and any upstream/network waiting.
+- `process_ms` measures synchronous SSE decoding and frame inspection wall time.
+  It is not a CPU profile. `max_pending_frame_bytes` describes buffered partial
+  events without storing their contents.
+- `output_send_ms` and `output_calls` measure the existing send routine, including
+  idempotency capture and waiting for the bounded output queue. They do not prove
+  a network flush or receipt by the client.
+- Frame/comment counts and the last nonempty chunk timestamp help distinguish
+  early keepalives and incomplete events from a complete semantic response.
+
+Only scalar metadata and at most three fixed-size milestone snapshots are kept;
+there are no per-frame logs or payload samples. No forwarding, frame parsing,
+terminal filtering, queue size, timeout or retry decisions change. A latency
+partition localizes a wait boundary; it does not by itself prove a software bug.
