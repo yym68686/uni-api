@@ -18,6 +18,7 @@ ENGLISH = ("This key does not accept requests with fewer than 2000 input tokens 
            "(judged by request body size).")
 MODEL_UNAVAILABLE = "This model is not available."
 UPSTREAM_PROCESSING_FAILURE = "The upstream service could not process this request."
+UPSTREAM_REJECTED_REQUEST = "Upstream rejected the request"
 GENERIC_UPSTREAM_ERROR = {"error": {
     "code": "upstream_error", "message": "Upstream request failed", "type": "upstream_error",
 }}
@@ -185,6 +186,18 @@ def verify(binary, endpoint, hedging):
                      502, ["limited", "also-limited"] * 3),
                     ("quoted-upstream-processing-message",
                      f"Invalid input: expected '{UPSTREAM_PROCESSING_FAILURE}'",
+                     "retry", False, 400, ["limited"]),
+                    ("upstream-rejected-request", UPSTREAM_REJECTED_REQUEST, "retry", False,
+                     200, ["limited", "fallback"]),
+                    ("wrapped-upstream-rejected-request", json.dumps({"error": {
+                        "type": "invalid_request_error", "message": UPSTREAM_REJECTED_REQUEST}}),
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("upstream-rejected-no-retry", UPSTREAM_REJECTED_REQUEST, "no-retry", False,
+                     502, ["limited"]),
+                    ("upstream-rejected-exhausted", UPSTREAM_REJECTED_REQUEST, "exhausted", False,
+                     502, ["limited", "also-limited"] * 3),
+                    ("quoted-upstream-rejected-message",
+                     f"Invalid input: expected '{UPSTREAM_REJECTED_REQUEST}'",
                      "retry", False, 400, ["limited"]),
                     ("generic-upstream", GENERIC_UPSTREAM_ERROR, "retry", False,
                      200, ["limited", "fallback"]),

@@ -234,6 +234,15 @@ pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) 
             {
                 return true;
             }
+            // Some upstream gateways keep the OpenAI error type while replacing
+            // the standard processing message. Require the complete envelope
+            // and an absent/null code so ordinary validation errors stay 400.
+            if matches("type", "invalid_request_error")
+                && matches("message", "Upstream rejected the request")
+                && error.get("code").is_none_or(Value::is_null)
+            {
+                return true;
+            }
         }
         let message = match parsed.as_ref() {
             Some(payload) => payload

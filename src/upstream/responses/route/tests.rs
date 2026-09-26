@@ -1737,6 +1737,46 @@ fn upstream_processing_failure_is_a_retryable_gateway_error() {
     assert!(!is_provider_request_processing_failure(502, body));
 }
 
+#[test]
+fn upstream_rejected_request_is_a_retryable_gateway_error() {
+    let body =
+        r#"{"error":{"message":"Upstream rejected the request","type":"invalid_request_error"}}"#;
+    for detail in [
+        body.to_owned(),
+        json!({"error": {"message": body}}).to_string(),
+        json!({"detail": {"type": "invalid_request_error", "message": " UPSTREAM REJECTED THE REQUEST "}}).to_string(),
+    ] {
+        for endpoint in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/chat/completions",
+        ] {
+            let policy = classify_provider_failure(400, &detail, None, endpoint, true, None);
+            assert_eq!(policy.status, 502, "{detail}");
+            assert!(policy.retryable);
+            assert!(!policy.request_scoped);
+            let disabled = classify_provider_failure(400, &detail, None, endpoint, false, None);
+            assert_eq!(disabled.status, 502);
+            assert!(!disabled.retryable);
+        }
+    }
+    for detail in [
+        "Upstream rejected the request".to_owned(),
+        json!({"error": {"message": "Upstream rejected the request", "type": "upstream_error"}}).to_string(),
+        json!({"error": {"message": "Upstream rejected the request", "type": "invalid_request_error", "code": "invalid_type"}}).to_string(),
+        json!({"error": {"message": "Invalid input: expected 'Upstream rejected the request'", "type": "invalid_request_error"}}).to_string(),
+        json!({"error": {"message": "Invalid input"}, "input": body}).to_string(),
+    ] {
+        let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true, None);
+        assert_eq!(policy.status, 400, "{detail}");
+        assert!(policy.request_scoped);
+        assert!(!policy.retryable);
+    }
+    for status in [401, 403, 404, 413, 429, 500, 503] {
+        assert_eq!(remap_provider_status(status, body), status);
+    }
+}
+
 #[tokio::test]
 async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
     let body = r#"{"error":{"code":"upstream_error","message":"Upstream request failed","type":"upstream_error"}}"#;
