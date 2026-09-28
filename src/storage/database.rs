@@ -23,6 +23,9 @@ enum Backend {
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestStat {
+    /// Observed native Responses termination; absent for legacy/other protocols.
+    pub terminal_kind: Option<String>,
+    pub response_completed: Option<bool>,
     pub fact_usage: crate::observability::usage::FactUsage,
     pub stream: bool,
     pub upstream_model: String,
@@ -51,6 +54,9 @@ pub struct RequestStat {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStat {
+    /// Observed native Responses termination; absent for legacy/other protocols.
+    pub terminal_kind: Option<String>,
+    pub response_completed: Option<bool>,
     pub transport_timing: Option<crate::observability::stream::TransportTiming>,
     pub duration_ms: Option<f64>,
     pub first_output_ms: Option<f64>,

@@ -592,9 +592,10 @@ impl ResponsesRoute {
         let kind = outcome
             .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or("completed");
-        let success = matches!(kind, "completed" | "incomplete");
-        let status = outcome_status(outcome, if success { 200 } else { 502 });
+            .unwrap_or("unknown");
+        let accepted = matches!(kind, "completed" | "incomplete");
+        let success = kind == "completed";
+        let status = outcome_status(outcome, if accepted { 200 } else { 502 });
         if matches!(kind, "semantic_failure" | "semantic_error") {
             // Apply the normal failure accounting and cooldown policy, but
             // never dispatch a retry after output has been committed.
@@ -603,7 +604,9 @@ impl ResponsesRoute {
             return;
         }
         let upstream_status = outcome_status_from(outcome, "upstream_status_code", status);
-        if success {
+        // This is a statistics change: an incomplete stream remains terminal
+        // and keeps the existing retry/cooldown policy and response bytes.
+        if accepted {
             self.record_success().await;
         } else {
             self.has_attempt_failure = true;
@@ -855,7 +858,7 @@ impl ResponsesRoute {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let success = matches!(kind, "completed" | "incomplete");
+        let success = kind == "completed";
         let detail = if success {
             ""
         } else {
@@ -875,6 +878,8 @@ impl ResponsesRoute {
             .map(|attempt| attempt.actual_model.as_str());
         let status_origin = if success {
             "upstream_success"
+        } else if kind == "incomplete" {
+            "upstream_incomplete"
         } else if self.last_failure_origin.is_empty() {
             "native_route_selection"
         } else {
@@ -916,6 +921,9 @@ impl ResponsesRoute {
         let (prompt_price, completion_price) =
             model_prices(&self.snapshot.preferences, &self.request_model);
         self.persistence.record_request(RequestStat {
+            terminal_kind: Some(kind.to_owned()),
+            response_completed: (self.stream && self.endpoint == "/v1/responses")
+                .then_some(kind == "completed"),
             fact_usage: crate::observability::usage::FactUsage::from_usage(outcome.get("usage")),
             stream: self.stream,
             upstream_model: final_actual_model.unwrap_or_default().to_owned(),
@@ -999,6 +1007,12 @@ impl ResponsesRoute {
             return;
         };
         self.persistence.record_channel(ChannelStat {
+            terminal_kind: outcome
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            response_completed: (self.stream && self.endpoint == "/v1/responses")
+                .then_some(outcome.get("kind").and_then(Value::as_str) == Some("completed")),
             transport_timing: outcome
                 .get("transport_timing")
                 .cloned()
@@ -1327,7 +1341,8 @@ pub(crate) fn failure_origin(outcome: &Value) -> &'static str {
         Some("protocol_error") => "ember_protocol",
         Some("semantic_failure" | "semantic_error") => "upstream_semantic",
         Some("downstream_disconnected") => "downstream_client",
-        Some("completed" | "incomplete") => "upstream_success",
+        Some("incomplete") => "upstream_incomplete",
+        Some("completed") => "upstream_success",
         _ => "ember_native",
     }
 }

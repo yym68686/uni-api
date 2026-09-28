@@ -285,7 +285,7 @@ impl ChannelMetrics {
             s.inflight = s.inflight.saturating_sub(1);
             let b = s.bucket(now / 60);
             match outcome {
-                "success" | "completed" | "incomplete" => {
+                "success" | "completed" => {
                     b.success += 1;
                     b.last_success = Some(now)
                 }

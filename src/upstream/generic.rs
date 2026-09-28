@@ -443,6 +443,8 @@ pub(crate) async fn run_hedged_attempt_loop(
                 } = success;
                 debug_assert!(stream_outcome.is_none());
                 execution.state.persistence.record_channel(ChannelStat {
+                    terminal_kind: None,
+                    response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
@@ -545,6 +547,8 @@ pub(crate) async fn run_hedged_attempt_loop(
                     }
                 }
                 execution.state.persistence.record_channel(ChannelStat {
+                    terminal_kind: None,
+                    response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
@@ -876,6 +880,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         })
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
+                            terminal_kind: None,
+                            response_completed: None,
                             transport_timing: None,
                             duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                             first_output_ms: outcome.first_output_ms,
@@ -969,6 +975,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     return response;
                 }
                 state.persistence.record_channel(ChannelStat {
+                    terminal_kind: None,
+                    response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
@@ -1034,6 +1042,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     }
                 }
                 state.persistence.record_channel(ChannelStat {
+                    terminal_kind: None,
+                    response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                     first_output_ms: None,
