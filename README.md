@@ -13,12 +13,12 @@
 
 ## Introduction
 
-For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai, Cohere, Groq, Cloudflare, OpenRouter, [0-0.pro](https://0-0.pro/r/uniapi) and more.
+For personal use, one/new-api is too complex with many commercial features that individuals don't need. If you don't want a complicated frontend interface and prefer support for more models, you can try uni-api. This is a project that unifies the management of large language model APIs, allowing you to call multiple backend services through a single unified API interface, converting them all to OpenAI format, and supporting load balancing. Currently supported backend services include: OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai, Cohere, Groq, Cloudflare, OpenRouter, Requesty, [0-0.pro](https://0-0.pro/r/uniapi) and more.
 
 ## ✨ Features
 
 - No front-end, pure configuration file to configure API channels. You can run your own API station just by writing a file, and the documentation has a detailed configuration guide, beginner-friendly.
-- Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, OpenRouter, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
+- Unified management of multiple backend services, supporting providers such as OpenAI, Deepseek, OpenRouter, Requesty, and other APIs in OpenAI format. Supports OpenAI Dalle-3 image generation.
 - Simultaneously supports Anthropic, Gemini, Vertex AI, Azure, AWS, xai, Cohere, Groq, Cloudflare, [0-0.pro](https://0-0.pro/r/uniapi). Vertex simultaneously supports Claude and Gemini API.
 - Support OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai native tool use function calls.
 - Support OpenAI, Anthropic, Gemini, Vertex, Azure, AWS, xai native image recognition API.
@@ -238,7 +238,7 @@ providers:
       - causallm-35b-beta2ep-q6k: causallm-35b
       - anthropic/claude-sonnet-4-5
     tools: false
-    engine: openrouter # Force the use of a specific message format, currently supports gpt, claude, gemini, openrouter native format, optional
+    engine: openrouter # Force the use of a specific message format, currently supports gpt, claude, gemini, openrouter, requesty native format, optional
 
   # Doubao (Volcengine Ark) Translation via /api/v3/responses
   - provider: doubao-translate
