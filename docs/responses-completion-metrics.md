@@ -21,9 +21,11 @@ Older exporters collapsed incomplete responses into `outcome=success`, losing
 termination evidence. Such historical success facts cannot safely be relabeled
 by looking at token counts or missing first-output latency. Consumers retain the
 legacy outcome when completion evidence is absent, and identify this limitation
-in their metric explanation. Explicit historical `outcome=incomplete` can be
+as unknown historical failures where recorded. Explicit historical `outcome=incomplete` can be
 counted as failed without guessing.
 
 Run `python3 tests/http/verify_responses_success.py target/debug/uni-api-front`
 for isolated real HTTP/SSE checks, including incomplete after blank/real text,
 EOF, `[DONE]`, normal completion and tool-only completion across provider modes.
+
+The exporter also writes a bounded `failure_reason` code. Incomplete reasons distinguish output-budget exhaustion and content filtering; protocol EOF without the terminal event, transport failures, upstream failure events and HTTP status errors have separate codes. It never exports raw upstream error text as a reason label.

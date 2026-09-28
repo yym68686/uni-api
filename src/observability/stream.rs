@@ -17,6 +17,7 @@ pub(crate) struct StreamStats {
     pub(crate) delta_events: u64,
     pub(crate) normalized_events: u64,
     pub(crate) usage: Option<Value>,
+    pub(crate) incomplete_reason: Option<&'static str>,
     pub(crate) wire_hash: Option<Sha256>,
     pub(crate) started_at: tokio::time::Instant,
     pub(crate) first_output_ms: Option<f64>,
@@ -109,6 +110,7 @@ impl StreamStats {
             delta_events: 0,
             normalized_events: 0,
             usage: None,
+            incomplete_reason: None,
             wire_hash: sampled.then(Sha256::new),
             started_at: tokio::time::Instant::now(),
             first_output_ms: None,
@@ -143,6 +145,7 @@ impl StreamStats {
             "delta_events": self.delta_events,
             "normalized_events": self.normalized_events,
             "usage": self.usage,
+            "incomplete_reason": self.incomplete_reason,
             "wire_sha256": hash,
             "wire_hash_sampled": self.wire_hash.is_some(),
             "stream_mode": self.stream_mode,
@@ -155,6 +158,18 @@ impl StreamStats {
 
     pub(crate) fn observe_semantic_output(&mut self, event_type: &str, payload: &Value) {
         let elapsed = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        if event_type == "response.incomplete" {
+            self.incomplete_reason = Some(
+                match payload
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                {
+                    Some("max_output_tokens") => "max_output_tokens",
+                    Some("content_filter") => "content_filter",
+                    _ => "unknown",
+                },
+            );
+        }
         if event_type == "response.created" && self.response_created_ms.is_none() {
             self.response_created_ms = Some(elapsed);
         }

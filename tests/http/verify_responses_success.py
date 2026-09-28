@@ -125,6 +125,7 @@ def main():
                             assert fact["outcome"] == ("success" if complete else "failed"), fact
                             if "incomplete" in case:
                                 assert fact["terminal_kind"] == "incomplete", fact
+                                assert fact["failure_reason"] == "responses_max_output_tokens", fact
                                 if kind == "request": assert fact["status"] == 200, fact
                 print("PASS: 18 real SSE cases; HTTP 200, tool completion, incomplete, EOF, [DONE], live metrics, S3 request/attempt facts, unchanged passthrough")
             except Exception:

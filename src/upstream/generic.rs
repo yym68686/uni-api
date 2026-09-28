@@ -444,6 +444,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                 debug_assert!(stream_outcome.is_none());
                 execution.state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
+                    failure_reason: None,
                     response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -548,6 +549,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                 }
                 execution.state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
+                    failure_reason: None,
                     response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -881,6 +883,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
                             terminal_kind: None,
+                            failure_reason: None,
                             response_completed: None,
                             transport_timing: None,
                             duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -976,6 +979,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 }
                 state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
+                    failure_reason: None,
                     response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -1043,6 +1047,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 }
                 state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
+                    failure_reason: None,
                     response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),

@@ -302,6 +302,7 @@ pub(crate) fn inspect_terminal_frame(
         }
     }
     validate_terminal(event_type, &payload)?;
+    stats.observe_semantic_output(event_type, &payload);
     if let Some(usage) = extract_usage(&payload) {
         stats.usage = Some(usage.clone());
     }

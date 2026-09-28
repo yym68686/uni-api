@@ -922,6 +922,7 @@ impl ResponsesRoute {
             model_prices(&self.snapshot.preferences, &self.request_model);
         self.persistence.record_request(RequestStat {
             terminal_kind: Some(kind.to_owned()),
+            failure_reason: metric_failure_reason(kind, outcome),
             response_completed: (self.stream && self.endpoint == "/v1/responses")
                 .then_some(kind == "completed"),
             fact_usage: crate::observability::usage::FactUsage::from_usage(outcome.get("usage")),
@@ -1007,6 +1008,13 @@ impl ResponsesRoute {
             return;
         };
         self.persistence.record_channel(ChannelStat {
+            failure_reason: metric_failure_reason(
+                outcome
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                outcome,
+            ),
             terminal_kind: outcome
                 .get("kind")
                 .and_then(Value::as_str)
@@ -1332,6 +1340,42 @@ pub(crate) fn outcome_status_from(outcome: &Value, key: &str, fallback: u16) -> 
         .filter(|status| *status > 0)
         .unwrap_or(u64::from(fallback))
         .min(u64::from(u16::MAX)) as u16
+}
+
+pub(crate) fn metric_failure_reason(kind: &str, outcome: &Value) -> Option<String> {
+    let reason = match kind {
+        "completed" => return None,
+        "incomplete" => match outcome.get("incomplete_reason").and_then(Value::as_str) {
+            Some("max_output_tokens") => "responses_max_output_tokens",
+            Some("content_filter") => "responses_content_filter",
+            _ => "responses_incomplete",
+        },
+        "protocol_error" => {
+            let detail = outcome
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if detail.contains("without a terminal") || detail.contains("before a terminal") {
+                "missing_response_completed"
+            } else {
+                "protocol_error"
+            }
+        }
+        "transport_error" => "transport_error",
+        "semantic_failure" | "semantic_error" => "upstream_response_failed",
+        "http_error" => {
+            let status = outcome_status(outcome, 0);
+            return Some(if (400..=599).contains(&status) {
+                format!("upstream_http_{status}")
+            } else {
+                "upstream_http_error".into()
+            });
+        }
+        "downstream_disconnected" => "downstream_disconnected",
+        "native_route_exhausted" | "failed_before_commit" => "no_successful_channel",
+        _ => "other",
+    };
+    Some(reason.to_owned())
 }
 
 pub(crate) fn failure_origin(outcome: &Value) -> &'static str {
