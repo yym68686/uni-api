@@ -336,11 +336,7 @@ impl GatewayRuntime {
         if !["set", "reset", "reset_all"].contains(&input.action.as_str()) {
             return Err(bad("Invalid action"));
         }
-        if input.order.len() > 1024
-            || input.disabled.len() > 1024
-            || input.model.len() > 512
-            || input.api_key_id.len() > 128
-        {
+        if input.model.len() > 512 || input.api_key_id.len() > 128 {
             return Err(bad("Control scope too large"));
         }
         if input.action == "set" {
@@ -390,9 +386,6 @@ impl GatewayRuntime {
                 if input.order.is_empty() && input.disabled.is_empty() {
                     state.rules.remove(&scope);
                 } else {
-                    if state.rules.len() >= 128 && !state.rules.contains_key(&scope) {
-                        return Err(bad("Too many temporary scopes"));
-                    }
                     state.rules.insert(
                         scope,
                         Rule {
@@ -486,9 +479,7 @@ impl GatewayRuntime {
             || input.api_key.len() > 8192
             || input.api_key.contains(['\r', '\n'])
             || input.models.is_empty()
-            || input.models.len() > 32
             || input.position == 0
-            || input.position > 1025
         {
             return Err(bad("Invalid temporary channel"));
         }
@@ -540,21 +531,6 @@ impl GatewayRuntime {
             {
                 return Err(bad("Provider name already in use"));
             }
-        }
-        if state.temporary.len() >= 128 && !state.temporary.contains_key(&input.provider) {
-            return Err(bad("Too many temporary channels"));
-        }
-        let new_scopes = input
-            .models
-            .iter()
-            .filter(|m| {
-                !state
-                    .rules
-                    .contains_key(&(input.api_key_id.clone(), (*m).clone()))
-            })
-            .count();
-        if state.rules.len() + new_scopes > 128 {
-            return Err(bad("Too many temporary scopes"));
         }
         // Keep other already imported models when adding another tested subset.
         let mut models = state
@@ -658,9 +634,7 @@ impl GatewayRuntime {
         let mut orders = Vec::new();
         if input.action == "replace" {
             if input.models.is_empty()
-                || input.models.len() > 32
                 || input.position == 0
-                || input.position > 1025
                 || input.models.iter().any(|m| {
                     m.is_empty() || m.len() > 256 || m.contains('/') || m.contains(['\r', '\n'])
                 })
@@ -691,18 +665,6 @@ impl GatewayRuntime {
                 }
                 names.insert(input.position - 1, input.provider.clone());
                 orders.push((model.clone(), names));
-            }
-            let new_scopes = input
-                .models
-                .iter()
-                .filter(|m| {
-                    !state
-                        .rules
-                        .contains_key(&(input.api_key_id.clone(), (*m).clone()))
-                })
-                .count();
-            if state.rules.len() + new_scopes > 128 {
-                return Err(bad("Too many temporary scopes"));
             }
         }
         // Remove only this provider from affected orders/disable lists. Preserve
@@ -824,10 +786,7 @@ impl GatewayRuntime {
             "Configuration unavailable".into(),
         ))?;
         let bad = |s: &str| (StatusCode::BAD_REQUEST, s.to_string());
-        if ![1, 2].contains(&input.snapshot.version)
-            || input.snapshot.rules.len() > 128
-            || input.snapshot.temporary_channels.len() > 128
-        {
+        if ![1, 2].contains(&input.snapshot.version) {
             return Err(bad("Invalid retained configuration"));
         }
         let mut state = self.channel_controls.write().await;
@@ -853,7 +812,6 @@ impl GatewayRuntime {
                 || p.api_key.len() > if p.definition.is_some() { 16384 } else { 8192 }
                 || p.api_key.contains(['\r', '\n'])
                 || p.models.is_empty()
-                || p.models.len() > if p.definition.is_some() { 1024 } else { 32 }
                 || p.models.iter().any(|m| {
                     m.is_empty()
                         || m.len() > 256
@@ -918,9 +876,6 @@ impl GatewayRuntime {
             };
             candidate.temporary.insert(p.provider, provider);
         }
-        if input.snapshot.channel_settings.len() > 1024 {
-            return Err(bad("Too many channel settings"));
-        }
         for (name, mut setting) in input.snapshot.channel_settings {
             let provider = candidate
                 .temporary
@@ -947,24 +902,37 @@ impl GatewayRuntime {
             .values()
             .find(|k| crate::routing::catalog::can_inspect_all(&overlay, k))
             .ok_or(bad("Administrator unavailable"))?;
+        // Build each key's catalog once. Restoring many model scopes must not
+        // rescan all providers and models for every individual rule.
+        let mut catalogs: HashMap<String, HashMap<String, BTreeSet<String>>> = HashMap::new();
         for rule in input.snapshot.rules {
-            if rule.order.len() > 1024
-                || rule.disabled.len() > 1024
-                || rule.model.len() > 512
-                || rule.api_key_id.len() > 128
-            {
+            if rule.model.len() > 512 || rule.api_key_id.len() > 128 {
                 return Err(bad("Retained rule too large"));
             }
-            let allowed = entries(&overlay, caller, Some(&rule.api_key_id))
-                .map_err(|_| bad("Retained key unavailable"))?;
-            let names: BTreeSet<_> = allowed
-                .into_iter()
-                .filter(|(_, m)| rule.model.is_empty() || m == &rule.model)
-                .map(|(p, _)| p.name.to_string())
-                .collect();
+            if !catalogs.contains_key(&rule.api_key_id) {
+                let allowed = entries(&overlay, caller, Some(&rule.api_key_id))
+                    .map_err(|_| bad("Retained key unavailable"))?;
+                let mut models: HashMap<String, BTreeSet<String>> = HashMap::new();
+                for (provider, model) in allowed {
+                    models
+                        .entry(model)
+                        .or_default()
+                        .insert(provider.name.to_string());
+                    models
+                        .entry(String::new())
+                        .or_default()
+                        .insert(provider.name.to_string());
+                }
+                catalogs.insert(rule.api_key_id.clone(), models);
+            }
+            let names = catalogs
+                .get(&rule.api_key_id)
+                .and_then(|models| models.get(&rule.model));
             for values in [&rule.order, &rule.disabled] {
                 if values.iter().collect::<BTreeSet<_>>().len() != values.len()
-                    || values.iter().any(|p| !names.contains(p))
+                    || values
+                        .iter()
+                        .any(|p| !names.is_some_and(|names| names.contains(p)))
                 {
                     return Err(bad("Retained rule references an unavailable channel"));
                 }
@@ -1042,7 +1010,7 @@ impl GatewayRuntime {
                 let mut bytes = Vec::new();
                 while let Some(part) = stream.next().await {
                     let part = part.map_err(|_| "Restore response interrupted")?;
-                    if bytes.len() + part.len() > 2 * 1024 * 1024 {
+                    if bytes.len().saturating_add(part.len()) > crate::control::config_body_limit() {
                         return Err("Restore snapshot too large");
                     };
                     bytes.extend_from_slice(&part);

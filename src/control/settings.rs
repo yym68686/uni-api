@@ -393,7 +393,7 @@ fn validate_paths(c: &Change) -> Result<(), Failure> {
         .iter()
         .map(|(p, _, _)| format!("/{p}"))
         .collect();
-    if c.provider.is_empty() || c.provider.len() > 256 || c.set.len() + c.remove.len() > 128 {
+    if c.provider.is_empty() || c.provider.len() > 256 {
         return Err(bad("Channel settings patch is too large"));
     }
     for p in c.set.keys().chain(c.remove.iter()) {
@@ -453,7 +453,7 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
             || valid(api)
             || api
                 .as_array()
-                .is_some_and(|a| !a.is_empty() && a.len() <= 1024 && a.iter().all(valid)))
+                .is_some_and(|a| !a.is_empty() && a.iter().all(valid)))
         {
             return Err(field_error("/api"));
         }
@@ -517,7 +517,7 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
     }
     if let Some(models) = materialized.get("model").and_then(Value::as_array) {
         let mut exposed = BTreeSet::new();
-        if models.is_empty() || models.len() > 1024 {
+        if models.is_empty() {
             return Err(field_error("/model"));
         }
         for model in models {
@@ -885,7 +885,6 @@ impl GatewayRuntime {
         apply: bool,
     ) -> Result<Value, Failure> {
         if input.changes.is_empty()
-            || input.changes.len() > 100
             || input.operation_id.is_empty()
             || input.operation_id.len() > 128
         {
@@ -935,9 +934,6 @@ impl GatewayRuntime {
                         "Invalid channel setting: new channel identity (invalid or duplicate name)",
                     ));
                 }
-                if candidate.temporary.len() >= 128 {
-                    return Err(bad("Too many temporary channels"));
-                }
                 if !base.api_key_order.iter().any(|token| {
                     crate::routing::catalog::key_id(token) == original_change.create_to_key
                 }) {
@@ -979,9 +975,6 @@ impl GatewayRuntime {
                     .any(|t| crate::routing::catalog::key_id(t) == original_change.copy_to_key)
                 {
                     return Err(bad("Destination API key not found"));
-                }
-                if state.temporary.len() >= 128 {
-                    return Err(bad("Too many temporary channels"));
                 }
                 let source = state
                     .overlay(base.clone())
@@ -1174,6 +1167,55 @@ mod tests {
     use axum::http::HeaderMap;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
+    #[tokio::test]
+    async fn large_channel_and_rule_snapshot_restores_atomically() {
+        let store = fixture().await;
+        let revision = store.settings_view("one").await.unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let key = crate::routing::catalog::key_id("caller-a");
+        let changes:Vec<Value>=(0..129).map(|i|json!({"provider":format!("large-{i}"),"create_to_key":key,"set":{"/engine":"gpt","/base_url":"https://example.test/v1/responses","/api":["fixture"],"/model":["m"]}})).collect();
+        let input: Mutation = serde_json::from_value(
+            json!({"operation_id":"large-batch","revision":revision,"changes":changes}),
+        )
+        .unwrap();
+        store.settings_change(input, true).await.unwrap();
+        assert_eq!(store.channel_controls.read().await.temporary.len(), 129);
+        let models: Vec<String> = (0..1025).map(|i| format!("m-{i}")).collect();
+        // Use the standard temporary-channel snapshot format with >128 rules
+        // and >32 models on one channel, independent of settings export shape.
+        let rules: Vec<Value> = models
+            .iter()
+            .map(|m| json!({"api_key_id":key,"model":m,"order":["sub2api-large"],"disabled":[]}))
+            .collect();
+        let restored = fixture().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer admin-token".parse().unwrap());
+        let rev = restored.controls_view(&headers).await.unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut channels = vec![
+            json!({"provider":"sub2api-large","api_key_id":key,"base_url":"https://example.test/v1/responses","api_key":"fixture","models":models}),
+        ];
+        for i in 0..128 {
+            channels.push(json!({"provider":format!("sub2api-extra-{i}"),"api_key_id":key,"base_url":"https://example.test/v1/responses","api_key":"fixture","models":["extra"]}));
+        }
+        let input=serde_json::from_value(json!({"revision":rev,"snapshot":{"version":2,"rules":rules,"temporary_channels":channels}})).unwrap();
+
+        restored.restore_controls(&headers, input).await.unwrap();
+        assert_eq!(restored.channel_controls.read().await.temporary.len(), 129);
+        let restored_view = restored.controls_view(&headers).await.unwrap();
+        assert_eq!(restored_view["rules"].as_array().unwrap().len(), 1025);
+        assert_eq!(
+            restored.snapshot().await.unwrap().providers_by_name["sub2api-large"]
+                .models
+                .len(),
+            1025
+        );
+        assert_eq!(store.channel_controls.read().await.temporary.len(), 129);
+    }
     #[tokio::test]
     async fn all_supported_engines_can_be_created_restored_and_removed() {
         assert_eq!(schema()["create_provider"], true);

@@ -438,7 +438,7 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
         if let Err(response) = require_admin(state, &headers).await {
             return response;
         }
-        let raw = match to_bytes(request.into_body(), 2 * 1024 * 1024).await {
+        let raw = match to_bytes(request.into_body(), crate::control::config_body_limit()).await {
             Ok(v) => v,
             Err(_) => {
                 return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Settings request too large")
@@ -471,11 +471,7 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
                 "Platform administrator key required",
             );
         }
-        let limit = if path == "/v1/channel-controls/restore" {
-            2 * 1024 * 1024
-        } else {
-            64 * 1024
-        };
+        let limit = crate::control::config_body_limit();
         let body = match to_bytes(request.into_body(), limit).await {
             Ok(body) => body,
             Err(_) => {
@@ -542,11 +538,7 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
     }
     match path.as_str() {
         "/v1/api_config/update" => {
-            let limit = std::env::var("RUST_ADMIN_CONFIG_MAX_BYTES")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(16 * 1024 * 1024);
+            let limit = crate::control::config_body_limit();
             let body = match to_bytes(request.into_body(), limit).await {
                 Ok(body) => body,
                 Err(error) => {
