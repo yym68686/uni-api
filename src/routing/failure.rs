@@ -262,9 +262,15 @@ pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) 
             candidate = message.to_owned();
             continue;
         }
-        return message
-            .trim()
-            .eq_ignore_ascii_case("The upstream service could not process this request.");
+        // Responses streams expose only the extracted semantic error message.
+        // Match the entire channel rejection, including in that plain-text form;
+        // an echoed phrase in a client validation message must stay a 400.
+        return [
+            "The upstream service could not process this request.",
+            "Upstream rejected illegal short-input distillation or heartbeat probing.",
+        ]
+        .iter()
+        .any(|expected| message.trim().eq_ignore_ascii_case(expected));
     }
     false
 }

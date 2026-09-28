@@ -19,6 +19,7 @@ ENGLISH = ("This key does not accept requests with fewer than 2000 input tokens 
 MODEL_UNAVAILABLE = "This model is not available."
 UPSTREAM_PROCESSING_FAILURE = "The upstream service could not process this request."
 UPSTREAM_REJECTED_REQUEST = "Upstream rejected the request"
+SHORT_INPUT_REJECTION = "Upstream rejected illegal short-input distillation or heartbeat probing."
 GENERIC_UPSTREAM_ERROR = {"error": {
     "code": "upstream_error", "message": "Upstream request failed", "type": "upstream_error",
 }}
@@ -42,6 +43,18 @@ class Upstream(BaseHTTPRequestHandler):
         if channel != "fallback":
             raw = json.dumps(self.server.error, ensure_ascii=self.server.escape).encode()
             status, content_type = 400, "application/json"
+            if self.server.error_mode != "http":
+                error = {"type": "invalid_request_error", "status_code": 400,
+                         "message": self.server.error["error"]["message"]}
+                events = [{"type": "response.created", "response": {"id": "resp_reject", "status": "in_progress"}}]
+                events.append({"type": "response.output_text.delta",
+                               "delta": "started" if self.server.error_mode == "postcommit" else " "})
+                if self.server.error_mode == "error":
+                    events.append({"type": "error", "error": error})
+                else:
+                    events.append({"type": "response.failed", "response": {"status": "failed", "error": error}})
+                raw = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+                status, content_type = 200, "text/event-stream"
         else:
             status = 200
             if self.path.endswith("/chat/completions"):
@@ -82,7 +95,7 @@ class Upstream(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-def verify(binary, endpoint, hedging):
+def verify(binary, endpoint, hedging, engine="gpt"):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     server.hits = []
     server.payloads = []
@@ -92,7 +105,7 @@ def verify(binary, endpoint, hedging):
         upstream_endpoint = "/v1/responses" if endpoint.endswith("/compact") else endpoint
         config = {
             "providers": [{
-                "provider": name, "engine": "gpt",
+                "provider": name, "engine": engine,
                 "base_url": f"http://127.0.0.1:{server.server_port}/{name}{upstream_endpoint}",
                 "api": "fixture-upstream", "model": ["test-model"],
                 "preferences": {"cooldown_period": 0},
@@ -230,9 +243,30 @@ def verify(binary, endpoint, hedging):
                     ("model-mismatch-echo", {"error": {"message": "Invalid input"}, "input": MODEL_MISMATCH},
                      "retry", False, 400, ["limited"]),
                 ]
+                cases += [
+                    ("short-input-rejection", {"error": {"message": SHORT_INPUT_REJECTION}}, "retry", False, 200, ["limited", "fallback"]),
+                    ("short-input-wrapped", json.dumps({"error": {"message": SHORT_INPUT_REJECTION}}), "retry", False, 200, ["limited", "fallback"]),
+                    ("short-input-no-retry", SHORT_INPUT_REJECTION, "no-retry", False, 502, ["limited"]),
+                    ("short-input-exhausted", SHORT_INPUT_REJECTION, "exhausted", False, 502, ["limited", "also-limited"] * 3),
+                    ("short-input-quoted", f"Invalid input: expected '{SHORT_INPUT_REJECTION}'", "retry", False, 400, ["limited"]),
+                ]
+                if endpoint == "/v1/responses" and engine == "codex":
+                    cases += [
+                        ("sse-error-retry", SHORT_INPUT_REJECTION, "retry", False, 200, ["limited", "fallback"]),
+                        ("sse-failed-retry", SHORT_INPUT_REJECTION, "retry", False, 200, ["limited", "fallback"]),
+                        ("sse-error-no-retry", SHORT_INPUT_REJECTION, "no-retry", False, 502, ["limited"]),
+                        ("sse-failed-exhausted", SHORT_INPUT_REJECTION, "exhausted", False, 502, ["limited", "also-limited"] * 3),
+                        ("sse-error-validation", "Missing required parameter: input", "retry", False, 400, ["limited"]),
+                        ("sse-postcommit", SHORT_INPUT_REJECTION, "retry", False, 200, ["limited"]),
+                    ]
                 checked = 0
                 for streaming in ([False] if endpoint.endswith("/compact") else [False, True]):
                     for label, message, key, escape, expected_status, expected_hits in cases:
+                        if label.startswith("sse-") and not streaming:
+                            continue
+                        server.error_mode = ("postcommit" if label == "sse-postcommit" else
+                                             "error" if label.startswith("sse-error") else
+                                             "failed" if label.startswith("sse-failed") else "http")
                         server.hits.clear()
                         server.payloads.clear()
                         server.error = (message if isinstance(message, dict) else
@@ -253,11 +287,15 @@ def verify(binary, endpoint, hedging):
                                 assert sent.get("reasoning", {}).get("effort") == "max" or sent.get("reasoning_effort") == "max", context
                             if key in ("mapped-key", "overridden-key"):
                                 assert server.payloads[0]["model"] == "gpt-5.5", context
-                        if status == 200:
+                        if label == "sse-postcommit":
+                            assert b"started" in raw and b"response.completed" not in raw, context
+                        elif status == 200:
                             assert b"test" in raw and b"invalid_request_error" not in raw, context
                             assert b"Upstream request failed" not in raw, context
                             if streaming:
                                 assert "text/event-stream" in content_type, context
+                        elif label.startswith(("short-input", "sse-")):
+                            assert (SHORT_INPUT_REJECTION.encode() if label != "sse-error-validation" else b"Missing required parameter") in raw, context
                         elif status == 503:
                             assert b"All configured providers failed for model test-model" in raw, context
                         elif label.startswith("model-mismatch"):
@@ -268,7 +306,7 @@ def verify(binary, endpoint, hedging):
                             assert b"invalid_request_error" in raw, context
                         checked += 1
                 assert config_path.read_bytes() == original
-                print(f"PASS provider failure failover {endpoint} hedge={hedging}: {checked} HTTP cases")
+                print(f"PASS provider failure failover {endpoint} hedge={hedging} engine={engine}: {checked} HTTP cases")
             except Exception:
                 print((root / "log").read_text()[-8000:])
                 raise
@@ -288,3 +326,6 @@ if __name__ == "__main__":
     for endpoint in ["/v1/responses", "/v1/chat/completions", "/v1/responses/compact"]:
         for hedging in [False, True]:
             verify(binary, endpoint, hedging)
+
+    for hedging in [False, True]:
+        verify(binary, "/v1/responses", hedging, engine="codex")

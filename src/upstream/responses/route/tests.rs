@@ -1777,6 +1777,78 @@ fn upstream_rejected_request_is_a_retryable_gateway_error() {
     }
 }
 
+#[test]
+fn short_input_channel_rejection_is_retryable_in_http_and_semantic_forms() {
+    let message = "Upstream rejected illegal short-input distillation or heartbeat probing.";
+    let body = json!({"error": {"message": message}}).to_string();
+    for detail in [
+        message.to_owned(),
+        body.clone(),
+        json!({"error": {"message": body}}).to_string(),
+        json!({"detail": {"message": message.to_uppercase()}}).to_string(),
+    ] {
+        for endpoint in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/chat/completions",
+            "/v1/messages",
+        ] {
+            for auto_retry in [false, true] {
+                let policy =
+                    classify_provider_failure(400, &detail, None, endpoint, auto_retry, None);
+                assert_eq!(
+                    (policy.status, policy.retryable, policy.request_scoped),
+                    (502, auto_retry, false)
+                );
+            }
+        }
+        for status in [200, 401, 403, 404, 413, 429, 500, 503] {
+            assert_eq!(remap_provider_status(status, &detail), status);
+        }
+    }
+    for detail in [
+        format!("Invalid input: expected '{message}'"),
+        json!({"error": {"message": "Missing required parameter: input"}, "input": message})
+            .to_string(),
+        json!({"input": {"message": message}}).to_string(),
+        "Invalid heartbeat input".to_owned(),
+    ] {
+        let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true, None);
+        assert_eq!(
+            (policy.status, policy.retryable, policy.request_scoped),
+            (400, false, true)
+        );
+    }
+}
+
+#[tokio::test]
+async fn short_input_semantic_rejection_preserves_wire_status_and_retries_next_channel() {
+    let mut route = native_route_for_test(named_provider("rejecting"), 2).await;
+    route.providers.insert(1, named_provider("fallback"));
+    let plan = route.next_plan().await.unwrap().unwrap();
+    let message = "Upstream rejected illegal short-input distillation or heartbeat probing.";
+    assert!(
+        route
+            .record_plan_failure(
+                plan,
+                &json!({
+                    "kind": "semantic_error", "status_code": 400, "upstream_status_code": 200,
+                    "detail": message, "committed": false,
+                })
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+    assert_eq!(route.upstream_ledger[0]["status_code"], 200);
+    assert_eq!(
+        route.upstream_ledger[0]["error_sha256"],
+        sha256_hex(message)
+    );
+    assert_eq!(route.routing_ledger[0]["status_code"], 502);
+    let fallback = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+}
+
 #[tokio::test]
 async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
     let body = r#"{"error":{"code":"upstream_error","message":"Upstream request failed","type":"upstream_error"}}"#;
