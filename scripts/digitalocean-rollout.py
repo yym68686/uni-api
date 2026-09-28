@@ -10,20 +10,16 @@ bodies.
 from __future__ import annotations
 
 import argparse
-import json
-import os
-from pathlib import Path
+import shlex
 import subprocess
-import sys
-import tempfile
-import time
 
 
 REMOTE_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
-import copy
+import fcntl
+import os
 import hashlib
 import json
 from pathlib import Path
@@ -32,9 +28,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-
-import yaml
-
 
 PRIMARY = "uni-api"
 CANDIDATE = "uni-api-management-candidate"
@@ -100,6 +93,8 @@ def image_info(image):
 
 
 def admin_token():
+    import yaml
+
     try:
         return yaml.safe_load(CONFIG.read_text())["api_keys"][0]["api"]
     except Exception as exc:
@@ -251,7 +246,7 @@ def choose_policy():
     base = json.loads(ORIGIN_POLICY.read_text())
     actual = adapted_header_count()
     expected = base.get("credential_header_count")
-    if actual == expected:
+    if (expected, actual) != (2, 0):
         raise RolloutError("Caddy guard check failed; policy mismatch was not the header count")
     temporary = tempfile.NamedTemporaryFile(
         mode="w", prefix="uni-api-origin-policy-", suffix=".json", dir="/tmp", delete=False
@@ -291,7 +286,11 @@ def public_probes():
 
 
 def stop_clean(name):
-    run(["docker", "stop", "-t", "650", name])
+    ports = {PRIMARY: PRIMARY_PORT, CANDIDATE: CANDIDATE_PORT}
+    if name not in ports or current_origin_port() == ports[name]:
+        raise RolloutError("refusing to stop the serving port")
+    print(f"draining={name} force_timeout=disabled", flush=True)
+    run(["docker", "stop", "-t", "-1", name])
     state = inspect(name)["State"]
     if state.get("ExitCode") != 0 or state.get("OOMKilled"):
         raise RolloutError(f"{name} did not exit cleanly")
@@ -323,6 +322,8 @@ def write_candidate_env(primary, source_commit):
         if not values.get(name):
             raise RolloutError(f"primary environment is missing {name}")
     values["SOURCE_COMMIT"] = source_commit
+    if any("\n" in value or "\r" in value for value in values.values()):
+        raise RolloutError("environment contains a newline; refusing an ambiguous env-file")
     CANDIDATE_ENV.write_text("\n".join(f"{key}={value}" for key, value in values.items()) + "\n")
     CANDIDATE_ENV.chmod(0o600)
     CANDIDATE_DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -378,8 +379,13 @@ def final_report(image):
         raise RolloutError("final Caddy port is not 8001")
     if primary["Image"] != image["id"]:
         raise RolloutError("primary image does not match the release image")
+    if env.get("SOURCE_COMMIT") != image["source_commit"]:
+        raise RolloutError("primary SOURCE_COMMIT does not match the release image")
     if not primary["State"].get("Running") or primary.get("RestartCount") != 0:
         raise RolloutError("primary is not healthy after rollout")
+    if not health(PRIMARY_PORT):
+        raise RolloutError("primary health check failed")
+    retained_equal(PRIMARY_PORT)
     public_probes()
     print(
         json.dumps(
@@ -400,7 +406,7 @@ def final_report(image):
     )
 
 
-def check_only(image_ref):
+def check_only(image_ref, expected_commit=""):
     primary = inspect(PRIMARY)
     image = image_info(image_ref)
     if current_origin_port() != PRIMARY_PORT:
@@ -408,6 +414,9 @@ def check_only(image_ref):
     summary = control_summary(PRIMARY_PORT, require_bootstrap=True)
     if not health(PRIMARY_PORT):
         raise RolloutError("primary health check failed")
+    if expected_commit and env_map(primary).get("SOURCE_COMMIT") != expected_commit:
+        raise RolloutError("serving SOURCE_COMMIT differs from the expected release")
+    retained_equal(PRIMARY_PORT)
     print(
         json.dumps(
             {
@@ -426,94 +435,118 @@ def check_only(image_ref):
     )
 
 
-def rollout(args):
-    primary = inspect(PRIMARY)
-    compose_metadata(args.image)
-    current_port = current_origin_port()
-    run(["docker", "pull", args.image])
-    image = image_info(args.image)
-    candidate = inspect(CANDIDATE, missing_ok=True)
-    primary_image = primary["Image"]
-    policy, temporary_policy = choose_policy()
+def retained_equal(port):
+    """Compare routing/settings with the console's durable source snapshot."""
+    live = get_json(port, "/v1/channel-controls")
+    serving = inspect(PRIMARY if port == PRIMARY_PORT else CANDIDATE)
+    env = env_map(serving)
+    request = urllib.request.Request(env["UNI_API_CONTROL_RESTORE_URL"], headers={
+        "Authorization": "Bearer " + env["UNI_API_CONTROL_RESTORE_TOKEN"],
+        "X-Uni-Channel-Settings-Version": "1",
+    })
+    with urllib.request.urlopen(request, timeout=25) as response:
+        retained = json.load(response)
+    if not retained.get("enabled") or not retained.get("snapshot_id"):
+        raise RolloutError("console retention is disabled or has no verified snapshot")
+    saved = retained["snapshot"]
+    def routing(value):
+        return {
+            "rules": sorted(value.get("rules", []), key=lambda row: (row["api_key_id"], row["model"])),
+            "channels": sorted([
+                {"provider": row["provider"], "api_key_id": row["api_key_id"], "models": sorted(row["models"])}
+                for row in value.get("temporary_channels", [])
+            ], key=lambda row: row["provider"]),
+        }
+    def digest(value):
+        # Match control/settings.rs, which canonicalizes integral JSON floats.
+        def normalize(item):
+            if isinstance(item, dict):
+                return {key: normalize(child) for key, child in item.items()}
+            if isinstance(item, list):
+                return [normalize(child) for child in item]
+            if isinstance(item, float) and item.is_integer() and abs(item) < 9007199254740992:
+                return int(item)
+            return item
+        return hashlib.sha256(json.dumps(normalize(value), sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    definitions = {row["provider"]: row["definition"] for row in saved.get("temporary_channels", []) if row.get("definition")}
+    if (routing(saved) != routing(live)
+        or digest(saved.get("channel_settings", {})) != live.get("channel_settings_digest")
+        or digest(definitions) != live.get("channel_definitions_digest")):
+        raise RolloutError("console saved intent differs; preserve the serving instance")
+    print(f"retained_equal_port={port}", flush=True)
 
-    if current_port == PRIMARY_PORT and not (candidate and candidate["State"].get("Running")) and primary_image == image["id"]:
-        try:
+
+def rollout(args):
+    # This lock serializes invocations of this script, including long drains.
+    primary = inspect(PRIMARY)
+    service = compose_metadata(args.image)
+    baseline = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (COMPOSE, CONFIG)}
+    def unchanged():
+        if any(hashlib.sha256(p.read_bytes()).hexdigest() != value for p, value in baseline.items()):
+            raise RolloutError("base config or Compose changed during rollout")
+        if compose_metadata(args.image) != service:
+            raise RolloutError("effective Compose configuration changed during rollout")
+        if image_info(args.image)["id"] != image["id"]:
+            raise RolloutError("image tag moved during rollout; preserve serving candidate")
+
+    current_port = current_origin_port()
+    candidate = inspect(CANDIDATE, missing_ok=True)
+    if candidate and candidate["State"].get("Running"):
+        # Resume the pinned candidate, never pull a newer tag over an active rollout.
+        image = image_info(candidate["Image"])
+        if image_info(args.image)["id"] != image["id"]:
+            raise RolloutError("active candidate and image tag differ; manual reconciliation required")
+    else:
+        if current_port != PRIMARY_PORT:
+            raise RolloutError("Caddy is on 8002 without a running candidate")
+        run(["docker", "pull", args.image])
+        image = image_info(args.image)
+    if args.expected_commit and image["source_commit"] != args.expected_commit:
+        raise RolloutError("image SOURCE_COMMIT differs from the expected release")
+    policy, temporary_policy = choose_policy()
+    try:
+        retained_equal(current_port)
+        if current_port == PRIMARY_PORT and primary["Image"] == image["id"]:
+            if candidate and candidate["State"].get("Running"):
+                stop_clean(CANDIDATE)
             final_report(image)
             print("no_update_needed=true", flush=True)
             return
-        finally:
-            if temporary_policy:
-                temporary_policy.unlink(missing_ok=True)
-
-    if candidate and candidate["State"].get("Running"):
-        if current_port != CANDIDATE_PORT or candidate["Image"] != image["id"]:
-            raise RolloutError("a running candidate does not match the current safe resume state")
-        print("resuming_candidate=true", flush=True)
-    else:
-        if current_port != PRIMARY_PORT:
-            raise RolloutError("Caddy is not on 8001 and no safe running candidate exists")
-        image = image_info(args.image)
-        if primary_image == image["id"]:
-            raise RolloutError("latest image is already serving; refusing a needless restart")
-        write_candidate_env(primary, image["source_commit"])
-        start_candidate(primary, image["id"], image["source_commit"])
-        candidate_summary = wait_ready(
-            CANDIDATE,
-            CANDIDATE_PORT,
-            require_bootstrap=True,
-            timeout_seconds=args.ready_timeout,
-        )
-        require_equal(candidate_summary, control_summary(PRIMARY_PORT), "candidate/primary")
-
-    traffic_port = current_port
-    try:
-        if traffic_port == PRIMARY_PORT:
-            require_equal(control_summary(PRIMARY_PORT), control_summary(CANDIDATE_PORT), "pre-switch")
+        if not (candidate and candidate["State"].get("Running")):
+            # Existing stopped spools are preserved and mounted again, never deleted.
+            write_candidate_env(primary, image["source_commit"])
+            start_candidate(primary, image["id"], image["source_commit"])
+        wait_ready(CANDIDATE, CANDIDATE_PORT, require_bootstrap=True,
+                   timeout_seconds=args.ready_timeout)
+        retained_equal(CANDIDATE_PORT)
+        unchanged()
+        if current_port == PRIMARY_PORT:
+            require_equal(control_summary(PRIMARY_PORT), control_summary(CANDIDATE_PORT, require_bootstrap=True), "pre-switch")
             switch(policy, PRIMARY_PORT, CANDIDATE_PORT)
-            traffic_port = CANDIDATE_PORT
 
+        # Check the live serving candidate even on resume before stopping anything.
+        if current_origin_port() != CANDIDATE_PORT or not health(CANDIDATE_PORT):
+            raise RolloutError("candidate is not serving and healthy")
         primary = inspect(PRIMARY)
-        if primary["State"].get("Running"):
-            stop_clean(PRIMARY)
-
-        run(
-            [
-                "docker",
-                "compose",
-                "--project-directory",
-                "/root",
-                "-f",
-                str(COMPOSE),
-                "up",
-                "-d",
-                "--no-deps",
-                "--force-recreate",
-                "--pull",
-                "never",
-                "uni-api",
-            ]
-        )
-        primary_summary = wait_ready(
-            PRIMARY,
-            PRIMARY_PORT,
-            require_bootstrap=True,
-            timeout_seconds=args.ready_timeout,
-        )
-        candidate_summary = control_summary(CANDIDATE_PORT, require_bootstrap=True)
-        require_equal(primary_summary, candidate_summary, "primary/candidate")
+        if primary["Image"] != image["id"] or not primary["State"].get("Running"):
+            if primary["State"].get("Running"):
+                stop_clean(PRIMARY)
+            unchanged()
+            run(["docker", "compose", "--project-directory", "/root", "-f", str(COMPOSE),
+                 "up", "-d", "--no-deps", "--pull", "never", "uni-api"])
+        primary_summary = wait_ready(PRIMARY, PRIMARY_PORT, require_bootstrap=True,
+                                     timeout_seconds=args.ready_timeout)
+        require_equal(primary_summary, control_summary(CANDIDATE_PORT, require_bootstrap=True), "pre-switch-back")
+        retained_equal(PRIMARY_PORT)
+        unchanged()
         if inspect(PRIMARY)["Image"] != image["id"]:
             raise RolloutError("Compose started a different image")
-
         switch(policy, CANDIDATE_PORT, PRIMARY_PORT)
-        traffic_port = PRIMARY_PORT
         stop_clean(CANDIDATE)
         final_report(image)
-    except Exception as exc:
-        print(
-            f"rollout_failed traffic_port={traffic_port} candidate_kept={traffic_port == CANDIDATE_PORT}",
-            flush=True,
-        )
-        raise exc
+    except Exception:
+        print("rollout_failed=true serving_instance_preserved=true", flush=True)
+        raise
     finally:
         if temporary_policy:
             temporary_policy.unlink(missing_ok=True)
@@ -524,12 +557,19 @@ def main():
     parser.add_argument("--image", default="yym68686/uni-api:latest")
     parser.add_argument("--ready-timeout", type=int, default=300)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--expected-commit", default="")
     args = parser.parse_args()
     try:
         if args.check_only:
-            check_only(args.image)
+            check_only(args.image, args.expected_commit)
         else:
-            rollout(args)
+            os.umask(0o077)
+            with open("/root/uni-api-rollout.lock", "a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise RolloutError("another DigitalOcean rollout is already running")
+                rollout(args)
     except (OSError, RolloutError, urllib.error.URLError) as exc:
         print(f"ERROR: {exc}", file=__import__("sys").stderr)
         raise SystemExit(1)
@@ -546,12 +586,12 @@ def main() -> int:
     parser.add_argument("--image", default="yym68686/uni-api:latest")
     parser.add_argument("--ready-timeout", type=int, default=300)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--expected-commit", default="")
+    parser.add_argument("--ssh-option", action="append", default=[],
+                        help="SSH -o option; repeat for a connection-specific override")
     args = parser.parse_args()
 
-    command = [
-        "ssh",
-        "-T",
-        args.remote,
+    remote_command = [
         "python3",
         "-",
         "--image",
@@ -559,8 +599,13 @@ def main() -> int:
         "--ready-timeout",
         str(args.ready_timeout),
     ]
+    remote_command += ["--expected-commit", args.expected_commit]
     if args.check_only:
-        command.append("--check-only")
+        remote_command.append("--check-only")
+    command = ["ssh", "-T"]
+    for option in args.ssh_option + ["BatchMode=yes", "ConnectTimeout=15", "ServerAliveInterval=15", "ServerAliveCountMax=3"]:
+        command += ["-o", option]
+    command += [args.remote, shlex.join(remote_command)]
     result = subprocess.run(command, input=REMOTE_SCRIPT, text=True, check=False)
     return result.returncode
 
