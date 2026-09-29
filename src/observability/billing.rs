@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Receipt {
     base: String,
     key_hash: String,
@@ -21,6 +21,15 @@ struct Receipt {
     error_fields: Value,
     secret: String,
     headers_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for Receipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receipt")
+            .field("status", &self.status)
+            .field("headers_ms", &self.headers_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -296,6 +305,8 @@ mod tests {
         a.start();
         let h = HeaderMap::new();
         a.headers(&h, 403, "secret");
+        a.target("https://upstream.test/v1/responses", "private-upstream-key");
+        assert!(!format!("{a:?}").contains("private-upstream-key"));
         let body = br#"{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance"}"#;
         a.error_body(403, body);
         let e = a.event().unwrap();
