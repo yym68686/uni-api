@@ -165,6 +165,10 @@ impl Controls {
             }
         }
         let mut snapshot = (*base).clone();
+        snapshot.preferences = Arc::new(crate::control::global_settings::overlay(
+            &base.preferences,
+            self.settings.get(crate::control::global_settings::SCOPE),
+        ));
         let mut providers = (*base.providers).clone();
         let mut by_name = (*base.providers_by_name).clone();
         let mut keys = (*base.api_keys).clone();
@@ -877,6 +881,17 @@ impl GatewayRuntime {
             candidate.temporary.insert(p.provider, provider);
         }
         for (name, mut setting) in input.snapshot.channel_settings {
+            if name == crate::control::global_settings::SCOPE {
+                crate::control::global_settings::validate_intent(&setting).map_err(|e| bad(&e))?;
+                let merged =
+                    crate::control::global_settings::overlay(&base.preferences, Some(&setting));
+                crate::control::global_settings::validate(
+                    &crate::control::global_settings::document(&merged),
+                )
+                .map_err(|e| bad(&e))?;
+                candidate.settings.insert(name, setting);
+                continue;
+            }
             let provider = candidate
                 .temporary
                 .get(&name)

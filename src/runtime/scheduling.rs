@@ -127,15 +127,12 @@ impl GatewayRuntime {
                     .insert(route_key, now + provider_model_circuit_open_period());
             }
         }
-        let global_seconds = self
-            .current
-            .read()
+        let globals = self
+            .snapshot()
             .await
-            .as_ref()
-            .and_then(|snapshot| preference_f64(&snapshot.preferences, "cooldown_period"));
-        let channel_seconds = preference_f64(&provider.preferences, "cooldown_period")
-            .or(global_seconds)
-            .unwrap_or(0.0);
+            .map(|s| s.preferences.clone())
+            .unwrap_or_default();
+        let channel_seconds = cooldown_seconds(&provider.preferences, &globals, "cooldown_period");
         if has_alternative && channel_seconds > 0.0 {
             self.scheduling.channel_cooldowns.lock().await.insert(
                 (provider.name.to_string(), original_model.to_owned()),
@@ -151,9 +148,11 @@ impl GatewayRuntime {
             || lower_detail.contains("insufficient_quota")
             || lower_detail.contains("billing_hard_limit_reached");
         let key_seconds = if quota_failure {
-            preference_f64(&provider.preferences, "api_key_quota_cooldown_period")
-                .filter(|value| *value > 0.0)
-                .unwrap_or(6.0 * 60.0 * 60.0)
+            cooldown_seconds(
+                &provider.preferences,
+                &globals,
+                "api_key_quota_cooldown_period",
+            )
         } else if status == 429
             && [
                 "rate_limit_exceeded",
@@ -168,12 +167,14 @@ impl GatewayRuntime {
             .iter()
             .any(|marker| lower_detail.contains(marker))
         {
-            preference_f64(&provider.preferences, "api_key_rate_limit_cooldown_period")
-                .filter(|value| *value > 0.0)
-                .unwrap_or(30.0 * 60.0)
-                .max(retry_after_seconds(detail).unwrap_or(0.0))
+            cooldown_seconds(
+                &provider.preferences,
+                &globals,
+                "api_key_rate_limit_cooldown_period",
+            )
+            .max(retry_after_seconds(detail).unwrap_or(0.0))
         } else {
-            preference_f64(&provider.preferences, "api_key_cooldown_period").unwrap_or(0.0)
+            cooldown_seconds(&provider.preferences, &globals, "api_key_cooldown_period")
         };
         if key_seconds > 0.0 {
             self.scheduling.key_cooldowns.lock().await.insert(
@@ -374,4 +375,26 @@ pub(crate) struct SchedulingState {
     pub(crate) client_windows: Arc<Mutex<RateWindows>>,
     pub(crate) provider_windows: Arc<Mutex<RateWindows>>,
     pub(crate) routing_cursors: Arc<Mutex<HashMap<(String, String), usize>>>,
+}
+
+// Match channel-first inheritance and preserve the existing special zero
+// semantics for quota/rate-limit cooldowns.
+pub(crate) fn cooldown_seconds(
+    provider: &serde_json::Map<String, Value>,
+    global: &serde_json::Map<String, Value>,
+    key: &str,
+) -> f64 {
+    let fallback = match key {
+        "api_key_quota_cooldown_period" => 21600.0,
+        "api_key_rate_limit_cooldown_period" => 1800.0,
+        _ => 0.0,
+    };
+    let value = preference_f64(provider, key)
+        .or_else(|| preference_f64(global, key))
+        .unwrap_or(fallback);
+    if fallback > 0.0 && value <= 0.0 {
+        fallback
+    } else {
+        value
+    }
 }

@@ -29,7 +29,7 @@ pub(crate) struct ProviderSettings {
     pub compiled: Option<Arc<Provider>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Mutation {
     pub revision: String,
@@ -377,11 +377,12 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
 }
 
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"supported":true,"create_provider":true,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
+    json!({"version":1,"supported":true,"global_settings":true,"create_provider":true,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
 }
 
 pub(crate) fn valid_created_name(name: &str) -> bool {
     !name.is_empty()
+        && name != crate::control::global_settings::SCOPE
         && name.len() <= 100
         && name
             .chars()
@@ -755,6 +756,20 @@ impl GatewayRuntime {
             "Configuration unavailable".into(),
         ))?;
         let effective = state.overlay(base.clone());
+        if provider == crate::control::global_settings::SCOPE {
+            let mut raw = crate::control::global_settings::document(&base.preferences);
+            raw["provider"] = json!(provider);
+            let mut merged = crate::control::global_settings::document(&effective.preferences);
+            merged["provider"] = json!(provider);
+            let settings = state.settings.get(provider).cloned().unwrap_or_default();
+            let fields=crate::control::global_settings::KEYS.iter().map(|k| {
+                let v=merged["preferences"].get(*k).cloned().or_else(||crate::control::global_settings::default_value(k));
+                (format!("/preferences/{k}"),json!({"value":v,"inherited_value":crate::control::global_settings::default_value(k),"inherited_source":"default","source":if merged["preferences"].get(*k).is_some(){"global"}else{"default"},"can_inherit":true,"note":crate::control::global_settings::note(k)}))
+            }).collect::<serde_json::Map<_,_>>();
+            return Ok(
+                json!({"provider":provider,"kind":"global","revision":state.revision(&base),"base":raw,"effective":merged,"override_paths":settings.set.keys().chain(settings.remove.iter()).collect::<Vec<_>>(),"affected_keys":base.api_key_order.iter().map(|t|json!({"key_id":crate::routing::catalog::key_id(t),"models":[]})).collect::<Vec<_>>(),"available_keys":[],"global_preferences":{},"resolved_fields":fields,"schema":crate::control::global_settings::schema()}),
+            );
+        }
         let p = effective
             .providers_by_name
             .get(provider)
@@ -786,7 +801,7 @@ impl GatewayRuntime {
         });
         let conflict = compile(&merged, original).err();
         Ok(
-            json!({"provider":provider,"revision":state.revision(&base),"config_revision":base.revision.as_ref(),"kind":if state.temporary.contains_key(provider){"imported"}else{"configured"},"base":redact_at(&raw,""),"effective":redact_at(&merged,""),"override_paths":settings.set.keys().chain(settings.remove.iter()).collect::<Vec<_>>(),"affected_keys":affected(&effective,provider),"api_key_id":p.preferences.get("__temporary_key_id"),"schema":schema,"conflict":conflict,"available_keys":base.api_key_order.iter().enumerate().map(|(i,token)|json!({"key_id":crate::routing::catalog::key_id(token),"position":i+1})).collect::<Vec<_>>(),"global_preferences":redact_at(&json!({"preferences":base.preferences.as_ref()}),"")["preferences"]}),
+            json!({"provider":provider,"revision":state.revision(&base),"config_revision":base.revision.as_ref(),"kind":if state.temporary.contains_key(provider){"imported"}else{"configured"},"base":redact_at(&raw,""),"effective":redact_at(&merged,""),"override_paths":settings.set.keys().chain(settings.remove.iter()).collect::<Vec<_>>(),"affected_keys":affected(&effective,provider),"api_key_id":p.preferences.get("__temporary_key_id"),"schema":schema,"conflict":conflict,"available_keys":base.api_key_order.iter().enumerate().map(|(i,token)|json!({"key_id":crate::routing::catalog::key_id(token),"position":i+1})).collect::<Vec<_>>(),"global_preferences":redact_at(&json!({"preferences":effective.preferences.as_ref()}),"")["preferences"],"resolved_fields":crate::control::global_settings::field_values(&merged,&effective.preferences)}),
         )
     }
     pub(crate) async fn settings_providers(&self) -> Result<Value, Failure> {
@@ -920,6 +935,54 @@ impl GatewayRuntime {
         let mut previews = Vec::new();
         let mut seen = BTreeSet::new();
         for original_change in &input.changes {
+            if original_change.provider == crate::control::global_settings::SCOPE {
+                let c = original_change;
+                if !c.copy_to_key.is_empty()
+                    || !c.create_to_key.is_empty()
+                    || c.delete_copy
+                    || !seen.insert(c.provider.clone())
+                {
+                    return Err(bad("Invalid global settings operation"));
+                }
+                let requested = ProviderSettings {
+                    set: c.set.clone(),
+                    remove: c.remove.clone(),
+                    compiled: None,
+                };
+                crate::control::global_settings::validate_intent(&requested).map_err(bad)?;
+                let raw = crate::control::global_settings::document(&base.preferences);
+                let prior = state.settings.get(&c.provider).cloned().unwrap_or_default();
+                let before = merge(&raw, &prior.set, &prior.remove);
+                let after = merge(if c.reset { &raw } else { &before }, &c.set, &c.remove);
+                crate::control::global_settings::validate(&after).map_err(bad)?;
+                let mut next = ProviderSettings::default();
+                collect_diff(&raw, &after, "", &mut next);
+                if next.set.is_empty() && next.remove.is_empty() {
+                    candidate.settings.remove(&c.provider);
+                } else {
+                    candidate.settings.insert(c.provider.clone(), next);
+                }
+                let effective = candidate.overlay(base.clone());
+                let provider = input
+                    .sample
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .and_then(|name| effective.providers_by_name.get(name))
+                    .or_else(|| effective.providers.first());
+                let sample=provider.map(|p| {
+                    let model=input.sample.get("model").and_then(Value::as_str).filter(|m|!m.is_empty()).unwrap_or_else(||p.models.keys().next().map(String::as_str).unwrap_or(""));
+                    let upstream=p.models.get(model).map(String::as_str).unwrap_or(model);
+                    let endpoint=input.sample.get("endpoint").and_then(Value::as_str).unwrap_or("/v1/responses");
+                    let stream=input.sample.get("stream").and_then(Value::as_bool).unwrap_or(true);
+                    let timeouts=crate::routing::timeouts::resolve_timeouts(&effective,p,model,upstream,&p.engine,stream,input.sample.get("request_type").and_then(Value::as_str),"",endpoint,"POST");
+                    json!({"scope":"global","provider":p.name.as_ref(),"model":model,"endpoint":endpoint,"stream":stream,"timeouts":timeouts,"hedging":crate::control::global_settings::resolved_hedging(&effective.preferences)})
+                }).unwrap_or(json!({"scope":"global"}));
+                previews.push(
+                    json!({"provider":c.provider,"before":before,"after":after,"sample":sample}),
+                );
+                continue;
+            }
+
             if !original_change.create_to_key.is_empty() {
                 let name = &original_change.provider;
                 if !original_change.copy_to_key.is_empty()
@@ -1091,8 +1154,9 @@ impl GatewayRuntime {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            let preview_snapshot = candidate.overlay(base.clone());
             let timeout = crate::routing::timeouts::resolve_timeouts(
-                &base,
+                &preview_snapshot,
                 &compiled,
                 request_model,
                 upstream,
@@ -1139,8 +1203,18 @@ impl GatewayRuntime {
         let effective = candidate.overlay(base.clone());
         for p in &mut previews {
             let name = p["provider"].as_str().unwrap().to_owned();
-            p["previous_keys"] = json!(affected(&state.overlay(base.clone()), &name));
-            p["affected_keys"] = json!(affected(&effective, &name));
+            if name == crate::control::global_settings::SCOPE {
+                let keys = base
+                    .api_key_order
+                    .iter()
+                    .map(|t| json!({"key_id":crate::routing::catalog::key_id(t),"models":[]}))
+                    .collect::<Vec<_>>();
+                p["previous_keys"] = json!(keys);
+                p["affected_keys"] = json!(keys);
+            } else {
+                p["previous_keys"] = json!(affected(&state.overlay(base.clone()), &name));
+                p["affected_keys"] = json!(affected(&effective, &name));
+            }
         }
         let mut result = json!({"operation_id":input.operation_id,"status":if apply{"applied"}else{"validated"},"revision":if apply{candidate.revision(&base)}else{state.revision(&base)},"previews":previews,"settings_digest":digest(&candidate.settings)});
         result["intent"] = json!({"settings":candidate.settings,"temporary_definitions":candidate.settings_definitions(&base)});
@@ -1167,6 +1241,114 @@ mod tests {
     use axum::http::HeaderMap;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
+    #[tokio::test]
+    async fn global_preferences_are_atomic_inherited_and_restorable() {
+        use crate::control::global_settings::SCOPE;
+        let store = fixture().await;
+        let before = store.snapshot().await.unwrap();
+        let view = store.settings_view(SCOPE).await.unwrap();
+        assert_eq!(
+            view["resolved_fields"]["/preferences/model_timeout"]["value"],
+            100
+        );
+        let mutation:Mutation=serde_json::from_value(json!({"revision":view["revision"],"operation_id":"global","changes":[{"provider":SCOPE,"set":{
+            "/preferences/model_timeout":120,
+            "/preferences/cooldown_period":42,
+            "/preferences/api_key_cooldown_period":7,
+            "/preferences/hedging":{"enabled":true,"max_inflight_attempts":2,"winner_policy":"first_valid_success"},
+            "/preferences/timeout_policy":{"default":{"connect":4},"rules":[{"match":{"endpoint":"/v1/responses","stream":true},"timeout":{"first_byte":8,"idle":15}},{"match":{"endpoint":"/v1/responses","stream":false},"timeout":{"total":180}}]}
+        }}]})).unwrap();
+        let preview = store
+            .settings_change(mutation.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(preview["status"], "validated");
+        assert_eq!(
+            store.snapshot().await.unwrap().preferences,
+            before.preferences
+        );
+        let applied = store.settings_change(mutation.clone(), true).await.unwrap();
+        assert_eq!(
+            applied,
+            store.settings_change(mutation, true).await.unwrap()
+        );
+        let live = store.snapshot().await.unwrap();
+        assert!(crate::upstream::hedging::parse_hedging(&live.preferences).active());
+        assert_eq!(before.preferences.len(), 0);
+        let channel = store.settings_view("one").await.unwrap();
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/model_timeout"]["value"],
+            120
+        );
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/model_timeout"]["source"],
+            "global"
+        );
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/cooldown_period"]["value"],
+            30
+        );
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/cooldown_period"]["source"],
+            "channel"
+        );
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/api_key_cooldown_period"]["value"],
+            7
+        );
+        let mut inherit = change(channel["revision"].as_str().unwrap(), "inherit", json!({}));
+        inherit.changes[0].remove = vec!["/preferences/cooldown_period".into()];
+        store.settings_change(inherit, true).await.unwrap();
+        let channel = store.settings_view("one").await.unwrap();
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/cooldown_period"]["value"],
+            42
+        );
+        assert_eq!(
+            channel["resolved_fields"]["/preferences/cooldown_period"]["source"],
+            "global"
+        );
+        let snapshot = store.snapshot().await.unwrap();
+        let p = &snapshot.providers[0];
+        let timeouts = |stream, endpoint| {
+            crate::routing::timeouts::resolve_timeouts(
+                &snapshot, p, "public", "public", &p.engine, stream, None, "", endpoint, "POST",
+            )
+        };
+        assert_eq!(timeouts(true, "/v1/responses").first_byte, Some(8.0));
+        assert_eq!(timeouts(false, "/v1/responses").first_byte, Some(180.0));
+        assert_eq!(timeouts(true, "/v1/messages").first_byte, Some(120.0));
+        assert_eq!(
+            crate::runtime::scheduling::cooldown_seconds(
+                &p.preferences,
+                &snapshot.preferences,
+                "api_key_cooldown_period"
+            ),
+            7.0
+        );
+        let exported = store.settings_export().await.unwrap();
+        let restored = fixture().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer admin-token".parse().unwrap());
+        let revision = restored.controls_view(&headers).await.unwrap()["revision"].clone();
+        restored.restore_controls(&headers,serde_json::from_value(json!({"revision":revision,"snapshot":{"version":2,"rules":[],"temporary_channels":[],"channel_settings":exported["channel_settings"]}})).unwrap()).await.unwrap();
+        assert_eq!(
+            restored.snapshot().await.unwrap().preferences,
+            snapshot.preferences
+        );
+        assert_eq!(
+            restored.settings_view("one").await.unwrap()["resolved_fields"],
+            channel["resolved_fields"]
+        );
+        let rev = store.settings_view(SCOPE).await.unwrap()["revision"].clone();
+        let invalid:Mutation=serde_json::from_value(json!({"revision":rev,"operation_id":"invalid-global","changes":[{"provider":SCOPE,"set":{"/preferences/hedging":{"enabled":true,"max_inflight_attempts":99}}}]})).unwrap();
+        assert!(store.settings_change(invalid, true).await.is_err());
+        assert_eq!(
+            store.snapshot().await.unwrap().preferences,
+            snapshot.preferences
+        );
+        assert!(!valid_created_name(SCOPE));
+    }
     #[tokio::test]
     async fn large_channel_and_rule_snapshot_restores_atomically() {
         let store = fixture().await;

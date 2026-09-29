@@ -1,4 +1,5 @@
 pub(crate) mod channels;
+pub(crate) mod global_settings;
 pub(crate) mod settings;
 
 // Authenticated configuration has no fixed byte quota by default. Operators

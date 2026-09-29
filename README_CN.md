@@ -1134,6 +1134,10 @@ providers:
 
 - 如何开启请求的延迟对冲？
 
+uni-api-web 的“设置 → 来源 → 全局设置”可热更新 `model_timeout`、`timeout_policy`、`keepalive_interval`、四类冷却以及 `hedging`。渠道设置接口通过 `resolved_fields` 返回继承值、来源和运行时默认说明；删除渠道字段表示继承来源的全局设置，和恢复 YAML 基础值是不同操作。密钥冷却也按渠道 → 全局 → 运行时默认值解析；限流冷却和额度冷却保持原有的 0 回退语义，分别使用 1800 和 21600 秒。`AUTO_RETRY` 由调用方 API key 控制，渠道同名字段不生效。
+
+全局修改使用现有渠道设置预览、原子应用和加密保留机制，保存在 `channel_settings.__uni_console_global_preferences__` 保留作用域中；它不会成为可路由渠道，也不会重写基础配置文件。启用控制台“保留临时配置”后，来源重启前会先恢复全局和渠道设置，验证失败时新实例不接流量。不要将带有该保留作用域的快照回滚到不支持全局设置的旧版网关。
+
 `hedging` 是全局 `preferences` 下的请求编排策略，适用于 Rust Responses 原生流式数据面和 `/v1/chat/completions` 非流式 generic 数据面。它不会改变 `timeout_policy` 的配置来源：Responses 流式 attempt 在有效 `first_byte` 到期且仍未产生有效输出时触发下一个渠道；非流式 Chat Completions attempt 在等待上游响应头达到有效 `first_byte` 时触发下一个渠道。触发后原 attempt 继续运行，任一 attempt 先产生有效成功结果就作为赢家，其他未完成 attempt 会被取消。`write`、`pool` 仍是请求发送阶段的硬截止，`total` 仍限制整个 attempt；`total` 从该 attempt 发起时开始计算，不会改成整个客户端请求的共享总时限。
 
 ```yaml
