@@ -100,6 +100,13 @@ def main():
                     except OSError: pass
                     time.sleep(.05)
                 for provider, _ in variants:
+                    # This endpoint is a current-minute live gauge, not a
+                    # rolling history query. Keep this sub-second six-request
+                    # fixture within one bucket; immutable facts below still
+                    # verify every request regardless of wall-clock time.
+                    minute_offset = time.time() % 60
+                    if minute_offset > 55:
+                        time.sleep(60 - minute_offset + .01)
                     for case in cases:
                         status, raw = call("POST", "/v1/responses", {"model": "gpt-6-astra", "input": case, "stream": True}, provider, provider + "-" + case)
                         assert status == 200, (provider, case, status, raw)
