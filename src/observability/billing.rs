@@ -18,6 +18,9 @@ struct Receipt {
     ids: Vec<String>,
     status: u16,
     error_sha256: String,
+    error_fields: Value,
+    secret: String,
+    headers_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -54,12 +57,14 @@ impl BillingAttempt {
             r.base = billing_base(url);
             if !secret.is_empty() {
                 r.key_hash = hex::encode(Sha256::digest(secret.as_bytes()));
+                r.secret = secret.to_owned();
             }
         }
     }
     pub(crate) fn headers(&self, headers: &HeaderMap, status: u16, secret: &str) {
         if let Ok(mut r) = self.receipt.lock() {
             r.status = status;
+            r.headers_ms = Some(now_ms());
             // Preserve typed receipt candidates. The console selects the
             // namespace matching the bound site adapter, never both bills.
             r.ids.clear();
@@ -78,6 +83,8 @@ impl BillingAttempt {
             if let Ok(mut r) = self.receipt.lock() {
                 if r.status == status {
                     r.error_sha256 = hex::encode(Sha256::digest(body));
+                    r.error_fields =
+                        crate::observability::request_trace::error_fields(body, &[&r.secret]);
                 }
             }
         }
@@ -99,6 +106,7 @@ impl BillingAttempt {
         event["billing_request_ids"] = json!(r.ids);
         event["status"] = json!(r.status);
         event["upstream_error_sha256"] = json!(r.error_sha256);
+        event["trace_detail"] = json!({"headers_at_ms":r.headers_ms,"error":r.error_fields});
         event.as_object_mut()?.remove("dispatch_ms");
         Some(event)
     }
@@ -295,7 +303,11 @@ mod tests {
             e["upstream_error_sha256"],
             "7650844e093da022f530f60d448c6e401ca17d5efd97d38978acf34e43cdcb71"
         );
-        assert!(!e.to_string().contains("INSUFFICIENT_BALANCE"));
+        assert_eq!(
+            e["trace_detail"]["error"]["error_code"],
+            "INSUFFICIENT_BALANCE"
+        );
+        assert!(e.get("body").is_none());
         let b = attempt();
         b.start();
         b.headers(&h, 200, "secret");

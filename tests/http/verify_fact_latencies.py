@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='uni-latency-repro-') as path:
    for name,_ in providers:
     status,body=call('POST','/v1/responses',{'model':'m','input':'fixture','stream':True},name);assert status==200;assert b'response.output_text.delta' in body
    deadline=time.monotonic()+8
-   while time.monotonic()<deadline and len(facts)<9:time.sleep(.1)
+   while time.monotonic()<deadline and sum(f['kind']=='request' for f in facts)<3:time.sleep(.1)
    for measurement in measurements:
     name=measurement['provider'];attempt=next(f for f in facts if f['kind']=='attempt'and f['provider']==name);dispatch=next(f for f in facts if f['kind']=='dispatch'and f['provider']==name)
     assert attempt.get('first_output_ms') is not None and attempt['first_output_ms'] >= measurement['send_to_first_text_ms'] - 25

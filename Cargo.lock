@@ -1643,6 +1643,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "http-body",
  "hyper-rustls",
  "hyper-util",
  "libc",

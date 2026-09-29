@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub(crate) fn emit(event: Value) {
+    crate::observability::request_trace::record_log(&event);
     eprintln!("{}", event);
     let Ok(endpoint) = std::env::var("FUGUE_OBSERVABILITY_ENDPOINT") else {
         return;

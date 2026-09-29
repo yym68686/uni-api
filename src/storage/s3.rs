@@ -357,7 +357,7 @@ pub fn dispatch_event(
     json!({"schema":1,"kind":"dispatch","key_id":key_id,"event_id":new_event_id("dispatch"),"instance_id":instance_id(),"at_ms":now_ms(),"request_id":request_id,"attempt_id":attempt_id,"provider":key.provider,"model":key.model,"upstream_model":key.upstream_model,"endpoint":key.endpoint,"stream":key.stream,"dispatch_ms":elapsed_ms})
 }
 
-fn instance_id() -> String {
+pub(crate) fn instance_id() -> String {
     static INSTANCE: OnceLock<String> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
@@ -369,7 +369,7 @@ fn instance_id() -> String {
 
 // Generate once when creating the fact. Retries replay the serialized value;
 // caller request IDs may repeat and must never be storage uniqueness keys.
-fn new_event_id(kind: &str) -> String {
+pub(crate) fn new_event_id(kind: &str) -> String {
     static PROCESS: OnceLock<String> = OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let process = PROCESS.get_or_init(|| {

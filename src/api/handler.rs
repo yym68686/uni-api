@@ -31,8 +31,27 @@ pub async fn handler(State(state): State<AppState>, mut request: Request) -> Res
     if let Some(response) = cors.preflight_response(request.method(), request.headers()) {
         return response;
     }
+    let trace = if crate::api::gateway::supports(
+        request.method(),
+        request.uri().path().trim_end_matches('/'),
+    ) {
+        let id = crate::observability::context::request_id(request.headers());
+        if let Ok(value) = HeaderValue::from_str(&id) {
+            request.headers_mut().insert("x-request-id", value);
+        }
+        Some(crate::observability::request_trace::RequestTrace::new(
+            id,
+            request.headers(),
+            request.uri().path(),
+        ))
+    } else {
+        None
+    };
     let mut response = handler_inner(state, request).await;
     cors.apply(&mut response);
+    if let Some(trace) = trace {
+        response = trace.response(response);
+    }
     response
 }
 
@@ -648,25 +667,22 @@ fn log_spool_observation(headers: &HeaderMap, status: StatusCode, observation: &
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split('-').nth(1))
         .unwrap_or(request_id);
-    eprintln!(
-        "{}",
-        serde_json::json!({
-            "event_type": "rust_request_spool",
-            "request_id": request_id,
-            "trace_id": trace_id,
-            "status_code": status.as_u16(),
-            "body_bytes": observation.body_bytes,
-            "memory_peak_bytes": observation.memory_peak_bytes,
-            "local_disk_bytes": observation.local_disk_bytes,
-            "local_free_bytes_at_start": observation.local_free_bytes_at_start,
-            "local_writable_bytes_at_start": observation.local_writable_bytes_at_start,
-            "local_free_inodes_at_start": observation.local_free_inodes_at_start,
-            "local_writable_inodes_at_start": observation.local_writable_inodes_at_start,
-            "resource_wait_ms": observation.resource_wait_ms,
-            "final_tier": observation.final_tier,
-            "failure_resource": observation.failure_resource,
-        })
-    );
+    crate::observability::request_trace::log(serde_json::json!({
+        "event_type": "rust_request_spool",
+        "request_id": request_id,
+        "trace_id": trace_id,
+        "status_code": status.as_u16(),
+        "body_bytes": observation.body_bytes,
+        "memory_peak_bytes": observation.memory_peak_bytes,
+        "local_disk_bytes": observation.local_disk_bytes,
+        "local_free_bytes_at_start": observation.local_free_bytes_at_start,
+        "local_writable_bytes_at_start": observation.local_writable_bytes_at_start,
+        "local_free_inodes_at_start": observation.local_free_inodes_at_start,
+        "local_writable_inodes_at_start": observation.local_writable_inodes_at_start,
+        "resource_wait_ms": observation.resource_wait_ms,
+        "final_tier": observation.final_tier,
+        "failure_resource": observation.failure_resource,
+    }));
 }
 
 fn duration_ms(duration: Duration) -> u64 {

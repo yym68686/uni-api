@@ -282,7 +282,7 @@ impl ResponsesRoute {
         } else {
             "heartbeat_items_converted"
         }] = json!(changed);
-        eprintln!("{log}");
+        crate::observability::request_trace::log(log);
         self.pending_history_repair = Some(plan);
         true
     }
@@ -709,37 +709,34 @@ impl ResponsesRoute {
                 "skip_reason": event.skip_reason,
             }));
         }
-        eprintln!(
-            "{}",
-            json!({
-                "kind": "log",
-                "fugue_table": "app_events",
-                "event": "routing_attempt",
-                "event_type": "routing_attempt",
-                "severity": event_severity(status, event.outcome),
-                "source": "uni-api-ember",
-                "message": "uni-api-ember native routing attempt",
-                "request_id": self.request_id,
-                "trace_id": self.request_id,
-                "path": "/v1/responses",
-                "path_template": "/v1/responses",
-                "route": "POST /v1/responses",
-                "method": "POST",
-                "model": self.request_model,
-                "provider": event.provider.name.to_string(),
-                "channel": event.provider.name.to_string(),
-                "role": self.api_key.role.as_ref(),
-                "actual_model": event.original_model,
-                "attempt_id": event.attempt_id,
-                "attempt_index": event.attempt_number.saturating_add(1),
-                "attempt_outcome": event.outcome,
-                "attempt_status_code": if status == 0 { None } else { Some(status) },
-                "skip_reason": event.skip_reason,
-                "streaming": self.stream,
-                "snapshot_revision": self.snapshot.revision.to_string(),
-                "rust_responses_data_plane": true,
-            })
-        );
+        crate::observability::request_trace::log(json!({
+            "kind": "log",
+            "fugue_table": "app_events",
+            "event": "routing_attempt",
+            "event_type": "routing_attempt",
+            "severity": event_severity(status, event.outcome),
+            "source": "uni-api-ember",
+            "message": "uni-api-ember native routing attempt",
+            "request_id": self.request_id,
+            "trace_id": self.request_id,
+            "path": "/v1/responses",
+            "path_template": "/v1/responses",
+            "route": "POST /v1/responses",
+            "method": "POST",
+            "model": self.request_model,
+            "provider": event.provider.name.to_string(),
+            "channel": event.provider.name.to_string(),
+            "role": self.api_key.role.as_ref(),
+            "actual_model": event.original_model,
+            "attempt_id": event.attempt_id,
+            "attempt_index": event.attempt_number.saturating_add(1),
+            "attempt_outcome": event.outcome,
+            "attempt_status_code": if status == 0 { None } else { Some(status) },
+            "skip_reason": event.skip_reason,
+            "streaming": self.stream,
+            "snapshot_revision": self.snapshot.revision.to_string(),
+            "rust_responses_data_plane": true,
+        }));
     }
 
     pub(crate) fn emit_upstream_attempt(
@@ -805,47 +802,45 @@ impl ResponsesRoute {
                 "first_text_ms": outcome.get("first_text_ms"),
             }));
         }
-        eprintln!(
-            "{}",
-            json!({
-                "kind": "log",
-                "fugue_table": "app_events",
-                "event": "upstream_attempt",
-                "event_type": "upstream_attempt",
-                "severity": event_severity(status, if success { "succeeded" } else { "failed" }),
-                "source": "uni-api-ember",
-                "message": "uni-api-ember native upstream attempt",
-                "request_id": attempt.request_id,
-                "trace_id": attempt.request_id,
-                "path": "/v1/responses",
-                "path_template": "/v1/responses",
-                "route": "POST /v1/responses",
-                "method": "POST",
-                "model": attempt.request_model,
-                "provider": attempt.provider,
-                "channel": attempt.provider,
-                "role": self.api_key.role.as_ref(),
-                "actual_model": attempt.actual_model,
-                "attempt_id": attempt.attempt_id,
-                "attempt_index": attempt.attempt_index,
-                "attempt_status_code": status,
-                "attempt_status_class": status_class(status),
-                "semantic_status_code": outcome.get("status_code").and_then(Value::as_u64),
-                "attempt_success": success,
-                "attempt_outcome": attempt_outcome,
-                "provider_model_unavailable": provider_model_unavailable,
-                "status_origin": failure_origin(outcome),
-                "error_sha256": error_sha256,
-                "duration_ms": duration_ms,
-                "transport_timing": outcome.get("transport_timing"),
-                "response_created_ms": outcome.get("response_created_ms"),
-                "first_text_ms": outcome.get("first_text_ms"),
-                "upstream_host": attempt.upstream_host,
-                "streaming": attempt.stream,
-                "snapshot_revision": attempt.snapshot_revision,
-                "rust_responses_data_plane": true,
-            })
-        );
+        crate::observability::request_trace::log(json!({
+            "kind": "log",
+            "fugue_table": "app_events",
+            "event": "upstream_attempt",
+            "event_type": "upstream_attempt",
+            "severity": event_severity(status, if success { "succeeded" } else { "failed" }),
+            "source": "uni-api-ember",
+            "message": "uni-api-ember native upstream attempt",
+            "request_id": attempt.request_id,
+            "trace_id": attempt.request_id,
+            "path": "/v1/responses",
+            "path_template": "/v1/responses",
+            "route": "POST /v1/responses",
+            "method": "POST",
+            "model": attempt.request_model,
+            "provider": attempt.provider,
+            "channel": attempt.provider,
+            "role": self.api_key.role.as_ref(),
+            "actual_model": attempt.actual_model,
+            "attempt_id": attempt.attempt_id,
+            "attempt_index": attempt.attempt_index,
+            "attempt_status_code": status,
+            "attempt_status_class": status_class(status),
+            "semantic_status_code": outcome.get("status_code").and_then(Value::as_u64),
+            "attempt_success": success,
+            "attempt_outcome": attempt_outcome,
+            "provider_model_unavailable": provider_model_unavailable,
+            "status_origin": failure_origin(outcome),
+            "error": crate::observability::request_trace::error_fields(detail.as_bytes(), &[self.last_provider_key.as_deref().unwrap_or_default(), self.api_key.token.as_ref()]),
+            "error_sha256": error_sha256,
+            "duration_ms": duration_ms,
+            "transport_timing": outcome.get("transport_timing"),
+            "response_created_ms": outcome.get("response_created_ms"),
+            "first_text_ms": outcome.get("first_text_ms"),
+            "upstream_host": attempt.upstream_host,
+            "streaming": attempt.stream,
+            "snapshot_revision": attempt.snapshot_revision,
+            "rust_responses_data_plane": true,
+        }));
     }
 
     pub(crate) fn emit_final_event(&mut self, status: u16, kind: &str, outcome: &Value) {
