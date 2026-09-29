@@ -215,8 +215,8 @@ def verify(binary, hedging):
                         if label == "later-unrelated-400":
                             success, expected_status = False, 400
                         if label == "exhausted":
-                            # Three providers + configured key budget (capped 10), plus one repair.
-                            expected = ["first", "first"] + ["fallback", "third", "first"] * 4
+                            # Three providers + automatic key budget (capped 10), including repair.
+                            expected = (["first", "first"] + ["fallback", "third", "first"] * 4)[:13]
                             success, expected_status = False, 404
                         context = (hedging, stream, label, status, raw[:500], server.hits)
                         assert status == expected_status, context

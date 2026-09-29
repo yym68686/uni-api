@@ -1,6 +1,7 @@
 use crate::config::snapshot::ApiKey;
 use crate::config::snapshot::Provider;
 use crate::routing::filters::provider_accepts_endpoint;
+use crate::routing::retry::RetryPolicy;
 use crate::routing::timeouts::model_preference;
 use crate::routing::timeouts::model_timeout;
 use crate::routing::timeouts::resolve_timeouts;
@@ -9,7 +10,6 @@ use crate::routing::types::AuthContext;
 use crate::routing::types::RouteResolutionError;
 use crate::runtime::state::GatewayRuntime;
 use crate::storage::database::Persistence;
-use crate::upstream::responses::prepare::pydantic_bool;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -269,34 +269,14 @@ impl GatewayRuntime {
             .then(|| Duration::from_secs_f64(interval))
     }
 
-    pub(crate) async fn auto_retry_enabled(&self, headers: &HeaderMap) -> bool {
-        self.auto_retry_budget(headers).await > 0
-    }
-
-    pub(crate) async fn auto_retry_budget(&self, headers: &HeaderMap) -> usize {
+    pub(crate) async fn retry_policy(&self, headers: &HeaderMap) -> RetryPolicy {
         let Some(snapshot) = self.snapshot().await else {
-            return 1;
+            return RetryPolicy::default();
         };
-        let Some(token) = extract_api_key(headers) else {
-            return 1;
-        };
-        let Some(value) = snapshot
-            .api_keys
-            .get(&token)
-            .and_then(|key| key.preferences.get("AUTO_RETRY"))
-        else {
-            return 1;
-        };
-        match value {
-            Value::Bool(enabled) => usize::from(*enabled),
-            Value::Number(number) => number.as_u64().unwrap_or(0).min(100) as usize,
-            Value::String(text) => text
-                .trim()
-                .parse::<usize>()
-                .unwrap_or_else(|_| usize::from(pydantic_bool(value).unwrap_or(true)))
-                .min(100),
-            _ => 1,
-        }
+        let value = extract_api_key(headers)
+            .and_then(|token| snapshot.api_keys.get(&token))
+            .and_then(|key| key.preferences.get("AUTO_RETRY"));
+        RetryPolicy::from_value(value)
     }
 
     #[allow(clippy::too_many_arguments)]

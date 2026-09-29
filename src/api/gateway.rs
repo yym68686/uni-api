@@ -4,7 +4,6 @@ use crate::providers::request::ALPHA_SEARCH_ENDPOINT;
 use crate::providers::types::PreparedInput;
 use crate::providers::video::video_task_route_for_path;
 use crate::routing::access::extract_api_key;
-use crate::routing::planner::compute_retry_count;
 use crate::runtime::context::AppState;
 use crate::runtime::scheduling::ProviderKeySelection;
 use crate::transport::http::json_error;
@@ -176,18 +175,17 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             );
         }
     }
-    let retry_budget = state.runtime.auto_retry_budget(&headers).await;
-    let max_attempts = if headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER)
-        || retry_budget == 0
-    {
-        1
+    let retry_policy = state.runtime.retry_policy(&headers).await;
+    let max_attempts = retry_policy.max_attempts(
+        &resolved.providers,
+        headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
+    );
+    let hedging = if max_attempts > 1 {
+        resolved.hedging
     } else {
-        compute_retry_count(&resolved.providers)
-            .max(resolved.providers.len().saturating_add(retry_budget))
-            .min(100)
+        Default::default()
     };
-    let hedging = resolved.hedging;
-    let auto_retry = state.runtime.auto_retry_enabled(&headers).await;
+    let auto_retry = retry_policy.enabled();
     let (input, image_reservations) = match prepare_image_inputs(&state, input).await {
         Ok(prepared) => prepared,
         Err((status, detail)) => return json_error(status, &detail),

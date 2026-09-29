@@ -3,11 +3,10 @@ use crate::providers::codex::oauth::CodexOAuthManager;
 use crate::routing::access::extract_api_key;
 use crate::routing::filters::detect_request_type;
 use crate::routing::filters::request_reasoning_effort;
-use crate::routing::planner::api_key_retry_budget;
-use crate::routing::planner::compute_retry_count;
 use crate::routing::planner::diagnostic_key;
 use crate::routing::planner::matching_providers;
 use crate::routing::planner::TARGET_PROVIDER_HEADER;
+use crate::routing::retry::RetryPolicy;
 use crate::runtime::resources::MemoryReservation;
 use crate::runtime::scheduling::parse_rate_limits;
 use crate::runtime::scheduling::tpr_exceeded;
@@ -389,13 +388,8 @@ pub async fn prepare_request(
         ));
     }
     let targeted = parts.headers.contains_key(TARGET_PROVIDER_HEADER);
-    let retry_count = if targeted {
-        1
-    } else {
-        compute_retry_count(&providers)
-            .max(api_key_retry_budget(&api_key, providers.len()))
-            .min(100)
-    };
+    let retry_policy = RetryPolicy::from_value(api_key.preferences.get("AUTO_RETRY"));
+    let max_attempts = retry_policy.max_attempts(&providers, targeted);
     ResponsesPreparation::Ready(ResponsesRoute {
         store: store.clone(),
         codex_oauth,
@@ -413,8 +407,8 @@ pub async fn prepare_request(
         request_id,
         request_body_bytes: observation.body_bytes,
         cursor: 0,
-        max_attempts: retry_count,
-        hedging: if targeted {
+        max_attempts,
+        hedging: if targeted || max_attempts == 1 {
             HedgingConfig::default()
         } else {
             parse_hedging(&snapshot.preferences)

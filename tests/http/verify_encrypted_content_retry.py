@@ -197,7 +197,7 @@ def verify(binary, hedging):
                         if label.startswith("repair-then-") or label == "later-unrelated-400": expected += ["fallback"]
                         if label == "later-unrelated-400": expected_status = 400
                         if label == "repeat-error": expected += ["fallback", "third"]
-                        if label == "exhausted": expected, expected_status = ["first", "first"] + ["fallback", "third", "first"] * 4, 400
+                        if label == "exhausted": expected, expected_status = (["first", "first"] + ["fallback", "third", "first"] * 4)[:13], 400
                         if label == "hedge-race": expected = ["first", "fallback", "first"]
                         if other: expected, expected_status = ["first", "first"], 400
                         if label in ("empty-first", "missing-first"): expected += ["fallback"]

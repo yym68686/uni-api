@@ -192,8 +192,8 @@ def verify(binary, hedging):
                                     ["first", "first"])
                         success = not no_repair or label in ("already-success", "postcommit")
                         if label == "exhausted":
-                            # Three providers + configured key budget (capped 10), plus one repair.
-                            expected = ["first", "first"] + ["fallback", "third", "first"] * 4
+                            # Three providers + automatic key budget (capped 10), including repair.
+                            expected = (["first", "first"] + ["fallback", "third", "first"] * 4)[:13]
                             success = False
                         context = (hedging, stream, label, status, raw[:500], server.hits)
                         assert status == (200 if success else 400), context

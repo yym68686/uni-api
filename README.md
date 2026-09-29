@@ -271,7 +271,7 @@ api_keys:
       SCHEDULING_ALGORITHM: fixed_priority # When SCHEDULING_ALGORITHM is fixed_priority, use fixed priority scheduling, always execute the channel of the first model with a request. Default is enabled, SCHEDULING_ALGORITHM default value is fixed_priority. SCHEDULING_ALGORITHM optional values are: fixed_priority, round_robin, weighted_round_robin, lottery, random.
       # When SCHEDULING_ALGORITHM is random, use random polling load balancing, randomly request the channel of the model with a request.
       # When SCHEDULING_ALGORITHM is round_robin, use polling load balancing, request the channel of the model used by the user in order.
-      AUTO_RETRY: true # Whether to automatically retry, automatically retry the next provider, true for automatic retry, false for no automatic retry, default is true. Also supports setting a number, indicating the number of retries.
+      AUTO_RETRY: true # Caller-key retry policy: true (default) selects an automatic budget; false or 0 disables retries. Integer N allows at most N retries after the first attempt, with an overall ceiling of 100 attempts. Hedged requests and input-repair resends share this budget. Numeric/boolean strings are supported; invalid values disable retries. Only api_keys[].preferences controls this policy.
       rate_limit: 15/min # Supports rate limiting, each API Key can request up to 15 times per minute, optional. The default is 999999/min. Supports multiple frequency constraints: 15/min,10/day
       # rate_limit: # You can set different frequency limits for each model
       #   gemini-2.5-flash: 10/min,500/day

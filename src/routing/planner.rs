@@ -592,34 +592,3 @@ pub(crate) fn xorshift(mut value: u64) -> u64 {
     value ^= value >> 7;
     value ^ (value << 17)
 }
-
-pub(crate) fn api_key_retry_budget(api_key: &ApiKey, provider_count: usize) -> usize {
-    let configured = api_key
-        .preferences
-        .get("AUTO_RETRY")
-        .map(|value| match value {
-            Value::Bool(enabled) => usize::from(*enabled),
-            Value::Number(number) => number.as_u64().unwrap_or(0) as usize,
-            Value::String(text) => text.trim().parse::<usize>().unwrap_or(1),
-            _ => 1,
-        })
-        .unwrap_or(1);
-    provider_count.saturating_add(configured)
-}
-
-pub(crate) fn compute_retry_count(providers: &[Arc<Provider>]) -> usize {
-    if providers.is_empty() {
-        return 0;
-    }
-    let retry = if providers.len() == 1 && providers[0].api_keys.len() > 1 {
-        providers[0].api_keys.len()
-    } else {
-        providers
-            .iter()
-            .map(|provider| provider.api_keys.len())
-            .sum::<usize>()
-            .saturating_mul(2)
-            .min(10)
-    };
-    providers.len().saturating_add(retry)
-}

@@ -271,7 +271,7 @@ api_keys:
       SCHEDULING_ALGORITHM: fixed_priority # 当 SCHEDULING_ALGORITHM 为 fixed_priority 时，使用固定优先级调度，永远执行第一个拥有请求的模型的渠道。默认开启，SCHEDULING_ALGORITHM 缺省值为 fixed_priority。SCHEDULING_ALGORITHM 可选值有：fixed_priority，round_robin，weighted_round_robin, lottery, random。
       # 当 SCHEDULING_ALGORITHM 为 random 时，使用随机轮训负载均衡，随机请求拥有请求的模型的渠道。
       # 当 SCHEDULING_ALGORITHM 为 round_robin 时，使用轮训负载均衡，按照顺序请求用户使用的模型的渠道。
-      AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true。也可以设置为数字，表示重试次数。
+      AUTO_RETRY: true # 调用方密钥重试策略：true（默认）使用自动预算；false 或 0 禁用重试。整数 N 表示首次请求后最多重试 N 次，总尝试次数仍不超过 100。并发备用请求和输入修复重发共用此预算。支持数字/布尔字符串，无效值禁用重试。仅 api_keys[].preferences 下的配置生效。
       rate_limit: 15/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认999999/min，选填。支持多个频率约束条件：15/min,10/day
       # rate_limit: # 可以为每个模型设置不同的频率限制
       #   gemini-2.5-flash: 10/min,500/day

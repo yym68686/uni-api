@@ -11,6 +11,7 @@ use crate::routing::access::model_prices;
 use crate::routing::access::preference_string;
 use crate::routing::failure::classify_provider_failure;
 use crate::routing::planner::TARGET_PROVIDER_HEADER;
+use crate::routing::retry::RetryPolicy;
 use crate::routing::timeouts::resolve_timeouts;
 use crate::routing::types::FailedRoute;
 use crate::runtime::resources::MemoryReservation;
@@ -160,6 +161,7 @@ impl ResponsesRoute {
         self.set_current_plan(&plan);
         let retryable = self.record_failure(outcome).await;
         if !self.auto_retry()
+            || !self.has_attempts_remaining()
             || self.request_headers.contains_key(TARGET_PROVIDER_HEADER)
             || self.endpoint != "/v1/responses"
         {
@@ -307,7 +309,7 @@ impl ResponsesRoute {
     }
 
     pub fn has_attempts_remaining(&self) -> bool {
-        self.cursor < self.max_attempts
+        self.cursor < self.max_attempts && self.upstream_attempts < self.max_attempts
     }
 
     pub async fn next_plan(&mut self) -> Result<Option<Plan>, String> {
@@ -315,7 +317,7 @@ impl ResponsesRoute {
             self.set_current_plan(&plan);
             return Ok(Some(plan));
         }
-        while self.cursor < self.max_attempts {
+        while self.has_attempts_remaining() {
             let attempt_number = self.routing_attempts;
             let provider = self.providers[self.cursor % self.providers.len()].clone();
             self.cursor += 1;
@@ -984,16 +986,7 @@ impl ResponsesRoute {
     }
 
     pub(crate) fn auto_retry(&self) -> bool {
-        self.api_key
-            .preferences
-            .get("AUTO_RETRY")
-            .map(|value| match value {
-                Value::Bool(enabled) => *enabled,
-                Value::Number(number) => number.as_u64().unwrap_or(0) > 0,
-                Value::String(text) => text.trim().parse::<usize>().map(|n| n > 0).unwrap_or(true),
-                _ => true,
-            })
-            .unwrap_or(true)
+        RetryPolicy::from_value(self.api_key.preferences.get("AUTO_RETRY")).enabled()
     }
 
     pub(crate) fn record_current_channel(&self, success: bool, outcome: &Value) {
