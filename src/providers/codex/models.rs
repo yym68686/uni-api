@@ -105,7 +105,28 @@ fn catalog(models: &[String]) -> Value {
         }
         cards.push(card);
     }
-    json!({"models": cards})
+    let mut catalog = json!({"models": cards});
+    let mut size = serde_json::to_vec(&catalog).unwrap().len();
+    // A growing route list can exceed the client limit again. Only remove a
+    // legacy prompt's exact duplicate, never structured behavior or variables.
+    for card in catalog["models"].as_array_mut().unwrap() {
+        if size < 1024 * 1024 {
+            break;
+        }
+        let duplicate = card["model_messages"].as_object().is_some_and(|messages| {
+            card["base_instructions"].is_string()
+                && messages.get("instructions_template") == Some(&card["base_instructions"])
+                && messages
+                    .iter()
+                    .all(|(field, value)| field == "instructions_template" || value.is_null())
+        });
+        if duplicate {
+            let before = serde_json::to_vec(card).unwrap().len();
+            card.as_object_mut().unwrap().remove("model_messages");
+            size -= before - serde_json::to_vec(card).unwrap().len();
+        }
+    }
+    catalog
 }
 
 pub(crate) fn response(models: &[String], headers: &HeaderMap) -> Response<Body> {
@@ -273,6 +294,52 @@ mod tests {
             .unwrap();
         assert!(custom.get("model_messages").is_none());
         assert!(custom["base_instructions"].as_str().is_some());
+    }
+
+    #[test]
+    fn growing_catalog_removes_only_exact_prompt_duplicates_when_over_limit() {
+        let known = templates()
+            .iter()
+            .filter(|model| {
+                model["slug"] != "gpt-reserve" && model["slug"] != "gpt-5.3-codex-spark"
+            })
+            .collect::<Vec<_>>();
+        let mut models = known
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        models.extend((0..34).map(|index| format!("custom-model-{index}")));
+        let value = catalog(&models);
+        let body = serde_json::to_vec(&value).unwrap();
+        let cards = value["models"].as_array().unwrap();
+        assert_eq!(cards.len(), 42);
+        assert!(body.len() < 1024 * 1024, "catalog is {} bytes", body.len());
+        let mut removed = 0;
+        for original in known {
+            let card = cards
+                .iter()
+                .find(|m| m["slug"] == original["slug"])
+                .unwrap();
+            let mut expected = original.clone();
+            if card.get("model_messages").is_none() {
+                removed += 1;
+                let messages = expected
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("model_messages")
+                    .unwrap();
+                assert_eq!(messages["instructions_template"], card["base_instructions"]);
+                for (field, value) in messages.as_object().unwrap() {
+                    assert!(field == "instructions_template" || value.is_null());
+                }
+            }
+            assert_eq!(card, &expected);
+        }
+        assert!(removed > 0, "fixture must exercise size compaction");
+        let astra = cards.iter().find(|m| m["slug"] == "gpt-6-astra").unwrap();
+        assert_eq!(astra["context_window"], 600000);
+        assert_eq!(astra["max_context_window"], 872000);
+        assert!(astra.get("model_messages").is_some());
     }
 
     #[tokio::test]
