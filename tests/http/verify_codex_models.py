@@ -125,16 +125,26 @@ def verify(binary):
                     assert raw == baseline and headers["etag"] == baseline_etag, version
                 cards = {model["slug"]: model for model in json.loads(baseline)["models"]}
                 assert set(cards) == expected, (set(cards), expected)
+                assert len(baseline) < 1024 * 1024, len(baseline)
                 for slug in expected & known.keys():
                     assert cards[slug] == known[slug], slug
                 assert cards["gpt-6-astra"]["context_window"] == 600000
                 for slug in expected - known.keys():
                     assert cards[slug]["display_name"] == slug
                     for field, value in known["gpt-5.6-sol"].items():
-                        if field not in {"slug", "display_name", "description", "priority"}:
+                        if field not in {"slug", "display_name", "description", "priority", "model_messages"}:
                             assert cards[slug][field] == value, (slug, field)
+                    assert "model_messages" not in cards[slug]
+                    assert cards[slug]["base_instructions"] == known["gpt-5.6-sol"]["base_instructions"]
+                status, codex_headers, codex_body = call("/v1/codex/models")
+                assert status == 200
+                assert codex_body == baseline
+                assert codex_headers["x-uni-api-models-source"] == "key-scoped-catalog"
+                assert int(codex_headers["content-length"]) == len(codex_body)
                 status, _, raw = call("/v1/models?client_version=another",
                                       headers={"If-None-Match": "W/" + baseline_etag})
+                assert status == 304 and not raw
+                status, _, raw = call("/v1/codex/models", headers={"If-None-Match": baseline_etag})
                 assert status == 304 and not raw
                 assert slugs("restricted-fixture") == {"gpt-6-sol"}
                 assert slugs("nested-fixture") == {"gpt-6-sol"}

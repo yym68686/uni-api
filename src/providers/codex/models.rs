@@ -96,6 +96,13 @@ fn catalog(models: &[String]) -> Value {
         card["display_name"] = json!(name);
         card["description"] = json!(format!("{name} via uni-api."));
         card["priority"] = json!(first_priority + index as u64);
+        // Unknown routes inherit the legacy instruction field from the fallback
+        // template. The same instructions are also present in model_messages;
+        // dropping that duplicate keeps the Codex catalog below its 1 MiB
+        // client-side limit while preserving the complete prompt semantics.
+        if let Some(card) = card.as_object_mut() {
+            card.remove("model_messages");
+        }
         cards.push(card);
     }
     json!({"models": cards})
@@ -213,16 +220,56 @@ mod tests {
             let card = cards.iter().find(|m| m["slug"] == slug).unwrap();
             assert_eq!(card["display_name"], slug);
             for (field, value) in fallback.as_object().unwrap() {
-                if !["slug", "display_name", "description", "priority"].contains(&field.as_str()) {
+                if ![
+                    "slug",
+                    "display_name",
+                    "description",
+                    "priority",
+                    "model_messages",
+                ]
+                .contains(&field.as_str())
+                {
                     assert_eq!(&card[field], value, "{slug}: {field}");
                 }
             }
+            assert!(card.get("model_messages").is_none());
+            assert_eq!(card["base_instructions"], fallback["base_instructions"]);
         }
         assert_eq!(catalog(&[]), json!({"models":[]}));
         assert_eq!(
             catalog(&models),
             catalog(&models.into_iter().rev().collect::<Vec<_>>())
         );
+    }
+
+    #[test]
+    fn synthesized_catalog_stays_under_codex_size_limit_and_preserves_astra_context() {
+        let mut models = templates()
+            .iter()
+            .filter_map(|model| model["slug"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        models.extend((0..26).map(|index| format!("custom-model-{index}")));
+        let value = catalog(&models);
+        let body = serde_json::to_vec(&value).unwrap();
+        assert!(body.len() < 1024 * 1024, "catalog is {} bytes", body.len());
+
+        let astra = value["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-astra")
+            .unwrap();
+        assert_eq!(astra["context_window"], 600000);
+        assert_eq!(astra["max_context_window"], 872000);
+
+        let custom = value["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "custom-model-0")
+            .unwrap();
+        assert!(custom.get("model_messages").is_none());
+        assert!(custom["base_instructions"].as_str().is_some());
     }
 
     #[tokio::test]

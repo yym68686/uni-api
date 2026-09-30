@@ -127,6 +127,7 @@ pub async fn handle(
             })
         }
         (&Method::GET, "/v1/models") => Some(models_response(state, uri, headers).await),
+        (&Method::GET, "/v1/codex/models") => Some(codex_models_response(state, headers).await),
         (&Method::GET, "/v1/model-channels") => {
             Some(model_channels_response(state, uri, headers).await)
         }
@@ -597,12 +598,10 @@ pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Bod
 async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Response<Body> {
     // Presence selects the rich response shape; the version value never selects
     // a different model set or metadata, including an explicitly empty value.
-    let codex_request = query_value(uri, "client_version").is_some();
-    let result = if codex_request {
-        state.runtime.codex_models_for_headers(headers).await
-    } else {
-        state.runtime.models_for_headers(headers).await
-    };
+    if query_value(uri, "client_version").is_some() {
+        return codex_models_response(state, headers).await;
+    }
+    let result = state.runtime.models_for_headers(headers).await;
     let models = match result {
         Ok(models) => models,
         Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
@@ -613,9 +612,6 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             )
         }
     };
-    if codex_request {
-        return crate::providers::codex::models::response(&models, headers);
-    }
     let systemone_models = match state
         .runtime
         .models_for_endpoint(headers, "/v1/systemone")
@@ -654,6 +650,20 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             }).collect::<Vec<_>>(),
         }),
     )
+}
+
+async fn codex_models_response(state: &AppState, headers: &HeaderMap) -> Response<Body> {
+    let models = match state.runtime.codex_models_for_headers(headers).await {
+        Ok(models) => models,
+        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
+    crate::providers::codex::models::response(&models, headers)
 }
 
 async fn stats_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Response<Body> {
