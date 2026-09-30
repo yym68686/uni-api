@@ -36,7 +36,7 @@ def verify(binary):
     known = {model["slug"]: model for model in templates}
     expected = {
         "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "codex-auto-review",
-        "claude-opus-5", "gemini-3.8-flash", "grok-4.6", "deepseek-v4-pro", "custom-chat",
+        "claude-opus-5", "gemini-3.8-flash", "grok-4.6", "deepseek-v4-pro", "deepseek-v4-flash", "custom-chat",
     }
     excluded = {
         "gpt-image-2", "gpt-image-2.5", "gemini-embedding-001", "text-embedding-004",
@@ -117,6 +117,7 @@ def verify(binary):
                     status, headers, raw = call("/v1/models?client_version=" + version)
                     assert status == 200 and headers["x-uni-api-models-source"] == "key-scoped-catalog"
                     assert int(headers["content-length"]) == len(raw)
+                    assert b"uni-api" not in raw.lower()
                     assert "private" in headers["cache-control"]
                     assert "x-uni-api-models-snapshot-client-version" not in headers
                     assert "x-uni-api-models-upstream-etag" not in headers
@@ -131,6 +132,7 @@ def verify(binary):
                 assert cards["gpt-6-astra"]["context_window"] == 600000
                 for slug in expected - known.keys():
                     assert cards[slug]["display_name"] == slug
+                    assert cards[slug]["description"] == slug
                     for field, value in known["gpt-5.6-sol"].items():
                         if field not in {"slug", "display_name", "description", "priority", "model_messages"}:
                             assert cards[slug][field] == value, (slug, field)
@@ -139,6 +141,7 @@ def verify(binary):
                 status, codex_headers, codex_body = call("/v1/codex/models")
                 assert status == 200
                 assert codex_body == baseline
+                assert b"uni-api" not in codex_body.lower()
                 assert codex_headers["x-uni-api-models-source"] == "key-scoped-catalog"
                 assert int(codex_headers["content-length"]) == len(codex_body)
                 status, _, raw = call("/v1/models?client_version=another",

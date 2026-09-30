@@ -94,7 +94,7 @@ fn catalog(models: &[String]) -> Value {
         let mut card = fallback.clone();
         card["slug"] = json!(name);
         card["display_name"] = json!(name);
-        card["description"] = json!(format!("{name} via uni-api."));
+        card["description"] = json!(name);
         card["priority"] = json!(first_priority + index as u64);
         // Unknown routes inherit the legacy instruction field from the fallback
         // template. The same instructions are also present in model_messages;
@@ -252,6 +252,9 @@ mod tests {
         let value = catalog(&models);
         let body = serde_json::to_vec(&value).unwrap();
         assert!(body.len() < 1024 * 1024, "catalog is {} bytes", body.len());
+        assert!(!String::from_utf8_lossy(&body)
+            .to_ascii_lowercase()
+            .contains("uni-api"));
 
         let astra = value["models"]
             .as_array()
