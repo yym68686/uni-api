@@ -1312,3 +1312,11 @@ have no error digest.
 
 `/v1/observability/runtime` exposes `billing_error_evidence`, `billing_receipt_correlation`, the native build
 version and source commit for deployment verification.
+
+
+Streaming timing observations start immediately before the upstream HTTP send,
+including response-header wait. Responses-to-Chat precommit filtering preserves
+observed `response.created`, first text and first semantic-output timestamps
+without forwarding filtered priming events. Entering or replaying the protocol
+converter does not restart these clocks. Historical missing/underestimated
+timings cannot be reconstructed; only newly observed requests use this fix.

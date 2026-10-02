@@ -1455,6 +1455,7 @@ pub(crate) async fn send_attempt(
         let mut translation = if prepared.adapter == ResponseAdapter::ResponsesToChat {
             provider_stream::translate_responses_to_chat(
                 response,
+                started,
                 output_protocol,
                 prepared.request_model.clone(),
                 prepared.chat_stream_include_usage,
@@ -1474,6 +1475,7 @@ pub(crate) async fn send_attempt(
         } else {
             provider_stream::translate(
                 response,
+                started,
                 protocol,
                 output_protocol,
                 prepared.request_model.clone(),

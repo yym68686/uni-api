@@ -70,10 +70,75 @@ struct StreamTimeouts {
 struct TranslationOptions {
     include_usage: bool,
     timeouts: StreamTimeouts,
+    timing: StreamTiming,
 }
 
+// Observation has one origin: immediately before sending the upstream HTTP
+// request. Precommit filtering may discard wire events, never their timestamps.
+#[derive(Clone, Copy)]
+struct StreamTiming {
+    started_at: tokio::time::Instant,
+    first_output_ms: Option<f64>,
+    response_created_ms: Option<f64>,
+    first_text_ms: Option<f64>,
+}
+
+impl StreamTiming {
+    fn new(started_at: tokio::time::Instant) -> Self {
+        Self {
+            started_at,
+            first_output_ms: None,
+            response_created_ms: None,
+            first_text_ms: None,
+        }
+    }
+
+    fn observe(&mut self, protocol: Protocol, value: &Value) {
+        let elapsed = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        if protocol == Protocol::Responses {
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if kind == "response.created" && self.response_created_ms.is_none() {
+                self.response_created_ms = Some(elapsed);
+            }
+            if kind == "response.output_text.delta"
+                && self.first_text_ms.is_none()
+                && value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+            {
+                self.first_text_ms = Some(elapsed);
+            }
+        }
+        if self.first_output_ms.is_none() && semantic_output_value(protocol, value) {
+            self.first_output_ms = Some(elapsed);
+        }
+    }
+
+    fn observe_sse(&mut self, event: &[u8]) {
+        // Parsing failures are still handled by the existing precommit parser.
+        let Ok(text) = std::str::from_utf8(event) else {
+            return;
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(value) = serde_json::from_str(&data) {
+            self.observe(Protocol::Responses, &value);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     response: reqwest::Response,
+    observed_from: tokio::time::Instant,
     protocol: Protocol,
     output_protocol: OutputProtocol,
     model: String,
@@ -99,12 +164,14 @@ pub fn translate(
         idle_timeout_seconds,
         total_timeout_seconds,
         false,
+        StreamTiming::new(observed_from),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn translate_responses_to_chat(
     response: reqwest::Response,
+    observed_from: tokio::time::Instant,
     output_protocol: OutputProtocol,
     model: String,
     include_usage: bool,
@@ -133,12 +200,15 @@ pub async fn translate_responses_to_chat(
     let idle = positive_duration(idle_timeout_seconds);
     let mut buffer = Vec::new();
     let mut retained = Vec::new();
+    let mut timing = StreamTiming::new(observed_from);
 
     loop {
         while let Some((end, separator)) = next_event_boundary(&buffer) {
             let event = buffer.drain(..end).collect::<Vec<_>>();
             buffer.drain(..separator);
-            match classify_responses_precommit_event(&event)? {
+            let decision = classify_responses_precommit_event(&event)?;
+            timing.observe_sse(&event);
+            match decision {
                 PrecommitDecision::Ignore => {}
                 PrecommitDecision::Retain => {
                     retained.extend_from_slice(&event);
@@ -172,6 +242,7 @@ pub async fn translate_responses_to_chat(
                             started.elapsed(),
                         ),
                         emit_precommit_comment,
+                        timing,
                     ));
                 }
             }
@@ -198,7 +269,9 @@ pub async fn translate_responses_to_chat(
             }
             None => {
                 if !buffer.iter().all(u8::is_ascii_whitespace) {
-                    match classify_responses_precommit_event(&buffer)? {
+                    let decision = classify_responses_precommit_event(&buffer)?;
+                    timing.observe_sse(&buffer);
+                    match decision {
                         PrecommitDecision::Commit => {
                             retained.extend_from_slice(&buffer);
                             let upstream = stream::iter([Ok(Bytes::from(retained))]).boxed();
@@ -216,6 +289,7 @@ pub async fn translate_responses_to_chat(
                                     started.elapsed(),
                                 ),
                                 emit_precommit_comment,
+                                timing,
                             ));
                         }
                         PrecommitDecision::Ignore | PrecommitDecision::Retain => {}
@@ -244,6 +318,7 @@ fn spawn_translation(
     idle_timeout_seconds: Option<f64>,
     total_timeout_seconds: Option<f64>,
     emit_precommit_comment: bool,
+    timing: StreamTiming,
 ) -> Translation {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (outcome_tx, outcome_rx) = oneshot::channel();
@@ -253,6 +328,7 @@ fn spawn_translation(
         }
         let options = TranslationOptions {
             include_usage,
+            timing,
             timeouts: StreamTimeouts {
                 idle: positive_duration(idle_timeout_seconds),
                 total: positive_duration(total_timeout_seconds),
@@ -332,6 +408,7 @@ async fn run_translation(
     options: TranslationOptions,
 ) -> Result<StreamOutcome, String> {
     let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
+    state.timing = options.timing;
     let timeouts = options.timeouts;
     for event in state.start_chunks() {
         send_wire(tx, &event, output_protocol).await?;
@@ -738,29 +815,8 @@ async fn process_json_bytes(
     }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
-    if protocol == Protocol::Responses {
-        let kind = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let elapsed = state.started_at.elapsed().as_secs_f64() * 1000.0;
-        if kind == "response.created" && state.response_created_ms.is_none() {
-            state.response_created_ms = Some(elapsed);
-        }
-        if kind == "response.output_text.delta"
-            && state.first_text_ms.is_none()
-            && value
-                .get("delta")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-        {
-            state.first_text_ms = Some(elapsed);
-        }
-    }
+    state.timing.observe(protocol, &value);
     let chunks = state.convert(protocol, &value);
-    if state.first_output_ms.is_none() && semantic_output_value(protocol, &value) {
-        state.first_output_ms = Some(state.started_at.elapsed().as_secs_f64() * 1000.0);
-    }
     for chunk in chunks {
         send_wire(tx, &chunk, state.output_protocol).await?;
     }
@@ -901,10 +957,7 @@ struct StreamState {
     output_protocol: OutputProtocol,
     include_usage: bool,
     responses: ResponsesOutputState,
-    started_at: tokio::time::Instant,
-    first_output_ms: Option<f64>,
-    response_created_ms: Option<f64>,
-    first_text_ms: Option<f64>,
+    timing: StreamTiming,
 }
 
 impl StreamState {
@@ -929,10 +982,7 @@ impl StreamState {
             output_protocol,
             include_usage,
             responses: ResponsesOutputState::new(model, created),
-            started_at: tokio::time::Instant::now(),
-            first_output_ms: None,
-            response_created_ms: None,
-            first_text_ms: None,
+            timing: StreamTiming::new(tokio::time::Instant::now()),
         }
     }
 
@@ -1434,9 +1484,9 @@ impl StreamState {
                 success: false,
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
-                first_output_ms: self.first_output_ms,
-                response_created_ms: self.response_created_ms,
-                first_text_ms: self.first_text_ms,
+                first_output_ms: self.timing.first_output_ms,
+                response_created_ms: self.timing.response_created_ms,
+                first_text_ms: self.timing.first_text_ms,
             },
             None => StreamOutcome {
                 observational_only: false,
@@ -1445,9 +1495,9 @@ impl StreamState {
                 success: true,
                 status_code: 200,
                 detail: String::new(),
-                first_output_ms: self.first_output_ms,
-                response_created_ms: self.response_created_ms,
-                first_text_ms: self.first_text_ms,
+                first_output_ms: self.timing.first_output_ms,
+                response_created_ms: self.timing.response_created_ms,
+                first_text_ms: self.timing.first_text_ms,
             },
         }
     }
@@ -1456,7 +1506,7 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        if !self.terminal && self.first_output_ms.is_none() {
+        if !self.terminal && self.timing.first_output_ms.is_none() {
             return Err("upstream stream ended before real output or a terminal event".into());
         }
         if self.output_protocol == OutputProtocol::Responses {
@@ -2288,6 +2338,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precommit_timings_include_headers_and_preserve_filtered_created_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            socket.write_all(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            socket.write_all(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n").await.unwrap();
+        });
+        let origin = tokio::time::Instant::now();
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        let translation = translate_responses_to_chat(
+            response,
+            origin,
+            OutputProtocol::Chat,
+            "public".into(),
+            false,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let outcome = translation.outcome.await.unwrap();
+        server.await.unwrap();
+        assert!(outcome.success);
+        let created = outcome.response_created_ms.unwrap();
+        let text = outcome.first_text_ms.unwrap();
+        assert!(created >= 150.0, "missing header wait: {created}");
+        assert!(
+            text - created >= 110.0,
+            "lost precommit event time: {created} / {text}"
+        );
+        assert!(outcome.first_output_ms.unwrap() >= text);
+        // Observation must not leak the filtered priming event or change wire data.
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!wire.contains("response.created"));
+        assert!(wire.contains("\"content\":\"hello\""));
+        assert!(wire.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn translated_stream_uses_send_origin_without_inventing_created_event() {
+        let response = mock_sse_response("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n").await;
+        let origin = tokio::time::Instant::now() - Duration::from_millis(240);
+        let translation = translate(
+            response,
+            origin,
+            Protocol::Chat,
+            OutputProtocol::Responses,
+            "public".into(),
+            false,
+            None,
+            None,
+        );
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let outcome = translation.outcome.await.unwrap();
+        assert!(outcome.success);
+        assert!(outcome.first_output_ms.unwrap() >= 240.0);
+        assert!(outcome.response_created_ms.is_none());
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("response.created"));
+    }
+
+    #[tokio::test]
     async fn responses_precommit_discards_provider_priming_frames() {
         let response = mock_sse_response(
             ": provider heartbeat\n\n\
@@ -2299,6 +2427,7 @@ mod tests {
         .await;
         let translation = translate_responses_to_chat(
             response,
+            tokio::time::Instant::now(),
             OutputProtocol::Chat,
             "public-model".into(),
             false,
@@ -2337,6 +2466,7 @@ mod tests {
         .await;
         let translation = translate_responses_to_chat(
             response,
+            tokio::time::Instant::now(),
             OutputProtocol::Chat,
             "public-model".into(),
             false,
@@ -2369,6 +2499,7 @@ mod tests {
         .await;
         let failure = match translate_responses_to_chat(
             response,
+            tokio::time::Instant::now(),
             OutputProtocol::Chat,
             "public-model".into(),
             false,
@@ -2407,6 +2538,7 @@ mod tests {
             None,
             None,
             true,
+            StreamTiming::new(tokio::time::Instant::now()),
         );
         let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
             .await
