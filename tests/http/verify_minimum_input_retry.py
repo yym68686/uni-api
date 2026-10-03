@@ -23,6 +23,11 @@ SHORT_INPUT_REJECTION = "Upstream rejected illegal short-input distillation or h
 GENERIC_UPSTREAM_ERROR = {"error": {
     "code": "upstream_error", "message": "Upstream request failed", "type": "upstream_error",
 }}
+SUPPORT_ONLY_ERROR = {"error": {
+    "code": "invalid_request_error", "type": "invalid_request_error",
+    "message": "Request could not be completed. Contact support with the request ID.",
+    "request_id": "fixture-upstream-request",
+}}
 MODEL_MISMATCH = {"error": {
     "code": "unsupported_value",
     "message": "Unsupported value: 'max' is not supported with the 'gpt-5.5' model. "
@@ -212,6 +217,18 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                     ("quoted-upstream-rejected-message",
                      f"Invalid input: expected '{UPSTREAM_REJECTED_REQUEST}'",
                      "retry", False, 400, ["limited"]),
+                    ("support-only", SUPPORT_ONLY_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                    ("support-only-wrapped", {"error": {"message": json.dumps(SUPPORT_ONLY_ERROR)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("support-only-no-retry", SUPPORT_ONLY_ERROR, "no-retry", False, 502, ["limited"]),
+                    ("support-only-exhausted", SUPPORT_ONLY_ERROR, "exhausted", False, 502,
+                     ["limited", "also-limited"] * 3),
+                    ("support-only-validation-code", {"error": {**SUPPORT_ONLY_ERROR["error"], "code": "invalid_type"}},
+                     "retry", False, 400, ["limited"]),
+                    ("support-only-param", {"error": {**SUPPORT_ONLY_ERROR["error"], "param": "input"}},
+                     "retry", False, 400, ["limited"]),
+                    ("support-only-echo", {"error": {"message": "Invalid input", "type": "invalid_request_error"},
+                     "input": SUPPORT_ONLY_ERROR}, "retry", False, 400, ["limited"]),
                     ("generic-upstream", GENERIC_UPSTREAM_ERROR, "retry", False,
                      200, ["limited", "fallback"]),
                     ("generic-upstream-wrapped", {"error": {"message": json.dumps(GENERIC_UPSTREAM_ERROR)}},

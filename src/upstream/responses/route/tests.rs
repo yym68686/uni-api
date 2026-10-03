@@ -1778,6 +1778,56 @@ fn upstream_rejected_request_is_a_retryable_gateway_error() {
 }
 
 #[test]
+fn support_only_upstream_rejection_is_a_retryable_gateway_error() {
+    let message = "Request could not be completed. Contact support with the request ID.";
+    let error = json!({"code": "invalid_request_error", "type": "invalid_request_error",
+        "message": message, "request_id": "fixture-upstream-request"});
+    let body = json!({"error": error}).to_string();
+    for detail in [
+        body.clone(),
+        json!({"error": {"message": body}}).to_string(),
+        json!({"detail": error}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "message": message}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "code": null,
+            "param": null, "message": message.to_ascii_uppercase()}})
+        .to_string(),
+    ] {
+        for endpoint in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/chat/completions",
+        ] {
+            for auto_retry in [true, false] {
+                let policy =
+                    classify_provider_failure(400, &detail, None, endpoint, auto_retry, None);
+                assert_eq!(policy.status, 502, "{detail}");
+                assert_eq!(policy.retryable, auto_retry);
+                assert!(!policy.request_scoped);
+            }
+        }
+    }
+    for detail in [
+        message.to_owned(),
+        json!({"error": {"message": message}}).to_string(),
+        json!({"error": {"type": "upstream_error", "message": message}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "code": "invalid_type", "message": message}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "param": "input", "message": message}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "code": 400, "message": message}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "message": format!("Invalid input: expected '{message}'")}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "message": "Missing required parameter: input"}, "input": {"error": error}}).to_string(),
+        json!({"error": {"type": "invalid_request_error", "message": "Invalid input"}, "debug": {"error": error}}).to_string(),
+    ] {
+        let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true, None);
+        assert_eq!(policy.status, 400, "{detail}");
+        assert!(!policy.retryable);
+        assert!(policy.request_scoped);
+    }
+    for status in [200, 401, 403, 404, 413, 422, 429, 500, 502, 503, 504] {
+        assert_eq!(remap_provider_status(status, &body), status);
+    }
+}
+
+#[test]
 fn short_input_channel_rejection_is_retryable_in_http_and_semantic_forms() {
     let message = "Upstream rejected illegal short-input distillation or heartbeat probing.";
     let body = json!({"error": {"message": message}}).to_string();

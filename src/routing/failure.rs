@@ -243,6 +243,20 @@ pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) 
             {
                 return true;
             }
+            // This generic support-only rejection carries no actionable client
+            // validation. Match only the structured error, ignoring its opaque
+            // request_id; never reinterpret a specific code or parameter error.
+            if matches("type", "invalid_request_error")
+                && matches(
+                    "message",
+                    "Request could not be completed. Contact support with the request ID.",
+                )
+                && (error.get("code").is_none_or(Value::is_null)
+                    || matches("code", "invalid_request_error"))
+                && error.get("param").is_none_or(Value::is_null)
+            {
+                return true;
+            }
         }
         let message = match parsed.as_ref() {
             Some(payload) => payload
