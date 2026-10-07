@@ -1244,7 +1244,7 @@ We take security seriously. If you discover any security issues, please contact 
 
 **Acknowledgments:**
 
-We would like to thank **@ryougishiki214** for reporting a security issue, which has been resolved in [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1).
+We would like to thank **[@ryougishiki214](https://github.com/hang333)** for reporting a security issue, which has been resolved in [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1).
 
 ## License
 

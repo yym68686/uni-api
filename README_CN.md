@@ -1239,7 +1239,7 @@ python3 tests/http/verify_control_restore.py target/debug/uni-api-front
 
 **致谢 (Acknowledgments):**
 
-*   我们特别感谢 **@ryougishiki214** 报告了一个安全问题，该问题已在 [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1) 版本中得到解决。
+*   我们特别感谢 **[@ryougishiki214](https://github.com/hang333)** 报告了一个安全问题，该问题已在 [v1.5.1](https://github.com/yym68686/uni-api/releases/tag/v1.5.1) 版本中得到解决。
 
 ## 许可证
 
