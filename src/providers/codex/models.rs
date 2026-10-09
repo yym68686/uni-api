@@ -18,7 +18,10 @@ fn templates() -> &'static [Value] {
         catalog["models"]
             .as_array()
             .expect("Codex model template array")
-            .clone()
+            .iter()
+            .cloned()
+            .map(compact_codex_card)
+            .collect()
     })
 }
 
@@ -66,6 +69,140 @@ pub(crate) fn is_conversational_model(model: &str) -> bool {
     .any(|part| leaf.contains(part))
 }
 
+// Keep canonical instructions byte-for-byte. Codex promotes base_instructions
+// into ModelMessages when instructions_template is absent, including when the
+// remaining structured tool/approval messages are present. Older clients also
+// understand base_instructions, so keep that field instead of two prompt copies.
+fn compact_codex_card(mut card: Value) -> Value {
+    let fields = card.as_object_mut().expect("model card object");
+    if let Some(messages) = fields
+        .get_mut("model_messages")
+        .and_then(Value::as_object_mut)
+    {
+        let instructions = messages.remove("instructions_template");
+        // Current Codex treats instructions_template as literal text. These old
+        // personality substitutions are no longer read by ModelMessages.
+        messages.remove("instructions_variables");
+        // ModelMessages' optional top-level fields all default to None. Do not
+        // recursively strip nulls from tool schemas or other structured values.
+        messages.retain(|_, value| !value.is_null());
+        if let Some(Value::String(instructions)) = instructions {
+            fields.insert("base_instructions".into(), Value::String(instructions));
+        }
+    }
+    if fields
+        .get("model_messages")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        fields.remove("model_messages");
+    }
+
+    for field in [
+        "guardian",
+        "description",
+        "default_reasoning_level",
+        "default_service_tier",
+        "available_access_programs",
+        "availability_nux",
+        "upgrade",
+        "model_messages",
+        "default_verbosity",
+        "apply_patch_tool_type",
+        "context_window",
+        "max_context_window",
+        "auto_compact_token_limit",
+        "comp_hash",
+        "auto_review_model_override",
+        "model_specialty",
+        "tool_mode",
+        "multi_agent_version",
+        "multi_agent_reasoning_effort",
+    ] {
+        if fields.get(field).is_some_and(Value::is_null) {
+            fields.remove(field);
+        }
+    }
+    for field in [
+        "include_skills_usage_instructions",
+        "include_plugin_usage_instructions",
+        "supports_image_detail_original",
+        "supports_search_tool",
+        "supports_experimental_context",
+        "use_responses_lite",
+        "supports_reasoning_effort_updates",
+        "node_repl_auto_review_required",
+        "node_repl_disabled",
+    ] {
+        if fields.get(field) == Some(&Value::Bool(false)) {
+            fields.remove(field);
+        }
+    }
+    for field in [
+        "include_apps_usage_instructions",
+        "supports_reasoning_summary_parameter",
+    ] {
+        if fields.get(field) == Some(&Value::Bool(true)) {
+            fields.remove(field);
+        }
+    }
+    for (field, default) in [
+        ("additional_speed_tiers", json!([])),
+        ("service_tiers", json!([])),
+        ("default_reasoning_summary", json!("auto")),
+        ("web_search_tool_type", json!("text")),
+        ("effective_context_window_percent", json!(95)),
+        ("input_modalities", json!(["text", "image"])),
+    ] {
+        if fields.get(field) == Some(&default) {
+            fields.remove(field);
+        }
+    }
+    // These are not consumed by Codex's ModelInfo. Keep the legacy required
+    // supports_reasoning_summaries / supports_parallel_tool_calls booleans.
+    for field in [
+        "available_in_plans",
+        "minimal_client_version",
+        "prefer_websockets",
+        "requires_sandboxed_review",
+    ] {
+        fields.remove(field);
+    }
+    card
+}
+
+fn uses_codex_instructions(name: &str) -> bool {
+    let leaf = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    leaf.starts_with("gpt-") || leaf.starts_with("codex-")
+}
+
+fn generic_card(name: &str, priority: u64) -> Value {
+    json!({
+        "slug": name,
+        "display_name": name,
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "support_verbosity": false,
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "experimental_supported_tools": [],
+        "base_instructions": include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/assets/codex/generic_instructions.md"
+        )).trim_end(),
+        // Retain the previous generic catalog's context/modality settings. They
+        // are compatibility metadata, not inferred provider-specific limits.
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "apply_patch_tool_type": "freeform",
+        "input_modalities": ["text", "image"],
+        "supports_reasoning_summary_parameter": false,
+        "supports_reasoning_summaries": false,
+        "supports_parallel_tool_calls": true,
+    })
+}
+
 fn catalog(models: &[String]) -> Value {
     let mut remaining: BTreeSet<&str> = models.iter().map(String::as_str).collect();
     let templates = templates();
@@ -75,8 +212,6 @@ fn catalog(models: &[String]) -> Value {
             .as_str()
             .is_some_and(|id| remaining.remove(id))
         {
-            // Preserve established GPT metadata byte-for-value, especially
-            // gpt-6-astra's 600000 context_window and hidden helper cards.
             cards.push(template.clone());
         }
     }
@@ -91,42 +226,20 @@ fn catalog(models: &[String]) -> Value {
         .unwrap_or(0)
         + 1;
     for (index, name) in remaining.into_iter().enumerate() {
-        let mut card = fallback.clone();
-        card["slug"] = json!(name);
-        card["display_name"] = json!(name);
-        card["description"] = json!(name);
-        card["priority"] = json!(first_priority + index as u64);
-        // Unknown routes inherit the legacy instruction field from the fallback
-        // template. The same instructions are also present in model_messages;
-        // dropping that duplicate keeps the Codex catalog below its 1 MiB
-        // client-side limit while preserving the complete prompt semantics.
-        if let Some(card) = card.as_object_mut() {
-            card.remove("model_messages");
-        }
+        let priority = first_priority + index as u64;
+        let card = if uses_codex_instructions(name) {
+            let mut card = fallback.clone();
+            card["slug"] = json!(name);
+            card["display_name"] = json!(name);
+            card["description"] = json!(name);
+            card["priority"] = json!(priority);
+            card
+        } else {
+            generic_card(name, priority)
+        };
         cards.push(card);
     }
-    let mut catalog = json!({"models": cards});
-    let mut size = serde_json::to_vec(&catalog).unwrap().len();
-    // A growing route list can exceed the client limit again. Only remove a
-    // legacy prompt's exact duplicate, never structured behavior or variables.
-    for card in catalog["models"].as_array_mut().unwrap() {
-        if size < 1024 * 1024 {
-            break;
-        }
-        let duplicate = card["model_messages"].as_object().is_some_and(|messages| {
-            card["base_instructions"].is_string()
-                && messages.get("instructions_template") == Some(&card["base_instructions"])
-                && messages
-                    .iter()
-                    .all(|(field, value)| field == "instructions_template" || value.is_null())
-        });
-        if duplicate {
-            let before = serde_json::to_vec(card).unwrap().len();
-            card.as_object_mut().unwrap().remove("model_messages");
-            size -= before - serde_json::to_vec(card).unwrap().len();
-        }
-    }
-    catalog
+    json!({"models": cards})
 }
 
 pub(crate) fn response(models: &[String], headers: &HeaderMap) -> Response<Body> {
@@ -237,7 +350,7 @@ mod tests {
             .iter()
             .find(|m| m["slug"] == "gpt-5.6-sol")
             .unwrap();
-        for slug in ["gpt-6-sol", "claude-opus-5"] {
+        for slug in ["gpt-6-sol"] {
             let card = cards.iter().find(|m| m["slug"] == slug).unwrap();
             assert_eq!(card["display_name"], slug);
             for (field, value) in fallback.as_object().unwrap() {
@@ -297,49 +410,117 @@ mod tests {
     }
 
     #[test]
-    fn growing_catalog_removes_only_exact_prompt_duplicates_when_over_limit() {
-        let known = templates()
-            .iter()
-            .filter(|model| {
-                model["slug"] != "gpt-reserve" && model["slug"] != "gpt-5.3-codex-spark"
-            })
-            .collect::<Vec<_>>();
-        let mut models = known
-            .iter()
-            .map(|model| model["slug"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        models.extend((0..34).map(|index| format!("custom-model-{index}")));
-        let value = catalog(&models);
-        let body = serde_json::to_vec(&value).unwrap();
-        let cards = value["models"].as_array().unwrap();
-        assert_eq!(cards.len(), 42);
-        assert!(body.len() < 1024 * 1024, "catalog is {} bytes", body.len());
-        let mut removed = 0;
-        for original in known {
-            let card = cards
+    fn all_gpt_prompts_and_structured_rules_are_preserved() {
+        let original: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/codex/codex_models_pro_0_153_2.json"
+        )))
+        .unwrap();
+        for before in original["models"].as_array().unwrap() {
+            let after = templates()
                 .iter()
-                .find(|m| m["slug"] == original["slug"])
+                .find(|m| m["slug"] == before["slug"])
                 .unwrap();
-            let mut expected = original.clone();
-            if card.get("model_messages").is_none() {
-                removed += 1;
-                let messages = expected
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("model_messages")
-                    .unwrap();
-                assert_eq!(messages["instructions_template"], card["base_instructions"]);
-                for (field, value) in messages.as_object().unwrap() {
-                    assert!(field == "instructions_template" || value.is_null());
+            let prompt = before["model_messages"]["instructions_template"]
+                .as_str()
+                .unwrap_or_else(|| before["base_instructions"].as_str().unwrap());
+            assert_eq!(after["base_instructions"], prompt, "{}", before["slug"]);
+            for (field, value) in before["model_messages"].as_object().unwrap() {
+                if !["instructions_template", "instructions_variables"].contains(&field.as_str())
+                    && !value.is_null()
+                {
+                    assert_eq!(
+                        &after["model_messages"][field], value,
+                        "{}: {field}",
+                        before["slug"]
+                    );
                 }
             }
-            assert_eq!(card, &expected);
+            for field in [
+                "context_window",
+                "max_context_window",
+                "visibility",
+                "priority",
+                "supported_reasoning_levels",
+                "supports_parallel_tool_calls",
+                "supports_reasoning_summaries",
+            ] {
+                assert_eq!(after[field], before[field], "{}: {field}", before["slug"]);
+            }
         }
-        assert!(removed > 0, "fixture must exercise size compaction");
-        let astra = cards.iter().find(|m| m["slug"] == "gpt-6-astra").unwrap();
-        assert_eq!(astra["context_window"], 600000);
-        assert_eq!(astra["max_context_window"], 872000);
-        assert!(astra.get("model_messages").is_some());
+    }
+
+    #[test]
+    fn unknown_models_use_small_cards_but_gpt_names_keep_full_instructions() {
+        for name in ["gpt-6-sol", "vendor/gpt-6.1-sol", "codex-future"] {
+            let value = catalog(&[name.to_owned()]);
+            let card = &value["models"][0];
+            assert_eq!(
+                card["base_instructions"],
+                templates()
+                    .iter()
+                    .find(|m| m["slug"] == "gpt-5.6-sol")
+                    .unwrap()["base_instructions"]
+            );
+        }
+        for name in [
+            "claude-opus-5",
+            "gemini-3.8-flash",
+            "vendor/claude-sonnet",
+            "custom-chat",
+        ] {
+            let value = catalog(&[name.to_owned()]);
+            let card = &value["models"][0];
+            assert!(serde_json::to_vec(card).unwrap().len() < 900);
+            assert!(card["base_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("AGENTS.md"));
+            assert!(!card["base_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("GPT-5"));
+            assert_eq!(card["supported_reasoning_levels"], json!([]));
+            assert_eq!(card["experimental_supported_tools"], json!([]));
+            assert_eq!(card["context_window"], 272000);
+            assert_eq!(card["max_context_window"], 872000);
+            assert_eq!(card["supports_reasoning_summary_parameter"], false);
+            assert_eq!(card["support_verbosity"], false);
+            assert!(card.get("service_tiers").is_none());
+            assert!(card.get("use_responses_lite").is_none());
+            assert!(card.get("tool_mode").is_none());
+        }
+    }
+
+    #[test]
+    fn representative_catalog_stays_below_300kb_without_dropping_models() {
+        let mut models = templates()
+            .iter()
+            .filter(|m| m["slug"] != "gpt-reserve" && m["slug"] != "gpt-5.3-codex-spark")
+            .map(|m| m["slug"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        models.extend(["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"].map(str::to_owned));
+        models.extend((0..32).map(|i| format!("third-party-model-{i}")));
+        let value = catalog(&models);
+        assert_eq!(value["models"].as_array().unwrap().len(), 43);
+        let body = serde_json::to_vec(&value).unwrap();
+        assert!(body.len() < 300_000, "catalog is {} bytes", body.len());
+        // More routes must not silently remove cards or alter existing ones.
+        models.extend((32..132).map(|i| format!("third-party-model-{i}")));
+        let expanded = catalog(&models);
+        assert_eq!(expanded["models"].as_array().unwrap().len(), 143);
+        assert!(serde_json::to_vec(&expanded).unwrap().len() < 400_000);
+        for card in value["models"].as_array().unwrap() {
+            assert_eq!(
+                expanded["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["slug"] == card["slug"])
+                    .unwrap()["base_instructions"],
+                card["base_instructions"]
+            );
+        }
     }
 
     #[tokio::test]

@@ -128,16 +128,37 @@ def verify(binary):
                 assert set(cards) == expected, (set(cards), expected)
                 assert len(baseline) < 1024 * 1024, len(baseline)
                 for slug in expected & known.keys():
-                    assert cards[slug] == known[slug], slug
+                    before, after = known[slug], cards[slug]
+                    messages = before.get("model_messages") or {}
+                    prompt = messages.get("instructions_template") or before["base_instructions"]
+                    assert after["base_instructions"] == prompt, slug
+                    for field, value in messages.items():
+                        if field not in {"instructions_template", "instructions_variables"} and value is not None:
+                            assert after["model_messages"][field] == value, (slug, field)
+                    for field in ["context_window", "max_context_window", "supported_reasoning_levels",
+                                  "visibility", "supports_parallel_tool_calls"]:
+                        assert after[field] == before[field], (slug, field)
                 assert cards["gpt-6-astra"]["context_window"] == 600000
+                assert cards["gpt-6-astra"]["max_context_window"] == 872000
                 for slug in expected - known.keys():
-                    assert cards[slug]["display_name"] == slug
-                    assert cards[slug]["description"] == slug
-                    for field, value in known["gpt-5.6-sol"].items():
-                        if field not in {"slug", "display_name", "description", "priority", "model_messages"}:
-                            assert cards[slug][field] == value, (slug, field)
-                    assert "model_messages" not in cards[slug]
-                    assert cards[slug]["base_instructions"] == known["gpt-5.6-sol"]["base_instructions"]
+                    card = cards[slug]
+                    assert card["display_name"] == slug
+                    if slug.startswith("gpt-"):
+                        assert card["base_instructions"] == known["gpt-5.6-sol"]["base_instructions"]
+                        assert card["supported_reasoning_levels"] == known["gpt-5.6-sol"]["supported_reasoning_levels"]
+                    else:
+                        assert len(json.dumps(card, separators=(",", ":")).encode()) < 900
+                        assert "AGENTS.md" in card["base_instructions"]
+                        assert "GPT-5" not in card["base_instructions"]
+                        assert card["supported_reasoning_levels"] == []
+                        assert card["experimental_supported_tools"] == []
+                        assert card["context_window"] == 272000
+                        assert card["max_context_window"] == 872000
+                        assert card["supports_reasoning_summary_parameter"] is False
+                        assert "service_tiers" not in card
+                        assert "use_responses_lite" not in card
+                        assert "tool_mode" not in card
+                    assert "model_messages" not in card
                 status, codex_headers, codex_body = call("/v1/codex/models")
                 assert status == 200
                 assert codex_body == baseline
