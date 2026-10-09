@@ -122,6 +122,7 @@ fn hedging_applies_only_to_nonstream_chat_completions() {
 
 fn test_provider(engine: &str, base_url: &str) -> Provider {
     Provider {
+        engine_mode: "explicit".into(),
         name: "provider-a".into(),
         base_url: base_url.to_owned().into(),
         engine: engine.to_owned().into(),

@@ -179,7 +179,7 @@ impl GatewayRuntime {
             } else if provider.api_keys.is_empty() && provider.client_email.is_none() {
                 (false, "no_provider_key")
             } else if route_cooling { (false, "channel_cooldown") } else { (true, "eligible") };
-            Some(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}))
+            Some(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"engine_mode":provider.engine_mode.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}))
         }).collect();
         rows.sort_by_key(|row| {
             controls

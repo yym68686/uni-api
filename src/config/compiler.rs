@@ -229,6 +229,7 @@ pub(crate) fn compile_provider(value: &Value) -> Option<Value> {
         "name": name,
         "base_url": base_url,
         "engine": engine,
+        "engine_mode": if item.get("engine").and_then(Value::as_str).is_some() { "explicit" } else { "auto" },
         "api": provider_api,
         "project_id": scalar_string(item.get("project_id").unwrap_or(&Value::Null)),
         "private_key": private_key,

@@ -335,6 +335,8 @@ yym68686/uni-api:latest
 
 When `engine` is omitted, uni-api infers it only from `base_url`, never from model names. A URL path ending in `/v1/responses` (including a deployment prefix, trailing slash, or query string) selects `codex`. Existing special URL rules such as Messages, Gemini, Vertex, AWS, Azure, and Cloudflare keep their priority; unmatched URLs select `gpt`. An explicitly configured `engine` always overrides inference. Console clients can omit `engine` to reuse the same inference during validation, creation, and restoration.
 
+The model-channel catalog exposes the effective `engine` separately from `engine_mode` (`auto` or `explicit`). Consoles should label automatic configuration as automatic, rather than presenting the inferred result as an explicit selection. An absent or empty mode from an older snapshot means its configuration mode is unknown.
+
 If you want to use Codex CLI / OpenAI Responses API clients directly against uni-api:
 
 1. Point the client `base_url` to uni-api and use a uni-api `api_keys[].api`.

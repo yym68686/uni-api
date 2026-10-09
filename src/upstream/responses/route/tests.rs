@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 fn provider() -> Provider {
     Provider {
+        engine_mode: "explicit".into(),
         name: Arc::from("fugue-codex"),
         base_url: Arc::from("https://example.com/v1/responses"),
         engine: Arc::from("codex"),

@@ -1547,6 +1547,15 @@ mod tests {
             store.settings_change(mutation(), false).await.unwrap();
             assert!(store.settings_view("auto").await.is_err());
             store.settings_change(mutation(), true).await.unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer admin-token".parse().unwrap());
+            let (rows, _, _) = store
+                .channel_catalog(&headers, "/v1/responses", true, None)
+                .await
+                .unwrap();
+            let row = rows.iter().find(|row| row["provider"] == "auto").unwrap();
+            assert_eq!(row["engine_mode"], "auto");
+            assert_eq!(row["engine"], expected);
             assert_eq!(
                 store.snapshot().await.unwrap().providers_by_name["auto"]
                     .engine
@@ -1558,6 +1567,26 @@ mod tests {
                     .get("engine")
                     .is_none()
             );
+            let revision = store.settings_view("auto").await.unwrap()["revision"].clone();
+            let explicit = serde_json::from_value(json!({"revision":revision,"operation_id":"explicit","changes":[{"provider":"auto","set":{"/engine":"gpt"}}]})).unwrap();
+            store.settings_change(explicit, true).await.unwrap();
+            let (rows, _, _) = store
+                .channel_catalog(&headers, "/v1/responses", true, None)
+                .await
+                .unwrap();
+            let row = rows.iter().find(|row| row["provider"] == "auto").unwrap();
+            assert_eq!(row["engine_mode"], "explicit");
+            assert_eq!(row["engine"], "gpt");
+            let revision = store.settings_view("auto").await.unwrap()["revision"].clone();
+            let automatic = serde_json::from_value(json!({"revision":revision,"operation_id":"automatic","changes":[{"provider":"auto","remove":["/engine"]}]})).unwrap();
+            store.settings_change(automatic, true).await.unwrap();
+            let (rows, _, _) = store
+                .channel_catalog(&headers, "/v1/responses", true, None)
+                .await
+                .unwrap();
+            let row = rows.iter().find(|row| row["provider"] == "auto").unwrap();
+            assert_eq!(row["engine_mode"], "auto");
+            assert_eq!(row["engine"], expected);
         }
     }
     #[tokio::test]

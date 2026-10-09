@@ -38,6 +38,8 @@ pub(crate) struct RawProvider {
     pub(crate) name: String,
     pub(crate) base_url: String,
     pub(crate) engine: Option<String>,
+    #[serde(default)]
+    pub(crate) engine_mode: String,
     pub(crate) api: Value,
     #[serde(default)]
     pub(crate) project_id: Option<String>,
@@ -95,6 +97,7 @@ pub(crate) struct Provider {
     pub(crate) name: Arc<str>,
     pub(crate) base_url: Arc<str>,
     pub(crate) engine: Arc<str>,
+    pub(crate) engine_mode: Arc<str>,
     pub(crate) api_keys: Arc<Vec<String>>,
     pub(crate) project_id: Option<Arc<str>>,
     pub(crate) private_key: Option<Arc<str>>,
@@ -119,6 +122,7 @@ pub(crate) fn runtime_provider(item: RawProvider, cursor: Arc<AtomicUsize>) -> A
         name: name.clone().into(),
         base_url: item.base_url.trim().to_owned().into(),
         engine: item.engine.unwrap_or_else(|| "gpt".into()).into(),
+        engine_mode: item.engine_mode.into(),
         api_keys: Arc::new(provider_api_keys(&item.api)),
         project_id: item
             .project_id

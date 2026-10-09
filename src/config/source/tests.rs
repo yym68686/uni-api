@@ -206,6 +206,14 @@ fn automatic_engine_uses_url_without_model_name_fallbacks() {
                 compiled["providers"][0]["engine"], expected,
                 "{model} / {base}"
             );
+            assert_eq!(
+                compiled["providers"][0]["engine_mode"],
+                if explicit.is_some() {
+                    "explicit"
+                } else {
+                    "auto"
+                }
+            );
         }
     }
 }
