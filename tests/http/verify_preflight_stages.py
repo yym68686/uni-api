@@ -108,7 +108,8 @@ try:
                 events = [json.loads(line[5:]) for line in wire.splitlines() if line.startswith(b"data:") and line[5:].strip() != b"[DONE]"]
                 assert any(e.get("type") == "response.output_text.delta" and e.get("delta") == "test" for e in events), events
                 assert call("POST", "/v1/responses", "error")[0] >= 400
-                assert call("POST", "/v1/responses", "eof")[0] >= 400
+                status, wire = call("POST", "/v1/responses", "eof")
+                assert status == 200 and b'event: error\n' in wire, (status, wire)
                 deadline = time.monotonic() + 8
                 while time.monotonic() < deadline:
                     attempts = {f["provider"]: f for f in facts if f["kind"] == "attempt"}
@@ -124,14 +125,14 @@ try:
                         assert timing["first_upstream_chunk_ms"] is None
                         assert timing["first_wire_prepared_ms"] is None
                     else:
-                        assert timing["preflight_read_wait_ms"] >= 250, timing
-                        assert timing["preflight_read_calls"] >= 2, timing
-                        assert timing["preflight_process_ms"] < timing["preflight_read_wait_ms"], timing
+                        assert 0 <= timing["preflight_read_wait_ms"] < 250, timing
+                        assert timing["preflight_read_calls"] == 1, timing
+                        assert timing["preflight_process_ms"] < 100, timing
                         assert timing["error_body_read_ms"] is None
-                        if name == "primer":
-                            assert timing["public_stream_ready_ms"] - timing["first_upstream_chunk_ms"] >= 250, timing
-                        else:
-                            assert timing["public_stream_ready_ms"] is None, timing
+                        assert 0 <= timing["public_stream_ready_ms"] - timing["first_upstream_chunk_ms"] < 100, timing
+                        assert timing["first_wire_prepared_ms"] is not None, timing
+                        if name == "eof":
+                            assert attempts[name]["first_output_ms"] is None, attempts[name]
                     assert "PRIVATE_FIXTURE_ERROR" not in json.dumps(attempts[name])
                     print("PASS", name, json.dumps(timing))
             finally:

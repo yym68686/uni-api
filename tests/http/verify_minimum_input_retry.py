@@ -297,7 +297,8 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                                        {"input": [{"role": "user", "content": "say test"}]})
                         status, content_type, raw = request(endpoint, payload, key)
                         context = (endpoint, hedging, streaming, label, status, raw, server.hits)
-                        assert status == expected_status, context
+                        inband_failure = label.startswith("sse-") and expected_status != 200
+                        assert status == (200 if inband_failure else expected_status), context
                         assert server.hits == expected_hits, context
                         if label.startswith("model-mismatch"):
                             for sent in server.payloads:
@@ -306,6 +307,14 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                                 assert server.payloads[0]["model"] == "gpt-5.5", context
                         if label == "sse-postcommit":
                             assert b"started" in raw and b"response.completed" not in raw, context
+                        elif inband_failure:
+                            events = [json.loads(line[5:]) for line in raw.splitlines()
+                                      if line.startswith(b"data:") and line[5:].strip() != b"[DONE]"]
+                            assert events[0] == {"type": "keepalive", "sequence_number": 0}, context
+                            assert events[-1]["type"] == "error", context
+                            assert events[-1]["error"]["status_code"] == expected_status, context
+                            assert b"resp_reject" not in raw and b"response.completed" not in raw, context
+                            assert (SHORT_INPUT_REJECTION.encode() if label != "sse-error-validation" else b"Missing required parameter") in raw, context
                         elif status == 200:
                             assert b"test" in raw and b"invalid_request_error" not in raw, context
                             assert b"Upstream request failed" not in raw, context

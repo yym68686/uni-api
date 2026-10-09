@@ -160,6 +160,7 @@ struct ActiveAttempt {
     buffered: Vec<Bytes>,
     stats: StreamStats,
     terminal: Option<Terminal>,
+    precommit_deadline: Option<tokio::time::Instant>,
     total_deadline: Option<tokio::time::Instant>,
     commit_reason: &'static str,
     precommit_keepalive_sent: bool,
@@ -915,6 +916,7 @@ async fn preflight_attempt_with_trigger(
         buffered: Vec::new(),
         stats,
         terminal: None,
+        precommit_deadline: (!hedge_triggered).then_some(first_deadline).flatten(),
         total_deadline,
         commit_reason: "real_output",
         precommit_keepalive_sent: keepalive_already_sent,
@@ -976,6 +978,7 @@ async fn preflight_attempt_with_trigger(
                     && error == "upstream deadline exceeded"
                 {
                     hedge_triggered = true;
+                    active.precommit_deadline = None;
                     if let Some(trigger) = trigger {
                         trigger.fire();
                     }
@@ -1046,27 +1049,25 @@ fn process_preflight_frames_inner(
         }
         let early_keepalive =
             !active.precommit_keepalive_sent && processed.canonical_keepalive && semantic_guard;
+        let synthetic_keepalive = !active.precommit_keepalive_sent
+            && semantic_guard
+            && processed.event_type.as_deref() == Some("response.created");
         let suppress_repeated_keepalive =
             active.precommit_keepalive_sent && processed.event_type.as_deref() == Some("keepalive");
         let transparent_response_created =
             !semantic_guard && processed.event_type.as_deref() == Some("response.created");
         let commits_response =
             processed.commits || transparent_response_created || processed.terminal.is_some();
-        if processed.event_type.as_deref() == Some("response.created")
-            && semantic_guard
-            && !active.precommit_keepalive_sent
-        {
-            active.buffered.push(Bytes::from_static(
+        if synthetic_keepalive {
+            active.early_output.push(Bytes::from_static(
                 b"event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":0}\n\n",
             ));
             active.precommit_keepalive_sent = true;
         }
         if let Some(wire) = processed.wire.filter(|_| !suppress_repeated_keepalive) {
-            let buffered_bytes: usize = active.buffered.iter().map(Bytes::len).sum();
-            if !started
+            if !active.business_committed
                 && !commits_response
-                && (active.buffered.len() >= active.plan.max_precommit_items
-                    || buffered_bytes.saturating_add(wire.len()) > active.plan.max_precommit_bytes)
+                && precommit_buffer_exceeded(active, wire.len())
             {
                 return Ok(Some(PreflightResult::Retry(json!({
                     "kind": "protocol_error",
@@ -1082,7 +1083,7 @@ fn process_preflight_frames_inner(
                 active.buffered.push(wire);
             }
         }
-        if processed.event_type.as_deref() == Some("keepalive") {
+        if early_keepalive {
             active.precommit_keepalive_sent = true;
         }
         if let Some(terminal) = processed.terminal {
@@ -1091,9 +1092,13 @@ fn process_preflight_frames_inner(
             active.business_committed = true;
             return Ok(Some(PreflightResult::Started(take_active(active)?)));
         }
-        if early_keepalive {
+        if early_keepalive || synthetic_keepalive {
             if !started {
-                active.commit_reason = "upstream_keepalive";
+                active.commit_reason = if synthetic_keepalive {
+                    "response_created_keepalive"
+                } else {
+                    "upstream_keepalive"
+                };
             }
             started = true;
         }
@@ -1129,6 +1134,7 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
         buffered: Vec::new(),
         stats: StreamStats::new(&active.plan.attempt_id),
         terminal: None,
+        precommit_deadline: active.precommit_deadline,
         total_deadline: active.total_deadline,
         commit_reason: active.commit_reason,
         precommit_keepalive_sent: active.precommit_keepalive_sent,
@@ -1403,6 +1409,11 @@ async fn run_active_attempt(
                 active.plan.idle_timeout_seconds,
             );
             let next_deadline = earlier_deadline(idle_deadline, active.total_deadline);
+            let next_deadline = if active.business_committed {
+                next_deadline
+            } else {
+                earlier_deadline(next_deadline, active.precommit_deadline)
+            };
             let next = tokio::select! {
                 _ = cancellation.cancelled(), if output.capture.is_none() => {
                     complete_disconnect(
@@ -2067,6 +2078,17 @@ async fn flush_initial_output(
     Ok(())
 }
 
+fn precommit_buffer_exceeded(active: &ActiveAttempt, wire_bytes: usize) -> bool {
+    active.buffered.len() >= active.plan.max_precommit_items
+        || active
+            .buffered
+            .iter()
+            .map(Bytes::len)
+            .sum::<usize>()
+            .saturating_add(wire_bytes)
+            > active.plan.max_precommit_bytes
+}
+
 fn semantic_failure_outcome(
     active: &ActiveAttempt,
     event_type: &str,
@@ -2271,6 +2293,13 @@ async fn process_active_frames(
                     return ActiveFrameResult::Done(false);
                 }
             } else {
+                if !processed.commits && precommit_buffer_exceeded(active, wire.len()) {
+                    return ActiveFrameResult::Retry(failure_retry_outcome(
+                        active,
+                        "protocol_error",
+                        "Responses upstream precommit buffer limit exceeded",
+                    ));
+                }
                 active.buffered.push(wire);
             }
         }
@@ -2667,6 +2696,7 @@ mod tests {
             buffered: Vec::new(),
             stats: StreamStats::default(),
             terminal: None,
+            precommit_deadline: None,
             total_deadline: None,
             commit_reason: "real_output",
             precommit_keepalive_sent: false,
@@ -2980,12 +3010,15 @@ mod tests {
             )
             .unwrap();
 
-        let PreflightResult::Retry(outcome) = process_preflight_frames(&mut active, frames)
+        let PreflightResult::Started(mut active) = process_preflight_frames(&mut active, frames)
             .unwrap()
             .unwrap()
         else {
             panic!("whitespace-only priming must remain retryable");
         };
+        assert_eq!(active.early_output.len(), 1);
+        let terminal = active.terminal.take().expect("semantic failure");
+        let outcome = semantic_retry_outcome(&active, terminal);
         assert_eq!(outcome["status_code"], 429);
         assert_eq!(outcome["committed"], false);
         assert!(!active.business_committed);
@@ -3068,7 +3101,33 @@ mod tests {
     }
 
     #[test]
-    fn codex_response_created_still_injects_the_precommit_keepalive() {
+    fn codex_response_created_starts_http_without_committing_business_output() {
+        let mut active = test_active("codex");
+        let frames = active.decoder.feed(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+        ).unwrap();
+        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("response.created must start the heartbeat immediately");
+        };
+        assert!(!active.business_committed);
+        assert_eq!(active.commit_reason, "response_created_keepalive");
+        assert_eq!(
+            active.early_output,
+            vec![Bytes::from_static(
+                b"event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":0}\n\n",
+            )]
+        );
+        assert_eq!(active.buffered.len(), 1);
+        assert!(active.buffered[0].starts_with(b"event: response.created\n"));
+        assert!(active.stats.first_output_ms.is_none());
+        assert!(active.stats.first_text_ms.is_none());
+    }
+
+    #[test]
+    fn codex_response_created_and_output_flush_heartbeat_before_business_events() {
         let mut active = test_active("codex");
         let frames = active
             .decoder
@@ -3084,9 +3143,10 @@ mod tests {
             panic!("expected substantive Codex output to commit");
         };
         assert!(active.business_committed);
-        assert_eq!(active.buffered.len(), 3);
-        assert!(active.buffered[0].starts_with(b"event: keepalive\n"));
-        assert!(active.buffered[1].starts_with(b"event: response.created\n"));
+        assert_eq!(active.early_output.len(), 1);
+        assert!(active.early_output[0].starts_with(b"event: keepalive\n"));
+        assert_eq!(active.buffered.len(), 2);
+        assert!(active.buffered[0].starts_with(b"event: response.created\n"));
     }
 
     #[test]
@@ -3108,6 +3168,32 @@ mod tests {
         assert!(active.business_committed);
         assert_eq!(active.buffered.len(), 1);
         assert!(active.buffered[0].len() > active.plan.max_precommit_bytes);
+    }
+
+    #[test]
+    fn codex_heartbeat_does_not_bypass_same_chunk_precommit_limits() {
+        for (items, bytes) in [(1, 4096), (128, 128)] {
+            let mut active = test_active("codex");
+            active.plan.max_precommit_items = items;
+            active.plan.max_precommit_bytes = bytes;
+            let frames = active
+                .decoder
+                .feed(
+                    b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+                  event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n\
+                  event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n",
+                )
+                .unwrap();
+            let PreflightResult::Retry(outcome) = process_preflight_frames(&mut active, frames)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("heartbeat must not bypass business buffer limits");
+            };
+            assert_eq!(outcome["committed"], false);
+            assert_eq!(outcome["kind"], "protocol_error");
+            assert!(!active.business_committed);
+        }
     }
 
     #[test]

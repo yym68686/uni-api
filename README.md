@@ -1093,6 +1093,8 @@ Before the first heartbeat, exhausted attempts return an HTTP error. After a hea
 
 Use `timeout_policy` when timeout depends on endpoint, stream mode, semantic request type, provider, engine, model, method, or role. `model_timeout` is still supported as the backward-compatible fallback; `timeout_policy` is the more precise rule system.
 
+For guarded Codex `/v1/responses` streams, the first `response.created` immediately sends `event: keepalive` with `data: {"type":"keepalive","sequence_number":0}`. Business events remain buffered until substantive output or a non-error terminal event. The heartbeat does not count as semantic output, reset the first-output deadline, disable precommit buffer limits, or prevent channel retries. A canonical upstream keepalive uses the same early path; precommit retries do not send a second heartbeat or leak failed attempts' buffered events. Transparent, unguarded Responses streams are unchanged. Once the heartbeat starts HTTP 200, exhausted retries report an in-band SSE error rather than changing the HTTP status. Response headers then describe the initial attempt and cannot change during retries; final signed settlement receipts remain authoritative for attribution.
+
 ```yaml
 preferences:
   model_timeout:
