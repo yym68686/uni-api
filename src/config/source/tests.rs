@@ -1,4 +1,5 @@
 use crate::config::compiler::compile_snapshot_bytes;
+use crate::config::compiler::infer_engine;
 use crate::config::discovery::discovered_model_ids;
 use crate::config::discovery::provider_models_url;
 use serde_json::{json, Value};
@@ -142,6 +143,71 @@ api_keys:
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["providers"][0]["engine"], "claude");
     assert_eq!(value["api_keys"][1]["model_rules"][0], "claude-a/*");
+}
+
+#[test]
+fn automatic_engine_uses_url_without_model_name_fallbacks() {
+    for (base, expected) in [
+        ("https://example.com/v1/responses", "codex"),
+        ("https://example.com/proxy/v1/responses/?version=1", "codex"),
+        (" https://example.com/V1/RESPONSES ", "codex"),
+        ("https://example.com/v1/responses-preview", "gpt"),
+        ("https://example.com/v1?redirect=/v1/responses", "gpt"),
+        ("https://example.com/v1/chat/completions", "gpt"),
+        ("https://example.com/v1", "gpt"),
+        ("https://example.com/v1/messages", "claude"),
+        ("https://example.com/claude/v1/responses", "claude"),
+        ("https://generativelanguage.googleapis.com/v1beta", "gemini"),
+        ("https://aiplatform.googleapis.com/v1/responses", "vertex"),
+        (
+            "https://bedrock-runtime.us-east-1.amazonaws.com/v1/responses",
+            "aws",
+        ),
+        ("https://api.cohere.com/v1/responses", "cohere"),
+        ("https://example.azure.com/v1/responses", "azure"),
+        (
+            "https://example.databricks.com/v1/responses",
+            "azure-databricks",
+        ),
+        ("https://example.workers.dev/v1/responses", "cloudflare"),
+        ("https://api.typesafe.ai/v1/responses", "typesafe"),
+        (
+            "https://example.com/doubao/v1/responses",
+            "doubao-translation",
+        ),
+    ] {
+        assert_eq!(infer_engine(base), expected, "{base}");
+    }
+    for model in [
+        "claude-opus",
+        "gemini-pro",
+        "gpt-6-luna",
+        "codex-review",
+        "grok",
+        "glm",
+        "deepseek",
+        "custom",
+    ] {
+        for (base, explicit, expected) in [
+            ("https://example.com/v1/responses", None, "codex"),
+            ("https://example.com/v1/responses", Some("gpt"), "gpt"),
+            ("https://example.com/v1", None, "gpt"),
+        ] {
+            let mut provider =
+                json!({"provider":"automatic","base_url":base,"api":"upstream","model":[model]});
+            if let Some(engine) = explicit {
+                provider["engine"] = json!(engine);
+            }
+            let config = json!({"providers":[provider],"api_keys":[{"api":"client","model":["automatic/*"]}]});
+            let bytes =
+                compile_snapshot_bytes(&serde_json::to_vec(&config).unwrap(), true).unwrap();
+            let compiled: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                compiled["providers"][0]["engine"], expected,
+                "{model} / {base}"
+            );
+        }
+    }
 }
 
 #[test]

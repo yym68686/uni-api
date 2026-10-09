@@ -377,7 +377,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
 }
 
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"supported":true,"global_settings":true,"create_provider":true,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
+    json!({"version":1,"supported":true,"global_settings":true,"create_provider":true,"automatic_engine":true,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
 }
 
 pub(crate) fn valid_created_name(name: &str) -> bool {
@@ -1004,10 +1004,9 @@ impl GatewayRuntime {
                 }
                 validate_paths(original_change)?;
                 let raw = merge(&json!({"provider":name}), &original_change.set, &[]);
-                if !schema()["engines"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&raw["engine"])
+                if raw
+                    .get("engine")
+                    .is_some_and(|engine| !schema()["engines"].as_array().unwrap().contains(engine))
                 {
                     return Err(bad("Invalid channel setting: /engine"));
                 }
@@ -1528,6 +1527,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn omitted_engine_is_inferred_during_creation_and_preview() {
+        for (base, expected) in [
+            ("https://upstream.example/v1/responses", "codex"),
+            ("https://upstream.example/v1/messages", "claude"),
+            ("https://upstream.example/v1beta", "gemini"),
+            ("https://upstream.example/v1", "gpt"),
+        ] {
+            let store = fixture().await;
+            let revision = store.settings_view("one").await.unwrap()["revision"].clone();
+            let mutation = || {
+                serde_json::from_value::<Mutation>(json!({
+                "revision":revision,"operation_id":"auto-create",
+                "changes":[{"provider":"auto","create_to_key":crate::routing::catalog::key_id("caller-a"),
+                    "set":{"/base_url":base,"/api":"fixture","/model":["claude-mixed","gpt-mixed","custom"]}}]
+            })).unwrap()
+            };
+            store.settings_change(mutation(), false).await.unwrap();
+            assert!(store.settings_view("auto").await.is_err());
+            store.settings_change(mutation(), true).await.unwrap();
+            assert_eq!(
+                store.snapshot().await.unwrap().providers_by_name["auto"]
+                    .engine
+                    .as_ref(),
+                expected
+            );
+            assert!(
+                store.settings_export().await.unwrap()["temporary_definitions"]["auto"]
+                    .get("engine")
+                    .is_none()
+            );
+        }
+    }
     #[tokio::test]
     async fn generic_creation_rejects_invalid_definitions_atomically() {
         let store = fixture().await;

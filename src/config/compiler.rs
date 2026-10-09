@@ -290,6 +290,14 @@ pub(crate) fn infer_engine(base_url: &str) -> String {
     if lower.contains("cloudflare") || lower.contains("workers.dev") {
         return "cloudflare".into();
     }
+    if Url::parse(base_url.trim()).ok().is_some_and(|url| {
+        url.path()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .ends_with("/v1/responses")
+    }) {
+        return "codex".into();
+    }
     "gpt".into()
 }
 
