@@ -1087,20 +1087,23 @@ impl StreamState {
                     .pointer("/response/usage")
                     .filter(|usage| usage.is_object())
                 {
+                    let usage = responses_usage_to_chat(Some(source_usage));
                     self.fact_usage
                         .merge(crate::observability::usage::FactUsage::from_usage(Some(
-                            source_usage,
+                            &usage,
                         )));
-                    let usage = responses_usage_to_chat(Some(source_usage));
                     self.prompt_tokens = number(usage.get("prompt_tokens"));
                     self.completion_tokens = number(usage.get("completion_tokens"));
                     self.chat_usage = Some(usage);
                 }
-                self.finish_chunks(if self.tools.is_empty() {
-                    "stop"
-                } else {
-                    "tool_calls"
-                })
+                self.finish_chunks_with_usage(
+                    if self.tools.is_empty() {
+                        "stop"
+                    } else {
+                        "tool_calls"
+                    },
+                    false,
+                )
             }
             "response.completed" => self.responses_failure(value, "response.failed"),
             "response.failed" | "error" => self.responses_failure(value, event),
@@ -1430,6 +1433,10 @@ impl StreamState {
     }
 
     fn finish_chunks(&mut self, reason: &str) -> Vec<Value> {
+        self.finish_chunks_with_usage(reason, true)
+    }
+
+    fn finish_chunks_with_usage(&mut self, reason: &str, synthesize_usage: bool) -> Vec<Value> {
         if self.terminal {
             return Vec::new();
         }
@@ -1444,7 +1451,8 @@ impl StreamState {
         if self.output_protocol == OutputProtocol::Responses {
             return vec![self.chunk(json!({}), Some(reason), Some(usage))];
         }
-        let emit_final_usage = self.include_usage || self.chat_usage.is_some();
+        let emit_final_usage =
+            (self.include_usage && synthesize_usage) || self.chat_usage.is_some();
         let mut chunks = vec![self.chunk(json!({}), Some(reason), None)];
         if emit_final_usage {
             chunks.push(json!({
@@ -2104,50 +2112,7 @@ fn gemini_usage_to_chat(usage: &Value) -> Value {
 }
 
 pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
-    let prompt_tokens = number(usage.and_then(|value| {
-        value
-            .get("prompt_tokens")
-            .or_else(|| value.get("input_tokens"))
-    }));
-    let completion_tokens = number(usage.and_then(|value| {
-        value
-            .get("completion_tokens")
-            .or_else(|| value.get("output_tokens"))
-    }));
-    let total_tokens = usage
-        .and_then(|value| value.get("total_tokens"))
-        .map(|value| number(Some(value)))
-        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
-    let prompt_details = usage.and_then(|value| {
-        value
-            .get("prompt_tokens_details")
-            .or_else(|| value.get("input_tokens_details"))
-    });
-    let completion_details = usage.and_then(|value| {
-        value
-            .get("completion_tokens_details")
-            .or_else(|| value.get("output_tokens_details"))
-    });
-    let mut mapped = json!({
-        "prompt_tokens":prompt_tokens,
-        "completion_tokens":completion_tokens,
-        "total_tokens":total_tokens,
-        "prompt_tokens_details":{
-            "cached_tokens":number(prompt_details.and_then(|value| value.get("cached_tokens"))),
-            "cache_write_tokens":number(prompt_details.and_then(|value| value.get("cache_write_tokens"))),
-            "audio_tokens":number(prompt_details.and_then(|value| value.get("audio_tokens"))),
-        },
-        "completion_tokens_details":{
-            "reasoning_tokens":number(completion_details.and_then(|value| value.get("reasoning_tokens"))),
-            "audio_tokens":number(completion_details.and_then(|value| value.get("audio_tokens"))),
-            "accepted_prediction_tokens":number(completion_details.and_then(|value| value.get("accepted_prediction_tokens"))),
-            "rejected_prediction_tokens":number(completion_details.and_then(|value| value.get("rejected_prediction_tokens"))),
-        },
-    });
-    if let Some(receipt) = usage.and_then(|v| v.get("oaix_settlement_receipt")) {
-        mapped["oaix_settlement_receipt"] = receipt.clone();
-    }
-    mapped
+    crate::protocols::responses::usage::to_chat(usage)
 }
 
 fn trim_ascii(mut value: &[u8]) -> &[u8] {
@@ -2783,6 +2748,45 @@ mod tests {
 
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].get("usage").is_none());
+    }
+
+    #[test]
+    fn responses_stream_does_not_invent_usage_with_client_opt_in() {
+        let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, true);
+        let chunks = state.responses(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed","usage":null},
+        }));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["usage"], Value::Null);
+        assert_eq!(state.fact_usage, Default::default());
+    }
+
+    #[test]
+    fn responses_stream_uses_native_usage_for_wire_and_facts() {
+        let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, true);
+        let chunks = state.responses(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed","usage":{
+                "input_tokens":11476,"output_tokens":107,"total_tokens":11583,
+                "prompt_tokens":0,"completion_tokens":0,
+                "input_tokens_details":{"cached_tokens":11264,"cache_write_tokens":32},
+                "prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},
+                "output_tokens_details":{"reasoning_tokens":67},
+                "completion_tokens_details":{"reasoning_tokens":0}
+            }},
+        }));
+        assert_eq!(chunks[1]["usage"]["prompt_tokens"], 11476);
+        assert_eq!(chunks[1]["usage"]["completion_tokens"], 107);
+        assert_eq!(
+            chunks[1]["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            67
+        );
+        assert_eq!(state.usage(), (11476, 107, 11583));
+        assert_eq!(state.fact_usage.input, Some(11476));
+        assert_eq!(state.fact_usage.output, Some(107));
+        assert_eq!(state.fact_usage.cache_read, Some(11264));
+        assert_eq!(state.fact_usage.cache_write, Some(32));
     }
 
     #[test]

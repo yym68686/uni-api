@@ -1551,7 +1551,7 @@ pub(crate) async fn send_attempt(
             upstream_url: prepared.url,
         });
     }
-    let upstream = if prepared.adapter == ResponseAdapter::Search {
+    let mut upstream = if prepared.adapter == ResponseAdapter::Search {
         let bytes = read_limited_upstream_body_with_idle(
             response,
             upstream_response_max_bytes(),
@@ -1586,6 +1586,9 @@ pub(crate) async fn send_attempt(
             response: None,
         })?
     };
+    if prepared.adapter == ResponseAdapter::ResponsesToChat {
+        crate::protocols::responses::usage::normalize_payload(&mut upstream);
+    }
     let fact_usage = crate::observability::usage::FactUsage::from_usage(
         upstream
             .get("usage")

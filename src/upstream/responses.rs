@@ -450,30 +450,32 @@ async fn serve_native_nonstream(
         };
         match send_native_nonstream_attempt(&state, &plan).await {
             Ok((status, mut headers, mut body, elapsed_ms)) if status.is_success() => {
-                let first_output_ms = serde_json::from_slice::<Value>(&body)
-                    .ok()
+                let mut payload = serde_json::from_slice::<Value>(&body).ok();
+                if let Some(payload) = payload.as_mut() {
+                    let mut changed =
+                        crate::protocols::responses::usage::normalize_payload(payload);
+                    if plan.normalize_custom_tool_call_ids {
+                        let mut normalizer = ResponsesItemIdNormalizer::default();
+                        changed |= normalizer.normalize(payload).unwrap_or(false);
+                    }
+                    if changed {
+                        body = serde_json::to_vec(payload).unwrap_or(body);
+                    }
+                }
+                let first_output_ms = payload
+                    .as_ref()
                     .filter(|p| {
                         p.get("output")
                             .and_then(Value::as_array)
                             .is_some_and(|items| items.iter().any(item_has_output))
                     })
                     .map(|_| elapsed_ms);
-                let usage = serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|payload| {
-                        payload
-                            .get("usage")
-                            .filter(|value| value.is_object())
-                            .cloned()
-                    });
-                if plan.normalize_custom_tool_call_ids {
-                    if let Ok(mut payload) = serde_json::from_slice::<Value>(&body) {
-                        let mut normalizer = ResponsesItemIdNormalizer::default();
-                        if normalizer.normalize(&mut payload).unwrap_or(false) {
-                            body = serde_json::to_vec(&payload).unwrap_or(body);
-                        }
-                    }
-                }
+                let usage = payload.as_ref().and_then(|payload| {
+                    payload
+                        .get("usage")
+                        .filter(|value| value.is_object())
+                        .cloned()
+                });
                 headers.insert(
                     "x-uni-api-data-plane",
                     HeaderValue::from_static("rust-native-v2"),
@@ -1841,6 +1843,10 @@ fn raw_terminal_prefix(
 ) -> Result<(Bytes, Option<Terminal>), String> {
     let mut prefix = BytesMut::new();
     for frame in frames {
+        let (frame, usage_normalized) = crate::protocols::responses::usage::normalize_frame(frame);
+        if usage_normalized {
+            stats.normalized_events = stats.normalized_events.saturating_add(1);
+        }
         if let Some(raw) = stats.raw_stream.as_mut() {
             raw.totals.frames = raw.totals.frames.saturating_add(1);
             if frame_is_comment_only(frame.raw()) {
@@ -2016,6 +2022,10 @@ async fn relay_selective_frames(
 ) -> Option<bool> {
     let mut batch = BytesMut::new();
     for frame in frames {
+        let (frame, usage_normalized) = crate::protocols::responses::usage::normalize_frame(frame);
+        if usage_normalized {
+            active.stats.normalized_events = active.stats.normalized_events.saturating_add(1);
+        }
         let special = selective_rewrite_candidate(&frame)
             || frame_is_comment_only(frame.raw())
             || terminal_candidate(&frame);

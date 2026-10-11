@@ -45,6 +45,10 @@ impl ResponsesProcessor {
         frame: SseFrame,
         stats: &mut StreamStats,
     ) -> Result<ProcessedEvent, String> {
+        let (frame, usage_normalized) = super::usage::normalize_frame(frame);
+        if usage_normalized {
+            stats.normalized_events = stats.normalized_events.saturating_add(1);
+        }
         stats.event_count = stats.event_count.saturating_add(1);
         let parsed = parse_sse_frame(&frame)?;
         if parsed.comment_only {
