@@ -549,7 +549,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                 }
                 execution.state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
-                    failure_reason: None,
+                    failure_reason: Some(failure.failure_reason.clone()),
                     response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -627,6 +627,7 @@ pub(crate) async fn run_hedged_attempt_loop(
 
     execution.state.persistence.record_request(RequestStat {
         is_flagged: true,
+        failure_reason: Some("no_successful_channel".into()),
         status: last_status.as_u16(),
         request_id: execution.request_id,
         trace_id: execution.trace_id,
@@ -856,6 +857,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 observational_only: false,
                                 status_code: 502,
                                 detail: "provider stream outcome was canceled".into(),
+                                failure_reason: Some("other"),
                                 first_output_ms: None,
                                 response_created_ms: None,
                                 first_text_ms: None,
@@ -872,6 +874,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.first_text_ms = outcome.first_text_ms;
                         request_stat.status = outcome.status_code;
                         request_stat.is_flagged = !outcome.success;
+                        request_stat.failure_reason = outcome.failure_reason.map(str::to_owned);
                         request_stat.timing_spans = json!({
                             "runtime": "rust",
                             "attempt_count": attempt_index + 1,
@@ -883,7 +886,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
                             terminal_kind: None,
-                            failure_reason: None,
+                            failure_reason: outcome.failure_reason.map(str::to_owned),
                             response_completed: None,
                             transport_timing: None,
                             duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -1047,7 +1050,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 }
                 state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
-                    failure_reason: None,
+                    failure_reason: Some(failure.failure_reason.clone()),
                     response_completed: None,
                     transport_timing: None,
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
@@ -1110,6 +1113,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
 
     state.persistence.record_request(RequestStat {
         is_flagged: true,
+        failure_reason: Some("no_successful_channel".into()),
         status: last_status.as_u16(),
         stream: input
             .payload
@@ -1151,6 +1155,7 @@ pub(crate) fn copy_oaix_headers(source: &HeaderMap, target: &mut HeaderMap) {
 }
 
 pub(crate) struct AttemptFailure {
+    pub(crate) failure_reason: String,
     pub(crate) status: StatusCode,
     pub(crate) detail: String,
     pub(crate) upstream_url: String,
@@ -1193,6 +1198,7 @@ pub(crate) async fn send_attempt(
         .upstream_client(proxy, http1_only, connect_timeout)
         .await
         .map_err(|error| AttemptFailure {
+            failure_reason: "other".into(),
             status: StatusCode::BAD_GATEWAY,
             detail: error,
             upstream_url: prepared.url.clone(),
@@ -1210,6 +1216,7 @@ pub(crate) async fn send_attempt(
         let token = vertex_access_token(&state.backend_client, provider)
             .await
             .map_err(|error| AttemptFailure {
+                failure_reason: "other".into(),
                 status: StatusCode::BAD_GATEWAY,
                 detail: error,
                 upstream_url: prepared.url.clone(),
@@ -1218,6 +1225,7 @@ pub(crate) async fn send_attempt(
         prepared.headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| AttemptFailure {
+                failure_reason: "other".into(),
                 status: StatusCode::BAD_GATEWAY,
                 detail: "Vertex OAuth token is not a valid header value".into(),
                 upstream_url: prepared.url.clone(),
@@ -1238,6 +1246,7 @@ pub(crate) async fn send_attempt(
                 .into_body(&observation)
                 .await
                 .map_err(|error| AttemptFailure {
+                    failure_reason: "other".into(),
                     status: error.status,
                     detail: error.message,
                     upstream_url: prepared.url.clone(),
@@ -1255,6 +1264,7 @@ pub(crate) async fn send_attempt(
             multipart_rewrite_body(storage, observation, &source_content_type, boundary, model)
                 .await
                 .map_err(|detail| AttemptFailure {
+                    failure_reason: "other".into(),
                     status: StatusCode::BAD_REQUEST,
                     detail,
                     upstream_url: prepared.url.clone(),
@@ -1279,6 +1289,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|detail| AttemptFailure {
+                failure_reason: "other".into(),
                 status: StatusCode::BAD_GATEWAY,
                 detail,
                 upstream_url: prepared.url.clone(),
@@ -1311,6 +1322,7 @@ pub(crate) async fn send_attempt(
     )
     .await
     .map_err(|_| AttemptFailure {
+        failure_reason: "transport_error".into(),
         status: StatusCode::GATEWAY_TIMEOUT,
         detail: "Upstream response headers timed out".into(),
         upstream_url: prepared.url.clone(),
@@ -1318,6 +1330,7 @@ pub(crate) async fn send_attempt(
     })?
     .output
     .map_err(|error| AttemptFailure {
+        failure_reason: "transport_error".into(),
         status: StatusCode::BAD_GATEWAY,
         detail: format!("Upstream transport error: {error}"),
         upstream_url: prepared.url.clone(),
@@ -1352,6 +1365,7 @@ pub(crate) async fn send_attempt(
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
         return Err(AttemptFailure {
+            failure_reason: format!("upstream_http_{}", status.as_u16()),
             status,
             detail: truncate_detail(&detail),
             upstream_url: prepared.url,
@@ -1390,6 +1404,7 @@ pub(crate) async fn send_attempt(
                 )
                 .await
                 .map_err(|failure| AttemptFailure {
+                    failure_reason: failure.failure_reason.unwrap_or("other").into(),
                     status: StatusCode::from_u16(failure.status_code)
                         .unwrap_or(StatusCode::BAD_GATEWAY),
                     detail: failure.detail,
@@ -1466,6 +1481,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|failure| AttemptFailure {
+                failure_reason: failure.failure_reason.unwrap_or("other").into(),
                 status: StatusCode::from_u16(failure.status_code)
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 detail: failure.detail,
@@ -1494,6 +1510,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|failure| AttemptFailure {
+                failure_reason: failure.failure_reason.unwrap_or("other").into(),
                 status: StatusCode::from_u16(failure.status_code)
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 detail: failure.detail,
@@ -1526,6 +1543,7 @@ pub(crate) async fn send_attempt(
         )
         .await
         .map_err(|error| AttemptFailure {
+            failure_reason: "other".into(),
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Read upstream response failed: {error}"),
             upstream_url: prepared.url.clone(),
@@ -1559,6 +1577,7 @@ pub(crate) async fn send_attempt(
         )
         .await
         .map_err(|error| AttemptFailure {
+            failure_reason: "other".into(),
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Read upstream response failed: {error}"),
             upstream_url: prepared.url.clone(),
@@ -1574,12 +1593,14 @@ pub(crate) async fn send_attempt(
         )
         .await
         .map_err(|error| AttemptFailure {
+            failure_reason: "other".into(),
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Read upstream response failed: {error}"),
             upstream_url: prepared.url.clone(),
             response: None,
         })?;
         serde_json::from_slice::<Value>(&bytes).map_err(|error| AttemptFailure {
+            failure_reason: "protocol_error".into(),
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Decode upstream response failed: {error}"),
             upstream_url: prepared.url.clone(),

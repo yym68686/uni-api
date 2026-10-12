@@ -37,6 +37,7 @@ pub(crate) fn observe(
                         Ok(bytes) => observer.feed(bytes),
                         Err(error) => {
                             observer.failure_detail = Some(error.to_string());
+                            observer.failure_reason = Some("transport_error");
                             observer.failed = true;
                             observer.ended = true;
                         }
@@ -71,6 +72,7 @@ struct Observer {
     terminal: bool,
     failed: bool,
     failure_detail: Option<String>,
+    failure_reason: Option<&'static str>,
     ended: bool,
     sender: Option<oneshot::Sender<StreamOutcome>>,
 }
@@ -89,6 +91,7 @@ impl Observer {
             terminal: false,
             failed: false,
             failure_detail: None,
+            failure_reason: None,
             ended: false,
             sender: None,
         }
@@ -137,12 +140,11 @@ impl Observer {
         if kind == "response.created" && self.response_created_ms.is_none() {
             self.response_created_ms = Some(elapsed);
         }
-        if kind == "response.output_text.delta"
-            && self.first_text_ms.is_none()
-            && value
-                .get("delta")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
+        use crate::protocols::provider_stream::{text_output_value, Protocol};
+        if self.first_text_ms.is_none()
+            && [Protocol::Responses, Protocol::Claude, Protocol::Chat]
+                .iter()
+                .any(|p| text_output_value(*p, &value))
         {
             self.first_text_ms = Some(elapsed);
         }
@@ -153,6 +155,7 @@ impl Observer {
             || value.pointer("/response/status").and_then(Value::as_str) == Some("failed")
         {
             self.failed = true;
+            self.failure_reason = Some("upstream_response_failed");
         }
         if matches!(
             kind,
@@ -187,7 +190,7 @@ impl Observer {
                 .get("delta")
                 .and_then(Value::as_str)
                 .is_some_and(|v| !v.is_empty()));
-        if semantic && self.first_output_ms.is_none() {
+        if (semantic || self.first_text_ms.is_some()) && self.first_output_ms.is_none() {
             self.first_output_ms = Some(self.start.elapsed().as_secs_f64() * 1000.0);
         }
     }
@@ -209,6 +212,13 @@ impl Observer {
                 499
             } else {
                 502
+            },
+            failure_reason: if success {
+                None
+            } else if !self.ended {
+                Some("downstream_disconnected")
+            } else {
+                self.failure_reason.or(Some("protocol_error"))
             },
             detail: if success {
                 String::new()
@@ -282,7 +292,7 @@ mod tests {
     #[test]
     fn fragmented_claude_usage_and_errors_are_observed_without_accumulating_payloads() {
         let mut o = Observer::new();
-        let wire = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":11}}}\r\n\r\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let wire = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":11}}}\r\n\r\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
         for bytes in wire.chunks(7) {
             o.feed(bytes);
         }
@@ -296,6 +306,8 @@ mod tests {
         );
         assert_eq!(result.fact_usage.cache_read, Some(11));
         assert!(result.first_output_ms.is_some());
+        assert!(result.first_text_ms.is_some());
+        assert!(result.response_created_ms.is_none());
         assert!(o.line.is_empty());
         o.feed(b"data: {\"type\":\"error\",\"error\":{\"message\":\"bad\"}}\n\n");
         assert!(!o.outcome().success);

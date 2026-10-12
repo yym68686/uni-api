@@ -226,7 +226,7 @@ pub async fn preflight(
         }
         let next = tokio::select! {
             biased;
-            () = tick(deadline) => return Err(PrecommitFailure { status_code: 504, detail: "Upstream chat first output timed out".into() }),
+            () = tick(deadline) => return Err(PrecommitFailure { failure_reason: Some("transport_error"), status_code: 504, detail: "Upstream chat first output timed out".into() }),
             chunk = body.next() => chunk,
         };
         match next {
@@ -247,6 +247,7 @@ pub async fn preflight(
 
 fn failure(detail: &str) -> PrecommitFailure {
     PrecommitFailure {
+        failure_reason: Some("protocol_error"),
         status_code: 502,
         detail: detail.into(),
     }
@@ -278,6 +279,7 @@ fn real_output(event: &[u8]) -> Result<bool, PrecommitFailure> {
             .filter(|status| (400..=599).contains(status))
             .unwrap_or(502) as u16;
         return Err(PrecommitFailure {
+            failure_reason: Some("upstream_response_failed"),
             status_code: status,
             detail: error.to_string(),
         });

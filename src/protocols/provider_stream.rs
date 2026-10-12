@@ -47,6 +47,7 @@ pub struct StreamOutcome {
     pub observational_only: bool,
     pub status_code: u16,
     pub detail: String,
+    pub failure_reason: Option<&'static str>,
     pub first_output_ms: Option<f64>,
     pub response_created_ms: Option<f64>,
     pub first_text_ms: Option<f64>,
@@ -56,6 +57,7 @@ pub struct StreamOutcome {
 pub struct PrecommitFailure {
     pub status_code: u16,
     pub detail: String,
+    pub failure_reason: Option<&'static str>,
 }
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
@@ -77,6 +79,8 @@ struct TranslationOptions {
 // request. Precommit filtering may discard wire events, never their timestamps.
 #[derive(Clone, Copy)]
 struct StreamTiming {
+    // Preserve the existing EOF/commit policy independently of added clocks.
+    routing_output_seen: bool,
     started_at: tokio::time::Instant,
     first_output_ms: Option<f64>,
     response_created_ms: Option<f64>,
@@ -86,6 +90,7 @@ struct StreamTiming {
 impl StreamTiming {
     fn new(started_at: tokio::time::Instant) -> Self {
         Self {
+            routing_output_seen: false,
             started_at,
             first_output_ms: None,
             response_created_ms: None,
@@ -94,6 +99,17 @@ impl StreamTiming {
     }
 
     fn observe(&mut self, protocol: Protocol, value: &Value) {
+        self.routing_output_seen |= if protocol == Protocol::Responses {
+            responses_event_has_real_output(
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                value,
+            )
+        } else {
+            semantic_output_value(Protocol::Chat, value)
+        };
         let elapsed = self.started_at.elapsed().as_secs_f64() * 1000.0;
         if protocol == Protocol::Responses {
             let kind = value
@@ -103,15 +119,9 @@ impl StreamTiming {
             if kind == "response.created" && self.response_created_ms.is_none() {
                 self.response_created_ms = Some(elapsed);
             }
-            if kind == "response.output_text.delta"
-                && self.first_text_ms.is_none()
-                && value
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-            {
-                self.first_text_ms = Some(elapsed);
-            }
+        }
+        if self.first_text_ms.is_none() && text_output_value(protocol, value) {
+            self.first_text_ms = Some(elapsed);
         }
         if self.first_output_ms.is_none() && semantic_output_value(protocol, value) {
             self.first_output_ms = Some(elapsed);
@@ -215,6 +225,7 @@ pub async fn translate_responses_to_chat(
                     retained.extend_from_slice(b"\n\n");
                     if retained.len() > MAX_STREAM_FRAME_BYTES {
                         return Err(PrecommitFailure {
+                            failure_reason: Some("protocol_error"),
                             status_code: 502,
                             detail: "upstream Responses precommit output exceeded 1 MiB".into(),
                         });
@@ -249,6 +260,7 @@ pub async fn translate_responses_to_chat(
         }
         if buffer.len() > MAX_STREAM_FRAME_BYTES {
             return Err(PrecommitFailure {
+                failure_reason: Some("protocol_error"),
                 status_code: 502,
                 detail: "upstream Responses SSE event exceeded 1 MiB before commit".into(),
             });
@@ -256,6 +268,7 @@ pub async fn translate_responses_to_chat(
         let next = next_upstream_chunk(&mut upstream, idle, precommit_deadline)
             .await
             .map_err(|detail| PrecommitFailure {
+                failure_reason: Some("transport_error"),
                 status_code: 504,
                 detail,
             })?;
@@ -263,6 +276,7 @@ pub async fn translate_responses_to_chat(
             Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
             Some(Err(error)) => {
                 return Err(PrecommitFailure {
+                    failure_reason: Some("transport_error"),
                     status_code: 502,
                     detail: format!("upstream Responses stream failed before commit: {error}"),
                 });
@@ -296,6 +310,7 @@ pub async fn translate_responses_to_chat(
                     }
                 }
                 return Err(PrecommitFailure {
+                    failure_reason: Some("protocol_error"),
                     status_code: 502,
                     detail:
                         "upstream Responses stream ended before real output or a completed terminal"
@@ -338,7 +353,7 @@ fn spawn_translation(
             () = tx.closed() => Ok(StreamOutcome {
                 usage: (0, 0, 0), fact_usage: Default::default(), success: false,
                 observational_only: false, status_code: 499,
-                detail: "downstream disconnected".into(), first_output_ms: None, response_created_ms: None, first_text_ms: None,
+                failure_reason: Some("downstream_disconnected"), detail: "downstream disconnected".into(), first_output_ms: None, response_created_ms: None, first_text_ms: None,
             }),
             result = run_translation(
             stream,
@@ -370,6 +385,7 @@ fn spawn_translation(
                     success: false,
                     observational_only: false,
                     status_code: 502,
+                    failure_reason: Some(stream_failure_reason(&error)),
                     detail: error,
                     first_output_ms: None,
                     response_created_ms: None,
@@ -421,7 +437,9 @@ async fn run_translation(
         while let Some(chunk) =
             next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
         {
-            buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+            buffer.extend_from_slice(
+                &chunk.map_err(|error| format!("upstream transport error: {error}"))?,
+            );
             drain_aws_frames(&mut buffer, &mut state, tx).await?;
             if buffer.len() > MAX_STREAM_FRAME_BYTES {
                 return Err("AWS event-stream frame exceeded 1 MiB".into());
@@ -444,7 +462,9 @@ async fn run_translation(
         while let Some(chunk) =
             next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
         {
-            buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+            buffer.extend_from_slice(
+                &chunk.map_err(|error| format!("upstream transport error: {error}"))?,
+            );
             drain_sse_events(&mut buffer, protocol, &mut state, tx).await?;
             if protocol == Protocol::Responses && state.terminal {
                 break;
@@ -461,7 +481,9 @@ async fn run_translation(
         while let Some(chunk) =
             next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
         {
-            buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+            buffer.extend_from_slice(
+                &chunk.map_err(|error| format!("upstream transport error: {error}"))?,
+            );
             while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = buffer.drain(..=index).collect::<Vec<_>>();
                 process_json_bytes(&line, protocol, &mut state, tx).await?;
@@ -476,7 +498,9 @@ async fn run_translation(
         while let Some(chunk) =
             next_upstream_chunk(&mut stream, timeouts.idle, total_deadline).await?
         {
-            for frame in framer.feed(&chunk.map_err(|error| error.to_string())?)? {
+            for frame in framer
+                .feed(&chunk.map_err(|error| format!("upstream transport error: {error}"))?)?
+            {
                 process_json_bytes(&frame, protocol, &mut state, tx).await?;
             }
         }
@@ -561,6 +585,7 @@ enum PrecommitDecision {
 
 fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision, PrecommitFailure> {
     let text = std::str::from_utf8(event).map_err(|_| PrecommitFailure {
+        failure_reason: Some("protocol_error"),
         status_code: 502,
         detail: "upstream Responses SSE was not UTF-8 before commit".into(),
     })?;
@@ -591,11 +616,13 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
     }
     if data.trim() == "[DONE]" {
         return Err(PrecommitFailure {
+            failure_reason: Some("protocol_error"),
             status_code: 502,
             detail: "upstream Responses stream emitted [DONE] before a terminal event".into(),
         });
     }
     let payload: Value = serde_json::from_str(&data).map_err(|error| PrecommitFailure {
+        failure_reason: Some("protocol_error"),
         status_code: 502,
         detail: format!("decode upstream Responses precommit event: {error}"),
     })?;
@@ -604,11 +631,13 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| PrecommitFailure {
+                failure_reason: Some("protocol_error"),
                 status_code: 502,
                 detail: "upstream Responses precommit event is missing a string type".into(),
             })?;
     if declared_event.is_some_and(|declared| declared != event_type) {
         return Err(PrecommitFailure {
+                failure_reason: Some("protocol_error"),
             status_code: 502,
             detail: format!(
                 "upstream Responses event field {declared_event:?} does not match payload type {event_type:?}"
@@ -624,6 +653,7 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             let (status_code, detail) =
                 crate::protocols::responses::events::responses_semantic_error(&payload, event_type);
             Err(PrecommitFailure {
+                failure_reason: Some("upstream_response_failed"),
                 status_code,
                 detail,
             })
@@ -645,11 +675,13 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
                             "response.failed",
                         );
                     return Err(PrecommitFailure {
+                        failure_reason: Some("protocol_error"),
                         status_code,
                         detail,
                     });
                 }
                 return Err(PrecommitFailure {
+                    failure_reason: Some("protocol_error"),
                     status_code: 502,
                     detail: "upstream Responses completed terminal is not valid".into(),
                 });
@@ -657,6 +689,7 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             Ok(PrecommitDecision::Commit)
         }
         "response.incomplete" => Err(PrecommitFailure {
+            failure_reason: Some("protocol_error"),
             status_code: 502,
             detail: "upstream Responses request ended incomplete before commit".into(),
         }),
@@ -678,12 +711,14 @@ fn validate_responses_terminal(event_type: &str, payload: &Value) -> Result<(), 
     if event_type.starts_with("response.") && !payload.get("response").is_some_and(Value::is_object)
     {
         return Err(PrecommitFailure {
+            failure_reason: Some("protocol_error"),
             status_code: 502,
             detail: format!("upstream Responses {event_type} event is missing response"),
         });
     }
     if event_type == "error" && payload.get("error").is_none_or(Value::is_null) {
         return Err(PrecommitFailure {
+            failure_reason: Some("protocol_error"),
             status_code: 502,
             detail: "upstream Responses error event is missing error".into(),
         });
@@ -823,7 +858,56 @@ async fn process_json_bytes(
     Ok(())
 }
 
-fn semantic_output_value(protocol: Protocol, value: &Value) -> bool {
+// Only real upstream body text counts as first text. Role, usage, reasoning,
+// tool arguments and synthetic downstream events are intentionally excluded.
+pub(crate) fn text_output_value(protocol: Protocol, value: &Value) -> bool {
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    match protocol {
+        Protocol::Responses => {
+            value.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+                && text(value.get("delta"))
+        }
+        Protocol::Chat => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| cs.iter().any(|c| text(c.pointer("/delta/content")))),
+        Protocol::Claude | Protocol::VertexClaude | Protocol::AwsBedrock => {
+            match value.get("type").and_then(Value::as_str) {
+                Some("content_block_start") => {
+                    value.pointer("/content_block/type").and_then(Value::as_str) == Some("text")
+                        && text(value.pointer("/content_block/text"))
+                }
+                Some("content_block_delta") => {
+                    value.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                        && text(value.pointer("/delta/text"))
+                }
+                _ => false,
+            }
+        }
+        Protocol::Gemini => value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.pointer("/content/parts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ps| {
+                            ps.iter().any(|p| {
+                                p.get("thought").and_then(Value::as_bool) != Some(true)
+                                    && text(p.get("text"))
+                            })
+                        })
+                })
+            }),
+        Protocol::Cohere => {
+            value.get("event_type").and_then(Value::as_str) == Some("text-generation")
+                && text(value.get("text"))
+        }
+        Protocol::Cloudflare => text(value.get("response")),
+    }
+}
+
+pub(crate) fn semantic_output_value(protocol: Protocol, value: &Value) -> bool {
     if protocol == Protocol::Responses {
         return responses_event_has_real_output(
             value
@@ -833,22 +917,64 @@ fn semantic_output_value(protocol: Protocol, value: &Value) -> bool {
             value,
         );
     }
-    value
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_some_and(|choices| {
-            choices.iter().any(|c| {
-                c.pointer("/delta/content")
+    if text_output_value(protocol, value) {
+        return true;
+    }
+    match protocol {
+        Protocol::Claude | Protocol::VertexClaude | Protocol::AwsBedrock => {
+            ["/delta/thinking", "/delta/partial_json"].iter().any(|p| {
+                value
+                    .pointer(p)
                     .and_then(Value::as_str)
-                    .is_some_and(|v| !v.is_empty())
-                    || c.pointer("/delta/reasoning_content")
+                    .is_some_and(|s| !s.is_empty())
+            }) || value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+        }
+        Protocol::Gemini => value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.pointer("/content/parts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ps| {
+                            ps.iter().any(|p| {
+                                p.get("functionCall").is_some()
+                                    || p.get("text")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty())
+                            })
+                        })
+                })
+            }),
+        _ => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.pointer("/delta/reasoning_content")
                         .and_then(Value::as_str)
                         .is_some_and(|v| !v.is_empty())
-                    || c.pointer("/delta/tool_calls")
-                        .and_then(Value::as_array)
-                        .is_some_and(|v| !v.is_empty())
-            })
-        })
+                        || c.pointer("/delta/tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|v| !v.is_empty())
+                })
+            }),
+    }
+}
+
+// These prefixes are produced by this translation loop, not upstream error
+// payloads (semantic failures have their own explicit outcome).
+fn stream_failure_reason(detail: &str) -> &'static str {
+    if detail == "downstream disconnected" {
+        "downstream_disconnected"
+    } else if detail.starts_with("upstream transport error:")
+        || detail.starts_with("upstream stream idle or total timeout")
+        || detail.starts_with("upstream stream total timeout")
+    {
+        "transport_error"
+    } else {
+        "protocol_error"
+    }
 }
 
 async fn drain_aws_frames(
@@ -888,6 +1014,7 @@ async fn drain_aws_frames(
             .map_err(|_| "AWS event-stream bytes field is not valid base64")?;
         let payload: Value = serde_json::from_slice(&decoded)
             .map_err(|error| format!("decode AWS Bedrock event: {error}"))?;
+        state.timing.observe(Protocol::Claude, &payload);
         let event_type = payload.get("type").and_then(Value::as_str);
         let chunks = match event_type {
             Some("message_delta") => {
@@ -1116,6 +1243,7 @@ impl StreamState {
             crate::protocols::responses::events::responses_semantic_error(value, event_type);
         self.terminal = true;
         self.failure = Some(PrecommitFailure {
+            failure_reason: Some("upstream_response_failed"),
             status_code,
             detail: detail.clone(),
         });
@@ -1492,6 +1620,7 @@ impl StreamState {
                 success: false,
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
+                failure_reason: failure.failure_reason,
                 first_output_ms: self.timing.first_output_ms,
                 response_created_ms: self.timing.response_created_ms,
                 first_text_ms: self.timing.first_text_ms,
@@ -1503,6 +1632,7 @@ impl StreamState {
                 success: true,
                 status_code: 200,
                 detail: String::new(),
+                failure_reason: None,
                 first_output_ms: self.timing.first_output_ms,
                 response_created_ms: self.timing.response_created_ms,
                 first_text_ms: self.timing.first_text_ms,
@@ -1514,7 +1644,7 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        if !self.terminal && self.timing.first_output_ms.is_none() {
+        if !self.terminal && !self.timing.routing_output_seen {
             return Err("upstream stream ended before real output or a terminal event".into());
         }
         if self.output_protocol == OutputProtocol::Responses {
@@ -2358,6 +2488,80 @@ mod tests {
         assert!(!wire.contains("response.created"));
         assert!(wire.contains("\"content\":\"hello\""));
         assert!(wire.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn native_claude_text_clocks_include_header_wait_and_exclude_reasoning() {
+        let mut timing =
+            StreamTiming::new(tokio::time::Instant::now() - Duration::from_millis(200));
+        timing.observe(
+            Protocol::Claude,
+            &json!({"type":"message_start","message":{"role":"assistant"}}),
+        );
+        assert!(timing.first_output_ms.is_none() && timing.first_text_ms.is_none());
+        timing.observe(Protocol::Claude, &json!({"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"thinking"}}));
+        let output = timing.first_output_ms.unwrap();
+        assert!(output >= 200.0 && timing.first_text_ms.is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        timing.observe(
+            Protocol::Claude,
+            &json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}),
+        );
+        assert!(timing.first_text_ms.unwrap() >= output + 20.0);
+        assert_eq!(timing.first_output_ms, Some(output));
+        assert!(timing.response_created_ms.is_none());
+        assert!(
+            !timing.routing_output_seen,
+            "adding clocks must not change EOF policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn translated_claude_stream_publishes_real_text_clocks() {
+        let response = mock_sse_response("data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n").await;
+        let translation = translate(
+            response,
+            tokio::time::Instant::now() - Duration::from_millis(200),
+            Protocol::Claude,
+            OutputProtocol::Chat,
+            "m".into(),
+            false,
+            None,
+            None,
+        );
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let outcome = translation.outcome.await.unwrap();
+        assert!(outcome.success && outcome.failure_reason.is_none());
+        assert!(outcome.first_output_ms.unwrap() >= 200.0);
+        assert!(outcome.first_text_ms.unwrap() >= 200.0);
+        assert!(outcome.response_created_ms.is_none());
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn native_first_text_does_not_include_usage_reasoning_or_tools() {
+        for (protocol, excluded, included) in [
+            (
+                Protocol::Chat,
+                json!({"choices":[{"delta":{"reasoning_content":"reason","tool_calls":[{}]}}]}),
+                json!({"choices":[{"delta":{"content":"hi"}}]}),
+            ),
+            (
+                Protocol::Claude,
+                json!({"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}),
+                json!({"type":"content_block_start","content_block":{"type":"text","text":"hi"}}),
+            ),
+            (
+                Protocol::Gemini,
+                json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"reason"}]}}]}),
+                json!({"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}),
+            ),
+        ] {
+            assert!(!text_output_value(protocol, &excluded));
+            assert!(text_output_value(protocol, &included));
+        }
     }
 
     #[tokio::test]
