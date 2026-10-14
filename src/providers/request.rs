@@ -274,17 +274,17 @@ pub(crate) fn build_attempt(
             let url = if matches!(engine.as_str(), "vertex" | "vertex-gemini") {
                 vertex_gemini_url(provider, original_model, provider_key, provider_stream)?
             } else {
-                let url = gemini_url(
+                gemini_url(
                     provider.base_url.as_ref(),
                     original_model,
                     provider_key,
                     provider_stream,
-                )?;
-                if gemini.is_some_and(|(_, a)| a == "countTokens") {
-                    url.replace(":generateContent", ":countTokens")
-                } else {
-                    url
-                }
+                )?
+            };
+            let url = if gemini.is_some_and(|(_, action)| action == "countTokens") {
+                url.replace(":generateContent", ":countTokens")
+            } else {
+                url
             };
             (
                 url,

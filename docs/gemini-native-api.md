@@ -22,7 +22,7 @@ existing idempotency and routing mechanisms. Errors use Google's `error` object.
 Gemini and Vertex Gemini providers preserve the native request/response JSON,
 including media, thought signatures, tools and native configuration. Model aliases,
 provider credentials and administrator overrides are applied by the existing
-provider preparation path. `countTokens` currently requires a Gemini provider.
+provider preparation path. `countTokens` requires a Gemini or Vertex Gemini provider.
 
 Chat, Responses and Messages providers accept Gemini text, inline image input,
 system instructions, function declarations, function call/result history and

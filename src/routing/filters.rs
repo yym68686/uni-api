@@ -7,7 +7,10 @@ pub(crate) fn provider_accepts_endpoint(provider: &Provider, endpoint: &str) -> 
         return true;
     }
     if crate::protocols::gemini::route(endpoint).is_some_and(|(_, a)| a == "countTokens") {
-        return provider.engine.eq_ignore_ascii_case("gemini");
+        return matches!(
+            provider.engine.trim().to_ascii_lowercase().as_str(),
+            "gemini" | "vertex" | "vertex-gemini"
+        );
     }
     let typesafe = provider.engine.trim().eq_ignore_ascii_case("typesafe");
     typesafe == (endpoint == "/v1/systemone")

@@ -65,6 +65,7 @@ def verify(binary):
     with tempfile.TemporaryDirectory(prefix='uni-gemini-') as directory:
         root=Path(directory); port=free_port(); base=f'http://127.0.0.1:{upstream.server_port}'
         providers=[]
+        providers.append({'provider':'vertex','engine':'vertex','base_url':base,'api':['ab.fixture'],'model':[{'vertex':'vertex'}]})
         for name,engine,path in [('gemini','gemini','/v1beta'),('responses','gpt','/v1/responses'),('codex','codex','/v1/responses'),('claude','claude','/v1/messages'),('chat','gpt','/v1/chat/completions')]:
             providers.append({'provider':name,'engine':engine,'base_url':base+path,'api':'fixture-provider','model':[{name:name}]+([{'tool':'tool'},{'broken':'broken'},{'error':'error'}] if name=='chat' else [])})
         (root/'config.json').write_text(json.dumps({'providers':providers,'api_keys':[{'api':'fixture-client','model':['all'],'preferences':{'AUTO_RETRY':False}}]}))
@@ -107,6 +108,7 @@ def verify(binary):
                     assert call('/v1beta/models/chat:generateContent',body,auth)[0]==200
                 assert call('/v1beta/models/chat:generateContent',body,'none')[0] in [401,403]
                 assert call('/v1beta/models/gemini:countTokens',body)[0]==200
+                assert call('/v1beta/models/vertex:countTokens',body)[0]==200
                 assert call('/v1beta/models/chat:countTokens',body)[0]>=400
                 status,_,raw=call('/v1beta/models',auth='query'); assert status==200 and any(m['name']=='models/responses' for m in json.loads(raw)['models'])
                 status,_,raw=call('/v1beta/models/chat:streamGenerateContent?alt=sse',body,extra={'Idempotency-Key':'native-fixture'}); assert status==200 and decode(raw)[-1]['usageMetadata']['totalTokenCount']==120
