@@ -18,6 +18,9 @@ impl FactUsage {
         let Some(u) = usage.filter(|u| u.is_object()) else {
             return Self::default();
         };
+        if let Some(original) = u.get("uniApiUsage").filter(|v| v.is_object()) {
+            return Self::from_usage(Some(original));
+        }
         let read = |paths: &[&str]| {
             paths
                 .iter()

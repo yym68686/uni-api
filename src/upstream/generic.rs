@@ -1461,11 +1461,10 @@ pub(crate) async fn send_attempt(
             ResponseAdapter::Passthrough => StreamProtocol::Chat,
             ResponseAdapter::Search => unreachable!(),
         };
-        let output_protocol = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat
-        {
-            StreamOutputProtocol::Responses
-        } else {
-            StreamOutputProtocol::Chat
+        let output_protocol = match prepared.downstream_protocol {
+            DownstreamProtocol::ResponsesCompat => StreamOutputProtocol::Responses,
+            DownstreamProtocol::Gemini => StreamOutputProtocol::Gemini,
+            DownstreamProtocol::Native => StreamOutputProtocol::Chat,
         };
         let mut translation = if prepared.adapter == ResponseAdapter::ResponsesToChat {
             provider_stream::translate_responses_to_chat(
@@ -1500,7 +1499,8 @@ pub(crate) async fn send_attempt(
                 remaining_timeout(timeouts.total, send_started.elapsed()),
             )
         };
-        if endpoint == "/v1/chat/completions"
+        if (endpoint == "/v1/chat/completions"
+            || prepared.downstream_protocol == DownstreamProtocol::Gemini)
             && prepared.adapter != ResponseAdapter::ResponsesToChat
         {
             translation = crate::protocols::chat::stream::preflight(
@@ -1610,11 +1610,31 @@ pub(crate) async fn send_attempt(
     if prepared.adapter == ResponseAdapter::ResponsesToChat {
         crate::protocols::responses::usage::normalize_payload(&mut upstream);
     }
+    if (prepared.downstream_protocol == DownstreamProtocol::Gemini
+        || prepared.adapter == ResponseAdapter::GeminiToChat)
+        && (upstream.get("error").is_some_and(|error| !error.is_null())
+            || upstream.get("status").and_then(Value::as_str) == Some("failed"))
+    {
+        return Err(AttemptFailure {
+            failure_reason: "upstream_response_failed".into(),
+            status: StatusCode::BAD_GATEWAY,
+            detail: upstream
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Upstream returned a failed response")
+                .to_owned(),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        });
+    }
     let fact_usage = crate::observability::usage::FactUsage::from_usage(
         upstream
             .get("usage")
             .or_else(|| upstream.get("usageMetadata")),
     );
+    let native_gemini = prepared.downstream_protocol == DownstreamProtocol::Gemini
+        && prepared.adapter == ResponseAdapter::GeminiToChat;
+    let preserved_gemini = native_gemini.then(|| upstream.clone());
     let normalized = match prepared.adapter {
         ResponseAdapter::Search => normalize_search_response(&prepared.url, &upstream),
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
@@ -1639,7 +1659,12 @@ pub(crate) async fn send_attempt(
         ),
         ResponseAdapter::Passthrough => upstream,
     };
-    let normalized = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
+    let measured_usage = usage(&normalized);
+    let normalized = if prepared.downstream_protocol == DownstreamProtocol::Gemini {
+        preserved_gemini.unwrap_or_else(|| {
+            crate::protocols::gemini::response_from_chat(&normalized, &prepared.request_model)
+        })
+    } else if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
         chat_to_responses_response(&normalized, &prepared.request_model)
     } else {
         normalized
@@ -1659,9 +1684,16 @@ pub(crate) async fn send_attempt(
             );
         }
     }
-    let usage = usage(&normalized);
+    let usage = measured_usage;
     let mut output = if prepared.downstream_stream {
-        if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
+        if prepared.downstream_protocol == DownstreamProtocol::Gemini {
+            let mut response = Response::new(Body::from(format!("data: {normalized}\n\n")));
+            response.headers_mut().insert(
+                "content-type",
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+        } else if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
             synthetic_responses_stream(normalized)
         } else {
             synthetic_chat_stream(normalized)

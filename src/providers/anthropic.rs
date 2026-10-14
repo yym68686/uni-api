@@ -88,6 +88,16 @@ pub(crate) fn chat_to_claude(input: &Value, original_model: &str) -> Result<Valu
         }
     }
     if let Some(output) = output.as_object_mut() {
+        if let Some(stop) = root.get("stop") {
+            output.insert(
+                "stop_sequences".into(),
+                if stop.is_string() {
+                    json!([stop])
+                } else {
+                    stop.clone()
+                },
+            );
+        }
         for name in ["temperature", "top_p", "top_k", "stop_sequences"] {
             if let Some(value) = root.get(name) {
                 output.insert(name.into(), value.clone());
@@ -236,17 +246,15 @@ pub(crate) fn claude_to_chat(value: &Value, model: &str) -> Value {
             .expect("chat message")
             .insert("tool_calls".into(), Value::Array(tool_calls));
     }
-    let usage = value.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let usage = crate::protocols::provider_stream::claude_usage_to_chat(
+        value.get("usage").unwrap_or(&Value::Null),
+    );
     json!({
         "id":value.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl-{}",unix_seconds()))),
         "object":"chat.completion",
         "created":unix_seconds(),
         "model":model,
-        "choices":[{"index":0,"message":message,"finish_reason":"stop"}],
-        "usage":{
-            "prompt_tokens":usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-            "completion_tokens":usage.get("output_tokens").cloned().unwrap_or(json!(0)),
-            "total_tokens":usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0) + usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
-        },
+        "choices":[{"index":0,"message":message,"finish_reason":match value.get("stop_reason").and_then(Value::as_str) { Some("max_tokens") => "length", Some("tool_use") => "tool_calls", Some("refusal") => "content_filter", _ => "stop" }}],
+        "usage":usage,
     })
 }

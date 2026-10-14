@@ -113,19 +113,28 @@ pub(crate) fn build_attempt(
                     .base_url
                     .to_ascii_lowercase()
                     .contains("/responses")));
-    let downstream_protocol = if path == "/v1/responses" && !native_responses_wire {
+    let gemini = crate::protocols::gemini::route(path);
+    let native_gemini =
+        gemini.is_some() && matches!(engine.as_str(), "gemini" | "vertex" | "vertex-gemini");
+    let downstream_protocol = if gemini.is_some_and(|(_, a)| a != "countTokens") {
+        DownstreamProtocol::Gemini
+    } else if path == "/v1/responses" && !native_responses_wire {
         DownstreamProtocol::ResponsesCompat
     } else {
         DownstreamProtocol::Native
     };
-    let downstream_stream = !is_alpha_search
-        && !is_systemone
-        && input
-            .payload
-            .as_ref()
-            .and_then(|payload| payload.get("stream"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    let downstream_stream = gemini
+        .map(|(_, a)| a == "streamGenerateContent")
+        .unwrap_or_else(|| {
+            !is_alpha_search
+                && !is_systemone
+                && input
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("stream"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        });
     let provider_stream = downstream_stream;
     let chat_stream_include_usage = path == "/v1/chat/completions"
         && input
@@ -216,15 +225,77 @@ pub(crate) fn build_attempt(
     if downstream_protocol == DownstreamProtocol::ResponsesCompat {
         payload = responses_to_chat_request(&payload, original_model)?;
     }
-    let wire_path = if downstream_protocol == DownstreamProtocol::ResponsesCompat {
-        "/v1/chat/completions"
-    } else {
-        path
-    };
+    if gemini.is_some() && !native_gemini {
+        payload =
+            crate::protocols::gemini::request_to_chat(&payload, original_model, downstream_stream)?;
+        let responses = engine == "codex"
+            || provider
+                .base_url
+                .to_ascii_lowercase()
+                .contains("/responses");
+        let claude = matches!(engine.as_str(), "claude" | "vertex-claude" | "aws");
+        if (responses || claude) && payload.get("n").is_some_and(|n| n.as_i64() != Some(1)) {
+            return Err("candidateCount must be 1 for Responses and Messages providers".into());
+        }
+        let unsupported: &[&str] = if responses {
+            &["top_k", "stop", "seed"]
+        } else if claude {
+            &["seed", "response_format"]
+        } else {
+            &[]
+        };
+        for field in unsupported {
+            if payload.get(*field).is_some() {
+                return Err(format!(
+                    "{field} is not supported by this upstream protocol"
+                ));
+            }
+        }
+    }
+    if native_gemini && gemini.is_some_and(|(_, action)| action == "countTokens") {
+        if let Some(request) = payload.get_mut("generateContentRequest") {
+            if !request.is_object() {
+                return Err("generateContentRequest must be an object".into());
+            }
+            request["model"] = json!(format!("models/{original_model}"));
+        }
+    }
+    let wire_path =
+        if downstream_protocol == DownstreamProtocol::ResponsesCompat || gemini.is_some() {
+            "/v1/chat/completions"
+        } else {
+            path
+        };
     let estimated_video_tokens = (path == "/v1/video/tasks")
         .then(|| estimate_video_tokens(&payload))
         .flatten();
     let (url, adapter, upstream_stream) = match engine.as_str() {
+        _ if native_gemini => {
+            let url = if matches!(engine.as_str(), "vertex" | "vertex-gemini") {
+                vertex_gemini_url(provider, original_model, provider_key, provider_stream)?
+            } else {
+                let url = gemini_url(
+                    provider.base_url.as_ref(),
+                    original_model,
+                    provider_key,
+                    provider_stream,
+                )?;
+                if gemini.is_some_and(|(_, a)| a == "countTokens") {
+                    url.replace(":generateContent", ":countTokens")
+                } else {
+                    url
+                }
+            };
+            (
+                url,
+                if gemini.is_some_and(|(_, a)| a == "countTokens") {
+                    ResponseAdapter::Passthrough
+                } else {
+                    ResponseAdapter::GeminiToChat
+                },
+                provider_stream,
+            )
+        }
         "typesafe" => {
             set_model(&mut payload, original_model)?;
             (
@@ -490,12 +561,20 @@ pub(crate) fn build_attempt(
     ) && engine != "vertex-claude"
         && !is_alpha_search
         && !is_systemone
+        && !native_gemini
     {
         if let Some(root) = payload.as_object_mut() {
             root.insert("stream".into(), Value::Bool(upstream_stream));
         }
     }
     if let Some(root) = payload.as_object_mut() {
+        if gemini.is_some()
+            && !native_gemini
+            && upstream_stream
+            && adapter == ResponseAdapter::Passthrough
+        {
+            root.insert("stream_options".into(), json!({"include_usage":true}));
+        }
         if is_alpha_search {
             sanitize_alpha_search_payload(root);
         } else {

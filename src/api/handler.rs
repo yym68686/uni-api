@@ -24,6 +24,13 @@ use std::time::Duration;
 const INTERNAL_PREFIX: &str = "/_internal/rust-responses";
 
 pub async fn handler(State(state): State<AppState>, mut request: Request) -> Response<Body> {
+    let gemini = crate::protocols::gemini::route(request.uri().path()).map(|(_, a)| a.to_owned());
+    let gemini_catalog = request.uri().path().starts_with("/v1beta/models");
+    let gemini_array = gemini.as_deref() == Some("streamGenerateContent")
+        && crate::upstream::generic::query_value(request.uri(), "alt").as_deref() != Some("sse");
+    if gemini.is_some() || gemini_catalog {
+        crate::protocols::gemini::normalize_auth(&mut request);
+    }
     request
         .extensions_mut()
         .insert(crate::observability::timing::RequestArrival::now());
@@ -48,6 +55,9 @@ pub async fn handler(State(state): State<AppState>, mut request: Request) -> Res
         None
     };
     let mut response = handler_inner(state, request).await;
+    if gemini.is_some() || gemini_catalog {
+        response = crate::protocols::gemini::wire_response(response, gemini_array).await;
+    }
     cors.apply(&mut response);
     if let Some(trace) = trace {
         response = trace.response(response);
@@ -85,7 +95,8 @@ async fn handler_inner(state: AppState, request: Request) -> Response<Body> {
         && request.method() == Method::POST
         && matches!(path.as_str(), "/v1/responses" | "/v1/responses/compact");
     let generic_idempotency_request = request.method() == Method::POST
-        && matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages")
+        && (matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages")
+            || crate::protocols::gemini::route(&path).is_some())
         && request.headers().contains_key("idempotency-key");
     let use_spooled_dispatch = use_rust_responses || generic_idempotency_request;
     let resource_wait = if path == "/healthz" {

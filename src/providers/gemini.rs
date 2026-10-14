@@ -355,6 +355,26 @@ pub(crate) fn apply_gemini_request_controls(
             Value::String(tier.to_ascii_uppercase()),
         );
     }
+    if let Some(format) = root.get("response_format") {
+        let generation = output
+            .entry("generationConfig")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("Gemini generation config");
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_object") => {
+                generation.insert("responseMimeType".into(), json!("application/json"));
+            }
+            Some("json_schema") => {
+                if let Some(schema) = format.pointer("/json_schema/schema") {
+                    generation.insert("responseMimeType".into(), json!("application/json"));
+                    generation.insert("responseJsonSchema".into(), schema.clone());
+                }
+            }
+            Some("text") | None => {}
+            _ => {}
+        }
+    }
     let effort = root
         .get("reasoning_effort")
         .and_then(Value::as_str)
@@ -584,12 +604,8 @@ pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Value {
         "object":"chat.completion",
         "created":unix_seconds(),
         "model":model,
-        "choices":[{"index":0,"message":message,"finish_reason":"stop"}],
-        "usage":{
-            "prompt_tokens":usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
-            "completion_tokens":usage.get("candidatesTokenCount").cloned().unwrap_or(json!(0)),
-            "total_tokens":usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
-        },
+        "choices":[{"index":0,"message":message,"finish_reason":crate::protocols::gemini::chat_finish_reason(value.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("STOP"))}],
+        "usage":crate::protocols::provider_stream::gemini_usage_to_chat(&usage),
     })
 }
 
@@ -615,5 +631,8 @@ pub(crate) fn gemini_url(
         }
     ));
     url.query_pairs_mut().clear().append_pair("key", key);
+    if stream {
+        url.query_pairs_mut().append_pair("alt", "sse");
+    }
     Ok(url.to_string())
 }

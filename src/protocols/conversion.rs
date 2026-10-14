@@ -91,6 +91,21 @@ pub(crate) fn responses_to_chat_request(
             output.insert(name.into(), value.clone());
         }
     }
+    if let Some(format) = root.get("text").and_then(|text| text.get("format")) {
+        output.insert(
+            "response_format".into(),
+            if format.get("type").and_then(Value::as_str) == Some("json_schema") {
+                let mut schema = format.clone();
+                schema
+                    .as_object_mut()
+                    .expect("format object")
+                    .remove("type");
+                json!({"type":"json_schema","json_schema":schema})
+            } else {
+                format.clone()
+            },
+        );
+    }
     if let Some(tools) = root.get("tools").and_then(Value::as_array) {
         output.insert(
             "tools".into(),
@@ -226,6 +241,22 @@ pub(crate) fn chat_to_responses(input: &Value, original_model: &str) -> Result<V
     output.insert("store".into(), Value::Bool(false));
     if let Some(max_tokens) = root.get("max_tokens") {
         output.insert("max_output_tokens".into(), max_tokens.clone());
+    }
+    if let Some(effort) = root.get("reasoning_effort") {
+        output.insert("reasoning".into(), json!({"effort":effort}));
+    }
+    if let Some(format) = root.get("response_format") {
+        let format = if format.get("type").and_then(Value::as_str) == Some("json_schema") {
+            let mut schema = format
+                .get("json_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            schema["type"] = json!("json_schema");
+            schema
+        } else {
+            format.clone()
+        };
+        output.insert("text".into(), json!({"format":format}));
     }
     for name in [
         "temperature",
@@ -678,6 +709,13 @@ pub(crate) fn chat_to_responses_response(value: &Value, model: &str) -> Value {
     });
     if let Some(receipt) = chat_usage.get("oaix_settlement_receipt") {
         response["usage"]["oaix_settlement_receipt"] = receipt.clone();
+    }
+    if let Some(reason @ ("length" | "content_filter")) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        response["status"] = json!("incomplete");
+        response["incomplete_details"] = json!({"reason":if reason == "length" { "max_output_tokens" } else { "content_filter" }});
     }
     response
 }

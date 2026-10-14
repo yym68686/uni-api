@@ -284,6 +284,20 @@ fn real_output(event: &[u8]) -> Result<bool, PrecommitFailure> {
             detail: error.to_string(),
         });
     }
+    if payload.get("candidates").is_some() || payload.get("promptFeedback").is_some() {
+        return Ok(payload.pointer("/promptFeedback/blockReason").is_some()
+            || payload
+                .get("candidates")
+                .and_then(Value::as_array)
+                .is_some_and(|cs| {
+                    cs.iter().any(|c| {
+                        c.get("finishReason").is_some()
+                            || c.pointer("/content/parts")
+                                .and_then(Value::as_array)
+                                .is_some_and(|p| !p.is_empty())
+                    })
+                }));
+    }
     Ok(payload
         .get("choices")
         .and_then(Value::as_array)

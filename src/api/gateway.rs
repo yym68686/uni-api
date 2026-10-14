@@ -41,7 +41,8 @@ pub(crate) const PUBLIC_JSON_ROUTES: &[&str] = &[
 
 pub fn supports(method: &Method, path: &str) -> bool {
     if *method == Method::POST
-        && (PUBLIC_JSON_ROUTES.contains(&path)
+        && (crate::protocols::gemini::route(path).is_some()
+            || PUBLIC_JSON_ROUTES.contains(&path)
             || matches!(
                 path,
                 "/v1/images/edits"
@@ -64,7 +65,8 @@ pub fn supports(method: &Method, path: &str) -> bool {
 }
 
 pub fn known_path(path: &str) -> bool {
-    PUBLIC_JSON_ROUTES.contains(&path)
+    crate::protocols::gemini::route(path).is_some()
+        || PUBLIC_JSON_ROUTES.contains(&path)
         || matches!(
             path,
             "/search"
@@ -115,11 +117,16 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     }
     let query_model = query_value(&uri, "model");
     let video_task_route = video_task_route_for_path(&path);
-    let mut request_model = input
-        .payload
-        .as_ref()
-        .and_then(|payload| payload.get("model"))
-        .and_then(Value::as_str)
+    let gemini_route = crate::protocols::gemini::route(&path);
+    let mut request_model = gemini_route
+        .map(|(model, _)| model)
+        .or_else(|| {
+            input
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("model"))
+                .and_then(Value::as_str)
+        })
         .or(query_model.as_deref())
         .unwrap_or(input.default_model.as_str())
         .trim()
@@ -243,6 +250,11 @@ pub(crate) fn missing_required_field(path: &str, payload: &Value) -> Option<&'st
                 || value.as_array().is_some_and(Vec::is_empty)
         })
     };
+    if crate::protocols::gemini::route(path).is_some_and(|(_, a)| a != "countTokens")
+        && missing("contents")
+    {
+        return Some("contents");
+    }
     match path {
         "/v1/systemone" if !root.get("model").is_some_and(Value::is_string) => Some("model"),
         "/v1/systemone" if !root.contains_key("state") => Some("state"),

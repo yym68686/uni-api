@@ -21,6 +21,7 @@ pub(crate) enum ResponseAdapter {
 pub(crate) enum DownstreamProtocol {
     Native,
     ResponsesCompat,
+    Gemini,
 }
 
 pub(crate) struct PreparedAttempt {

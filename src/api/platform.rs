@@ -89,6 +89,32 @@ pub async fn handle(
             ));
         }
     }
+    if *method == Method::GET && (path == "/v1beta/models" || path.starts_with("/v1beta/models/")) {
+        return Some(
+            match state
+                .runtime
+                .models_for_endpoint(headers, "/v1/chat/completions")
+                .await
+            {
+                Ok(models) => {
+                    let models: Vec<Value> = models.into_iter().filter(|m| crate::providers::codex::models::is_conversational_model(m)).map(|m| json!({"name":format!("models/{m}"),"displayName":m,"supportedGenerationMethods":["generateContent","streamGenerateContent"]})).collect();
+                    if let Some(model) = path.strip_prefix("/v1beta/models/") {
+                        models
+                            .into_iter()
+                            .find(|m| m["name"] == format!("models/{model}"))
+                            .map(|m| json_response(StatusCode::OK, m))
+                            .unwrap_or_else(|| json_error(StatusCode::NOT_FOUND, "Model not found"))
+                    } else {
+                        json_response(StatusCode::OK, json!({"models":models}))
+                    }
+                }
+                Err(status) => json_error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                    "Invalid API key",
+                ),
+            },
+        );
+    }
     let mut response = match (method, path) {
         (&Method::GET, "/healthz") => Some(json_response(
             StatusCode::OK,
@@ -103,7 +129,7 @@ pub async fn handle(
                     "runtime": "rust",
                     "native_version": env!("CARGO_PKG_VERSION"),
                     "source_commit": std::env::var("SOURCE_COMMIT").unwrap_or_else(|_| "unknown".into()),
-                    "capabilities": {"targeted_responses": true,"targeted_unconfigured_models":true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
+                    "capabilities": {"gemini_native":true,"gemini_cross_protocol":true,"targeted_responses": true,"targeted_unconfigured_models":true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
                     "request_body_limits": crate::transport::decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.runtime.is_ready().await,
                     "database_disabled": state.persistence.disabled(),

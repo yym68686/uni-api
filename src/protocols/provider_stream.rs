@@ -32,6 +32,7 @@ pub enum Protocol {
 pub enum OutputProtocol {
     Chat,
     Responses,
+    Gemini,
 }
 
 pub struct Translation {
@@ -370,6 +371,7 @@ fn spawn_translation(
             Err(error) => {
                 let payload = match output_protocol {
                     OutputProtocol::Chat => json!({"error":{"message":error}}),
+                    OutputProtocol::Gemini => crate::protocols::gemini::error(502, &error),
                     OutputProtocol::Responses => json!({
                         "type":"response.failed",
                         "response":{
@@ -1080,10 +1082,12 @@ struct StreamState {
     chat_usage: Option<Value>,
     fact_usage: crate::observability::usage::FactUsage,
     terminal: bool,
+    require_terminal: bool,
     failure: Option<PrecommitFailure>,
     output_protocol: OutputProtocol,
     include_usage: bool,
     responses: ResponsesOutputState,
+    gemini_output: crate::protocols::gemini::OutputState,
     timing: StreamTiming,
 }
 
@@ -1105,10 +1109,12 @@ impl StreamState {
             chat_usage: None,
             fact_usage: Default::default(),
             terminal: false,
+            require_terminal: output_protocol == OutputProtocol::Gemini,
             failure: None,
             output_protocol,
             include_usage,
             responses: ResponsesOutputState::new(model, created),
+            gemini_output: Default::default(),
             timing: StreamTiming::new(tokio::time::Instant::now()),
         }
     }
@@ -1122,6 +1128,39 @@ impl StreamState {
     }
 
     fn convert(&mut self, protocol: Protocol, value: &Value) -> Vec<Value> {
+        self.require_terminal |= protocol == Protocol::Gemini;
+        if (protocol == Protocol::Gemini || self.output_protocol == OutputProtocol::Gemini)
+            && value.get("error").is_some_and(|error| !error.is_null())
+        {
+            let error = &value["error"];
+            let status = error
+                .get("status_code")
+                .or_else(|| error.get("code"))
+                .and_then(Value::as_u64)
+                .filter(|code| (400..600).contains(code))
+                .unwrap_or(502) as u16;
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Upstream stream failed")
+                .to_owned();
+            self.failure = Some(PrecommitFailure {
+                status_code: status,
+                detail: detail.clone(),
+                failure_reason: Some("upstream_response_failed"),
+            });
+            self.terminal = true;
+            if self.output_protocol == OutputProtocol::Gemini {
+                return vec![crate::protocols::gemini::error(status, &detail)];
+            }
+            return self.encode_chunks(vec![
+                json!({"error":{"status_code":status,"message":detail}}),
+            ]);
+        }
+        if protocol == Protocol::Gemini && self.output_protocol == OutputProtocol::Gemini {
+            self.gemini(value);
+            return vec![value.clone()];
+        }
         let chunks = match protocol {
             Protocol::Chat => self.chat(value),
             Protocol::Responses => self.responses(value),
@@ -1158,6 +1197,25 @@ impl StreamState {
     }
 
     fn encode_chunks(&mut self, chunks: Vec<Value>) -> Vec<Value> {
+        if self.output_protocol == OutputProtocol::Gemini {
+            let mut output = Vec::new();
+            for chunk in chunks {
+                match self.gemini_output.encode(&chunk, &self.model) {
+                    Ok(events) => output.extend(events),
+                    Err(detail) => {
+                        self.failure = Some(PrecommitFailure {
+                            status_code: 502,
+                            detail: detail.clone(),
+                            failure_reason: Some("protocol_error"),
+                        });
+                        self.terminal = true;
+                        output.push(crate::protocols::gemini::error(502, &detail));
+                        break;
+                    }
+                }
+            }
+            return output;
+        }
         if self.output_protocol == OutputProtocol::Chat {
             chunks
         } else {
@@ -1319,6 +1377,8 @@ impl StreamState {
                     usage,
                 )));
             self.chat_usage = Some(gemini_usage_to_chat(usage));
+            // Gemini may report its final usage after the candidate finish frame.
+            output.push(json!({"choices":[],"usage":self.chat_usage}));
         }
         if value
             .pointer("/candidates/0/finishReason")
@@ -1326,11 +1386,19 @@ impl StreamState {
             .is_some()
             || value.pointer("/promptFeedback/blockReason").is_some()
         {
-            output.extend(self.finish_chunks(if self.tools.is_empty() {
-                "stop"
-            } else {
-                "tool_calls"
-            }));
+            let finish = crate::protocols::gemini::chat_finish_reason(
+                value
+                    .pointer("/candidates/0/finishReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("SAFETY"),
+            );
+            output.extend(
+                self.finish_chunks(if finish == "stop" && !self.tools.is_empty() {
+                    "tool_calls"
+                } else {
+                    finish
+                }),
+            );
         }
         output
     }
@@ -1403,10 +1471,11 @@ impl StreamState {
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
                     .map(|reason| {
-                        self.finish_chunks(if reason == "tool_use" {
-                            "tool_calls"
-                        } else {
-                            "stop"
+                        self.finish_chunks(match reason {
+                            "tool_use" => "tool_calls",
+                            "max_tokens" => "length",
+                            "refusal" => "content_filter",
+                            _ => "stop",
                         })
                     })
                     .unwrap_or_default()
@@ -1576,7 +1645,10 @@ impl StreamState {
                 "total_tokens":self.prompt_tokens.saturating_add(self.completion_tokens),
             })
         });
-        if self.output_protocol == OutputProtocol::Responses {
+        if matches!(
+            self.output_protocol,
+            OutputProtocol::Responses | OutputProtocol::Gemini
+        ) {
             return vec![self.chunk(json!({}), Some(reason), Some(usage))];
         }
         let emit_final_usage =
@@ -1644,6 +1716,9 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        if self.require_terminal && !self.terminal {
+            return Err("upstream stream ended without a terminal event".into());
+        }
         if !self.terminal && !self.timing.routing_output_seen {
             return Err("upstream stream ended before real output or a terminal event".into());
         }
@@ -1675,6 +1750,8 @@ struct ResponsesOutputState {
     tools: HashMap<usize, ResponsesToolItem>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    reported_usage: Option<Value>,
+    finish_reason: Option<String>,
     settlement_receipt: Option<Value>,
     completed: bool,
 }
@@ -1719,6 +1796,8 @@ impl ResponsesOutputState {
             tools: HashMap::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            reported_usage: None,
+            finish_reason: None,
             settlement_receipt: None,
             completed: false,
         }
@@ -1753,9 +1832,16 @@ impl ResponsesOutputState {
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
             self.prompt_tokens = number(usage.get("prompt_tokens"));
             self.completion_tokens = number(usage.get("completion_tokens"));
+            self.reported_usage = Some(usage.clone());
             if let Some(receipt) = usage.get("oaix_settlement_receipt") {
                 self.settlement_receipt = Some(receipt.clone());
             }
+        }
+        if let Some(reason) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(reason.to_owned());
         }
 
         let mut output = Vec::new();
@@ -2023,7 +2109,12 @@ impl ResponsesOutputState {
             ));
         }
         let response = self.response("completed", self.completed_output(), true);
-        output.push(self.event("response.completed", json!({"response":response})));
+        let event = if response["status"] == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        output.push(self.event(event, json!({"response":response})));
         output
     }
 
@@ -2062,6 +2153,23 @@ impl ResponsesOutputState {
             "incomplete_details":Value::Null,
         });
         if include_usage {
+            if let Some(reason @ ("length" | "content_filter")) = self.finish_reason.as_deref() {
+                response["status"] = json!("incomplete");
+                response["incomplete_details"] = json!({"reason":if reason == "length" { "max_output_tokens" } else { "content_filter" }});
+            }
+            if let Some(usage) = &self.reported_usage {
+                if let Some(total) = usage.get("total_tokens") {
+                    response["usage"]["total_tokens"] = total.clone();
+                }
+                for (source, target) in [
+                    ("prompt_tokens_details", "input_tokens_details"),
+                    ("completion_tokens_details", "output_tokens_details"),
+                ] {
+                    if let Some(details) = usage.get(source).filter(|value| value.is_object()) {
+                        response["usage"][target] = details.clone();
+                    }
+                }
+            }
             if let Some(receipt) = &self.settlement_receipt {
                 response["usage"]["oaix_settlement_receipt"] = receipt.clone();
             }
@@ -2153,7 +2261,7 @@ fn merge_usage_objects(target: &mut Value, source: &Value) {
     }
 }
 
-fn claude_usage_to_chat(usage: &Value) -> Value {
+pub(crate) fn claude_usage_to_chat(usage: &Value) -> Value {
     let mut mapped = usage.clone();
     if !mapped.is_object() {
         mapped = json!({});
@@ -2219,7 +2327,10 @@ fn claude_usage_to_chat(usage: &Value) -> Value {
     mapped
 }
 
-fn gemini_usage_to_chat(usage: &Value) -> Value {
+pub(crate) fn gemini_usage_to_chat(usage: &Value) -> Value {
+    if let Some(usage) = usage.get("uniApiUsage").filter(|u| u.is_object()) {
+        return usage.clone();
+    }
     let prompt_tokens = number(usage.get("promptTokenCount"));
     let reasoning_tokens = number(usage.get("thoughtsTokenCount"));
     let completion_tokens =
