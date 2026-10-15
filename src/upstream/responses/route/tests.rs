@@ -1779,6 +1779,62 @@ fn upstream_rejected_request_is_a_retryable_gateway_error() {
 }
 
 #[test]
+fn gemini_key_platform_mismatch_is_a_retryable_gateway_error() {
+    let message = "API key group platform is not gemini";
+    let error = json!({"code": 400, "message": message, "status": "INVALID_ARGUMENT"});
+    let body = error.to_string();
+    for detail in [
+        body.clone(),
+        json!({"error": error}).to_string(),
+        json!({"detail": error}).to_string(),
+        json!({"error": {"message": body}}).to_string(),
+        json!({"code": 400, "status": "invalid_argument", "message": message.to_uppercase(),
+            "param": null, "details": []})
+        .to_string(),
+    ] {
+        for endpoint in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/messages",
+            "/v1beta/models/gemini:generateContent",
+            "/v1beta/models/gemini:streamGenerateContent",
+            "/v1beta/models/gemini:countTokens",
+        ] {
+            for auto_retry in [true, false] {
+                let policy =
+                    classify_provider_failure(400, &detail, None, endpoint, auto_retry, None);
+                assert_eq!(
+                    (policy.status, policy.retryable, policy.request_scoped),
+                    (502, auto_retry, false),
+                    "{detail}"
+                );
+            }
+        }
+    }
+    for detail in [
+        message.to_owned(),
+        json!({"error": {"message": message}}).to_string(),
+        json!({"code": "400", "message": message, "status": "INVALID_ARGUMENT"}).to_string(),
+        json!({"code": 403, "message": message, "status": "INVALID_ARGUMENT"}).to_string(),
+        json!({"code": 400, "message": message, "status": "PERMISSION_DENIED"}).to_string(),
+        json!({"code": 400, "message": message, "status": "INVALID_ARGUMENT", "param": "contents"}).to_string(),
+        json!({"code": 400, "message": message, "status": "INVALID_ARGUMENT", "details": [{"fieldViolations": []}]}).to_string(),
+        json!({"code": 400, "message": "Missing required parameter: contents", "status": "INVALID_ARGUMENT"}).to_string(),
+        json!({"code": 400, "message": format!("Invalid input: expected '{message}'"), "status": "INVALID_ARGUMENT"}).to_string(),
+        json!({"error": {"message": "Invalid input"}, "input": error}).to_string(),
+        json!({"debug": error}).to_string(),
+    ] {
+        let policy = classify_provider_failure(400, &detail, None, "/v1/chat/completions", true, None);
+        assert_eq!((policy.status, policy.retryable, policy.request_scoped),
+            (400, false, true), "{detail}");
+    }
+    for status in [200, 401, 403, 404, 413, 422, 429, 500, 502, 503, 504] {
+        assert_eq!(remap_provider_status(status, &body), status);
+    }
+}
+
+#[test]
 fn support_only_upstream_rejection_is_a_retryable_gateway_error() {
     let message = "Request could not be completed. Contact support with the request ID.";
     let error = json!({"code": "invalid_request_error", "type": "invalid_request_error",

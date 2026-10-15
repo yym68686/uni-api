@@ -19,6 +19,12 @@ class Upstream(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         self.server.hits.append((self.path,body,dict(self.headers)))
+        if '/models/platform-limited:' in self.path or '/models/platform-also-limited:' in self.path:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(self.server.platform_error).encode())
+            return
         stream = body.get('stream') or ':streamGenerateContent' in self.path
         model = body.get('model','')
         if ':countTokens' in self.path:
@@ -61,6 +67,7 @@ class Upstream(BaseHTTPRequestHandler):
 
 def verify(binary):
     upstream=ThreadingHTTPServer(('127.0.0.1',0),Upstream); upstream.hits=[]
+    upstream.platform_error = {'code': 400, 'message': 'API key group platform is not gemini', 'status': 'INVALID_ARGUMENT'}
     threading.Thread(target=upstream.serve_forever,daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='uni-gemini-') as directory:
         root=Path(directory); port=free_port(); base=f'http://127.0.0.1:{upstream.server_port}'
@@ -68,9 +75,17 @@ def verify(binary):
         providers.append({'provider':'vertex','engine':'vertex','base_url':base,'api':['ab.fixture'],'model':[{'vertex':'vertex'}]})
         for name,engine,path in [('gemini','gemini','/v1beta'),('responses','gpt','/v1/responses'),('codex','codex','/v1/responses'),('claude','claude','/v1/messages'),('chat','gpt','/v1/chat/completions')]:
             providers.append({'provider':name,'engine':engine,'base_url':base+path,'api':'fixture-provider','model':[{name:name}]+([{'tool':'tool'},{'broken':'broken'},{'error':'error'}] if name=='chat' else [])})
-        (root/'config.json').write_text(json.dumps({'providers':providers,'api_keys':[{'api':'fixture-client','model':['all'],'preferences':{'AUTO_RETRY':False}}]}))
+        for name in ['limited', 'fallback', 'also-limited']:
+            providers.append({'provider': 'platform-'+name, 'engine': 'gemini', 'base_url': base+'/v1beta',
+                              'api': 'fixture-provider', 'model': [{'platform-'+name: 'platform'}],
+                              'preferences': {'cooldown_period': 0}})
+        keys = [{'api':'fixture-client','model':['all'],'preferences':{'AUTO_RETRY':False}},
+                {'api':'platform-retry','model':['platform-limited/*','platform-fallback/*']},
+                {'api':'platform-no-retry','model':['platform-limited/*','platform-fallback/*'], 'preferences':{'AUTO_RETRY':False}},
+                {'api':'platform-exhausted','model':['platform-limited/*','platform-also-limited/*']}]
+        (root/'config.json').write_text(json.dumps({'providers':providers,'api_keys':keys}))
         env={k:v for k,v in os.environ.items() if not k.startswith(('FACTS_S3_','UNI_API_CONTROL_RESTORE_','OTEL_','FUGUE_OTEL_')) and k!='CONFIG_URL'}
-        env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'config.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',NO_PROXY='127.0.0.1,localhost')
+        env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'config.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',NO_PROXY='127.0.0.1,localhost',PROVIDER_MODEL_CIRCUIT_FAILURE_THRESHOLD='1000')
         def call(path,body=None,auth='header',extra=None):
             headers={'Content-Type':'application/json'}
             if auth=='header': headers['x-goog-api-key']='fixture-client'
@@ -136,6 +151,30 @@ def verify(binary):
                     endpoint='streamGenerateContent?alt=sse' if marker=='late-error' else 'generateContent'
                     status,_,raw=call('/v1beta/models/gemini:'+endpoint,payload)
                     assert (status>=400 if marker=='json-error' else decode(raw)[-1].get('error')),raw
+                platform_cases = 0
+                for version in ['v1beta', 'v1']:
+                    for action in ['generateContent', 'streamGenerateContent?alt=sse', 'countTokens']:
+                        for key, expected, hits in [
+                            ('platform-retry', 200, ['limited', 'fallback']),
+                            ('platform-no-retry', 502, ['limited']),
+                            ('platform-exhausted', 502, ['limited', 'also-limited'] * 3),
+                        ]:
+                            upstream.hits.clear()
+                            status, _, raw = call(f'/{version}/models/platform:{action}', body,
+                                                  extra={'x-goog-api-key':key})
+                            actual = [path.split('/models/platform-',1)[1].split(':',1)[0] for path,_,_ in upstream.hits]
+                            assert status == expected and actual == hits, (version,action,key,status,raw,actual)
+                            if expected == 200:
+                                assert b'API key group' not in raw, raw
+                            platform_cases += 1
+                        upstream.platform_error = {'code':400,'message':'Missing required parameter: contents','status':'INVALID_ARGUMENT'}
+                        upstream.hits.clear()
+                        status, _, raw = call(f'/{version}/models/platform:{action}', body,
+                                              extra={'x-goog-api-key':'platform-retry'})
+                        assert status == 400 and len(upstream.hits) == 1, (status,raw,upstream.hits)
+                        upstream.platform_error = {'code':400,'message':'API key group platform is not gemini','status':'INVALID_ARGUMENT'}
+                        platform_cases += 1
+                print(f'Gemini platform-mismatch retry matrix passed: {platform_cases} cases')
                 assert all('fixture-client' not in path and headers.get('X-Goog-Api-Key') is None for path,_,headers in upstream.hits)
                 print('Gemini HTTP matrix passed: 30 generation combinations, auth, catalog, countTokens, idempotency, tools, failures, Responses reverse conversion')
             except Exception:

@@ -36,6 +36,10 @@ MODEL_MISMATCH = {"error": {
 }}
 
 
+GEMINI_PLATFORM_ERROR = {"code": 400, "message": "API key group platform is not gemini",
+                         "status": "INVALID_ARGUMENT"}
+
+
 class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -217,6 +221,16 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                     ("quoted-upstream-rejected-message",
                      f"Invalid input: expected '{UPSTREAM_REJECTED_REQUEST}'",
                      "retry", False, 400, ["limited"]),
+                    ("gemini-platform", GEMINI_PLATFORM_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                    ("gemini-platform-envelope", {"error": GEMINI_PLATFORM_ERROR}, "retry", False, 200, ["limited", "fallback"]),
+                    ("gemini-platform-wrapped", {"error": {"message": json.dumps(GEMINI_PLATFORM_ERROR)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("gemini-platform-no-retry", GEMINI_PLATFORM_ERROR, "no-retry", False, 502, ["limited"]),
+                    ("gemini-platform-exhausted", GEMINI_PLATFORM_ERROR, "exhausted", False, 502,
+                     ["limited", "also-limited"] * 3),
+                    ("gemini-platform-param", {**GEMINI_PLATFORM_ERROR, "param": "contents"}, "retry", False, 400, ["limited"]),
+                    ("gemini-platform-validation", {**GEMINI_PLATFORM_ERROR, "message": "Invalid contents"}, "retry", False, 400, ["limited"]),
+                    ("gemini-platform-echo", {"error": {"message": "Invalid input"}, "input": GEMINI_PLATFORM_ERROR}, "retry", False, 400, ["limited"]),
                     ("support-only", SUPPORT_ONLY_ERROR, "retry", False, 200, ["limited", "fallback"]),
                     ("support-only-wrapped", {"error": {"message": json.dumps(SUPPORT_ONLY_ERROR)}},
                      "retry", False, 200, ["limited", "fallback"]),
@@ -326,6 +340,8 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                             assert b"All configured providers failed for model test-model" in raw, context
                         elif label.startswith("model-mismatch"):
                             assert b"Unsupported value" in raw or b"Invalid input" in raw, context
+                        elif label.startswith("gemini-platform"):
+                            assert b"INVALID_ARGUMENT" in raw or b"Invalid input" in raw, context
                         elif label.startswith("generic-upstream"):
                             assert b"Upstream request failed" in raw, context
                         else:

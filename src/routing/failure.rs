@@ -211,6 +211,36 @@ pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) 
     let mut candidate = detail.to_owned();
     for _ in 0..3 {
         let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        // A provider key assigned to the wrong platform cannot serve this
+        // request. Require its complete structured error, not a generic Gemini
+        // INVALID_ARGUMENT or a phrase echoed from user input.
+        let platform_error = parsed.as_ref().and_then(|payload| {
+            payload
+                .get("error")
+                .filter(|value| value.is_object())
+                .or_else(|| payload.get("detail").filter(|value| value.is_object()))
+                .or_else(|| payload.is_object().then_some(payload))
+        });
+        if platform_error.is_some_and(|error| {
+            error.get("code").and_then(Value::as_u64) == Some(400)
+                && error
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("INVALID_ARGUMENT"))
+                && error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| {
+                        v.trim()
+                            .eq_ignore_ascii_case("API key group platform is not gemini")
+                    })
+                && error.get("param").is_none_or(Value::is_null)
+                && error
+                    .get("details")
+                    .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+        }) {
+            return true;
+        }
         if let Some(error) = parsed.as_ref().and_then(|payload| {
             payload
                 .get("error")
