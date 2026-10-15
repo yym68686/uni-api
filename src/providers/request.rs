@@ -224,6 +224,15 @@ pub(crate) fn build_attempt(
     let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
     if downstream_protocol == DownstreamProtocol::ResponsesCompat {
         payload = responses_to_chat_request(&payload, original_model)?;
+        // Anthropic extensions must survive Responses -> Chat -> Claude, but
+        // must not leak into unrelated provider adapters.
+        if matches!(engine.as_str(), "claude" | "vertex-claude" | "aws") {
+            for field in ["thinking", "output_config"] {
+                if let Some(value) = input.payload.as_ref().and_then(|v| v.get(field)) {
+                    payload[field] = value.clone();
+                }
+            }
+        }
     }
     if gemini.is_some() && !native_gemini {
         payload =
@@ -352,7 +361,10 @@ pub(crate) fn build_attempt(
             )
         }
         "claude" if wire_path == "/v1/chat/completions" => {
-            payload = chat_to_claude(&payload, original_model)?;
+            let mut target = serde_json::Map::from_iter([("model".into(), json!(original_model))]);
+            apply_overrides(&mut target, provider, request_model);
+            let target_model = target.get("model").and_then(Value::as_str).unwrap_or("");
+            payload = chat_to_claude(&payload, target_model)?;
             (
                 messages_url(provider.base_url.as_ref()),
                 ResponseAdapter::ClaudeToChat,

@@ -1,6 +1,6 @@
 use crate::protocols::content::content_text;
 use crate::runtime::clock::unix_seconds;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 // Bedrock rejects whitespace-only text blocks, including assistant placeholders
 // next to tool calls. Remove only plain placeholders from valid tool turns;
@@ -158,52 +158,7 @@ pub(crate) fn chat_to_claude(input: &Value, original_model: &str) -> Result<Valu
                 output.remove("tools");
             }
         }
-        let explicit_thinking = root.get("thinking").filter(|value| value.is_object());
-        let effort = root
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                root.get("reasoning")
-                    .and_then(|value| value.get("effort"))
-                    .and_then(Value::as_str)
-            });
-        if let Some(thinking) = explicit_thinking {
-            output.insert("thinking".into(), thinking.clone());
-            output.insert("temperature".into(), json!(1));
-            output.remove("top_p");
-            output.remove("top_k");
-            if let Some(budget) = thinking.get("budget_tokens").and_then(Value::as_i64) {
-                let max_tokens = output
-                    .get("max_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(4096)
-                    .max(budget + 1024);
-                output.insert("max_tokens".into(), json!(max_tokens));
-            }
-        } else if let Some(effort) = effort {
-            let budget = match effort.to_ascii_lowercase().as_str() {
-                "minimal" | "low" => 1024,
-                "medium" => 4096,
-                "high" => 8192,
-                "extra_high" | "xhigh" => 16384,
-                _ => 0,
-            };
-            if budget > 0 {
-                output.insert(
-                    "thinking".into(),
-                    json!({"type":"enabled","budget_tokens":budget}),
-                );
-                output.insert("temperature".into(), json!(1));
-                output.remove("top_p");
-                output.remove("top_k");
-                let max_tokens = output
-                    .get("max_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(4096)
-                    .max(budget + 1024);
-                output.insert("max_tokens".into(), json!(max_tokens));
-            }
-        }
+        apply_thinking(root, output, original_model);
         if let Some(tier) = root.get("service_tier").and_then(Value::as_str) {
             let tier = match tier.to_ascii_lowercase().as_str() {
                 "flex" | "standard" | "standard_only" => "standard_only",
@@ -213,6 +168,91 @@ pub(crate) fn chat_to_claude(input: &Value, original_model: &str) -> Result<Valu
         }
     }
     Ok(output)
+}
+
+// Capability is deliberately exact: aliases are resolved by the caller. Do not
+// infer new model capabilities from prefixes or silently change older models.
+fn uses_adaptive_thinking(model: &str) -> bool {
+    model == "claude-sonnet-5"
+}
+
+fn apply_thinking(root: &Map<String, Value>, output: &mut Map<String, Value>, model: &str) {
+    if let Some(config) = root.get("output_config") {
+        // Preserve format extensions and even invalid values for upstream validation.
+        output.insert("output_config".into(), config.clone());
+    }
+    let effort = root
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            root.get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str)
+        });
+    if let Some(thinking) = root.get("thinking") {
+        // Explicit disabled/adaptive/manual/invalid values must not be replaced
+        // by an inferred budget merely because reasoning_effort is present.
+        output.insert("thinking".into(), thinking.clone());
+    } else if uses_adaptive_thinking(model) {
+        let selected = output
+            .get("output_config")
+            .and_then(|v| v.get("effort"))
+            .and_then(Value::as_str)
+            .or(effort);
+        if let Some(effort) = selected {
+            output.insert(
+                "thinking".into(),
+                json!({"type":
+                if effort.eq_ignore_ascii_case("none") { "disabled" } else { "adaptive" }}),
+            );
+        }
+    } else if let Some(effort) = effort {
+        let budget = match effort.to_ascii_lowercase().as_str() {
+            "minimal" | "low" => 1024,
+            "medium" => 4096,
+            "high" => 8192,
+            "extra_high" | "xhigh" => 16384,
+            _ => 0,
+        };
+        if budget > 0 {
+            output.insert(
+                "thinking".into(),
+                json!({"type":"enabled","budget_tokens":budget}),
+            );
+        }
+    }
+    let mode = output
+        .get("thinking")
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if mode.as_deref() == Some("adaptive") {
+        if let Some(effort) = effort.filter(|v| !v.eq_ignore_ascii_case("none")) {
+            let config = output.entry("output_config").or_insert_with(|| json!({}));
+            if let Some(config) = config.as_object_mut() {
+                // Explicit effort (including null/invalid) wins; no guessed xhigh/max mapping.
+                config.entry("effort").or_insert_with(|| json!(effort));
+            }
+        }
+    } else if mode.as_deref() == Some("enabled") {
+        if let Some(budget) = output
+            .get("thinking")
+            .and_then(|v| v.get("budget_tokens"))
+            .and_then(Value::as_i64)
+        {
+            let max_tokens = output
+                .get("max_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(4096)
+                .max(budget.saturating_add(1024));
+            output.insert("max_tokens".into(), json!(max_tokens));
+        }
+    }
+    if matches!(mode.as_deref(), Some("enabled" | "adaptive")) {
+        output.insert("temperature".into(), json!(1));
+        output.remove("top_p");
+        output.remove("top_k");
+    }
 }
 
 pub(crate) fn claude_content(content: &Value) -> Vec<Value> {
@@ -340,5 +380,147 @@ mod blank_tool_text_tests {
             strip_blank_tool_turn_text(&mut payload);
             assert_eq!(payload, before);
         }
+    }
+}
+
+#[cfg(test)]
+mod adaptive_thinking_tests {
+    use super::chat_to_claude;
+    use serde_json::{json, Value};
+
+    fn convert(fields: Value, model: &str) -> Value {
+        let mut body = json!({"messages":[{"role":"user","content":"fixture"}],"max_tokens":256});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        chat_to_claude(&body, model).unwrap()
+    }
+
+    #[test]
+    fn supported_model_preserves_effort_and_output_limit() {
+        for effort in ["low", "medium", "high"] {
+            for field in [
+                json!({"reasoning_effort":effort}),
+                json!({"reasoning":{"effort":effort}}),
+            ] {
+                let body = convert(field, "claude-sonnet-5");
+                assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+                assert_eq!(body["output_config"]["effort"], effort);
+                assert_eq!(body["max_tokens"], 256);
+            }
+        }
+    }
+
+    #[test]
+    fn older_and_unknown_models_keep_manual_budget() {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-custom",
+            "unknown",
+        ] {
+            let body = convert(json!({"reasoning_effort":"high"}), model);
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"enabled","budget_tokens":8192})
+            );
+            assert_eq!(body["max_tokens"], 9216);
+            assert!(body.get("output_config").is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_output_config_is_merged_without_overwrite() {
+        let config =
+            json!({"effort":"low","format":{"type":"json_schema","schema":{"type":"object"}}});
+        let body = convert(
+            json!({"reasoning_effort":"high","output_config":config}),
+            "claude-sonnet-5",
+        );
+        assert_eq!(body["output_config"], config);
+        let body = convert(
+            json!({"reasoning_effort":"high","output_config":{"format":{"type":"text"}}}),
+            "claude-sonnet-5",
+        );
+        assert_eq!(
+            body["output_config"],
+            json!({"format":{"type":"text"},"effort":"high"})
+        );
+    }
+
+    #[test]
+    fn explicit_disable_preserves_sampling_and_prevents_inference() {
+        let body = convert(
+            json!({"thinking":{"type":"disabled"},"reasoning_effort":"high","temperature":0.4,"top_p":0.8,"top_k":8}),
+            "claude-sonnet-5",
+        );
+        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+        assert_eq!(body["temperature"], 0.4);
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["top_k"], 8);
+        assert_eq!(body["max_tokens"], 256);
+        assert!(body.get("output_config").is_none());
+        let body = convert(json!({"reasoning_effort":"none"}), "claude-sonnet-5");
+        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+    }
+
+    #[test]
+    fn explicit_manual_and_adaptive_intent_is_preserved() {
+        let body = convert(
+            json!({"thinking":{"type":"enabled","budget_tokens":1024},"reasoning_effort":"high"}),
+            "claude-sonnet-5",
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"enabled","budget_tokens":1024})
+        );
+        assert_eq!(body["max_tokens"], 2048);
+        assert!(body.get("output_config").is_none());
+        let body = convert(
+            json!({"thinking":{"type":"adaptive","display":"omitted"},"reasoning_effort":"high"}),
+            "custom-model",
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"adaptive","display":"omitted"})
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["max_tokens"], 256);
+    }
+
+    #[test]
+    fn invalid_explicit_fields_and_unmapped_efforts_reach_validation() {
+        for thinking in [Value::Null, json!("invalid"), json!({"type":"invalid"})] {
+            let body = convert(
+                json!({"thinking":thinking,"reasoning_effort":"high"}),
+                "claude-sonnet-5",
+            );
+            assert_eq!(body["thinking"], thinking);
+            assert!(body.get("output_config").is_none());
+        }
+        for config in [Value::Null, json!("invalid"), json!({"effort":null})] {
+            let body = convert(
+                json!({"output_config":config,"reasoning_effort":"high"}),
+                "claude-sonnet-5",
+            );
+            assert_eq!(body["output_config"], config);
+        }
+        for effort in ["xhigh", "max", "bogus"] {
+            let body = convert(json!({"reasoning_effort":effort}), "claude-sonnet-5");
+            assert_eq!(body["output_config"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn no_thinking_is_invented_without_intent_and_forced_tools_stay_forced() {
+        let body = convert(json!({}), "claude-sonnet-5");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        let body = convert(
+            json!({"reasoning_effort":"high","tool_choice":{"type":"function","function":{"name":"lookup"}}}),
+            "claude-sonnet-5",
+        );
+        assert_eq!(body["tool_choice"], json!({"type":"tool","name":"lookup"}));
+        assert_eq!(body["thinking"]["type"], "adaptive");
     }
 }
