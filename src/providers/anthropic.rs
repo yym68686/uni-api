@@ -2,6 +2,43 @@ use crate::protocols::content::content_text;
 use crate::runtime::clock::unix_seconds;
 use serde_json::{json, Value};
 
+// Bedrock rejects whitespace-only text blocks, including assistant placeholders
+// next to tool calls. Remove only plain placeholders from valid tool turns;
+// never alter signed thinking, tool arguments, or an otherwise empty message.
+pub(crate) fn strip_blank_tool_turn_text(payload: &mut Value) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let has_tool = blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_use")
+                && ["id", "name"].iter().all(|field| {
+                    block
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+                && block.get("input").is_some_and(Value::is_object)
+        });
+        if has_tool {
+            blocks.retain(|block| {
+                !(block.as_object().is_some_and(|fields| fields.len() == 2)
+                    && block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.trim().is_empty()))
+            });
+        }
+    }
+}
+
 pub(crate) fn chat_to_claude(input: &Value, original_model: &str) -> Result<Value, String> {
     let root = input
         .as_object()
@@ -257,4 +294,51 @@ pub(crate) fn claude_to_chat(value: &Value, model: &str) -> Value {
         "choices":[{"index":0,"message":message,"finish_reason":match value.get("stop_reason").and_then(Value::as_str) { Some("max_tokens") => "length", Some("tool_use") => "tool_calls", Some("refusal") => "content_filter", _ => "stop" }}],
         "usage":usage,
     })
+}
+
+#[cfg(test)]
+mod blank_tool_text_tests {
+    use super::strip_blank_tool_turn_text;
+    use serde_json::json;
+
+    #[test]
+    fn removes_only_plain_blank_assistant_tool_turn_text() {
+        let thinking =
+            json!({"type":"thinking","thinking":"signed content","signature":"signature"});
+        let tool = json!({"type":"tool_use","id":"tool_1","name":"run","input":{"text":" "}});
+        let meaningful = json!({"type":"text","text":" preserve spaces "});
+        let cache = json!({"type":"text","text":" ","cache_control":{"type":"ephemeral"}});
+        let mut payload = json!({"system":[{"type":"text","text":" "}],"messages":[
+            {"role":"assistant","content":[thinking,{"type":"text","text":" \n\t"},
+                {"type":"text","text":""},tool,meaningful,cache]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":" "}]}
+        ]});
+        let before = payload.clone();
+        strip_blank_tool_turn_text(&mut payload);
+        assert_eq!(
+            payload["messages"][0]["content"],
+            json!([thinking, tool, meaningful, cache])
+        );
+        assert_eq!(payload["system"], before["system"]);
+        assert_eq!(payload["messages"][1], before["messages"][1]);
+        let once = payload.clone();
+        strip_blank_tool_turn_text(&mut payload);
+        assert_eq!(payload, once);
+    }
+
+    #[test]
+    fn preserves_invalid_or_non_tool_messages() {
+        for message in [
+            json!({"role":"assistant","content":[{"type":"text","text":" "}]}),
+            json!({"role":"assistant","content":" "}),
+            json!({"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":"s"},{"type":"text","text":" "}]}),
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"","name":"run","input":{}},{"type":"text","text":" "}]}),
+            json!({"role":"user","content":[{"type":"tool_use","id":"tool_1","name":"run","input":{}},{"type":"text","text":" "}]}),
+        ] {
+            let mut payload = json!({"messages":[message]});
+            let before = payload.clone();
+            strip_blank_tool_turn_text(&mut payload);
+            assert_eq!(payload, before);
+        }
+    }
 }

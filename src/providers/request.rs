@@ -587,6 +587,14 @@ pub(crate) fn build_attempt(
             }
         }
     }
+    if wire_path == "/v1/messages"
+        || matches!(
+            adapter,
+            ResponseAdapter::ClaudeToChat | ResponseAdapter::AwsToChat
+        )
+    {
+        crate::providers::anthropic::strip_blank_tool_turn_text(&mut payload);
+    }
     // OpenAI-compatible overrides may explicitly disable upstream streaming.
     // Decode the wire format we actually requested before adapting the result.
     let upstream_stream = if matches!(
