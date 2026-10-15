@@ -13,9 +13,12 @@ checking the remaining amount. Its auth middleware may update the key's last-use
 timestamp; the query does not generate model traffic or spend model credits.
 
 The URL is derived from an HTTPS provider base ending in `/v1`, `/v1/responses`,
-`/v1/messages`, or `/v1/chat/completions`, preserving a deployment prefix. A bare
-HTTPS origin also works. Redirects are blocked and the caller cannot supply a URL
-or credential. Official OpenAI, Anthropic, DeepSeek and unsupported URL forms
+`/v1/messages`, or `/v1/chat/completions`, preserving a deployment prefix. Native
+Gemini `/v1beta`, `/v1beta/models`, and `/v1beta/models/<model>:generateContent`,
+`:streamGenerateContent`, or `:countTokens` also resolve to the same sibling
+`/v1/usage` (including equivalent `/v1/models` forms). A bare HTTPS origin also
+works. Redirects are blocked and the caller cannot supply a URL or credential.
+Official OpenAI, Anthropic, DeepSeek, Google Gemini/Vertex and unsupported URL forms
 are marked unsupported. Set provider `preferences.balance_query: false` to opt
 out. No routing selection, limits, cooldowns or model statistics are modified.
 

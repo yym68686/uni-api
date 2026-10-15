@@ -45,21 +45,37 @@ fn usage_url(base: &str, start_date: &str, end_date: &str) -> Option<Url> {
     {
         return None;
     }
+    let host = url.host_str()?;
     if matches!(
-        url.host_str()?,
-        "api.openai.com" | "api.anthropic.com" | "api.deepseek.com"
-    ) {
+        host,
+        "api.openai.com"
+            | "api.anthropic.com"
+            | "api.deepseek.com"
+            | "generativelanguage.googleapis.com"
+            | "aiplatform.googleapis.com"
+    ) || host.ends_with("-aiplatform.googleapis.com")
+    {
         return None;
     }
     let path = url.path().trim_end_matches('/');
     let prefix = if path.is_empty() {
         ""
-    } else if let Some(p) = path.strip_suffix("/v1") {
+    } else if let Some(p) = path
+        .strip_suffix("/v1")
+        .or_else(|| path.strip_suffix("/v1beta"))
+    {
         p
     } else {
-        ["/v1/responses", "/v1/chat/completions", "/v1/messages"]
-            .iter()
-            .find_map(|suffix| path.strip_suffix(suffix))?
+        [
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1beta/models",
+            "/v1/models",
+        ]
+        .iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .or_else(|| gemini_usage_prefix(path))?
     };
     let path = format!("{prefix}/v1/usage");
     url.set_path(&path);
@@ -70,6 +86,27 @@ fn usage_url(base: &str, start_date: &str, end_date: &str) -> Option<Url> {
         .append_pair("start_date", start_date)
         .append_pair("end_date", end_date);
     Some(url)
+}
+
+// Native Gemini uses /v1beta instead of /v1, but Sub2API billing is still
+// /v1/usage on that same service. Recognize only known model-operation paths;
+// do not guess the root of arbitrary URLs or discard a deployment prefix.
+fn gemini_usage_prefix(path: &str) -> Option<&str> {
+    for marker in ["/v1beta/models/", "/v1/models/"] {
+        if let Some((prefix, operation)) = path.rsplit_once(marker) {
+            let (model, action) = operation.rsplit_once(':')?;
+            if !model.is_empty()
+                && !model.contains('/')
+                && matches!(
+                    action,
+                    "generateContent" | "streamGenerateContent" | "countTokens"
+                )
+            {
+                return Some(prefix);
+            }
+        }
+    }
+    None
 }
 
 fn utc_date(seconds: u64) -> String {
@@ -411,12 +448,54 @@ mod tests {
             "http://example.test/v1",
             "https://user:secret@example.test/v1",
             "https://example.test/v1?api_key=x",
-            "https://example.test/v1beta",
             "https://api.openai.com/v1",
         ] {
             assert!(usage_url(url, "2026-09-01", "2026-09-02").is_none());
         }
     }
+    #[test]
+    fn derives_gemini_billing_siblings_without_dropping_deployment_prefixes() {
+        for (base, expected) in [
+            ("https://site.test/v1beta", "/v1/usage"),
+            ("https://site.test/gateway/v1beta/", "/gateway/v1/usage"),
+            (
+                "https://site.test/gateway/v1beta/models",
+                "/gateway/v1/usage",
+            ),
+            (
+                "https://site.test/gateway/v1beta/models/gemini-4-argon:streamGenerateContent",
+                "/gateway/v1/usage",
+            ),
+            (
+                "https://site.test/v1/models/gemini-4-argon:generateContent",
+                "/v1/usage",
+            ),
+        ] {
+            let url = usage_url(base, "2026-10-01", "2026-10-15").expect(base);
+            assert_eq!(url.host_str(), Some("site.test"));
+            assert_eq!(url.path(), expected, "{base}");
+            assert_eq!(
+                url.query(),
+                Some("start_date=2026-10-01&end_date=2026-10-15")
+            );
+        }
+        for base in [
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://aiplatform.googleapis.com/v1",
+            "https://us-central1-aiplatform.googleapis.com/v1",
+            "https://site.test/v1beta?key=secret",
+            "https://site.test/v1beta#fragment",
+            "https://site.test/v1beta/unknown",
+            "https://site.test/v1beta/models/a/other",
+            "https://site.test/v1beta/models/a:delete",
+        ] {
+            assert!(
+                usage_url(base, "2026-10-01", "2026-10-15").is_none(),
+                "{base}"
+            );
+        }
+    }
+
     #[test]
     fn distinguishes_wallet_quota_subscription_and_missing_data() {
         let wallet = normalize(&json!({"mode":"unrestricted","isValid":true,"balance":0,"unit":"USD","secret":"never return"}), None).unwrap();
@@ -462,6 +541,60 @@ mod tests {
         assert_eq!(all["actual_cost_usd"], 9.5);
         assert_eq!(all["actual_cost_samples"], 7);
     }
+    #[tokio::test]
+    async fn gemini_sibling_usage_keeps_credentials_and_balance_kinds() {
+        use axum::{http::HeaderMap, routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/gateway/v1/usage",
+            get(move |headers: HeaderMap| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let value = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                        Some("Bearer wallet-fixture") => json!({"mode":"unrestricted","isValid":true,"balance":57.5}),
+                        Some("Bearer quota-fixture") => json!({"mode":"quota_limited","isValid":true,"quota":{"remaining":3},"balance":57.5}),
+                        Some("Bearer subscription-fixture") => json!({"mode":"unrestricted","isValid":true,"subscription":{},"remaining":12}),
+                        _ => panic!("unexpected billing credential"),
+                    };
+                    axum::Json(value)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let service = Balances::new();
+        let mut url = usage_url(
+            "https://site.test/gateway/v1beta",
+            "2026-10-01",
+            "2026-10-15",
+        )
+        .unwrap();
+        // Redirect the derived URL to this test's isolated HTTP listener only.
+        url.set_scheme("http").unwrap();
+        url.set_host(Some("127.0.0.1")).unwrap();
+        url.set_port(Some(address.port())).unwrap();
+        for (credential, kind, amount) in [
+            ("wallet-fixture", "wallet", 57.5),
+            ("quota-fixture", "key_quota", 3.0),
+            ("subscription-fixture", "subscription", 12.0),
+        ] {
+            let result = service
+                .get(&url, credential, None, Some("gemini-4-argon"))
+                .await;
+            assert_eq!(result["status"], "ok");
+            assert_eq!(result["kind"], kind);
+            assert_eq!(result["amount"], amount);
+            assert!(!result.to_string().contains(credential));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        task.abort();
+    }
+
     #[tokio::test]
     async fn coalesces_requests_caches_failures_and_blocks_redirects() {
         use axum::{routing::get, Router};
