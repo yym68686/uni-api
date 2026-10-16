@@ -2464,3 +2464,65 @@ async fn local_cooldown_skip_does_not_overwrite_last_upstream_failure() {
     assert_eq!(final_message["status_code"], 503);
     assert!(route.final_emitted);
 }
+
+#[tokio::test]
+async fn committed_stream_failures_cool_only_the_failed_route_without_retrying() {
+    use crate::runtime::scheduling::ProviderKeySelection;
+
+    for (kind, should_cool) in [
+        ("protocol_error", true),
+        ("transport_error", true),
+        ("downstream_disconnected", false),
+        ("incomplete", false),
+        ("completed", false),
+    ] {
+        let mut upstream = provider();
+        upstream.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let upstream = Arc::new(upstream);
+        let mut route = native_route_for_test(upstream.clone(), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let plan = route.next_plan().await.unwrap().unwrap();
+        let planned = route.attempt_contexts.len();
+        let cursor = route.cursor;
+        route
+            .complete_native(&json!({
+                "kind": kind,
+                "status_code": if should_cool { 502 } else { 200 },
+                "upstream_status_code": 200,
+                "detail": "stream ended before a terminal event",
+                "committed": true,
+                "attempt_id": plan.attempt_id,
+            }))
+            .await;
+        assert_eq!(
+            route.attempt_contexts.len(),
+            planned,
+            "{kind}: replayed output"
+        );
+        assert_eq!(route.cursor, cursor, "{kind}: selected another provider");
+        assert_eq!(
+            route.upstream_ledger.len(),
+            1,
+            "{kind}: duplicate attempt fact"
+        );
+        let selected = route
+            .store
+            .select_provider_key(&upstream, "gpt-upstream")
+            .await;
+        assert_eq!(
+            matches!(selected, ProviderKeySelection::ChannelCooling),
+            should_cool,
+            "{kind}"
+        );
+        assert!(
+            matches!(
+                route
+                    .store
+                    .select_provider_key(&upstream, "another-model")
+                    .await,
+                ProviderKeySelection::Selected(_)
+            ),
+            "{kind}: unrelated model cooled"
+        );
+    }
+}

@@ -598,7 +598,10 @@ impl ResponsesRoute {
         let accepted = matches!(kind, "completed" | "incomplete");
         let success = kind == "completed";
         let status = outcome_status(outcome, if accepted { 200 } else { 502 });
-        if matches!(kind, "semantic_failure" | "semantic_error") {
+        if matches!(
+            kind,
+            "semantic_failure" | "semantic_error" | "protocol_error" | "transport_error"
+        ) {
             // Apply the normal failure accounting and cooldown policy, but
             // never dispatch a retry after output has been committed.
             let _ = self.record_failure(outcome).await;
