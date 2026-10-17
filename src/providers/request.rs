@@ -83,7 +83,7 @@ pub(crate) fn preview_channel_request(
     let mut url = Url::parse(&attempt.url).map_err(|_| "invalid prepared endpoint".to_owned())?;
     url.set_query(None);
     Ok(
-        json!({"url":url.to_string(),"method":attempt.method.as_str(),"header_names":attempt.headers.keys().map(|h|h.as_str()).collect::<Vec<_>>(),"body":body,"stream":attempt.upstream_stream}),
+        json!({"url":url.to_string(),"method":attempt.method.as_str(),"header_names":attempt.headers.keys().map(|h|h.as_str()).collect::<Vec<_>>(),"body":body,"stream":attempt.upstream_stream,"upstream_stream":attempt.upstream_stream,"downstream_stream":attempt.downstream_stream}),
     )
 }
 
@@ -606,6 +606,15 @@ pub(crate) fn build_attempt(
         )
     {
         crate::providers::anthropic::strip_blank_tool_turn_text(&mut payload);
+    }
+    // Capability applies only to the Responses generation wire endpoint (never compact/search).
+    if !is_alpha_search
+        && !is_systemone
+        && (path == "/v1/responses" || adapter == ResponseAdapter::ResponsesToChat)
+        && crate::providers::stream_mode::responses_wire(&engine, &url)
+        && crate::providers::stream_mode::stream_only(provider, request_model, original_model)
+    {
+        payload["stream"] = Value::Bool(true);
     }
     // OpenAI-compatible overrides may explicitly disable upstream streaming.
     // Decode the wire format we actually requested before adapting the result.

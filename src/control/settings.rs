@@ -361,6 +361,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
             "请求改写",
             "json",
         ),
+        ("preferences/upstream_stream_mode", "网络与适配", "json"),
         ("tools", "网络与适配", "boolean"),
         ("image", "网络与适配", "boolean"),
         ("preferences/proxy", "网络与适配", "secret"),
@@ -377,7 +378,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
 }
 
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"supported":true,"global_settings":true,"create_provider":true,"automatic_engine":true,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
+    json!({"version":1,"supported":true,"global_settings":true,"create_provider":true,"automatic_engine":true,"upstream_stream_mode":1,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
 }
 
 pub(crate) fn valid_created_name(name: &str) -> bool {
@@ -461,6 +462,9 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
     }
     if let Some(p) = raw.get("preferences") {
         let p = p.as_object().ok_or(field_error("/preferences"))?;
+        if let Some(mode) = p.get("upstream_stream_mode") {
+            crate::providers::stream_mode::validate(mode)?;
+        }
         for (k, v) in p {
             if k.starts_with("__") {
                 return Err(field_error("/preferences/internal"));

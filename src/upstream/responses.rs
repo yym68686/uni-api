@@ -63,6 +63,8 @@ pub(crate) struct Plan {
     pub(crate) url: String,
     pub(crate) headers: HashMap<String, String>,
     pub(crate) body: String,
+    #[serde(default)]
+    pub(crate) collect_stream: bool,
     pub(crate) proxy: Option<String>,
     pub(crate) engine: String,
     #[serde(default)]
@@ -449,7 +451,7 @@ async fn serve_native_nonstream(
             }
         };
         match send_native_nonstream_attempt(&state, &plan).await {
-            Ok((status, mut headers, mut body, elapsed_ms)) if status.is_success() => {
+            Ok((status, mut headers, mut body, elapsed_ms, collected)) if status.is_success() => {
                 let mut payload = serde_json::from_slice::<Value>(&body).ok();
                 if let Some(payload) = payload.as_mut() {
                     let mut changed =
@@ -498,13 +500,16 @@ async fn serve_native_nonstream(
                         idempotency::executed_header(&mut headers);
                     }
                 }
-                let mut outcome = json!({
-                    "kind": "completed",
-                    "status_code": status.as_u16(),
-                    "upstream_status_code": status.as_u16(),
-                    "downstream_bytes": body.len(),
-                    "first_output_ms":first_output_ms,
+                let mut outcome = collected.unwrap_or_else(|| {
+                    json!({
+                        "kind": "completed",
+                        "status_code": status.as_u16(),
+                        "upstream_status_code": status.as_u16(),
+                        "downstream_bytes": body.len(),
+                        "first_output_ms":first_output_ms,
+                    })
                 });
+                outcome["downstream_bytes"] = json!(body.len());
                 if let Some(usage) = usage {
                     outcome["usage"] = usage;
                 }
@@ -514,19 +519,24 @@ async fn serve_native_nonstream(
                 *response.headers_mut() = headers;
                 return response;
             }
-            Ok((status, _headers, body, _elapsed_ms)) => {
+            Ok((status, _headers, body, _elapsed_ms, collected)) => {
                 let detail = String::from_utf8_lossy(&body)
                     .chars()
                     .take(4096)
                     .collect::<String>();
-                let outcome = json!({
-                    "kind": "http_error",
-                    "status_code": status.as_u16(),
-                    "upstream_status_code": status.as_u16(),
-                    "body": detail,
-                    "committed": false,
+                let outcome = collected.unwrap_or_else(|| {
+                    json!({
+                        "kind": "http_error",
+                        "status_code": status.as_u16(),
+                        "upstream_status_code": status.as_u16(),
+                        "body": detail,
+                        "committed": false,
+                        "upstream_stream": plan.collect_stream,
+                        "downstream_stream": false,
+                    })
                 });
-                if !route.record_plan_failure(plan, &outcome).await {
+                let retry_allowed = outcome["retry_allowed"].as_bool().unwrap_or(true);
+                if !route.record_plan_failure(plan, &outcome).await || !retry_allowed {
                     let final_status = StatusCode::from_u16(route.last_status())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(final_status.as_u16(), "failed_before_commit");
@@ -540,6 +550,8 @@ async fn serve_native_nonstream(
                     "status_code": 502,
                     "detail": error,
                     "committed": false,
+                    "upstream_stream": plan.collect_stream,
+                    "downstream_stream": false,
                 });
                 if !route.record_failure(&outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
@@ -554,7 +566,7 @@ async fn serve_native_nonstream(
 async fn send_native_nonstream_attempt(
     state: &AppState,
     plan: &Plan,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>, f64), String> {
+) -> Result<(StatusCode, HeaderMap, Vec<u8>, f64, Option<Value>), String> {
     let client = state
         .upstream_client(
             plan.proxy.as_deref(),
@@ -613,7 +625,34 @@ async fn send_native_nonstream_attempt(
         );
     }
     let status = response.status();
-    let headers = filtered_response_headers(response.headers());
+    let mut headers = filtered_response_headers(response.headers());
+    if status.is_success() && plan.collect_stream {
+        let result = crate::protocols::responses::collect::collect(
+            response,
+            observation_started,
+            positive_duration(plan.idle_timeout_seconds),
+            plan.normalize_custom_tool_call_ids,
+        )
+        .await;
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.remove("content-length");
+        headers.remove("content-encoding");
+        let (status, payload, outcome) = match result {
+            Ok(done) => (status, done.payload, done.outcome),
+            Err(failure) => (
+                StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                json!({"error":{"message":failure.detail}}),
+                failure.outcome,
+            ),
+        };
+        return Ok((
+            status,
+            headers,
+            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            observation_started.elapsed().as_secs_f64() * 1000.0,
+            Some(outcome),
+        ));
+    }
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     loop {
@@ -636,6 +675,7 @@ async fn send_native_nonstream_attempt(
         headers,
         body,
         observation_started.elapsed().as_secs_f64() * 1000.0,
+        None,
     ))
 }
 
@@ -2674,6 +2714,7 @@ mod tests {
             url: "http://provider.example/v1/responses".into(),
             headers: HashMap::new(),
             body: "{}".into(),
+            collect_stream: false,
             proxy: None,
             engine: engine.into(),
             precommit_semantic_guard: None,

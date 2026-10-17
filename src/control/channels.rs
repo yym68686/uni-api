@@ -1015,6 +1015,7 @@ impl GatewayRuntime {
                 let response = client
                     .get(&url)
                     .header("X-Uni-Channel-Settings-Version", "1")
+                    .header("X-Uni-Upstream-Stream-Mode", "1")
                     .bearer_auth(&token)
                     .send()
                     .await

@@ -394,6 +394,16 @@ impl ResponsesRoute {
                 &engine,
                 self.wants_compact,
             )?;
+            let collect_stream = !self.stream
+                && !self.wants_compact
+                && crate::providers::stream_mode::stream_only(
+                    &provider,
+                    &self.request_model,
+                    &original_model,
+                );
+            if collect_stream {
+                payload["stream"] = Value::Bool(true);
+            }
             let body = serde_json::to_string(&payload)
                 .map_err(|error| format!("encode native upstream payload: {error}"))?;
             let attempt_id = native_attempt_id(&self.request_id, attempt_number);
@@ -402,7 +412,7 @@ impl ResponsesRoute {
                 &provider,
                 &provider_key,
                 &engine,
-                self.stream,
+                self.stream || collect_stream,
                 &self.request_id,
                 &attempt_id,
             )?;
@@ -472,6 +482,7 @@ impl ResponsesRoute {
                 url: normalize_upstream_url(&provider.base_url, &engine, self.wants_compact),
                 headers,
                 body,
+                collect_stream,
                 proxy: preference_string(&provider.preferences, "proxy")
                     .or_else(|| preference_string(&self.snapshot.preferences, "proxy")),
                 engine: engine.clone(),
@@ -796,6 +807,8 @@ impl ResponsesRoute {
                 "provider": attempt.provider,
                 "actual_model": attempt.actual_model,
                 "upstream_host": attempt.upstream_host,
+            "downstream_stream": attempt.stream,
+            "upstream_stream": outcome.get("upstream_stream").and_then(Value::as_bool).unwrap_or(attempt.stream),
                 "status_code": status,
                 "success": success,
                 "outcome": attempt_outcome,
@@ -842,6 +855,8 @@ impl ResponsesRoute {
             "response_created_ms": outcome.get("response_created_ms"),
             "first_text_ms": outcome.get("first_text_ms"),
             "upstream_host": attempt.upstream_host,
+            "downstream_stream": attempt.stream,
+            "upstream_stream": outcome.get("upstream_stream").and_then(Value::as_bool).unwrap_or(attempt.stream),
             "streaming": attempt.stream,
             "snapshot_revision": attempt.snapshot_revision,
             "rust_responses_data_plane": true,
@@ -887,6 +902,9 @@ impl ResponsesRoute {
         };
         let summary = json!({
             "request_kind": "responses",
+            "downstream_stream": self.stream,
+            "upstream_stream": outcome.get("upstream_stream").and_then(Value::as_bool)
+                .or_else(|| self.upstream_ledger.last().and_then(|v| v["upstream_stream"].as_bool())).unwrap_or(self.stream),
             "terminal_kind": kind,
             "model": self.request_model,
             "provider": final_provider,

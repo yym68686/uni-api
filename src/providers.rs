@@ -6,6 +6,7 @@ pub(crate) mod endpoints;
 pub(crate) mod gemini;
 pub(crate) mod overrides;
 pub(crate) mod request;
+pub(crate) mod stream_mode;
 pub(crate) mod types;
 pub(crate) mod vertex;
 pub(crate) mod video;

@@ -439,18 +439,30 @@ pub(crate) async fn run_hedged_attempt_loop(
                     usage,
                     fact_usage,
                     stream_outcome,
+                    collected_outcome,
                     upstream_url,
                 } = success;
                 debug_assert!(stream_outcome.is_none());
                 execution.state.persistence.record_channel(ChannelStat {
-                    terminal_kind: None,
+                    terminal_kind: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["kind"].as_str())
+                        .map(str::to_owned),
                     failure_reason: None,
-                    response_completed: None,
+                    response_completed: collected_outcome
+                        .as_ref()
+                        .map(|v| v["kind"] == "completed"),
                     transport_timing: None,
                     duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
-                    first_output_ms: None,
-                    response_created_ms: None,
-                    first_text_ms: None,
+                    first_output_ms: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["first_output_ms"].as_f64()),
+                    response_created_ms: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["response_created_ms"].as_f64()),
+                    first_text_ms: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["first_text_ms"].as_f64()),
                     request_id: execution.request_id.clone(),
                     attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
@@ -458,7 +470,9 @@ pub(crate) async fn run_hedged_attempt_loop(
                     upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
-                    success: true,
+                    success: collected_outcome
+                        .as_ref()
+                        .is_none_or(|v| v["kind"] == "completed"),
                     endpoint: execution.path.clone(),
                     stream: context.downstream_stream,
                 });
@@ -469,6 +483,16 @@ pub(crate) async fn run_hedged_attempt_loop(
                     .await;
                 execution.state.persistence.record_request(RequestStat {
                     fact_usage,
+                    terminal_kind: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["kind"].as_str())
+                        .map(str::to_owned),
+                    response_completed: collected_outcome
+                        .as_ref()
+                        .map(|v| v["kind"] == "completed"),
+                    is_flagged: collected_outcome
+                        .as_ref()
+                        .is_some_and(|v| v["kind"] != "completed"),
                     stream: context.downstream_stream,
                     status: status.as_u16(),
                     request_id: execution.request_id.clone(),
@@ -488,6 +512,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     completion_price: execution.completion_price,
                     timing_spans: json!({
                         "runtime": "rust",
+                        "stream_collection": collected_outcome,
                         "terminal": "hedge_winner",
                         "attempt_count": cursor,
                         "winner_attempt_index": context.attempt_index + 1,
@@ -608,7 +633,10 @@ pub(crate) async fn run_hedged_attempt_loop(
                     "failed",
                     Some(failure.status.as_u16()),
                 );
-                if policy.retryable && scheduler.has_capacity() {
+                if policy.retryable
+                    && failure.failure_reason != "stream_collection_after_output"
+                    && scheduler.has_capacity()
+                {
                     if let Some(plan) = next_generic_hedge_plan(
                         &execution,
                         &mut cursor,
@@ -806,10 +834,21 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     usage,
                     fact_usage,
                     stream_outcome,
+                    collected_outcome,
                     upstream_url,
                 } = success;
                 let request_stat = RequestStat {
                     fact_usage,
+                    terminal_kind: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["kind"].as_str())
+                        .map(str::to_owned),
+                    response_completed: collected_outcome
+                        .as_ref()
+                        .map(|v| v["kind"] == "completed"),
+                    is_flagged: collected_outcome
+                        .as_ref()
+                        .is_some_and(|v| v["kind"] != "completed"),
                     stream: downstream_stream,
                     upstream_model: original_model.clone(),
                     status: status.as_u16(),
@@ -829,6 +868,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     completion_price,
                     timing_spans: json!({
                         "runtime": "rust",
+                        "stream_collection": collected_outcome,
                         "attempt_count": attempt_index + 1,
                         "upstream_ms": attempt_started.elapsed().as_millis(),
                     })
@@ -981,14 +1021,25 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     return response;
                 }
                 state.persistence.record_channel(ChannelStat {
-                    terminal_kind: None,
+                    terminal_kind: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["kind"].as_str())
+                        .map(str::to_owned),
                     failure_reason: None,
-                    response_completed: None,
+                    response_completed: collected_outcome
+                        .as_ref()
+                        .map(|v| v["kind"] == "completed"),
                     transport_timing: None,
                     duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
-                    first_output_ms: None,
-                    response_created_ms: None,
-                    first_text_ms: None,
+                    first_output_ms: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["first_output_ms"].as_f64()),
+                    response_created_ms: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["response_created_ms"].as_f64()),
+                    first_text_ms: collected_outcome
+                        .as_ref()
+                        .and_then(|v| v["first_text_ms"].as_f64()),
                     request_id: request_id.clone(),
                     attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
@@ -996,7 +1047,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     upstream_model: original_model.clone(),
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
-                    success: true,
+                    success: collected_outcome
+                        .as_ref()
+                        .is_none_or(|v| v["kind"] == "completed"),
                     endpoint: path.clone(),
                     stream: downstream_stream,
                 });
@@ -1104,7 +1157,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     "failed",
                     Some(failure.status.as_u16()),
                 );
-                if !policy.retryable {
+                if !policy.retryable || failure.failure_reason == "stream_collection_after_output" {
                     break;
                 }
             }
@@ -1139,6 +1192,7 @@ pub(crate) struct AttemptSuccess {
     pub(crate) status: StatusCode,
     pub(crate) usage: (i64, i64, i64),
     pub(crate) fact_usage: crate::observability::usage::FactUsage,
+    pub(crate) collected_outcome: Option<Value>,
     pub(crate) stream_outcome:
         Option<tokio::sync::oneshot::Receiver<provider_stream::StreamOutcome>>,
     pub(crate) upstream_url: String,
@@ -1181,7 +1235,14 @@ pub(crate) async fn send_attempt(
             &prepared.request_model,
             &prepared.original_model,
             provider.engine.as_ref(),
-            prepared.upstream_stream,
+            if prepared.upstream_stream
+                && !prepared.downstream_stream
+                && crate::providers::stream_mode::responses_wire(&provider.engine, &prepared.url)
+            {
+                false
+            } else {
+                prepared.upstream_stream
+            },
             endpoint,
             prepared.method.as_str(),
         )
@@ -1372,11 +1433,46 @@ pub(crate) async fn send_attempt(
             response: Some(output),
         });
     }
+    let collect_responses = (endpoint == "/v1/responses"
+        || prepared.adapter == ResponseAdapter::ResponsesToChat)
+        && prepared.upstream_stream
+        && !prepared.downstream_stream
+        && crate::providers::stream_mode::responses_wire(&provider.engine, &prepared.url);
+    let mut response = Some(response);
+    let mut collected_outcome = None;
+    let collected = if collect_responses {
+        let done = crate::protocols::responses::collect::collect(
+            response.take().unwrap(),
+            started,
+            positive_duration(timeouts.idle),
+            false,
+        )
+        .await
+        .map_err(|failure| AttemptFailure {
+            failure_reason: if failure.outcome["retry_allowed"] == false {
+                "stream_collection_after_output"
+            } else {
+                "protocol_error"
+            }
+            .into(),
+            status: StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
+            detail: failure.detail,
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
+        collected_outcome = Some(done.outcome);
+        Some(done.payload)
+    } else {
+        None
+    };
     if prepared.adapter == ResponseAdapter::Passthrough
         && prepared.downstream_protocol == DownstreamProtocol::Native
         && prepared.upstream_stream
+        && !collect_responses
     {
         if response
+            .as_ref()
+            .unwrap()
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -1391,7 +1487,7 @@ pub(crate) async fn send_attempt(
                     .await;
             }
             let mut translation = crate::observability::passthrough::observe(
-                response,
+                response.take().unwrap(),
                 send_started,
                 guarded_chat,
                 positive_duration(timeouts.idle),
@@ -1421,13 +1517,14 @@ pub(crate) async fn send_attempt(
                 status,
                 usage: (0, 0, 0),
                 fact_usage: Default::default(),
+                collected_outcome: None,
                 stream_outcome: Some(translation.outcome),
                 upstream_url: prepared.url,
             });
         }
-        let headers = filtered_response_headers(response.headers());
+        let headers = filtered_response_headers(response.as_ref().unwrap().headers());
         let mut output = Response::new(Body::from_stream(upstream_chunks(
-            response,
+            response.take().unwrap(),
             positive_duration(timeouts.idle),
         )));
         *output.status_mut() = status;
@@ -1440,11 +1537,12 @@ pub(crate) async fn send_attempt(
             status,
             usage: (0, 0, 0),
             fact_usage: Default::default(),
+            collected_outcome: None,
             stream_outcome: None,
             upstream_url: prepared.url,
         });
     }
-    if prepared.upstream_stream {
+    if prepared.upstream_stream && !collect_responses {
         let protocol = match prepared.adapter {
             ResponseAdapter::ResponsesToChat => StreamProtocol::Responses,
             ResponseAdapter::GeminiToChat => StreamProtocol::Gemini,
@@ -1468,7 +1566,7 @@ pub(crate) async fn send_attempt(
         };
         let mut translation = if prepared.adapter == ResponseAdapter::ResponsesToChat {
             provider_stream::translate_responses_to_chat(
-                response,
+                response.take().unwrap(),
                 started,
                 output_protocol,
                 prepared.request_model.clone(),
@@ -1489,7 +1587,7 @@ pub(crate) async fn send_attempt(
             })?
         } else {
             provider_stream::translate(
-                response,
+                response.take().unwrap(),
                 started,
                 protocol,
                 output_protocol,
@@ -1528,16 +1626,18 @@ pub(crate) async fn send_attempt(
             status,
             usage: (0, 0, 0),
             fact_usage: Default::default(),
+            collected_outcome: None,
             stream_outcome: Some(translation.outcome),
             upstream_url: prepared.url,
         });
     }
     if prepared.adapter == ResponseAdapter::Passthrough
         && prepared.downstream_protocol == DownstreamProtocol::Native
+        && !collect_responses
     {
-        let headers = filtered_response_headers(response.headers());
+        let headers = filtered_response_headers(response.as_ref().unwrap().headers());
         let body = read_limited_upstream_body_with_idle(
-            response,
+            response.take().unwrap(),
             upstream_response_max_bytes(),
             positive_duration(timeouts.idle),
         )
@@ -1565,13 +1665,16 @@ pub(crate) async fn send_attempt(
             status,
             usage,
             fact_usage,
+            collected_outcome: None,
             stream_outcome: None,
             upstream_url: prepared.url,
         });
     }
-    let mut upstream = if prepared.adapter == ResponseAdapter::Search {
+    let mut upstream = if let Some(payload) = collected {
+        payload
+    } else if prepared.adapter == ResponseAdapter::Search {
         let bytes = read_limited_upstream_body_with_idle(
-            response,
+            response.take().unwrap(),
             upstream_response_max_bytes(),
             positive_duration(timeouts.idle),
         )
@@ -1587,7 +1690,7 @@ pub(crate) async fn send_attempt(
             .unwrap_or_else(|_| json!({"text":String::from_utf8_lossy(&bytes)}))
     } else {
         let bytes = read_limited_upstream_body_with_idle(
-            response,
+            response.take().unwrap(),
             upstream_response_max_bytes(),
             positive_duration(timeouts.idle),
         )
@@ -1701,6 +1804,12 @@ pub(crate) async fn send_attempt(
     } else {
         json_response(StatusCode::OK, normalized)
     };
+    if collect_responses && prepared.adapter == ResponseAdapter::Passthrough {
+        *output.headers_mut() = filtered_response_headers(&attribution_headers);
+        output
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
     copy_oaix_headers(&attribution_headers, output.headers_mut());
     output
         .headers_mut()
@@ -1710,6 +1819,7 @@ pub(crate) async fn send_attempt(
         status: StatusCode::OK,
         usage,
         fact_usage,
+        collected_outcome,
         stream_outcome: None,
         upstream_url: prepared.url,
     })
