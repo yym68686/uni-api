@@ -26,6 +26,12 @@ class Upstream(BaseHTTPRequestHandler):
                   ('effort' in config and config['effort'] not in ['low', 'medium', 'high']))
         if isinstance(thinking, dict) and thinking.get('type') == 'enabled' and payload['model'] == 'claude-sonnet-5':
             invalid = True
+        if payload['model'] == 'claude-haiku-5-5':
+            invalid = invalid or any(k in payload for k in ['temperature', 'top_p', 'top_k'])
+            if 'thinking' in payload:
+                invalid = invalid or not isinstance(thinking, dict) or thinking.get('type') not in ['adaptive', 'disabled']
+                if isinstance(thinking, dict):
+                    invalid = invalid or 'budget_tokens' in thinking
         if invalid:
             raw = b'{"error":{"type":"invalid_request_error","message":"Invalid thinking configuration"}}'
             status, content_type = 400, 'application/json'
@@ -65,10 +71,18 @@ def main(binary):
             ('unknown', 'claude-sonnet-5-custom', None),
             ('override-adaptive', 'claude-sonnet-4-6', 'claude-sonnet-5'),
             ('override-legacy', 'claude-sonnet-5', 'claude-sonnet-4-6'),
+            ('haiku', 'claude-haiku-5-5', None),
+            ('override-haiku', 'claude-haiku-4-5-20251001', 'claude-haiku-5-5'),
+            ('override-old-haiku', 'claude-haiku-5-5', 'claude-haiku-4-5-20251001'),
+            ('haiku-manual-override', 'claude-haiku-5-5', None),
         ]:
             prefs = {'cooldown_period': 0}
             if override:
                 prefs['post_body_parameter_overrides'] = {'model': override}
+            if name == 'haiku-manual-override':
+                prefs['post_body_parameter_overrides'] = {
+                    'thinking': {'type':'enabled','budget_tokens':2048},
+                    'output_config': {'effort':'low'}}
             providers.append({'provider': name, 'engine': 'claude', 'base_url': f'http://127.0.0.1:{upstream.server_port}/v1/messages',
                               'api': 'fixture', 'model': [{target: 'client-alias'}], 'preferences': prefs})
         config = {'providers': providers, 'api_keys': [
@@ -160,6 +174,99 @@ def main(binary):
                 upstream.hits=[];status,_=request('/v1/messages',body)
                 assert status==200 and upstream.hits[0]['messages']==body['messages']
                 assert upstream.hits[0]['output_config']==body['output_config'];count+=1
+                # Haiku's legacy native Messages format must normalize at the
+                # same outbound boundary as Chat/Responses, after model overrides.
+                signed_history = [
+                    {'role':'assistant','content':[
+                        {'type':'thinking','thinking':'signed fixture','signature':'exact-signature'},
+                        {'type':'tool_use','id':'call','name':'lookup','input':{'text':' preserve '}}]},
+                    {'role':'user','content':[{'type':'tool_result','tool_use_id':'call','content':'result'}]},
+                ]
+                for endpoint in ['/v1/messages','/v1/chat/completions','/v1/responses']:
+                    for stream in [False,True]:
+                        for key in ['haiku','override-haiku','override-old-haiku']:
+                            for effort in [None,'low']:
+                                fields={'thinking':{'type':'enabled','budget_tokens':2048}}
+                                if effort is not None: fields['output_config']={'effort':effort,'format':{'type':'json_schema','schema':{'type':'object'}}}
+                                body={'model':'client-alias','stream':stream,**fields}
+                                if endpoint.endswith('/responses'):
+                                    body.update(input=[{'role':'user','content':'fixture'}],max_output_tokens=8192)
+                                else:
+                                    body.update(messages=copy.deepcopy(signed_history) if endpoint=='/v1/messages' else [{'role':'user','content':'fixture'}],max_tokens=8192)
+                                before=copy.deepcopy(body);upstream.hits=[]
+                                status,raw=request(endpoint,body,key)
+                                assert status==200 and b'test' in raw,(endpoint,key,fields,status,raw)
+                                assert len(upstream.hits)==1
+                                wire=upstream.hits[0]
+                                expected='enabled' if key=='override-old-haiku' else 'adaptive'
+                                assert wire['thinking']['type']==expected,(endpoint,key,wire)
+                                assert ('budget_tokens' in wire['thinking'])==(expected=='enabled')
+                                assert wire.get('output_config')==body.get('output_config')
+                                assert wire['max_tokens']==8192
+                                if expected=='adaptive':assert 'temperature' not in wire
+                                if endpoint=='/v1/messages':assert wire['messages']==body['messages']
+                                assert body==before
+                                count+=1
+                        for fields in [
+                            {'thinking':{'type':'disabled'}},
+                            {'thinking':{'type':'adaptive'},'output_config':{'effort':'high'}},
+                            {},
+                        ]:
+                            body={'model':'client-alias','stream':stream,**copy.deepcopy(fields)}
+                            if endpoint.endswith('/responses'):body.update(input='fixture',max_output_tokens=256)
+                            else:body.update(messages=[{'role':'user','content':'fixture'}],max_tokens=256)
+                            upstream.hits=[];status,raw=request(endpoint,body,'haiku')
+                            assert status==200,(endpoint,fields,status,raw)
+                            assert len(upstream.hits)==1
+                            wire=upstream.hits[0]
+                            assert wire.get('thinking')==fields.get('thinking')
+                            assert wire.get('output_config')==fields.get('output_config')
+                            assert wire['max_tokens']==256 and 'temperature' not in wire
+                            count+=1
+                        # Invalid budgets and sampling are not silently repaired.
+                        for fields in [
+                            {'thinking':{'type':'enabled','budget_tokens':'2048'}},
+                            {'thinking':{'type':'enabled','budget_tokens':1}},
+                            {'thinking':{'type':'enabled'}},
+                            {'thinking':{'type':'adaptive','budget_tokens':2048}},
+                            {'thinking':{'type':'enabled','budget_tokens':2048},'temperature':0.2},
+                            {'thinking':{'type':'enabled','budget_tokens':2048},'output_config':{'effort':None}},
+                        ]:
+                            body={'model':'client-alias','stream':stream,**copy.deepcopy(fields)}
+                            if endpoint.endswith('/responses'):body.update(input='fixture',max_output_tokens=8192)
+                            else:body.update(messages=[{'role':'user','content':'fixture'}],max_tokens=8192)
+                            upstream.hits=[];status,raw=request(endpoint,body,'haiku')
+                            assert status==400 and len(upstream.hits)==1,(endpoint,fields,status,raw)
+                            if 'temperature' in fields:assert upstream.hits[0]['temperature']==0.2
+                            count+=1
+                # Inferred reasoning is supported for Haiku Chat/Responses and
+                # explicit legacy thinking must not inflate a small output limit.
+                for endpoint in ['/v1/chat/completions','/v1/responses']:
+                    for fields in [
+                        {'reasoning_effort':'high'},
+                        {'reasoning':{'effort':'high'}},
+                        {'thinking':{'type':'enabled','budget_tokens':2048},'output_config':{'effort':'high'}},
+                    ]:
+                        body={'model':'client-alias',**fields}
+                        if endpoint.endswith('/responses'):body.update(input='fixture',max_output_tokens=128)
+                        else:body.update(messages=[{'role':'user','content':'fixture'}],max_tokens=128)
+                        upstream.hits=[];status,raw=request(endpoint,body,'haiku')
+                        assert status==200,(fields,status,raw)
+                        wire=upstream.hits[0]
+                        assert wire['thinking']=={'type':'adaptive'} and wire['output_config']=={'effort':'high'}
+                        assert wire['max_tokens']==128 and 'temperature' not in wire
+                        count+=1
+                for endpoint in ['/v1/messages','/v1/chat/completions','/v1/responses']:
+                    for stream in [False,True]:
+                        body={'model':'client-alias','stream':stream,'thinking':{'type':'disabled'}}
+                        if endpoint.endswith('/responses'):body.update(input='fixture',max_output_tokens=256)
+                        else:body.update(messages=[{'role':'user','content':'fixture'}],max_tokens=256)
+                        upstream.hits=[];status,raw=request(endpoint,body,'haiku-manual-override')
+                        assert status==200 and len(upstream.hits)==1,(endpoint,status,raw)
+                        wire=upstream.hits[0]
+                        assert wire['thinking']=={'type':'adaptive'}
+                        assert wire['output_config']=={'effort':'low'} and wire['max_tokens']==256
+                        count+=1
                 print(f'PASS Claude adaptive thinking: {count} HTTP wire contracts including mapping, overrides, explicit fields and 400 preservation')
             finally:
                 proc.terminate()

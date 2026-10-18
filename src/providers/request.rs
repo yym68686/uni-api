@@ -606,6 +606,18 @@ pub(crate) fn build_attempt(
         )
     {
         crate::providers::anthropic::strip_blank_tool_turn_text(&mut payload);
+        if let Some(root) = payload.as_object_mut() {
+            let target_model = if engine == "aws" || engine == "vertex-claude" {
+                // Cloud adapters put the actual target in the URL.
+                original_model.to_owned()
+            } else {
+                root.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            crate::providers::anthropic::normalize_haiku_thinking(root, &target_model);
+        }
     }
     // Capability applies only to the Responses generation wire endpoint (never compact/search).
     if !is_alpha_search

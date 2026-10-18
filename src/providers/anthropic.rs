@@ -173,7 +173,29 @@ pub(crate) fn chat_to_claude(input: &Value, original_model: &str) -> Result<Valu
 // Capability is deliberately exact: aliases are resolved by the caller. Do not
 // infer new model capabilities from prefixes or silently change older models.
 fn uses_adaptive_thinking(model: &str) -> bool {
-    model == "claude-sonnet-5"
+    matches!(model, "claude-sonnet-5" | "claude-haiku-5-5")
+}
+
+// Haiku 5.5 rejects the legacy manual-thinking shape even on native Messages.
+// Keep this independent of Chat conversion, and run it again after channel
+// overrides. A token budget is not equivalent to an effort level.
+pub(crate) fn normalize_haiku_thinking(root: &mut Map<String, Value>, model: &str) {
+    if model != "claude-haiku-5-5" {
+        return;
+    }
+    let Some(thinking) = root.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return;
+    };
+    // Malformed manual budgets still reach normal upstream validation.
+    if thinking.get("type").and_then(Value::as_str) == Some("enabled")
+        && thinking
+            .get("budget_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|budget| budget >= 1024)
+    {
+        thinking.insert("type".into(), json!("adaptive"));
+        thinking.remove("budget_tokens");
+    }
 }
 
 fn apply_thinking(root: &Map<String, Value>, output: &mut Map<String, Value>, model: &str) {
@@ -190,8 +212,8 @@ fn apply_thinking(root: &Map<String, Value>, output: &mut Map<String, Value>, mo
                 .and_then(Value::as_str)
         });
     if let Some(thinking) = root.get("thinking") {
-        // Explicit disabled/adaptive/manual/invalid values must not be replaced
-        // by an inferred budget merely because reasoning_effort is present.
+        // Explicit thinking wins over inferred reasoning. Known legacy Haiku
+        // settings are normalized below; disabled/invalid values stay intact.
         output.insert("thinking".into(), thinking.clone());
     } else if uses_adaptive_thinking(model) {
         let selected = output
@@ -221,6 +243,7 @@ fn apply_thinking(root: &Map<String, Value>, output: &mut Map<String, Value>, mo
             );
         }
     }
+    normalize_haiku_thinking(output, model);
     let mode = output
         .get("thinking")
         .and_then(|v| v.get("type"))
@@ -248,7 +271,9 @@ fn apply_thinking(root: &Map<String, Value>, output: &mut Map<String, Value>, mo
             output.insert("max_tokens".into(), json!(max_tokens));
         }
     }
-    if matches!(mode.as_deref(), Some("enabled" | "adaptive")) {
+    // Do not invent sampling parameters for Haiku 5.5. Explicit unsupported
+    // values must remain visible to upstream validation, not silently removed.
+    if model != "claude-haiku-5-5" && matches!(mode.as_deref(), Some("enabled" | "adaptive")) {
         output.insert("temperature".into(), json!(1));
         output.remove("top_p");
         output.remove("top_k");
@@ -522,5 +547,106 @@ mod adaptive_thinking_tests {
         );
         assert_eq!(body["tool_choice"], json!({"type":"tool","name":"lookup"}));
         assert_eq!(body["thinking"]["type"], "adaptive");
+    }
+}
+
+#[cfg(test)]
+mod haiku_thinking_tests {
+    use super::{chat_to_claude, normalize_haiku_thinking};
+    use serde_json::{json, Value};
+
+    fn normalize(mut value: Value, model: &str) -> Value {
+        normalize_haiku_thinking(value.as_object_mut().unwrap(), model);
+        value
+    }
+
+    #[test]
+    fn normalizes_only_legacy_mode_without_guessing_effort_or_changing_history() {
+        let body = json!({
+            "thinking":{"type":"enabled","budget_tokens":2048,"display":"summarized"},
+            "max_tokens":8192, "system":[{"type":"text","text":"unchanged"}],
+            "messages":[{"role":"assistant","content":[
+                {"type":"thinking","thinking":"signed","signature":"signature"},
+                {"type":"tool_use","id":"call","name":"lookup","input":{"query":"original"}}
+            ]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":"result"}]}]
+        });
+        let out = normalize(body.clone(), "claude-haiku-5-5");
+        assert_eq!(
+            out["thinking"],
+            json!({"type":"adaptive","display":"summarized"})
+        );
+        assert!(out.get("output_config").is_none());
+        for field in ["max_tokens", "system", "messages"] {
+            assert_eq!(out[field], body[field]);
+        }
+        assert_eq!(normalize(out.clone(), "claude-haiku-5-5"), out);
+    }
+
+    #[test]
+    fn preserves_explicit_effort_and_other_validation_fields() {
+        for config in [
+            json!({"effort":"low","format":{"type":"json_schema"}}),
+            json!({"effort":null}),
+            json!("invalid"),
+        ] {
+            let body = json!({"thinking":{"type":"enabled","budget_tokens":2048},
+                "output_config":config,"temperature":0.3,"max_tokens":8192});
+            let out = normalize(body.clone(), "claude-haiku-5-5");
+            assert_eq!(out["output_config"], config);
+            assert_eq!(out["temperature"], body["temperature"]);
+            assert_eq!(out["max_tokens"], body["max_tokens"]);
+        }
+    }
+
+    #[test]
+    fn leaves_disabled_adaptive_invalid_and_other_models_unchanged() {
+        for thinking in [
+            json!({"type":"disabled","budget_tokens":2048}),
+            json!({"type":"adaptive","budget_tokens":2048}),
+            json!({"type":"enabled"}),
+            json!({"type":"enabled","budget_tokens":null}),
+            json!({"type":"enabled","budget_tokens":"2048"}),
+            json!({"type":"enabled","budget_tokens":-1}),
+            json!({"type":"enabled","budget_tokens":1}),
+            json!({"type":"invalid","budget_tokens":2048}),
+            Value::Null,
+        ] {
+            let body = json!({"thinking":thinking,"reasoning_effort":"high"});
+            assert_eq!(normalize(body.clone(), "claude-haiku-5-5"), body);
+        }
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-5-5-custom",
+            "claude-sonnet-5",
+            "unknown",
+        ] {
+            let body = json!({"thinking":{"type":"enabled","budget_tokens":2048}});
+            assert_eq!(normalize(body.clone(), model), body);
+        }
+    }
+
+    #[test]
+    fn chat_normalizes_before_manual_budget_can_inflate_the_output_limit() {
+        let body = json!({"messages":[{"role":"user","content":"fixture"}],"max_tokens":256,
+            "thinking":{"type":"enabled","budget_tokens":2048},"output_config":{"effort":"low"},
+            "reasoning_effort":"high","tool_choice":{"type":"function","function":{"name":"lookup"}}});
+        let out = chat_to_claude(&body, "claude-haiku-5-5").unwrap();
+        assert_eq!(out["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(out["max_tokens"], 256);
+        assert_eq!(out["output_config"], json!({"effort":"low"}));
+        assert_eq!(out["tool_choice"], json!({"type":"tool","name":"lookup"}));
+        assert!(out.get("temperature").is_none());
+    }
+
+    #[test]
+    fn inferred_haiku_adaptive_preserves_explicit_sampling_for_validation() {
+        let body = json!({"messages":[{"role":"user","content":"fixture"}],"max_tokens":128,
+            "reasoning_effort":"high","temperature":0.2,"top_p":0.8,"top_k":5});
+        let out = chat_to_claude(&body, "claude-haiku-5-5").unwrap();
+        assert_eq!(out["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(out["output_config"], json!({"effort":"high"}));
+        for field in ["max_tokens", "temperature", "top_p", "top_k"] {
+            assert_eq!(out[field], body[field]);
+        }
     }
 }
