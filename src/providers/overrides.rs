@@ -23,6 +23,7 @@ pub(crate) fn apply_overrides(
         root.insert("store".into(), Value::Bool(false));
         root.remove("response_format");
         root.remove("temperature");
+        root.remove("top_p");
     }
 }
 

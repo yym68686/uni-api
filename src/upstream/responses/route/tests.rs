@@ -1122,6 +1122,7 @@ fn payload_compiler_matches_codex_contract_without_double_json_envelope() {
         "input": [{"type":"reasoning","id":"rs_1","cache_control":{}}],
         "stream": true,
         "temperature": 1,
+        "top_p": 0.8,
         "response_format": {"type": "json_object"},
         "store": true,
         "max_output_tokens": 42,
@@ -1140,6 +1141,7 @@ fn payload_compiler_matches_codex_contract_without_double_json_envelope() {
     assert_eq!(payload["store"], false);
     assert_eq!(payload["instructions"], "");
     assert!(payload.get("temperature").is_none());
+    assert!(payload.get("top_p").is_none());
     assert!(payload.get("response_format").is_none());
     assert!(payload.get("max_output_tokens").is_none());
     assert!(payload.get("previous_response_id").is_none());
@@ -1157,18 +1159,31 @@ fn codex_defaults_follow_overrides_without_mutating_provider_or_other_engines() 
             json!({
                 "store": true,
                 "temperature": 0.5,
+                "top_p": 0.5,
                 "response_format": {"type": "json_object"},
                 "__remove__": ["metadata.remove"],
                 "gpt-public": {
                     "__remove__": ["store"],
                     "temperature": 0.7,
+                    "top_p": 0.7,
                     "response_format": {"type": "text"},
                     "metadata": {"model_specific": true}
                 }
             }),
         )]);
         provider.preferences = Arc::new(preferences.clone());
-        let mut payload = json!({"metadata": {"remove": true, "keep": true}});
+        let mut payload = json!({
+            "top_p": 0.9,
+            "metadata": {"remove": true, "keep": true},
+            "tools": [{"type": "function", "name": "sample", "parameters": {
+                "type": "object", "properties": {"top_p": {"type": "number"}},
+                "required": ["top_p"]
+            }}],
+            "input": [{"type": "function_call", "name": "sample", "call_id": "call_1",
+                "arguments": "{\"top_p\":0.3}"}]
+        });
+        let original_tools = payload["tools"].clone();
+        let original_input = payload["input"].clone();
         apply_overrides(payload.as_object_mut().unwrap(), &provider, "gpt-public");
         assert_eq!(
             payload["metadata"],
@@ -1177,12 +1192,16 @@ fn codex_defaults_follow_overrides_without_mutating_provider_or_other_engines() 
         if engine == "gpt" {
             assert!(payload.get("store").is_none());
             assert_eq!(payload["temperature"], 0.7);
+            assert_eq!(payload["top_p"], 0.7);
             assert_eq!(payload["response_format"], json!({"type": "text"}));
         } else {
             assert_eq!(payload["store"], false);
             assert!(payload.get("temperature").is_none());
+            assert!(payload.get("top_p").is_none());
             assert!(payload.get("response_format").is_none());
         }
+        assert_eq!(payload["tools"], original_tools);
+        assert_eq!(payload["input"], original_input);
         assert_eq!(*provider.preferences, preferences);
     }
 }
@@ -1193,7 +1212,7 @@ fn codex_compact_omits_store_after_applying_defaults() {
     provider.preferences = Arc::new(Map::new());
     let mut payload = json!({
         "model": "gpt-public", "input": "hello", "store": true,
-        "temperature": 1, "response_format": {"type": "json_object"}
+        "temperature": 1, "top_p": 0.8, "response_format": {"type": "json_object"}
     });
     compile_payload(
         &mut payload,
@@ -1204,7 +1223,7 @@ fn codex_compact_omits_store_after_applying_defaults() {
         true,
     )
     .unwrap();
-    for field in ["store", "temperature", "response_format"] {
+    for field in ["store", "temperature", "top_p", "response_format"] {
         assert!(payload.get(field).is_none(), "unexpected field {field}");
     }
 }

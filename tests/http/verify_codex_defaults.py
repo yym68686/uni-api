@@ -58,8 +58,8 @@ def verify(binary):
         "legacy": {"post_body_parameter_overrides": {
             "store": False, "__remove__": ["response_format", "temperature"]}},
         "conflicting": {"post_body_parameter_overrides": {
-            "store": True, "temperature": 0.2, "response_format": {"type": "text"},
-            "public-model": {"__remove__": ["store"], "temperature": 0.9,
+            "store": True, "temperature": 0.2, "top_p": 0.2, "response_format": {"type": "text"},
+            "public-model": {"__remove__": ["store"], "temperature": 0.9, "top_p": 0.9,
                              "response_format": {"type": "json_object"},
                              "metadata": {"model_override": True}}}},
         "gpt": {},
@@ -115,10 +115,16 @@ def verify(binary):
                 for provider in variants:
                     for path in ["/v1/responses", "/v1/responses/compact", "/v1/chat/completions"]:
                         for stream in ([False] if path.endswith("/compact") else [False, True]):
-                            payload = {"model": "public-model", "store": True, "temperature": 0.6,
+                            payload = {"model": "public-model", "store": True, "temperature": 0.6, "top_p": 0.6,
                                        "response_format": {"type": "json_object"}, "stream": stream}
                             payload.update({"messages": [{"role": "user", "content": "hi"}]}
                                            if path.endswith("/completions") else {"input": "hi"})
+                            function = {"name": "sampling_tool", "parameters": {
+                                "type": "object", "properties": {"top_p": {"type": "number"}},
+                                "required": ["top_p"]}}
+                            payload["tools"] = [{"type": "function", "function": function}
+                                                if path.endswith("/completions")
+                                                else {"type": "function", **function}]
                             upstream.hits.clear()
                             status, raw = request(path, payload, provider)
                             assert status == 200, (provider, path, stream, status, raw)
@@ -126,7 +132,9 @@ def verify(binary):
                             upstream_path, body = upstream.hits[0]
                             assert upstream_path.startswith(f"/{provider}/"), upstream_path
                             assert body["model"] == "upstream-model", body
+                            assert body["tools"][0]["parameters"] == function["parameters"], body
                             if provider != "gpt":
+                                assert "top_p" not in body, (provider, path, stream, body)
                                 assert "temperature" not in body and "response_format" not in body, body
                                 if path.endswith("/compact"):
                                     assert "store" not in body, body
@@ -136,6 +144,7 @@ def verify(binary):
                                     assert body["metadata"]["model_override"] is True, body
                             else:
                                 assert body["temperature"] == 0.6, body
+                                assert body["top_p"] == 0.6, body
                                 if path == "/v1/responses":
                                     assert body["store"] is True, body
                                     assert body["response_format"] == payload["response_format"], body
@@ -143,7 +152,7 @@ def verify(binary):
                             checked += 1
                 assert config_path.read_bytes() == original
                 print(f"PASS Codex defaults: {checked} HTTP cases; Responses, compact, Chat, streaming, "
-                      "legacy/conflicting overrides, GPT isolation, config unchanged")
+                      "top_p removal, legacy/conflicting overrides, nested tool schema, GPT isolation, config unchanged")
             except Exception:
                 print((root / "log").read_text()[-8000:])
                 raise
