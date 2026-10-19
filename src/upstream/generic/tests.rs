@@ -306,7 +306,7 @@ fn gemini_and_claude_payloads_preserve_system_and_tools() {
         ],
         "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
     });
-    let gemini = chat_to_gemini(&input, "gemini-upstream").unwrap();
+    let gemini = chat_to_gemini(&input, "gemini-upstream", true).unwrap();
     assert_eq!(gemini["systemInstruction"]["parts"][0]["text"], "system");
     assert_eq!(
         gemini["tools"][0]["functionDeclarations"][0]["name"],
@@ -437,7 +437,7 @@ fn gemini_audio_and_claude_controls_are_translated() {
         "modalities":["audio"],
         "audio":{"voice":"Aoede"}
     });
-    let gemini = chat_to_gemini(&input, "gemini-3-flash").unwrap();
+    let gemini = chat_to_gemini(&input, "gemini-3-flash", true).unwrap();
     assert_eq!(
         gemini["contents"][0]["parts"][0]["inlineData"]["mimeType"],
         "audio/wav"

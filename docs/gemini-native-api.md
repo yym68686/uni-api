@@ -42,6 +42,16 @@ structured output and streamed/non-streamed results use the existing conversion
 pipeline. Cached and reasoning token details survive the return conversion.
 Truncation and safety stops return an incomplete Responses result.
 
+For converted Chat/Responses requests ending in ordinary assistant text, the
+Gemini adapter preserves that text and appends a user turn containing `Continue.`.
+This supports Gemini providers that reject a final `model` turn. It is an explicit
+continuation instruction, not assistant-prefix completion. The adapter only adds
+it when all function calls have a matching result in order; parallel call batches
+are supported. Unresolved, duplicate or malformed tool records, non-text endings,
+and unsupported Responses history items do not enable this normalization.
+Native Gemini requests and explicit provider body overrides retain their existing
+behavior. No status-code remapping or new retry policy is involved.
+
 ## Usage
 
 Gemini `promptTokenCount` includes cached input. `candidatesTokenCount` excludes

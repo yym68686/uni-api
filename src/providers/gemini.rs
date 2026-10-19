@@ -3,7 +3,7 @@ use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use url::Url;
 
@@ -16,13 +16,23 @@ pub(crate) struct ThoughtSignatureCache {
 pub(crate) static GEMINI_THOUGHT_SIGNATURES: OnceLock<Mutex<ThoughtSignatureCache>> =
     OnceLock::new();
 
-pub(crate) fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Value, String> {
+pub(crate) fn chat_to_gemini(
+    input: &Value,
+    original_model: &str,
+    allow_continuation: bool,
+) -> Result<Value, String> {
     let root = input
         .as_object()
         .ok_or_else(|| "chat request body must be an object".to_owned())?;
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
     let mut tool_names = HashMap::new();
+    let messages = root
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let append_continuation = allow_continuation && should_append_gemini_continuation(messages);
     for message in root
         .get("messages")
         .and_then(Value::as_array)
@@ -43,12 +53,7 @@ pub(crate) fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Valu
             }
         }
     }
-    for message in root
-        .get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for message in messages {
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -113,6 +118,14 @@ pub(crate) fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Valu
     if contents.is_empty() {
         contents.push(json!({"role":"user","parts":[{"text":"No messages"}]}));
     }
+    // Some Gemini providers reject requests ending with a model turn. Keep the
+    // converted assistant history intact, then explicitly ask Gemini to
+    // continue only when the final assistant turn is ordinary text and every
+    // preceding tool call has a matching result. Native Gemini requests do not
+    // pass through this converter and remain unchanged.
+    if append_continuation {
+        contents.push(json!({"role":"user","parts":[{"text":"Continue."}]}));
+    }
     let mut generation = Map::new();
     if let Some(value) = root.get("temperature") {
         generation.insert("temperature".into(), value.clone());
@@ -171,6 +184,166 @@ pub(crate) fn chat_to_gemini(input: &Value, original_model: &str) -> Result<Valu
     }
     apply_gemini_request_controls(&mut output, root, original_model);
     Ok(output)
+}
+
+// Responses conversion can omit unsupported items/parts. Never let such loss
+// make an unsupported ending or tool history eligible for continuation.
+pub(crate) fn responses_allow_gemini_continuation(input: &Value) -> bool {
+    let Some(items) = input.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    if !items
+        .iter()
+        .all(|item| match item.get("type").and_then(Value::as_str) {
+            Some("message") | None => item.get("role").and_then(Value::as_str).is_some(),
+            Some("function_call") => {
+                ["call_id", "name"].iter().all(|key| {
+                    item.get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+                }) && item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|v| v.is_object())
+            }
+            Some("function_call_output") => {
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+                    && item.get("output").is_some_and(|v| !v.is_null())
+            }
+            _ => false,
+        })
+    {
+        return false;
+    }
+    let Some(last) = items.last() else {
+        return false;
+    };
+    if last.get("role").and_then(Value::as_str) != Some("assistant")
+        || !last.as_object().is_some_and(|o| {
+            o.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "type"
+                        | "role"
+                        | "content"
+                        | "id"
+                        | "status"
+                        | "internal_chat_message_metadata_passthrough"
+                )
+            })
+        })
+    {
+        return false;
+    }
+    plain_text_content(last.get("content"), &["input_text", "output_text", "text"])
+}
+
+fn should_append_gemini_continuation(messages: &[Value]) -> bool {
+    if !messages.last().is_some_and(is_plain_assistant_text_turn) {
+        return false;
+    }
+
+    let mut pending = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut receiving_results = false;
+    for message in messages {
+        if message.get("function_call").is_some_and(|v| !v.is_null()) {
+            return false;
+        }
+        let calls = match message.get("tool_calls") {
+            None | Some(Value::Null) => &[][..],
+            Some(Value::Array(calls)) => calls.as_slice(),
+            _ => return false,
+        };
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") if !calls.is_empty() => {
+                // Responses serializes parallel calls as adjacent assistant
+                // messages. Permit the batch until its first tool result.
+                if !pending.is_empty() && receiving_results {
+                    return false;
+                }
+                receiving_results = false;
+                for call in calls {
+                    let Some(id) = call.get("id").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    let valid_function = call.get("type").and_then(Value::as_str)
+                        == Some("function")
+                        && call
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.trim().is_empty())
+                        && call
+                            .pointer("/function/arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+                            .is_some_and(|args| args.is_object());
+                    if id.trim().is_empty() || !valid_function || !seen.insert(id) {
+                        return false;
+                    }
+                    pending.insert(id);
+                }
+            }
+            Some("tool") if calls.is_empty() => {
+                let Some(id) = message.get("tool_call_id").and_then(Value::as_str) else {
+                    return false;
+                };
+                if !pending.remove(id) || message.get("content").is_none_or(Value::is_null) {
+                    return false;
+                }
+                receiving_results = true;
+            }
+            Some("user" | "system" | "developer" | "assistant")
+                if calls.is_empty() && pending.is_empty() => {}
+            _ => return false,
+        }
+    }
+    pending.is_empty()
+}
+
+fn is_plain_assistant_text_turn(message: &Value) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant")
+        || !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "role" | "content" | "name" | "tool_calls"))
+        || match message.get("tool_calls") {
+            None | Some(Value::Null) => false,
+            Some(Value::Array(calls)) => !calls.is_empty(),
+            _ => true,
+        }
+    {
+        return false;
+    }
+    plain_text_content(message.get("content"), &["text"])
+}
+
+fn plain_text_content(content: Option<&Value>, types: &[&str]) -> bool {
+    match content {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(parts)) => {
+            !parts.is_empty()
+                && parts.iter().all(|part| {
+                    part.as_object().is_some_and(|o| o.len() == 2)
+                        && part
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| types.contains(&t))
+                        && part.get("text").and_then(Value::as_str).is_some()
+                })
+                && parts.iter().any(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn sanitize_gemini_schema(value: &mut Value) {
@@ -635,4 +808,168 @@ pub(crate) fn gemini_url(
         url.query_pairs_mut().append_pair("alt", "sse");
     }
     Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod gemini_model_turn_tests {
+    use super::{
+        chat_to_gemini, responses_allow_gemini_continuation, should_append_gemini_continuation,
+    };
+    use serde_json::{json, Value};
+
+    fn assistant_text(text: &str) -> Value {
+        json!({"role":"assistant","content":text})
+    }
+
+    #[test]
+    fn appends_user_turn_after_resolved_tool_history_and_preserves_every_turn() {
+        let messages = vec![
+            json!({"role":"user","content":"run the tool"}),
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call-1","content":"tool result"}),
+            assistant_text("The result is ready."),
+        ];
+        assert!(should_append_gemini_continuation(&messages));
+        let input = json!({"model":"gemini-test","messages":messages,"max_tokens":77,"tools":[{"function":{"name":"lookup","parameters":{"type":"object"}}}]});
+        let output = chat_to_gemini(&input, "gemini-test", true).unwrap();
+        let contents = output["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 5);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["functionCall"]["name"], "lookup");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
+        assert_eq!(contents[3]["role"], "model");
+        assert_eq!(contents[3]["parts"][0]["text"], "The result is ready.");
+        assert_eq!(contents[4]["role"], "user");
+        assert_eq!(contents[4]["parts"][0]["text"], "Continue.");
+        assert_eq!(output["generationConfig"]["maxOutputTokens"], 77);
+        assert_eq!(
+            output["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+    }
+
+    #[test]
+    fn supports_parallel_responses_calls_and_keeps_signatures() {
+        let signature = "test-signature";
+        let id = super::gemini_call_id(Some(signature), 0);
+        let input = json!({"input":[
+            {"type":"message","role":"user","content":"start"},
+            {"type":"function_call","call_id":id,"name":"one","arguments":"{}"},
+            {"type":"function_call","call_id":"b","name":"two","arguments":"{}"},
+            {"type":"function_call_output","call_id":"b","output":"result b"},
+            {"type":"function_call_output","call_id":id,"output":"result a"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ready"}]}
+        ]});
+        assert!(responses_allow_gemini_continuation(&input));
+        let chat =
+            crate::protocols::conversion::responses_to_chat_request(&input, "gemini-test").unwrap();
+        let wire = chat_to_gemini(&chat, "gemini-test", true).unwrap();
+        let turns = wire["contents"].as_array().unwrap();
+        assert_eq!(turns.len(), 7);
+        assert_eq!(turns[1]["parts"][0]["thoughtSignature"], signature);
+        assert_eq!(turns[5]["parts"][0]["text"], "ready");
+        assert_eq!(
+            turns[6],
+            json!({"role":"user","parts":[{"text":"Continue."}]})
+        );
+    }
+
+    #[test]
+    fn skips_unsupported_or_lossy_responses_endings_and_invalid_tools() {
+        let plain = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ready"}]});
+        for unsupported in [
+            json!({"type":"custom_tool_call","call_id":"a"}),
+            json!({"type":"reasoning","encrypted_content":"signature"}),
+        ] {
+            assert!(!responses_allow_gemini_continuation(
+                &json!({"input":[unsupported,plain.clone()]})
+            ));
+        }
+        let mut mixed = plain.clone();
+        mixed["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"refusal","refusal":"no"}));
+        assert!(!responses_allow_gemini_continuation(
+            &json!({"input":[mixed]})
+        ));
+        for args in [Value::Null, json!("not json"), json!("[]")] {
+            assert!(!responses_allow_gemini_continuation(&json!({"input":[
+                {"type":"function_call","call_id":"a","name":"lookup","arguments":args},
+                {"type":"function_call_output","call_id":"a","output":"ok"},plain.clone()]})));
+        }
+        let mut signed = plain.clone();
+        signed["content"][0]["signature"] = json!("signature");
+        assert!(!responses_allow_gemini_continuation(
+            &json!({"input":[signed]})
+        ));
+    }
+
+    #[test]
+    fn leaves_nonplain_chat_endings_and_bad_tool_fields_unchanged() {
+        for extra in [
+            json!({"tool_calls":{}}),
+            json!({"function_call":{"name":"legacy"}}),
+            json!({"reasoning_content":"thought"}),
+        ] {
+            let mut message = assistant_text("ready");
+            message
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(!should_append_gemini_continuation(&[message]));
+        }
+        let input = json!({"messages":[assistant_text("ready")]});
+        let unchanged = chat_to_gemini(&input, "gemini-test", false).unwrap();
+        assert_eq!(unchanged["contents"].as_array().unwrap().len(), 1);
+        assert_eq!(unchanged["contents"][0]["role"], "model");
+    }
+
+    #[test]
+    fn does_not_append_after_user_turn_or_without_assistant_text() {
+        assert!(!should_append_gemini_continuation(&[
+            json!({"role":"assistant","content":"answer"}),
+            json!({"role":"user","content":"next"}),
+        ]));
+        assert!(!should_append_gemini_continuation(&[assistant_text(
+            "  \n"
+        )]));
+        assert!(!should_append_gemini_continuation(&[json!({
+            "role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]
+        })]));
+        assert!(!should_append_gemini_continuation(&[json!({
+            "role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]
+        })]));
+    }
+
+    #[test]
+    fn does_not_append_when_tool_history_is_unresolved_or_malformed() {
+        let call = json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]});
+        let result = json!({"role":"tool","tool_call_id":"call-1","content":"result"});
+        assert!(!should_append_gemini_continuation(&[
+            call.clone(),
+            assistant_text("done")
+        ]));
+        assert!(!should_append_gemini_continuation(&[
+            result,
+            assistant_text("done")
+        ]));
+        assert!(!should_append_gemini_continuation(&[
+            call.clone(),
+            json!({"role":"tool","tool_call_id":"call-1","content":"first"}),
+            json!({"role":"tool","tool_call_id":"call-1","content":"duplicate"}),
+            assistant_text("done"),
+        ]));
+        assert!(!should_append_gemini_continuation(&[
+            call,
+            json!({"role":"user","content":"interleaved before result"}),
+            json!({"role":"tool","tool_call_id":"call-1","content":"late result"}),
+            assistant_text("done"),
+        ]));
+    }
 }

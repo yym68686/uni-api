@@ -336,7 +336,12 @@ pub(crate) fn build_attempt(
             )
         }
         "gemini" | "vertex" | "vertex-gemini" if wire_path == "/v1/chat/completions" => {
-            payload = chat_to_gemini(&payload, original_model)?;
+            let allow_continuation = downstream_protocol != DownstreamProtocol::ResponsesCompat
+                || input
+                    .payload
+                    .as_ref()
+                    .is_some_and(crate::providers::gemini::responses_allow_gemini_continuation);
+            payload = chat_to_gemini(&payload, original_model, allow_continuation)?;
             (
                 if matches!(engine.as_str(), "vertex" | "vertex-gemini") {
                     vertex_gemini_url(provider, original_model, provider_key, provider_stream)?
