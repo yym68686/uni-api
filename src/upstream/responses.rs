@@ -3274,6 +3274,41 @@ mod tests {
     }
 
     #[test]
+    fn generic_semantic_upstream_failures_map_to_bad_gateway() {
+        for message in ["upstream_error", "Upstream request failed"] {
+            for event in ["error", "response.failed"] {
+                for wire_status in [None, Some(400), Some(401), Some(429), Some(503)] {
+                    let mut error = json!({"code": "upstream_error", "type": "upstream_error", "message": message});
+                    if let Some(status) = wire_status {
+                        error["status_code"] = json!(status);
+                    }
+                    let payload = if event == "error" {
+                        json!({"type": event, "error": error})
+                    } else {
+                        json!({"type": event, "response": {"status": "failed", "error": error}})
+                    };
+                    let expected = match wire_status {
+                        None | Some(400) => 502,
+                        Some(status) => status,
+                    };
+                    assert_eq!(
+                        responses_semantic_error(&payload, event),
+                        (expected, message.into())
+                    );
+                }
+            }
+            for field in ["param", "code", "type"] {
+                let mut error = json!({"status_code": 400, "code": "upstream_error", "type": "upstream_error", "message": message});
+                error[field] = json!("invalid_type");
+                assert_eq!(
+                    responses_semantic_error(&json!({"error": error}), "error"),
+                    (400, message.into())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn semantic_failures_preserve_responses_http_status_and_detail() {
         assert_eq!(
             responses_semantic_error(

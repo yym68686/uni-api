@@ -100,13 +100,19 @@ def main():
                     except OSError: pass
                     time.sleep(.05)
                 for provider, _ in variants:
-                    # This endpoint is a current-minute live gauge, not a
-                    # rolling history query. Keep this sub-second six-request
-                    # fixture within one bucket; immutable facts below still
-                    # verify every request regardless of wall-clock time.
-                    minute_offset = time.time() % 60
-                    if minute_offset > 55:
-                        time.sleep(60 - minute_offset + .01)
+                    # The live gauge uses its own monotonic clock, anchored to
+                    # whole startup seconds. Wall time can already be in the
+                    # next minute while that clock is still in the old bucket.
+                    # Align against the endpoint's clock with room for all six
+                    # requests; immutable facts below cover every terminal.
+                    metrics_path = "/v1/channel-metrics?model=gpt-6-astra&endpoint=/v1/responses&stream=true"
+                    while True:
+                        status, raw = call("GET", metrics_path)
+                        assert status == 200
+                        gauge_time = json.loads(raw)["generated_at"]
+                        if gauge_time % 60 < 50:
+                            break
+                        time.sleep(61 - gauge_time % 60)
                     for case in cases:
                         status, raw = call("POST", "/v1/responses", {"model": "gpt-6-astra", "input": case, "stream": True}, provider, provider + "-" + case)
                         assert status == 200, (provider, case, status, raw)
@@ -114,9 +120,11 @@ def main():
                             assert b"response.incomplete" in raw and b"response.completed" not in raw
                         if provider == "gpt" and case in ("completed", "tool", "blank-incomplete", "partial-incomplete"):
                             assert raw == wire_by_case[case], (provider, case, "wire changed")
-                    status, raw = call("GET", "/v1/channel-metrics?model=gpt-6-astra&endpoint=/v1/responses&stream=true")
+                    status, raw = call("GET", metrics_path)
                     assert status == 200
-                    row = next(r for r in json.loads(raw)["data"] if r["provider"] == provider)
+                    metrics = json.loads(raw)
+                    assert metrics["generated_at"] // 60 == gauge_time // 60, "fixture crossed a live gauge bucket"
+                    row = next(r for r in metrics["data"] if r["provider"] == provider)
                     stats = row["stats"]
                     assert stats["success"] == 2 and stats["failed"] == 4, row
                 deadline = time.monotonic() + 8

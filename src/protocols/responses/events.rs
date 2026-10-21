@@ -15,6 +15,8 @@ pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u1
         payload.get("error")
     }
     .or_else(|| payload.get("error"));
+    let generic_upstream_error =
+        error.is_some_and(crate::routing::failure::is_generic_upstream_error);
     let detail = error
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
@@ -39,8 +41,21 @@ pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u1
             .as_u64()
             .or_else(|| candidate.as_str()?.parse::<u64>().ok());
         if let Some(status @ 400..=599) = parsed {
-            return (status as u16, detail);
+            // Classify before dropping the structured envelope. Otherwise a
+            // generic upstream failure carrying status 400 suppresses failover.
+            return (
+                if status == 400 && generic_upstream_error {
+                    502
+                } else {
+                    status as u16
+                },
+                detail,
+            );
         }
+    }
+
+    if generic_upstream_error {
+        return (502, detail);
     }
 
     let code = error

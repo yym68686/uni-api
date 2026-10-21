@@ -203,6 +203,22 @@ pub(crate) fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
     false
 }
 
+pub(crate) fn is_generic_upstream_error(error: &Value) -> bool {
+    let matches = |field: &str, expected: &str| {
+        error
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+    };
+    // Gateways sometimes replace all three fields with "upstream_error".
+    // Only recognize the complete generic envelope; specific validation codes,
+    // parameters and text echoed from input must keep their client-error policy.
+    matches("type", "upstream_error")
+        && (matches("message", "Upstream request failed") || matches("message", "upstream_error"))
+        && (error.get("code").is_none_or(Value::is_null) || matches("code", "upstream_error"))
+        && error.get("param").is_none_or(Value::is_null)
+}
+
 pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) -> bool {
     if status != 400 {
         return false;
@@ -247,23 +263,15 @@ pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) 
                 .filter(|value| value.is_object())
                 .or_else(|| payload.get("detail").filter(|value| value.is_object()))
         }) {
-            // Some gateways hide the original failure behind this generic 400.
-            // Require the explicit upstream type and whole message; a specific
-            // validation code or echoed input must keep its client-error policy.
+            if is_generic_upstream_error(error) {
+                return true;
+            }
             let matches = |field: &str, expected: &str| {
                 error
                     .get(field)
                     .and_then(Value::as_str)
                     .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
             };
-            let generic_code =
-                error.get("code").is_none_or(Value::is_null) || matches("code", "upstream_error");
-            if matches("type", "upstream_error")
-                && matches("message", "Upstream request failed")
-                && generic_code
-            {
-                return true;
-            }
             // Some upstream gateways keep the OpenAI error type while replacing
             // the standard processing message. Require the complete envelope
             // and an absent/null code so ordinary validation errors stay 400.

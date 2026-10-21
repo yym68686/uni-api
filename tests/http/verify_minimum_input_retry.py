@@ -23,6 +23,9 @@ SHORT_INPUT_REJECTION = "Upstream rejected illegal short-input distillation or h
 GENERIC_UPSTREAM_ERROR = {"error": {
     "code": "upstream_error", "message": "Upstream request failed", "type": "upstream_error",
 }}
+OPAQUE_UPSTREAM_ERROR = {"error": {
+    "code": "upstream_error", "message": "upstream_error", "type": "upstream_error",
+}}
 SUPPORT_ONLY_ERROR = {"error": {
     "code": "invalid_request_error", "type": "invalid_request_error",
     "message": "Request could not be completed. Contact support with the request ID.",
@@ -52,9 +55,12 @@ class Upstream(BaseHTTPRequestHandler):
         if channel != "fallback":
             raw = json.dumps(self.server.error, ensure_ascii=self.server.escape).encode()
             status, content_type = 400, "application/json"
-            if self.server.error_mode != "http":
-                error = {"type": "invalid_request_error", "status_code": 400,
-                         "message": self.server.error["error"]["message"]}
+            if channel == "auth-failure":
+                status = 502
+                raw = json.dumps({"error": {"type": "upstream_error", "message":
+                    "Upstream authentication failed, please contact administrator"}}).encode()
+            elif self.server.error_mode != "http":
+                error = {**self.server.error["error"], "status_code": 400}
                 events = [{"type": "response.created", "response": {"id": "resp_reject", "status": "in_progress"}}]
                 events.append({"type": "response.output_text.delta",
                                "delta": "started" if self.server.error_mode == "postcommit" else " "})
@@ -118,7 +124,7 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                 "base_url": f"http://127.0.0.1:{server.server_port}/{name}{upstream_endpoint}",
                 "api": "fixture-upstream", "model": ["test-model"],
                 "preferences": {"cooldown_period": 0},
-            } for name in ["limited", "fallback", "also-limited"]] + [
+            } for name in ["limited", "fallback", "also-limited", "auth-failure"]] + [
                 {"provider": "mapped", "engine": "gpt", "api": "fixture-upstream",
                  "base_url": f"http://127.0.0.1:{server.server_port}/mapped{upstream_endpoint}",
                  "model": [{"gpt-5.5": "test-model"}], "preferences": {"cooldown_period": 0}},
@@ -132,6 +138,9 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                 {"api": "no-retry", "model": ["limited/*", "fallback/*"],
                  "preferences": {"AUTO_RETRY": False}},
                 {"api": "exhausted", "model": ["limited/*", "also-limited/*"]},
+                {"api": "incident", "model": ["auth-failure/*", "limited/*", "fallback/*"]},
+                {"api": "bounded", "model": ["limited/*", "also-limited/*", "fallback/*"],
+                 "preferences": {"AUTO_RETRY": 1}},
                 {"api": "mapped-key", "model": ["mapped/*", "fallback/*"]},
                 {"api": "overridden-key", "model": ["overridden/*", "fallback/*"]},
             ],
@@ -243,6 +252,28 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                      "retry", False, 400, ["limited"]),
                     ("support-only-echo", {"error": {"message": "Invalid input", "type": "invalid_request_error"},
                      "input": SUPPORT_ONLY_ERROR}, "retry", False, 400, ["limited"]),
+                    ("generic-upstream-opaque", OPAQUE_UPSTREAM_ERROR, "retry", False,
+                     200, ["limited", "fallback"]),
+                    ("generic-upstream-opaque-incident", OPAQUE_UPSTREAM_ERROR, "incident", False,
+                     200, ["auth-failure", "limited", "fallback"]),
+                    ("generic-upstream-opaque-wrapped", {"error": {"message": json.dumps(OPAQUE_UPSTREAM_ERROR)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("generic-upstream-opaque-no-retry", OPAQUE_UPSTREAM_ERROR, "no-retry", False,
+                     502, ["limited"]),
+                    ("generic-upstream-opaque-exhausted", OPAQUE_UPSTREAM_ERROR, "exhausted", False,
+                     502, ["limited", "also-limited"] * 3),
+                    ("generic-upstream-opaque-bounded", OPAQUE_UPSTREAM_ERROR, "bounded", False,
+                     502, ["limited", "also-limited"]),
+                    ("generic-upstream-opaque-validation-code", {"error": {
+                        **OPAQUE_UPSTREAM_ERROR["error"], "code": "invalid_type"}}, "retry", False, 400, ["limited"]),
+                    ("generic-upstream-opaque-param", {"error": {
+                        **OPAQUE_UPSTREAM_ERROR["error"], "param": "input"}}, "retry", False, 400, ["limited"]),
+                    ("generic-upstream-param", {"error": {
+                        **GENERIC_UPSTREAM_ERROR["error"], "param": "input"}}, "retry", False, 400, ["limited"]),
+                    ("generic-upstream-opaque-client-type", {"error": {
+                        **OPAQUE_UPSTREAM_ERROR["error"], "type": "invalid_request_error"}}, "retry", False, 400, ["limited"]),
+                    ("generic-upstream-opaque-echo", {"error": {"type": "invalid_request_error",
+                        "message": "Invalid input"}, "input": OPAQUE_UPSTREAM_ERROR}, "retry", False, 400, ["limited"]),
                     ("generic-upstream", GENERIC_UPSTREAM_ERROR, "retry", False,
                      200, ["limited", "fallback"]),
                     ("generic-upstream-wrapped", {"error": {"message": json.dumps(GENERIC_UPSTREAM_ERROR)}},
@@ -283,6 +314,13 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                 ]
                 if endpoint == "/v1/responses" and engine == "codex":
                     cases += [
+                        ("sse-error-opaque-retry", OPAQUE_UPSTREAM_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                        ("sse-failed-opaque-retry", OPAQUE_UPSTREAM_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                        ("sse-error-opaque-no-retry", OPAQUE_UPSTREAM_ERROR, "no-retry", False, 502, ["limited"]),
+                        ("sse-failed-opaque-exhausted", OPAQUE_UPSTREAM_ERROR, "exhausted", False, 502, ["limited", "also-limited"] * 3),
+                        ("sse-postcommit-opaque", OPAQUE_UPSTREAM_ERROR, "retry", False, 200, ["limited"]),
+                        ("sse-error-opaque-param", {"error": {**OPAQUE_UPSTREAM_ERROR["error"], "param": "input"}},
+                         "retry", False, 400, ["limited"]),
                         ("sse-error-retry", SHORT_INPUT_REJECTION, "retry", False, 200, ["limited", "fallback"]),
                         ("sse-failed-retry", SHORT_INPUT_REJECTION, "retry", False, 200, ["limited", "fallback"]),
                         ("sse-error-no-retry", SHORT_INPUT_REJECTION, "no-retry", False, 502, ["limited"]),
@@ -295,7 +333,7 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                     for label, message, key, escape, expected_status, expected_hits in cases:
                         if label.startswith("sse-") and not streaming:
                             continue
-                        server.error_mode = ("postcommit" if label == "sse-postcommit" else
+                        server.error_mode = ("postcommit" if label.startswith("sse-postcommit") else
                                              "error" if label.startswith("sse-error") else
                                              "failed" if label.startswith("sse-failed") else "http")
                         server.hits.clear()
@@ -319,7 +357,7 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                                 assert sent.get("reasoning", {}).get("effort") == "max" or sent.get("reasoning_effort") == "max", context
                             if key in ("mapped-key", "overridden-key"):
                                 assert server.payloads[0]["model"] == "gpt-5.5", context
-                        if label == "sse-postcommit":
+                        if label.startswith("sse-postcommit"):
                             assert b"started" in raw and b"response.completed" not in raw, context
                         elif inband_failure:
                             events = [json.loads(line[5:]) for line in raw.splitlines()
@@ -328,14 +366,14 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                             assert events[-1]["type"] == "error", context
                             assert events[-1]["error"]["status_code"] == expected_status, context
                             assert b"resp_reject" not in raw and b"response.completed" not in raw, context
-                            assert (SHORT_INPUT_REJECTION.encode() if label != "sse-error-validation" else b"Missing required parameter") in raw, context
+                            assert server.error["error"]["message"].encode() in raw, context
                         elif status == 200:
                             assert b"test" in raw and b"invalid_request_error" not in raw, context
                             assert b"Upstream request failed" not in raw, context
                             if streaming:
                                 assert "text/event-stream" in content_type, context
                         elif label.startswith(("short-input", "sse-")):
-                            assert (SHORT_INPUT_REJECTION.encode() if label != "sse-error-validation" else b"Missing required parameter") in raw, context
+                            assert server.error["error"]["message"].encode() in raw, context
                         elif status == 503:
                             assert b"All configured providers failed for model test-model" in raw, context
                         elif label.startswith("model-mismatch"):
@@ -343,7 +381,7 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                         elif label.startswith("gemini-platform"):
                             assert b"INVALID_ARGUMENT" in raw or b"Invalid input" in raw, context
                         elif label.startswith("generic-upstream"):
-                            assert b"Upstream request failed" in raw, context
+                            assert (b"upstream_error" if "opaque" in label else b"Upstream request failed") in raw, context
                         else:
                             assert b"invalid_request_error" in raw, context
                         checked += 1
