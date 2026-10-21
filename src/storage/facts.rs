@@ -1,10 +1,7 @@
-//! Durable immutable request-fact exporter. The bounded queue is outside the
-
+//! Bounded, authenticated request-fact exporter. The queue is outside the
 //! request critical path: full or unavailable storage drops facts with an
-
 //! explicit counter, while serving remains available.
 
-use hmac::{Hmac, Mac};
 use reqwest::Client;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
@@ -16,8 +13,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use url::Url;
 
-type HmacSha256 = Hmac<Sha256>;
-
 const QUEUE_CAPACITY: usize = 4096;
 
 const BATCH_SIZE: usize = 128;
@@ -25,17 +20,18 @@ const BATCH_SIZE: usize = 128;
 const BATCH_WAIT: Duration = Duration::from_secs(2);
 
 const UPLOAD_RETRIES: usize = 3;
+const SPOOL_LIMIT: u64 = 64 * 1024 * 1024;
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+static QUEUED: AtomicU64 = AtomicU64::new(0);
+static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct UploadConfig {
     client: Client,
     endpoint: String,
-    bucket: String,
-    prefix: String,
-    access: String,
-    secret: String,
-    token: Option<String>,
+    token: String,
     instance: String,
+    epoch: String,
     spool: PathBuf,
 }
 
@@ -46,44 +42,26 @@ pub struct FactWriter {
 
 impl FactWriter {
     pub fn from_env() -> Option<Self> {
-        let endpoint = std::env::var("FACTS_S3_ENDPOINT")
-            .ok()?
-            .trim_end_matches('/')
-            .to_string();
-        let bucket = std::env::var("FACTS_S3_BUCKET").ok()?.trim().to_string();
-        let access = std::env::var("FACTS_S3_ACCESS_KEY_ID")
-            .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
-            .ok()?
-            .trim()
-            .to_string();
-        let secret = std::env::var("FACTS_S3_SECRET_ACCESS_KEY")
-            .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
-            .ok()?
-            .trim()
-            .to_string();
-        if Url::parse(&endpoint).ok()?.host_str().is_none() || bucket.is_empty() {
-            return None;
-        }
+        let (endpoint, token) = ingest_target_from_env()?;
         let (sender, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let config = UploadConfig {
             client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(20))
                 .build()
                 .ok()?,
             endpoint,
-            bucket,
-            prefix: std::env::var("FACTS_S3_PREFIX").unwrap_or_else(|_| "uni-api-facts/v1".into()),
-            access,
-            secret,
-            token: std::env::var("FACTS_S3_SESSION_TOKEN").ok(),
-            instance: std::env::var("INSTANCE_ID")
-                .unwrap_or_else(|_| format!("uni-api-{}", std::process::id())),
+            token,
+            instance: instance_id(),
+            epoch: new_event_id("exporter"),
             spool: PathBuf::from(
-                std::env::var("FACTS_S3_SPOOL_DIR").unwrap_or_else(|_| "./data/facts-spool".into()),
+                std::env::var("FACTS_SPOOL_DIR")
+                    .or_else(|_| std::env::var("FACTS_S3_SPOOL_DIR"))
+                    .unwrap_or_else(|_| "./data/facts-spool".into()),
             ),
         };
         if std::fs::create_dir_all(&config.spool).is_err() {
-            eprintln!("facts_s3_init_failed reason=spool_unavailable");
+            eprintln!("facts_ingest_init_failed reason=spool_unavailable");
             return None;
         }
         let retry_config = config.clone();
@@ -93,12 +71,18 @@ impl FactWriter {
         tokio::spawn(async move {
             while let Some(batch) = receive_batch(&mut rx, BATCH_WAIT).await {
                 let Some((key, body)) = batch_payload(&config, &batch) else {
+                    QUEUED.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+                    DROPPED.fetch_add(batch.len() as u64, Ordering::Relaxed);
                     continue;
                 };
                 let spool = persist_batch(&config, &key, &body).await;
+                QUEUED.fetch_sub(batch.len() as u64, Ordering::Relaxed);
                 if let Err(error) = upload_body_with_retry(&config, &key, &body).await {
+                    if !spool {
+                        DROPPED.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    }
                     eprintln!(
-                        "{{\"event_type\":\"facts_s3_upload_error\",\"error\":{:?},\"spooled\":{}}}",
+                        "{{\"event_type\":\"facts_ingest_upload_error\",\"error\":{:?},\"spooled\":{}}}",
                         error,
                         spool
                     )
@@ -113,8 +97,11 @@ impl FactWriter {
         Some(Self { sender })
     }
     pub fn enqueue(&self, event: Value) {
+        QUEUED.fetch_add(1, Ordering::Relaxed);
         if self.sender.try_send(event).is_err() {
-            eprintln!("facts_s3_queue_dropped record_type=request_fact");
+            QUEUED.fetch_sub(1, Ordering::Relaxed);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            eprintln!("facts_ingest_queue_dropped record_type=request_fact");
         }
     }
 }
@@ -139,7 +126,7 @@ async fn receive_batch(rx: &mut mpsc::Receiver<Value>, wait: Duration) -> Option
     Some(batch)
 }
 
-fn batch_payload(c: &UploadConfig, batch: &[Value]) -> Option<(String, String)> {
+fn batch_payload(_c: &UploadConfig, batch: &[Value]) -> Option<(String, String)> {
     let body = batch
         .iter()
         .map(serde_json::to_string)
@@ -148,77 +135,119 @@ fn batch_payload(c: &UploadConfig, batch: &[Value]) -> Option<(String, String)> 
         .join("\n")
         + "\n";
     let digest = hex_sha(&body);
-    let key = format!(
-        "{}/{}/{}/batch-{}.jsonl",
-        c.prefix.trim_matches('/'),
-        c.instance,
-        "immutable",
-        digest
-    );
+    let key = digest;
     Some((key, body))
 }
 
-async fn upload_body(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?;
-    let secs = now.as_secs();
-    let date = chrono_date(secs);
-    let amz = chrono_timestamp(secs);
-    let hash = hex_sha(body);
-    let url = format!("{}/{}/{}", c.endpoint, c.bucket, key);
-    let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
-    let host = parsed.host_str().ok_or("S3 endpoint host missing")?;
-    let headers = format!(
-        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-        host, hash, amz
-    );
-    let signed = "host;x-amz-content-sha256;x-amz-date";
-    let canonical = format!(
-        "PUT\n/{}/{}\n\n{}\n{}\n{}",
-        c.bucket, key, headers, signed, hash
-    );
-    let scope = format!("{}/auto/s3/aws4_request", date);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz,
-        scope,
-        hex_sha(&canonical)
-    );
-    let kdate = hmac(format!("AWS4{}", c.secret).as_bytes(), date.as_bytes());
-    let kregion = hmac(&kdate, b"auto");
-    let kservice = hmac(&kregion, b"s3");
-    let signing = hmac(&kservice, b"aws4_request");
-    let auth = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-        c.access,
-        scope,
-        signed,
-        hex::encode(hmac(&signing, string_to_sign.as_bytes()))
-    );
-    let mut req = c
-        .client
-        .put(url)
-        .header("Host", host)
-        .header("x-amz-content-sha256", hash)
-        .header("x-amz-date", amz)
-        .header("Authorization", auth)
-        .header("Content-Type", "application/x-ndjson")
-        .body(body.to_owned());
-    if let Some(token) = &c.token {
-        req = req.header("x-amz-security-token", token)
+// Only a digest-matching commit acknowledgement permits deleting a batch.
+// Redirects are disabled so the credential cannot leave its configured origin.
+async fn upload_body(c: &UploadConfig, _key: &str, body: &str) -> Result<(), String> {
+    if body.len() > 4 * 1024 * 1024 {
+        return Err("fact batch too large".into());
     }
-    let resp = req
+    let hash = hex_sha(body);
+    let response = c
+        .client
+        .post(&c.endpoint)
+        .bearer_auth(&c.token)
+        .header("Content-Type", "application/x-ndjson")
+        .header("X-Uni-Facts-Version", "1")
+        .header("X-Uni-Facts-Instance", &c.instance)
+        .header("X-Uni-Facts-Epoch", &c.epoch)
+        .header(
+            "X-Uni-Facts-Sequence",
+            EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed).to_string(),
+        )
+        .header(
+            "X-Uni-Facts-Dropped",
+            DROPPED.load(Ordering::Relaxed).to_string(),
+        )
+        .header(
+            "X-Uni-Facts-Pending",
+            QUEUED
+                .load(Ordering::Relaxed)
+                .saturating_add(
+                    spool_pending(c)
+                        .await
+                        .saturating_sub(u64::from(!body.is_empty())),
+                )
+                .to_string(),
+        )
+        .body(body.to_owned())
         .send()
         .await
-        .map_err(|_| "S3 fact upload failed".to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("S3 fact upload HTTP {}", resp.status()));
+        .map_err(|_| "fact ingestion transport failed")?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "fact ingestion HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    if response.content_length().is_some_and(|n| n > 4096) {
+        return Err("invalid fact acknowledgement".into());
+    }
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(part) = stream.next().await {
+        let part = part.map_err(|_| "incomplete fact acknowledgement")?;
+        if bytes.len() + part.len() > 4096 {
+            return Err("invalid fact acknowledgement".into());
+        }
+        bytes.extend_from_slice(&part);
+    }
+    let ack: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid fact acknowledgement")?;
+    if ack["format"] != "facts-ack-v1" || ack["sha256"] != hash {
+        return Err("fact acknowledgement mismatch".into());
     }
     Ok(())
 }
 
+fn ingest_target_from_env() -> Option<(String, String)> {
+    let explicit = std::env::var("FACTS_INGEST_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let endpoint = match explicit {
+        Some(url) => url,
+        None => {
+            let restore = std::env::var("UNI_API_CONTROL_RESTORE_URL").ok()?;
+            ingest_url(&restore)?
+        }
+    };
+    let token = std::env::var("FACTS_INGEST_TOKEN")
+        .or_else(|_| std::env::var("UNI_API_CONTROL_RESTORE_TOKEN"))
+        .ok()?;
+    let parsed = Url::parse(&endpoint).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || token.trim().is_empty()
+    {
+        return None;
+    }
+    Some((endpoint, token))
+}
+
+fn ingest_url(restore: &str) -> Option<String> {
+    let mut url = Url::parse(restore).ok()?;
+    let (prefix, id) = url.path().rsplit_once("/v1/runtime-restore/")?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    url.set_path(&format!("{prefix}/v1/runtime-facts/{id}"));
+    Some(url.to_string())
+}
+
 async fn persist_batch(c: &UploadConfig, key: &str, body: &str) -> bool {
+    if body.len() > 4 * 1024 * 1024 {
+        return false;
+    }
+    if !reserve_spool(c, body.len() as u64).await {
+        return false;
+    }
     let digest = hex_sha(body);
     let target = c.spool.join(format!("{}.jsonl", digest));
     if tokio::fs::try_exists(&target).await.unwrap_or(false) {
@@ -226,7 +255,7 @@ async fn persist_batch(c: &UploadConfig, key: &str, body: &str) -> bool {
     }
     let pending = c.spool.join(format!("{}.pending", digest));
     if tokio::fs::write(&pending, body.as_bytes()).await.is_err() {
-        eprintln!("facts_s3_spool_write_failed digest={digest}");
+        eprintln!("facts_ingest_spool_write_failed digest={digest}");
         return false;
     }
     if let Ok(file) = tokio::fs::OpenOptions::new()
@@ -237,7 +266,7 @@ async fn persist_batch(c: &UploadConfig, key: &str, body: &str) -> bool {
         let _ = file.sync_all().await;
     }
     if tokio::fs::rename(&pending, &target).await.is_err() {
-        eprintln!("facts_s3_spool_commit_failed digest={digest}");
+        eprintln!("facts_ingest_spool_commit_failed digest={digest}");
         return false;
     }
     let _ = key;
@@ -258,24 +287,76 @@ async fn retry_spool(c: UploadConfig) {
                 let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
                     continue;
                 };
-                let key = format!(
-                    "{}/{}/{}/batch-{}.jsonl",
-                    c.prefix.trim_matches('/'),
-                    c.instance,
-                    "immutable",
-                    name
-                );
+                let key = name.to_string();
                 if upload_body_with_retry(&c, &key, &body).await.is_ok() {
                     let _ = tokio::fs::remove_file(path).await;
                 }
             }
         }
+        if QUEUED.load(Ordering::Relaxed) == 0 && spool_pending(&c).await == 0 {
+            let _ = upload_body(&c, "", "").await;
+        }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
 
+async fn spool_pending(c: &UploadConfig) -> u64 {
+    let Ok(mut entries) = tokio::fs::read_dir(&c.spool).await else {
+        return 1;
+    };
+    let mut count = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().and_then(|v| v.to_str()) == Some("jsonl") {
+            count += 1;
+        }
+        if count >= 4096 {
+            break;
+        }
+    }
+    count
+}
+
+async fn reserve_spool(c: &UploadConfig, incoming: u64) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(&c.spool).await else {
+        return false;
+    };
+    let mut files = Vec::new();
+    let mut size = 0u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            return false;
+        };
+        size = size.saturating_add(meta.len());
+        files.push((meta.modified().unwrap_or(UNIX_EPOCH), path, meta.len()));
+        if files.len() >= 4096 {
+            return false;
+        }
+    }
+    files.sort_by_key(|row| row.0);
+    for (_, path, bytes) in files {
+        if size.saturating_add(incoming) <= SPOOL_LIMIT {
+            break;
+        }
+        let Ok(body) = tokio::fs::read_to_string(&path).await else {
+            return false;
+        };
+        let records = body.lines().filter(|line| !line.trim().is_empty()).count() as u64;
+        if tokio::fs::remove_file(&path).await.is_err() {
+            return false;
+        }
+        size = size.saturating_sub(bytes);
+        DROPPED.fetch_add(records, Ordering::Relaxed);
+        eprintln!("facts_ingest_spool_evicted bytes={bytes}");
+    }
+    size.saturating_add(incoming) <= SPOOL_LIMIT
+}
+
 async fn upload_body_with_retry(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
-    let mut last = String::from("S3 fact upload failed");
+    let mut last = String::from("fact ingestion failed");
     for attempt in 0..UPLOAD_RETRIES {
         match upload_body(c, key, body).await {
             Ok(()) => return Ok(()),
@@ -290,39 +371,8 @@ async fn upload_body_with_retry(c: &UploadConfig, key: &str, body: &str) -> Resu
     Err(last)
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut m = HmacSha256::new_from_slice(key).expect("HMAC key");
-    m.update(data);
-    m.finalize().into_bytes().to_vec()
-}
-
 fn hex_sha(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
-}
-
-fn chrono_date(secs: u64) -> String {
-    let days = secs / 86400;
-    let z = days as i64 + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    format!("{:04}{:02}{:02}", year, m, d)
-}
-
-fn chrono_timestamp(secs: u64) -> String {
-    format!(
-        "{}T{:02}{:02}{:02}Z",
-        chrono_date(secs),
-        ((secs % 86400) / 3600),
-        ((secs % 3600) / 60),
-        secs % 60
-    )
 }
 
 static WRITER: OnceLock<Option<FactWriter>> = OnceLock::new();
@@ -542,12 +592,9 @@ mod tests {
         let config = UploadConfig {
             client: Client::new(),
             endpoint: "https://example.invalid".into(),
-            bucket: "bucket".into(),
-            prefix: "facts/v1".into(),
-            access: "access".into(),
-            secret: "secret".into(),
-            token: None,
+            token: "fixture".into(),
             instance: "instance".into(),
+            epoch: "fixture-epoch".into(),
             spool: PathBuf::from("/tmp/facts-test"),
         };
         let batch = vec![json!({"event_id":"one","schema":1})];
@@ -563,12 +610,9 @@ mod tests {
         let config = UploadConfig {
             client: Client::new(),
             endpoint: "https://example.invalid".into(),
-            bucket: "bucket".into(),
-            prefix: "facts/v1".into(),
-            access: "access".into(),
-            secret: "secret".into(),
-            token: None,
+            token: "fixture".into(),
             instance: "instance".into(),
+            epoch: "fixture-epoch".into(),
             spool: PathBuf::from("/tmp/facts-test"),
         };
         let a = batch_payload(&config, &[json!({"event_id":"one"})])
@@ -579,4 +623,109 @@ mod tests {
             .0;
         assert_ne!(a, b);
     }
+}
+#[test]
+fn ingest_target_preserves_source_and_public_proxy_prefix() {
+    assert_eq!(
+        ingest_url("https://console.test/analytics/v1/runtime-restore/primary").as_deref(),
+        Some("https://console.test/analytics/v1/runtime-facts/primary")
+    );
+    assert!(ingest_url("https://console.test/bootstrap").is_none());
+    assert!(ingest_url("https://console.test/v1/runtime-restore/one/two").is_none());
+}
+
+#[tokio::test]
+async fn ingest_only_acknowledges_matching_digest_and_never_follows_redirects() {
+    use axum::{
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Json, Router,
+    };
+    use std::sync::Arc;
+    let mode = Arc::new(AtomicU64::new(0));
+    async fn handler(
+        State(mode): State<Arc<AtomicU64>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> (StatusCode, HeaderMap, Json<Value>) {
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer fixture-secret"
+        );
+        let mut response_headers = HeaderMap::new();
+        let value = mode.load(Ordering::Relaxed);
+        if value == 2 {
+            response_headers.insert(
+                "location",
+                "http://127.0.0.1:1/credential-trap".parse().unwrap(),
+            );
+        }
+        (
+            if value == 2 {
+                StatusCode::TEMPORARY_REDIRECT
+            } else {
+                StatusCode::OK
+            },
+            response_headers,
+            Json(
+                json!({"format":"facts-ack-v1","sha256":if value==0{hex_sha(&body)}else{"wrong".into()}}),
+            ),
+        )
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/facts", post(handler))
+        .with_state(mode.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let c = UploadConfig {
+        client: Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        endpoint: format!("http://{address}/facts"),
+        token: "fixture-secret".into(),
+        instance: "fixture".into(),
+        epoch: "fixture-epoch".into(),
+        spool: std::env::temp_dir().join("absent-facts-spool"),
+    };
+    assert!(upload_body(&c, "", "{}\n").await.is_ok());
+    mode.store(1, Ordering::Relaxed);
+    assert_eq!(
+        upload_body(&c, "", "{}\n").await.unwrap_err(),
+        "fact acknowledgement mismatch"
+    );
+    mode.store(2, Ordering::Relaxed);
+    assert_eq!(
+        upload_body(&c, "", "{}\n").await.unwrap_err(),
+        "fact ingestion HTTP 307"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn spool_capacity_evicts_oldest_file_before_reserving_new_bytes() {
+    let root = std::env::temp_dir().join(new_event_id("spool-test"));
+    std::fs::create_dir(&root).unwrap();
+    let c = UploadConfig {
+        client: Client::new(),
+        endpoint: "http://127.0.0.1/unused".into(),
+        token: "fixture".into(),
+        instance: "fixture".into(),
+        epoch: "epoch".into(),
+        spool: root.clone(),
+    };
+    for name in ["old", "middle", "new"] {
+        std::fs::File::create(root.join(format!("{name}.jsonl")))
+            .unwrap()
+            .set_len(30 * 1024 * 1024)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reserve_spool(&c, 4 * 1024 * 1024).await);
+    assert!(!root.join("old.jsonl").exists());
+    assert!(root.join("middle.jsonl").exists());
+    assert!(root.join("new.jsonl").exists());
+    std::fs::remove_dir_all(root).unwrap();
 }

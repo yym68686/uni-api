@@ -87,7 +87,7 @@ def verify(binary, hedging):
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0",
                    RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0")
         for key in list(env):
-            if key.startswith(("FACTS_S3_", "UNI_API_CONTROL_RESTORE_")):
+            if key.startswith(("FACTS_", "UNI_API_CONTROL_RESTORE_")):
                 env.pop(key)
         with (root / "log").open("w+") as log:
             process = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)

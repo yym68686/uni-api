@@ -1,4 +1,5 @@
-"""Request trace regression: local gateway, local upstreams and local S3 only."""
+"""Request trace regression: local gateway, local upstreams and local fact ingestion only."""
+from fact_sink import accept_facts
 import http.client
 import json
 import os
@@ -17,14 +18,8 @@ class Stub(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def do_PUT(self):
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        facts.extend(json.loads(line) for line in body.splitlines() if line)
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
     def do_POST(self):
+        if self.path == "/facts": return accept_facts(self, facts)
         self.rfile.read(int(self.headers["Content-Length"]))
         rejected = self.path.startswith("/reject/")
         body = json.dumps({"code": "INSUFFICIENT_BALANCE", "message": "Insufficient account balance", "debug": "private-prompt"} if rejected else {
@@ -51,8 +46,7 @@ with tempfile.TemporaryDirectory(prefix="uni-request-trace-") as directory:
     env.update(PORT=str(port), DISABLE_DATABASE="true", UNI_API_CONFIG_PATH=str(root / "api.json"),
         RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root / "snapshot.json"), UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "ledger"),
         RUST_REQUEST_SPOOL_DIRECTORY=str(root / "body-spool"), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0", RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0",
-        NO_PROXY="127.0.0.1,localhost", FACTS_S3_ENDPOINT=f"http://127.0.0.1:{server.server_port}", FACTS_S3_BUCKET="fixture",
-        FACTS_S3_ACCESS_KEY_ID="fixture", FACTS_S3_SECRET_ACCESS_KEY="fixture", FACTS_S3_SPOOL_DIR=str(root / "facts-spool"))
+        NO_PROXY="127.0.0.1,localhost", FACTS_INGEST_URL=f"http://127.0.0.1:{server.server_port}"+"/facts", FACTS_INGEST_TOKEN="fixture", FACTS_SPOOL_DIR=str(root / "facts-spool"))
 
     def call(path, request_id=None, authorized=True):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)

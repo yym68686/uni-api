@@ -84,7 +84,7 @@ def verify(binary):
                 {'api':'platform-no-retry','model':['platform-limited/*','platform-fallback/*'], 'preferences':{'AUTO_RETRY':False}},
                 {'api':'platform-exhausted','model':['platform-limited/*','platform-also-limited/*']}]
         (root/'config.json').write_text(json.dumps({'providers':providers,'api_keys':keys}))
-        env={k:v for k,v in os.environ.items() if not k.startswith(('FACTS_S3_','UNI_API_CONTROL_RESTORE_','OTEL_','FUGUE_OTEL_')) and k!='CONFIG_URL'}
+        env={k:v for k,v in os.environ.items() if not k.startswith(('FACTS_','UNI_API_CONTROL_RESTORE_','OTEL_','FUGUE_OTEL_')) and k!='CONFIG_URL'}
         env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'config.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',NO_PROXY='127.0.0.1,localhost',PROVIDER_MODEL_CIRCUIT_FAILURE_THRESHOLD='1000')
         def call(path,body=None,auth='header',extra=None):
             headers={'Content-Type':'application/json'}

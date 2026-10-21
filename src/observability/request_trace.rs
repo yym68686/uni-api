@@ -75,11 +75,11 @@ pub(crate) fn log(event: Value) {
 }
 
 fn emit(mut value: Value) {
-    if let Some(writer) = crate::storage::s3::global() {
+    if let Some(writer) = crate::storage::facts::global() {
         value["schema"] = json!(1);
         value["kind"] = json!("trace");
-        value["event_id"] = json!(crate::storage::s3::new_event_id("trace"));
-        value["instance_id"] = json!(crate::storage::s3::instance_id());
+        value["event_id"] = json!(crate::storage::facts::new_event_id("trace"));
+        value["instance_id"] = json!(crate::storage::facts::instance_id());
         value["at_ms"] = json!(now_ms());
         writer.enqueue(value);
     }

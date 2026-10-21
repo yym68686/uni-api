@@ -10,7 +10,7 @@ const DEFAULT_WRITE_QUEUE: usize = 4096;
 
 #[derive(Clone)]
 pub struct Persistence {
-    fact_writer: Option<crate::storage::s3::FactWriter>,
+    fact_writer: Option<crate::storage::facts::FactWriter>,
     backend: Arc<Backend>,
     writer: Option<mpsc::Sender<WriteEvent>>,
 }
@@ -85,12 +85,12 @@ impl Persistence {
     pub async fn initialize(disabled: bool) -> Result<Self, String> {
         if disabled {
             return Ok(Self {
-                fact_writer: crate::storage::s3::global(),
+                fact_writer: crate::storage::facts::global(),
                 backend: Arc::new(Backend::Disabled),
                 writer: None,
             });
         }
-        let fact_writer = crate::storage::s3::global();
+        let fact_writer = crate::storage::facts::global();
         let backend = match std::env::var("DB_TYPE")
             .unwrap_or_else(|_| "sqlite".into())
             .trim()
@@ -161,7 +161,7 @@ impl Persistence {
 
     pub fn record_request(&self, stat: RequestStat) {
         if let Some(writer) = &self.fact_writer {
-            writer.enqueue(crate::storage::s3::request_event(&stat));
+            writer.enqueue(crate::storage::facts::request_event(&stat));
         }
         let Some(writer) = &self.writer else {
             return;
@@ -172,7 +172,7 @@ impl Persistence {
     }
     pub fn record_channel(&self, stat: ChannelStat) {
         if let Some(writer) = &self.fact_writer {
-            writer.enqueue(crate::storage::s3::attempt_event(&stat));
+            writer.enqueue(crate::storage::facts::attempt_event(&stat));
         }
         let Some(writer) = &self.writer else {
             return;

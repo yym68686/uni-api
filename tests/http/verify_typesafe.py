@@ -93,7 +93,7 @@ def verify(binary):
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"),
                    NO_PROXY="127.0.0.1,localhost", RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0",
                    RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0")
-        env = {k: v for k, v in env.items() if not k.startswith(("FACTS_S3_", "UNI_API_CONTROL_RESTORE_"))}
+        env = {k: v for k, v in env.items() if not k.startswith(("FACTS_", "UNI_API_CONTROL_RESTORE_"))}
 
         def call(method, path, body=None, key="business"):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)

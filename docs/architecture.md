@@ -20,7 +20,7 @@ uni-api 是独立的模型路由网关。仓库根目录是单个 Rust crate，�
 | `src/protocols/` | 协议内容转换、SSE framing、流事件解析和 Responses 修复规则。 |
 | `src/transport/` | HTTP 头过滤、请求/响应体读取、解压、multipart 与 spool。 |
 | `src/observability/` | 请求上下文、dispatch/stream 时间、用量、指标及事实生成。 |
-| `src/storage/` | 可选数据库、请求事实持久化及 S3 导出。 |
+| `src/storage/` | 可选数据库、受限重试队列及请求事实 HTTP 上报。 |
 | `assets/` | 编译期内置模型目录和静态图标，不放生产渠道配置。 |
 | `tests/http/` | 真实进程与隔离本地上游的 Python 回归。 |
 | `tests/fixtures/` | 配置、协议和流的固定样例；`manual/` 是历史手工样例。 |
@@ -71,7 +71,7 @@ Provider 和协议模块不依赖 HTTP handler 或请求重试执行器。
 - uni-api 执行渠道配置、选路、重试与冷却，并生成请求事实。
 - uni-api-web 控制台负责管理流程、配置意图的持久保存和分析。
 - 0-0 的账户、余额和账务主事实，以及 OAIX 的账号池，仍属于各自系统。
-- S3 请求事实与可选数据库实现留在网关；分析缓存和控制台业务不搬入网关。
+- 网关异步上报请求事实，uni-api-web 在 PostgreSQL 保存并按容量淘汰历史；分析和控制台业务不搬入网关。
 
 ## 开发、构建与回归
 

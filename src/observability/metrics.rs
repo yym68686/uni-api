@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-// Historical channel statistics are served by the S3/DuckDB analytics API.
+// Historical channel statistics are served by the PostgreSQL analytics API.
 // Keep only the current minute here for live gauges; this process must not
 // become a second history store.
 const RETENTION_MINUTES: u64 = 1;

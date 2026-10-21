@@ -1,4 +1,5 @@
 """Only loopback fixtures: heartbeat, split event, and delayed semantic event."""
+from fact_sink import accept_facts
 import http.client
 import json
 import os
@@ -23,13 +24,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def do_PUT(self):
-        facts.extend(json.loads(line) for line in self.rfile.read(int(self.headers['Content-Length'])).splitlines())
-        self.send_response(200)
-        self.send_header('Content-Length', '0')
-        self.end_headers()
-
     def do_POST(self):
+        if self.path == "/facts": return accept_facts(self, facts)
         observed_peers.append(self.client_address)
         self.rfile.read(int(self.headers['Content-Length']))
         self.send_response(200)
@@ -57,7 +53,7 @@ try:
         config = {'providers': [{'provider': 'raw', 'engine': 'gpt', 'api': 'fixture', 'base_url': f'http://127.0.0.1:{server.server_port}/v1/responses', 'model': ['m']}], 'api_keys': [{'api': 'fixture-admin', 'model': ['all']}]}
         (root/'api.json').write_text(json.dumps(config))
         env = {k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','LANG','DYLD_LIBRARY_PATH')}
-        env.update(PORT=str(port), DISABLE_DATABASE='true', UNI_API_CONFIG_PATH=str(root/'api.json'), RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'), UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'), RUST_REQUEST_SPOOL_DIRECTORY=str(root/'body-spool'), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0', RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0', NO_PROXY='127.0.0.1,localhost', FACTS_S3_ENDPOINT=f'http://127.0.0.1:{server.server_port}', FACTS_S3_BUCKET='fixture', FACTS_S3_ACCESS_KEY_ID='fixture', FACTS_S3_SECRET_ACCESS_KEY='fixture', FACTS_S3_SPOOL_DIR=str(root/'facts-spool'))
+        env.update(PORT=str(port), DISABLE_DATABASE='true', UNI_API_CONFIG_PATH=str(root/'api.json'), RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'), UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'), RUST_REQUEST_SPOOL_DIRECTORY=str(root/'body-spool'), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0', RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0', NO_PROXY='127.0.0.1,localhost', FACTS_INGEST_URL=f'http://127.0.0.1:{server.server_port}'+"/facts", FACTS_INGEST_TOKEN='fixture', FACTS_SPOOL_DIR=str(root/'facts-spool'))
         with (root/'runtime.log').open('w') as log:
             p = subprocess.Popen([str(Path(sys.argv[1]).resolve())], cwd=root, env=env, stdout=log, stderr=log)
             try:

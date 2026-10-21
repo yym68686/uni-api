@@ -59,8 +59,8 @@ impl AttemptDispatch {
         *self.recorded.get_or_init(|| {
             let elapsed = self.arrival.0.elapsed().as_secs_f64() * 1000.0;
             metrics.observe_dispatch(&self.key, elapsed);
-            if let Some(writer) = crate::storage::s3::global() {
-                writer.enqueue(crate::storage::s3::dispatch_event(
+            if let Some(writer) = crate::storage::facts::global() {
+                writer.enqueue(crate::storage::facts::dispatch_event(
                     &self.key,
                     &self.request_id,
                     &self.attempt_id,

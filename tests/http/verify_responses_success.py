@@ -1,4 +1,5 @@
 """Verify completion statistics against real SSE and immutable exported facts."""
+from fact_sink import accept_facts
 import http.client
 import json
 import os
@@ -20,14 +21,8 @@ class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def do_PUT(self):
-        raw = self.rfile.read(int(self.headers["Content-Length"]))
-        facts.extend(json.loads(line) for line in raw.splitlines() if line)
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
     def do_POST(self):
+        if self.path == "/facts": return accept_facts(self, facts)
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         case = payload["input"]
         events = [{"type": "response.created", "response": {"status": "in_progress"}}]
@@ -76,8 +71,7 @@ def main():
         env.update(PORT=str(port), DISABLE_DATABASE="true", UNI_API_CONFIG_PATH=str(root / "api.json"),
             RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root / "snapshot.json"), UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "ledger"),
             RUST_REQUEST_SPOOL_DIRECTORY=str(root / "body-spool"), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0", RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0",
-            NO_PROXY="127.0.0.1,localhost", FACTS_S3_ENDPOINT=f"http://127.0.0.1:{upstream.server_port}", FACTS_S3_BUCKET="fixture",
-            FACTS_S3_ACCESS_KEY_ID="fixture", FACTS_S3_SECRET_ACCESS_KEY="fixture", FACTS_S3_SPOOL_DIR=str(root / "facts-spool"))
+            NO_PROXY="127.0.0.1,localhost", FACTS_INGEST_URL=f"http://127.0.0.1:{upstream.server_port}"+"/facts", FACTS_INGEST_TOKEN="fixture", FACTS_SPOOL_DIR=str(root / "facts-spool"))
 
         def call(method, path, body=None, provider=None, request_id=None):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
@@ -142,7 +136,7 @@ def main():
                                 assert fact["terminal_kind"] == "incomplete", fact
                                 assert fact["failure_reason"] == "responses_max_output_tokens", fact
                                 if kind == "request": assert fact["status"] == 200, fact
-                print("PASS: 18 real SSE cases; HTTP 200, tool completion, incomplete, EOF, [DONE], live metrics, S3 request/attempt facts, unchanged passthrough")
+                print("PASS: 18 real SSE cases; HTTP 200, tool completion, incomplete, EOF, [DONE], live metrics, HTTP-ingested request/attempt facts, unchanged passthrough")
             except Exception:
                 print((root / "runtime.log").read_text()[-18000:], file=sys.stderr)
                 raise

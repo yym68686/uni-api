@@ -8,7 +8,7 @@ attempts, even if the public stream already began with HTTP 200 or partial text.
 A completed tool call does not need assistant text to count as successful.
 
 The gateway applies this definition to live channel metrics, stored channel and
-request statistics, and immutable S3 facts. Request/attempt facts add nullable
+request statistics, and deduplicated HTTP-exported facts. Request/attempt facts add nullable
 `terminal_kind` and `response_completed` fields. `response_completed` is a boolean
 only for observed native streaming `/v1/responses`; non-streaming requests and
 other protocols leave it null. HTTP status and semantic completion are distinct.

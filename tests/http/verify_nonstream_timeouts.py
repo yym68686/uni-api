@@ -120,7 +120,7 @@ def verify(binary):
         # A developer's production exporter/restore environment must never leak
         # into this fixture. All requests and credentials stay on loopback.
         for key in list(env):
-            if key.startswith(("FACTS_S3_", "UNI_API_CONTROL_RESTORE_")):
+            if key.startswith(("FACTS_", "UNI_API_CONTROL_RESTORE_")):
                 env.pop(key)
         with (root / "log").open("w+") as log:
             process = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)

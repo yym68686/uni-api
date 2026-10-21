@@ -125,7 +125,7 @@ def verify(binary, hedging):
         original = json.dumps(config).encode()
         config_path.write_bytes(original)
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("FACTS_S3_", "OTEL_", "FUGUE_OTEL_", "UNI_API_CONTROL_RESTORE_"))
+               if not k.startswith(("FACTS_", "OTEL_", "FUGUE_OTEL_", "UNI_API_CONTROL_RESTORE_"))
                and k != "CONFIG_URL"}
         env.update(PORT=str(port), DISABLE_DATABASE="true", UNI_API_CONFIG_PATH=str(config_path),
                    RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root / "snapshot.json"),

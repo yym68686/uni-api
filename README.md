@@ -1297,7 +1297,7 @@ channel disabled return 503. Changes emit `channel_controls_changed` audit logs.
 
 ### Upstream receipt correlation facts
 
-When the existing S3 fact exporter is enabled, each actually dispatched model
+When the authenticated HTTP fact exporter is enabled, each actually dispatched model
 attempt also emits an independent `billing` fact. It records the direct upstream
 response's `X-Client-Request-ID` as `billing_request_ids: ["client:<id>"]`, a
 normalized upstream site, SHA-256 of the credential actually sent, caller key
@@ -1326,3 +1326,16 @@ observed `response.created`, first text and first semantic-output timestamps
 without forwarding filtered priming events. Entering or replaying the protocol
 converter does not restart these clocks. Historical missing/underestimated
 timings cannot be reconstructed; only newly observed requests use this fix.
+
+### PostgreSQL console fact export
+
+Set `FACTS_INGEST_URL` and `FACTS_INGEST_TOKEN`, or retain the existing
+`UNI_API_CONTROL_RESTORE_URL` and `UNI_API_CONTROL_RESTORE_TOKEN`: the exporter
+derives `/v1/runtime-facts/{source_id}` from the restore URL. The receiver must
+support `facts-ack-v1` before upgrading the gateway. S3 credentials are no longer
+used for request facts. The console owns PostgreSQL and size-based FIFO retention.
+
+Fact export is asynchronous, with a 4096-event queue and a 64 MiB local retry spool.
+Only a matching SHA-256 commit acknowledgement removes a batch. Backpressure or
+unavailable telemetry cannot block model request serving; loss/backlog metadata
+is reported to the console. Configuration recovery remains a separate protocol.

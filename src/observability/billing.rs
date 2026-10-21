@@ -101,7 +101,7 @@ impl BillingAttempt {
     fn event(&self) -> Option<Value> {
         let started = self.started.get()?;
         let r = self.receipt.lock().ok()?;
-        let mut event = crate::storage::s3::dispatch_event(
+        let mut event = crate::storage::facts::dispatch_event(
             &self.key,
             &self.request_id,
             &self.attempt_id,
@@ -124,7 +124,7 @@ impl BillingAttempt {
 impl Drop for BillingAttempt {
     fn drop(&mut self) {
         if let Some(event) = self.event() {
-            if let Some(writer) = crate::storage::s3::global() {
+            if let Some(writer) = crate::storage::facts::global() {
                 writer.enqueue(event);
             }
         }

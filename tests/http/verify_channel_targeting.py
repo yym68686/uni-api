@@ -35,7 +35,7 @@ def verify(binary, endpoint):
         (root/'api.json').write_text(json.dumps(config))
         env=dict(os.environ,PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'api.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),NO_PROXY='127.0.0.1,localhost',RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0')
         # Do not inherit production export settings into a fixture.
-        env={k:v for k,v in env.items() if not k.startswith('FACTS_S3_')}
+        env={k:v for k,v in env.items() if not k.startswith('FACTS_')}
         with (root/'log').open('w+') as log:
             process=subprocess.Popen([str(binary)],cwd=root,env=env,stdout=log,stderr=log)
             def request(method,path,key='admin-test',target=None):

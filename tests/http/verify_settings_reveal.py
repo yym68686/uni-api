@@ -5,7 +5,7 @@ with tempfile.TemporaryDirectory(prefix='reveal-qa-')as tmp:
  root=pathlib.Path(tmp);s=socket.socket();s.bind(('127.0.0.1',0));port=s.getsockname()[1];s.close()
  config={'providers':[{'provider':'one','base_url':'http://127.0.0.1:1/v1/responses','api':['fixture-a','fixture-b'],'model':['model-a']}],'api_keys':[{'api':'catalog','model':['all']},{'api':'admin-token','role':'admin','model':['all']},{'api':'ordinary','model':['all']}]}
  (root/'api.json').write_text(json.dumps(config))
- env={k:v for k,v in os.environ.items()if not k.startswith(('FACTS_S3_','UNI_API_CONTROL_RESTORE'))}
+ env={k:v for k,v in os.environ.items()if not k.startswith(('FACTS_','UNI_API_CONTROL_RESTORE'))}
  env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'api.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),NO_PROXY='127.0.0.1,localhost')
  with (root/'log').open('w')as log:
   p=subprocess.Popen([str(binary)],cwd=root,env=env,stdout=log,stderr=log)

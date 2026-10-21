@@ -98,7 +98,7 @@ def verify(binary):
                               {'api':'retry-fixture','model':['native/*','fallback/*'],'preferences':{'AUTO_RETRY':1}}],
                   'preferences':{'hedging':{'enabled':False}}}
         config_path = root/'api.json'; config_path.write_text(json.dumps(config)); original = config_path.read_bytes()
-        env = {k:v for k,v in os.environ.items() if not k.startswith(('FACTS_S3_','UNI_API_CONTROL_RESTORE_'))}
+        env = {k:v for k,v in os.environ.items() if not k.startswith(('FACTS_','UNI_API_CONTROL_RESTORE_'))}
         env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(config_path),NO_PROXY='127.0.0.1,localhost',
                    RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',

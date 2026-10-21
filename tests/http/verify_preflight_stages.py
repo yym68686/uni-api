@@ -1,4 +1,5 @@
 """Real local HTTP waits must remain distinct from gateway processing."""
+from fact_sink import accept_facts
 import http.client
 import json
 import os
@@ -23,13 +24,8 @@ class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def do_PUT(self):
-        facts.extend(json.loads(line) for line in self.rfile.read(int(self.headers["Content-Length"])).splitlines())
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
     def do_POST(self):
+        if self.path == "/facts": return accept_facts(self, facts)
         self.rfile.read(int(self.headers["Content-Length"]))
         name = self.path.split("/")[1]
         time.sleep(.2)
@@ -77,9 +73,8 @@ try:
                    UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "ledger"),
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / "request-spool"), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0",
                    RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0", NO_PROXY="127.0.0.1,localhost",
-                   FACTS_S3_ENDPOINT=f"http://127.0.0.1:{server.server_port}", FACTS_S3_BUCKET="fixture",
-                   FACTS_S3_ACCESS_KEY_ID="fixture", FACTS_S3_SECRET_ACCESS_KEY="fixture",
-                   FACTS_S3_SPOOL_DIR=str(root / "facts-spool"))
+                   FACTS_INGEST_URL=f"http://127.0.0.1:{server.server_port}"+"/facts", FACTS_INGEST_TOKEN="fixture",
+                   FACTS_SPOOL_DIR=str(root / "facts-spool"))
 
         def call(method, path, name=None):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

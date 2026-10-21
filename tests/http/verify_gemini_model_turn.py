@@ -51,7 +51,7 @@ def verify(binary):
         ]
         config = {'providers': providers, 'api_keys': [{'api': 'fixture-client', 'model': ['all'], 'preferences': {'AUTO_RETRY': False}}]}
         (root / 'config.json').write_text(json.dumps(config))
-        env = {k: v for k, v in os.environ.items() if not k.startswith(('FACTS_S3_', 'UNI_API_CONTROL_RESTORE_', 'OTEL_', 'FUGUE_OTEL_')) and k != 'CONFIG_URL'}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('FACTS_', 'UNI_API_CONTROL_RESTORE_', 'OTEL_', 'FUGUE_OTEL_')) and k != 'CONFIG_URL'}
         env.update(PORT=str(port), DISABLE_DATABASE='true', UNI_API_CONFIG_PATH=str(root / 'config.json'),
                    RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root / 'snapshot'), UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / 'ledger'),
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / 'spool'), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',
