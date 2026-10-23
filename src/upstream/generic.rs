@@ -546,9 +546,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     context,
                     mut failure,
                 } = failure;
-                let policy = classify_provider_failure(
-                    failure.status.as_u16(),
-                    &failure.detail,
+                let policy = failure.policy(
                     Some(&context.provider),
                     &execution.path,
                     execution.auto_retry,
@@ -631,7 +629,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     &execution.method,
                     &failure.upstream_url,
                     "failed",
-                    Some(failure.status.as_u16()),
+                    Some(failure.observed_status()),
                 );
                 if policy.retryable
                     && failure.failure_reason != "stream_collection_after_output"
@@ -1077,14 +1075,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
             Err(mut failure) => {
                 upstream_failed = true;
-                let policy = classify_provider_failure(
-                    failure.status.as_u16(),
-                    &failure.detail,
-                    Some(&provider),
-                    &path,
-                    auto_retry,
-                    wire_model.as_deref(),
-                );
+                let policy =
+                    failure.policy(Some(&provider), &path, auto_retry, wire_model.as_deref());
                 failure.status =
                     StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 if let Some(response) = failure.response.as_mut() {
@@ -1155,7 +1147,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &method,
                     &failure.upstream_url,
                     "failed",
-                    Some(failure.status.as_u16()),
+                    Some(failure.observed_status()),
                 );
                 if !policy.retryable || failure.failure_reason == "stream_collection_after_output" {
                     break;
@@ -1214,6 +1206,45 @@ pub(crate) struct AttemptFailure {
     pub(crate) detail: String,
     pub(crate) upstream_url: String,
     pub(crate) response: Option<Response<Body>>,
+}
+
+impl AttemptFailure {
+    fn observed_status(&self) -> u16 {
+        if self.failure_reason == crate::routing::thinking_signature::FAILURE_REASON {
+            400
+        } else {
+            self.status.as_u16()
+        }
+    }
+
+    fn policy(
+        &self,
+        provider: Option<&Provider>,
+        endpoint: &str,
+        auto_retry: bool,
+        upstream_model: Option<&str>,
+    ) -> crate::routing::types::ProviderFailurePolicy {
+        if self.failure_reason == crate::routing::thinking_signature::FAILURE_REASON {
+            // Incompatible with this request's signed history, not evidence of
+            // a broken provider/key. Do not put unrelated requests on cooldown.
+            crate::routing::types::ProviderFailurePolicy {
+                status: 502,
+                retryable: auto_retry,
+                request_scoped: true,
+                provider_model_unavailable: false,
+                force_quota_cooldown: false,
+            }
+        } else {
+            classify_provider_failure(
+                self.status.as_u16(),
+                &self.detail,
+                provider,
+                endpoint,
+                auto_retry,
+                upstream_model,
+            )
+        }
+    }
 }
 
 pub(crate) async fn send_attempt(
@@ -1300,8 +1331,20 @@ pub(crate) async fn send_attempt(
     if let Some(timeout) = request_timeout {
         request = request.timeout(timeout);
     }
+    // Retain a shared byte view only until response headers/error validation.
+    // Parse it only for the exact signature error, not for successful requests.
+    let messages_wire = Url::parse(&prepared.url)
+        .ok()
+        .is_some_and(|url| url.path().trim_end_matches('/').ends_with("/v1/messages"));
+    let mut signature_request = None;
     request = match prepared.body {
-        AttemptBody::Json(body) => request.body(body),
+        AttemptBody::Json(body) => {
+            let body = Bytes::from(body);
+            if messages_wire {
+                signature_request = Some(body.clone());
+            }
+            request.body(body)
+        }
         AttemptBody::Replay(storage, observation) => {
             let body = storage
                 .into_body(&observation)
@@ -1425,14 +1468,37 @@ pub(crate) async fn send_attempt(
         output
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        let signature_failure = signature_request.as_ref().is_some_and(|request| {
+            crate::routing::thinking_signature::rejected_block(status.as_u16(), &detail, request)
+        });
+        if signature_failure {
+            let request_id = prepared
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            crate::observability::telemetry::emit(json!({
+                "kind":"log", "fugue_table":"app_events", "event":"thinking_signature_fallback",
+                "event_type":"thinking_signature_fallback", "severity":"warn", "source":"uni-api-ember",
+                "message":"signed thinking history rejected by provider", "request_id":request_id,
+                "provider":provider.name.as_ref(), "model":prepared.request_model,
+                "actual_model":prepared.original_model, "path":endpoint,
+                "attempt_status_code":400, "routing_status_code":502,
+            }));
+        }
         return Err(AttemptFailure {
-            failure_reason: format!("upstream_http_{}", status.as_u16()),
+            failure_reason: if signature_failure {
+                crate::routing::thinking_signature::FAILURE_REASON.into()
+            } else {
+                format!("upstream_http_{}", status.as_u16())
+            },
             status,
             detail: truncate_detail(&detail),
             upstream_url: prepared.url,
             response: Some(output),
         });
     }
+    drop(signature_request);
     let collect_responses = (endpoint == "/v1/responses"
         || prepared.adapter == ResponseAdapter::ResponsesToChat)
         && prepared.upstream_stream

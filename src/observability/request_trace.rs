@@ -26,6 +26,7 @@ pub(crate) fn record_log(log: &Value) {
         stage,
         "routing_attempt"
             | "upstream_attempt"
+            | "thinking_signature_fallback"
             | "rust_request_spool"
             | "responses_empty_name_repair"
             | "responses_missing_item_repair"
@@ -46,6 +47,7 @@ pub(crate) fn record_log(log: &Value) {
         "attempt_index",
         "attempt_outcome",
         "attempt_status_code",
+        "routing_status_code",
         "semantic_status_code",
         "skip_reason",
         "status_origin",
