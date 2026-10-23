@@ -132,6 +132,22 @@ impl Controls {
         }
         definitions
     }
+    pub(crate) fn export(&self, base: &Snapshot) -> Value {
+        json!({"revision":self.revision(base),"channel_settings":self.settings,"digest":crate::control::settings::digest(&self.settings),"temporary_definitions":self.settings_definitions(base)})
+    }
+    pub(crate) fn management_read_copy(&self) -> Self {
+        Self {
+            instance: self.instance.clone(),
+            sequence: self.sequence,
+            rules: self.rules.clone(),
+            temporary: self.temporary.clone(),
+            overlay_cache: self.overlay_cache.clone(),
+            settings: self.settings.clone(),
+            temporary_documents: self.temporary_documents.clone(),
+            settings_operations: BTreeMap::new(),
+            bootstrap_restore: self.bootstrap_restore.clone(),
+        }
+    }
     fn effective_temporary(&self, p: &Arc<Provider>, base: &Snapshot) -> Arc<Provider> {
         if let Some(setting) = self.settings.get(p.name.as_ref()) {
             let raw = self

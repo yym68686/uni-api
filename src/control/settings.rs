@@ -882,9 +882,7 @@ impl GatewayRuntime {
             StatusCode::SERVICE_UNAVAILABLE,
             "Configuration unavailable".into(),
         ))?;
-        Ok(
-            json!({"revision":state.revision(&base),"channel_settings":state.settings,"digest":digest(&state.settings),"temporary_definitions":state.settings_definitions(&base)}),
-        )
+        Ok(state.export(&base))
     }
     pub(crate) async fn settings_operation(&self, id: &str) -> Result<Value, Failure> {
         self.channel_controls

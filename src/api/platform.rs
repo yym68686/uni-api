@@ -41,6 +41,12 @@ pub async fn handle(
             }
             "/v1/channel-settings/providers" => state.runtime.settings_providers().await,
             "/v1/channel-settings/export" => state.runtime.settings_export().await,
+            "/v1/channel-settings/management-snapshot" => {
+                state.runtime.management_snapshot(headers, false).await
+            }
+            "/v1/channel-settings/management-revision" => {
+                state.runtime.management_snapshot(headers, true).await
+            }
             _ => {
                 state
                     .runtime
