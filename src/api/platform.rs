@@ -71,6 +71,7 @@ pub async fn handle(
             path,
             "/v1/observability/runtime"
                 | "/v1/channel-controls"
+                | "/v1/channel-controls/revision"
                 | "/v1/api-keys"
                 | "/v1/model-channels"
                 | "/v1/channel-metrics"
@@ -148,6 +149,16 @@ pub async fn handle(
                     "upstream_http_clients":details.get("upstream_http_clients").cloned().unwrap_or(Value::Null),
                 }),
             ))
+        }
+        (&Method::GET, "/v1/channel-controls/revision") => {
+            let mut response = match state.runtime.management_observation_revision(headers).await {
+                Ok(value) => json_response(StatusCode::OK, value),
+                Err((status, message)) => json_error(status, &message),
+            };
+            response
+                .headers_mut()
+                .insert("cache-control", HeaderValue::from_static("no-store"));
+            Some(response)
         }
         (&Method::GET, "/v1/channel-controls") => {
             Some(match state.runtime.controls_view(headers).await {

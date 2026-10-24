@@ -42,6 +42,42 @@ fn catalog(
 }
 
 impl GatewayRuntime {
+    // Observation credentials need only prove their CURRENT authorization and
+    // configuration revision. Do not rebuild rules, settings digests or all
+    // temporary model lists to return these two scalar values.
+    pub(crate) async fn management_observation_revision(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Value, (StatusCode, String)> {
+        let token = crate::routing::access::extract_api_key(headers)
+            .ok_or((StatusCode::FORBIDDEN, "Invalid API key".into()))?;
+        let base = self.base_snapshot().await.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable".into(),
+        ))?;
+        let controls = self.channel_controls.read().await;
+        if self
+            .base_snapshot()
+            .await
+            .is_none_or(|current| current.revision != base.revision)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Configuration changed during read".into(),
+            ));
+        }
+        let effective = controls.overlay(base.clone());
+        let caller = effective
+            .api_keys
+            .get(&token)
+            .ok_or((StatusCode::FORBIDDEN, "Invalid API key".into()))?;
+        if !crate::routing::catalog::can_inspect_all(&effective, caller) {
+            return Err((StatusCode::FORBIDDEN, "Permission denied".into()));
+        }
+        Ok(
+            json!({"format":"management-revision-v1", "revision":controls.revision(&base), "config_revision":base.revision.as_ref()}),
+        )
+    }
     pub(crate) async fn management_snapshot(
         &self,
         headers: &HeaderMap,
@@ -166,6 +202,72 @@ mod tests {
         let store = GatewayRuntime::new();
         *store.current.write().await = Some(Arc::new(snapshot));
         store
+    }
+
+    #[tokio::test]
+    async fn observation_revision_preserves_catalog_authorization_and_live_control_version() {
+        let store = fixture().await;
+        let observer = headers("catalog-only");
+        let admin = headers("admin-token");
+        let before = store
+            .management_observation_revision(&observer)
+            .await
+            .unwrap();
+        let current = store.controls_view(&observer).await.unwrap();
+        assert_eq!(
+            before,
+            json!({"format":"management-revision-v1", "revision":current["revision"], "config_revision":current["config_revision"]})
+        );
+        assert_eq!(
+            before,
+            store.management_snapshot(&admin, true).await.unwrap()
+        );
+        assert!(serde_json::to_vec(&before).unwrap().len() < 256);
+        for token in ["ordinary", "invalid"] {
+            assert_eq!(
+                store
+                    .management_observation_revision(&headers(token))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        let kid = crate::routing::catalog::key_id("ordinary");
+        store
+            .mutate_controls(
+                &admin,
+                serde_json::from_value(json!({"revision":current["revision"],
+            "action":"set", "api_key_id":kid, "model":"a", "order":["first","second"]}))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let after = store
+            .management_observation_revision(&observer)
+            .await
+            .unwrap();
+        assert_ne!(before["revision"], after["revision"]);
+        assert_eq!(
+            after,
+            store.management_snapshot(&admin, true).await.unwrap()
+        );
+        assert_eq!(after.as_object().unwrap().len(), 3);
+        let base = store.base_snapshot().await.unwrap();
+        let mut revoked = (*base).clone();
+        let mut keys = (*revoked.api_keys).clone();
+        keys.remove("catalog-only");
+        revoked.api_keys = Arc::new(keys);
+        revoked.revision = "after-revocation".into();
+        *store.current.write().await = Some(Arc::new(revoked));
+        assert_eq!(
+            store
+                .management_observation_revision(&observer)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     fn management_fields(rows: Vec<Value>) -> Vec<Value> {
