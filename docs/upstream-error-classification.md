@@ -86,3 +86,18 @@ retain their exact location check. Other `<nil>` errors, missing attribution
 suffixes, quoted text, prefix-binding guidance and non-Messages wire errors do
 not match. Existing nested error wrappers cannot override a specific validation
 code or parameter. This is not a blanket retry for arbitrary HTTP 400 errors.
+
+### Masked relay signature errors
+
+A second observed HTTP 400 envelope uses `error.type="<nil>"` and the exact
+message `***.***.content.0: Invalid \`signature\` in \`thinking\` block`
+followed by one ` (request id: <opaque-id>)` suffix. Only this literal mask and
+block index are accepted; the receipt uses the same bounded opaque-ID grammar.
+`code` and `param` must be absent/null. Numeric positions with only one receipt,
+other masks, extra prose, and specific validation codes retain their behavior.
+
+Because the masked position cannot locate an original block, this envelope uses
+the same complete signed-history validation as the reindexed relay. Requests
+and signatures remain unchanged. Raw attempt/billing status stays 400; routing
+uses 502 with the existing retry budget, no global cooldown, and no retry after
+output has been committed. This does not change ordinary parameter validation.

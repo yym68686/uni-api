@@ -1,6 +1,6 @@
 //! A signed history block may be accepted by one Messages provider and rejected
 //! by another. Recognize only the observed signature error and its actual wire
-//! block (or the exact reindexed relay envelope); never rewrite signed history.
+//! block (or an exact reindexed/masked relay envelope); never rewrite history.
 use serde_json::Value;
 
 pub(crate) const FAILURE_REASON: &str = "thinking_signature_incompatible";
@@ -30,7 +30,7 @@ pub(crate) fn rejected_block(status: u16, detail: &str, request: &[u8]) -> bool 
             })
         }
         Rejection::ReindexedRelay => {
-            // This relay reports positions after its own transformation. The
+            // These relays transform or mask the reported positions. The
             // original location cannot identify a block. Require signed history
             // and leave missing/malformed thinking signatures as client errors.
             let mut found = false;
@@ -76,17 +76,29 @@ fn strip_relay_receipts(message: &str) -> Option<&str> {
     let (message, receipts) = message.split_once(" (luban request id: ")?;
     let (luban, request) = receipts.split_once(") (request id: ")?;
     let request = request.strip_suffix(')')?;
-    let valid_id = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 128
-            && s.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-    };
-    if !luban.strip_prefix("req_").is_some_and(valid_id) || luban.len() > 128 || !valid_id(request)
+    if !luban.strip_prefix("req_").is_some_and(valid_receipt_id)
+        || luban.len() > 128
+        || !valid_receipt_id(request)
     {
         return None;
     }
     Some(message)
+}
+
+fn valid_receipt_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
+
+// This observed relay masks the message position. Do not accept arbitrary
+// wildcards, unmasked single-receipt errors, or additional validation guidance.
+fn masked_relay_error(message: &str) -> bool {
+    message
+        .strip_prefix("***.***.content.0: Invalid `signature` in `thinking` block (request id: ")
+        .and_then(|receipt| receipt.strip_suffix(')'))
+        .is_some_and(valid_receipt_id)
 }
 
 fn error_location(detail: &str) -> Option<Rejection> {
@@ -119,6 +131,9 @@ fn error_location(detail: &str) -> Option<Rejection> {
         let message = if relay {
             if !error.get("code").is_none_or(Value::is_null) {
                 return None;
+            }
+            if masked_relay_error(message) {
+                return Some(Rejection::ReindexedRelay);
             }
             strip_relay_receipts(message)?
         } else if error.get("type").and_then(Value::as_str) == Some("invalid_request_error") {
@@ -309,6 +324,111 @@ mod tests {
             &json!({"error":{"code":"invalid_type","message":original.to_string()}}).to_string(),
             raw.as_bytes()
         ));
+    }
+
+    fn masked_error() -> Value {
+        json!({"error":{"type":"<nil>","message":
+            "***.***.content.0: Invalid `signature` in `thinking` block (request id: fixture-request-3)"}})
+    }
+
+    #[test]
+    fn masked_relay_accepts_only_the_observed_envelope() {
+        let raw = request().to_string();
+        let original = masked_error();
+        for body in [
+            original.clone(),
+            json!({"error":{"type":"upstream_error","message":original.to_string()}}),
+            json!({"detail":original["error"]}),
+        ] {
+            assert!(rejected_block(400, &body.to_string(), raw.as_bytes()));
+            for status in [200, 403, 422, 500] {
+                assert!(!rejected_block(status, &body.to_string(), raw.as_bytes()));
+            }
+        }
+        let mut null_fields = original.clone();
+        null_fields["error"]["code"] = Value::Null;
+        null_fields["error"]["param"] = Value::Null;
+        assert!(rejected_block(
+            400,
+            &null_fields.to_string(),
+            raw.as_bytes()
+        ));
+        let message = original["error"]["message"].as_str().unwrap();
+        for changed in [
+            message.replace("fixture-request-3", ""),
+            message.replace("fixture-request-3", &"a".repeat(129)),
+            message.replace("fixture-request-3", "with space"),
+            message.replace("fixture-request-3", "https://example.com"),
+            message.replace("***.***", "messages.1"),
+            message.replace("***.***", "*.***"),
+            message.replace("content.0", "content.1"),
+            message.replace("signature", "text"),
+            message.replace(" (request id: fixture-request-3)", ""),
+            format!("{message} (request id: second)"),
+            format!("Quoted input: {message}"),
+            format!("{message}. The block is bound to a different conversation."),
+        ] {
+            let mut other = original.clone();
+            other["error"]["message"] = json!(changed);
+            assert!(!rejected_block(400, &other.to_string(), raw.as_bytes()));
+        }
+        for (field, value) in [
+            ("type", json!("invalid_request_error")),
+            ("type", Value::Null),
+            ("code", json!("invalid_request_error")),
+            ("code", json!("invalid_type")),
+            ("param", json!("messages")),
+        ] {
+            let mut other = original.clone();
+            other["error"][field] = value;
+            assert!(!rejected_block(400, &other.to_string(), raw.as_bytes()));
+        }
+        for (field, value) in [
+            ("code", "invalid_type"),
+            ("param", "messages"),
+            ("type", "authentication_error"),
+        ] {
+            let mut wrapper = json!({"error":{"message":original.to_string()}});
+            wrapper["error"][field] = json!(value);
+            assert!(!rejected_block(400, &wrapper.to_string(), raw.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn masked_relay_preserves_missing_or_malformed_history_errors() {
+        let detail = masked_error().to_string();
+        for body in [
+            json!({}),
+            json!({"messages":[]}),
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+        ] {
+            assert!(!rejected_block(400, &detail, body.to_string().as_bytes()));
+        }
+        for (field, value) in [
+            ("signature", Value::Null),
+            ("signature", json!("")),
+            ("signature", json!(" \n")),
+            ("signature", json!(42)),
+            ("thinking", Value::Null),
+        ] {
+            let mut body = request();
+            let mut invalid = body["messages"][1]["content"][0].clone();
+            invalid[field] = value;
+            body["messages"][1]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(invalid);
+            assert!(!rejected_block(400, &detail, body.to_string().as_bytes()));
+        }
+        let mut body = request();
+        body["messages"][1]["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("signature");
+        assert!(!rejected_block(400, &detail, body.to_string().as_bytes()));
+        let mut body = request();
+        body["messages"][1]["role"] = json!("user");
+        assert!(!rejected_block(400, &detail, body.to_string().as_bytes()));
     }
 
     #[test]

@@ -18,6 +18,9 @@ ERROR = {"error": {"type": "invalid_request_error", "message":
 RELAY_ERROR = {"error": {"type": "<nil>", "message":
     "messages.3.content.79: Invalid `signature` in `thinking` block "
     "(luban request id: req_fixture_1) (request id: fixture-request-2)"}}
+MASKED_ERROR = {"error": {"type": "<nil>", "message":
+    "***.***.content.0: Invalid `signature` in `thinking` block "
+    "(request id: fixture-request-3)"}}
 BODY = {"model": "claude-opus-5-5", "max_tokens": 32000, "thinking": {"type": "adaptive"},
         "output_config": {"effort": "high"}, "tools": [{"name": "read", "input_schema": {"type": "object"}}],
         "messages": [{"role": "user", "content": "fixture"},
@@ -107,10 +110,11 @@ def main(binary):
                     time.sleep(.05)
                 else: raise AssertionError('not ready')
                 count=0
-                relay_rid = None
-                for error in [ERROR, RELAY_ERROR, {"error": {"message": json.dumps(RELAY_ERROR)}}]:
+                fact_rids = []
+                for error in [ERROR, RELAY_ERROR, MASKED_ERROR, {"error": {"message": json.dumps(RELAY_ERROR)}},
+                              {"error": {"message": json.dumps(MASKED_ERROR)}}]:
                     upstream.error = error
-                    if error == RELAY_ERROR: relay_rid = f'signature-{count}'
+                    fact_rids.append(f'signature-{count}')
                     for stream in [False,True]:
                         for key,expected,hits in [('retry',200,['first','fallback']),('no-retry',502,['first']),
                                                   ('exhausted',502,['first','also-reject']*3),('retry',200,['first','fallback'])]:
@@ -124,22 +128,23 @@ def main(binary):
                             count+=1
                 # Same first provider is still selected immediately: no long global cooldown.
                 negatives=[('missing-signature',None),('empty-signature',''),('blank-signature',' \n'),('non-string',42)]
-                for error in [ERROR, RELAY_ERROR]:
+                for error in [ERROR, RELAY_ERROR, MASKED_ERROR]:
                     upstream.error = error
                     for name,sig in negatives:
                         upstream.hits=[];body=copy.deepcopy(BODY);body['messages'][1]['content'][0]['signature']=sig
                         status,_=call(body,rid=name);assert status==400 and len(upstream.hits)==1
                         count+=1
-                upstream.error = RELAY_ERROR
-                for variant in ('no-thinking', 'mixed-invalid', 'user-thinking'):
-                    body = copy.deepcopy(BODY)
-                    if variant == 'no-thinking': body['messages'][1]['content'].pop(0)
-                    elif variant == 'mixed-invalid': body['messages'][1]['content'].append({'type':'thinking','thinking':'','signature':''})
-                    else: body['messages'][1]['role'] = 'user'
-                    upstream.hits = []
-                    status,_ = call(body, rid=variant)
-                    assert status == 400 and len(upstream.hits) == 1
-                    count += 1
+                for history_error in (RELAY_ERROR, MASKED_ERROR):
+                    upstream.error = history_error
+                    for variant in ('no-thinking', 'mixed-invalid', 'user-thinking'):
+                        body = copy.deepcopy(BODY)
+                        if variant == 'no-thinking': body['messages'][1]['content'].pop(0)
+                        elif variant == 'mixed-invalid': body['messages'][1]['content'].append({'type':'thinking','thinking':'','signature':''})
+                        else: body['messages'][1]['role'] = 'user'
+                        upstream.hits = []
+                        status,_ = call(body, rid=variant)
+                        assert status == 400 and len(upstream.hits) == 1
+                        count += 1
                 for error in [
                     {"error":{"type":"invalid_request_error","message":"Missing required parameter: max_tokens"}},
                     {"error":{**ERROR['error'],'code':'invalid_type'}},
@@ -148,7 +153,16 @@ def main(binary):
                     upstream.hits=[];upstream.error=error
                     status,_=call(BODY,rid=f'negative-{count}');assert status==400 and len(upstream.hits)==1
                     count+=1
-                for error in [ERROR, RELAY_ERROR]:
+                for patch in [
+                    {'code':'invalid_type'}, {'code':'invalid_request_error'}, {'param':'messages'},
+                    {'type':'invalid_request_error'},
+                    {'message':MASKED_ERROR['error']['message']+'. The block is bound to a different conversation.'},
+                    {'message':MASKED_ERROR['error']['message'].replace('***.***','messages.1')},
+                    {'message':MASKED_ERROR['error']['message'].replace('content.0','content.1')}]:
+                    upstream.error={'error':{**MASKED_ERROR['error'],**patch}};upstream.hits=[]
+                    status,_=call(BODY,rid=f'masked-negative-{count}')
+                    assert status==400 and len(upstream.hits)==1;count+=1
+                for error in [ERROR, RELAY_ERROR, MASKED_ERROR]:
                     upstream.error=error;upstream.hits=[];upstream.mode='http'
                     status,_=call(BODY,key='gpt-only',path='/v1/chat/completions',rid=f'not-messages-{count}')
                     assert status==400 and len(upstream.hits)==1;count+=1
@@ -157,9 +171,9 @@ def main(binary):
                     assert status==200 and b'done' in raw and len(upstream.hits)==1;count+=1
                 deadline=time.monotonic()+10
                 while time.monotonic()<deadline:
-                    if all(any(f.get('kind')=='request' and f.get('request_id')==rid for f in upstream.facts) for rid in ('signature-0', relay_rid)):break
+                    if all(any(f.get('kind')=='request' and f.get('request_id')==rid for f in upstream.facts) for rid in fact_rids):break
                     time.sleep(.1)
-                for rid in ('signature-0', relay_rid):
+                for rid in fact_rids:
                     selected=[f for f in upstream.facts if f.get('request_id')==rid]
                     assert any(f.get('kind')=='billing' and f.get('status')==400 for f in selected),selected
                     assert any(f.get('stage')=='upstream_attempt' and f.get('trace_detail',{}).get('attempt_status_code')==400 for f in selected),selected
