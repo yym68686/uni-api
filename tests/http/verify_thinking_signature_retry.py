@@ -15,6 +15,9 @@ from verify_dispatch_timing import free_port
 
 ERROR = {"error": {"type": "invalid_request_error", "message":
          "messages.1.content.0: Invalid `signature` in `thinking` block"}}
+RELAY_ERROR = {"error": {"type": "<nil>", "message":
+    "messages.3.content.79: Invalid `signature` in `thinking` block "
+    "(luban request id: req_fixture_1) (request id: fixture-request-2)"}}
 BODY = {"model": "claude-opus-5-5", "max_tokens": 32000, "thinking": {"type": "adaptive"},
         "output_config": {"effort": "high"}, "tools": [{"name": "read", "input_schema": {"type": "object"}}],
         "messages": [{"role": "user", "content": "fixture"},
@@ -47,7 +50,7 @@ class Upstream(BaseHTTPRequestHandler):
         self.server.hits.append((channel, body))
         if self.server.mode == 'postcommit' and channel == 'first':
             status, content_type = 200, 'text/event-stream'
-            raw = sse(EVENTS[:3] + [{"type": "error", **ERROR}])
+            raw = sse(EVENTS[:3] + [{"type": "error", **self.server.error}])
         elif channel != 'fallback':
             status, content_type, raw = 400, 'application/json', json.dumps(self.server.error).encode()
         else:
@@ -104,23 +107,39 @@ def main(binary):
                     time.sleep(.05)
                 else: raise AssertionError('not ready')
                 count=0
-                for stream in [False,True]:
-                    for key,expected,hits in [('retry',200,['first','fallback']),('no-retry',502,['first']),
-                                              ('exhausted',502,['first','also-reject']*3),('retry',200,['first','fallback'])]:
-                        upstream.hits=[];body={**copy.deepcopy(BODY),'stream':stream};rid=f'signature-{count}'
-                        status,raw=call(body,key,rid)
-                        assert status==expected,(key,status,raw)
-                        assert [c for c,_ in upstream.hits]==hits,upstream.hits
-                        assert all(b==body for _,b in upstream.hits),'request history mutated'
-                        if status==502: assert json.loads(raw)==ERROR
-                        if status==200 and stream: assert b'message_stop' in raw
-                        count+=1
+                relay_rid = None
+                for error in [ERROR, RELAY_ERROR, {"error": {"message": json.dumps(RELAY_ERROR)}}]:
+                    upstream.error = error
+                    if error == RELAY_ERROR: relay_rid = f'signature-{count}'
+                    for stream in [False,True]:
+                        for key,expected,hits in [('retry',200,['first','fallback']),('no-retry',502,['first']),
+                                                  ('exhausted',502,['first','also-reject']*3),('retry',200,['first','fallback'])]:
+                            upstream.hits=[];body={**copy.deepcopy(BODY),'stream':stream};rid=f'signature-{count}'
+                            status,raw=call(body,key,rid)
+                            assert status==expected,(key,status,raw)
+                            assert [c for c,_ in upstream.hits]==hits,upstream.hits
+                            assert all(b==body for _,b in upstream.hits),'request history mutated'
+                            if status==502: assert json.loads(raw)==error
+                            if status==200 and stream: assert b'message_stop' in raw
+                            count+=1
                 # Same first provider is still selected immediately: no long global cooldown.
                 negatives=[('missing-signature',None),('empty-signature',''),('blank-signature',' \n'),('non-string',42)]
-                for name,sig in negatives:
-                    upstream.hits=[];body=copy.deepcopy(BODY);body['messages'][1]['content'][0]['signature']=sig
-                    status,_=call(body,rid=name);assert status==400 and len(upstream.hits)==1
-                    count+=1
+                for error in [ERROR, RELAY_ERROR]:
+                    upstream.error = error
+                    for name,sig in negatives:
+                        upstream.hits=[];body=copy.deepcopy(BODY);body['messages'][1]['content'][0]['signature']=sig
+                        status,_=call(body,rid=name);assert status==400 and len(upstream.hits)==1
+                        count+=1
+                upstream.error = RELAY_ERROR
+                for variant in ('no-thinking', 'mixed-invalid', 'user-thinking'):
+                    body = copy.deepcopy(BODY)
+                    if variant == 'no-thinking': body['messages'][1]['content'].pop(0)
+                    elif variant == 'mixed-invalid': body['messages'][1]['content'].append({'type':'thinking','thinking':'','signature':''})
+                    else: body['messages'][1]['role'] = 'user'
+                    upstream.hits = []
+                    status,_ = call(body, rid=variant)
+                    assert status == 400 and len(upstream.hits) == 1
+                    count += 1
                 for error in [
                     {"error":{"type":"invalid_request_error","message":"Missing required parameter: max_tokens"}},
                     {"error":{**ERROR['error'],'code':'invalid_type'}},
@@ -129,21 +148,23 @@ def main(binary):
                     upstream.hits=[];upstream.error=error
                     status,_=call(BODY,rid=f'negative-{count}');assert status==400 and len(upstream.hits)==1
                     count+=1
-                upstream.error=ERROR;upstream.hits=[]
-                status,_=call(BODY,key='gpt-only',path='/v1/chat/completions',rid='not-messages')
-                assert status==400 and len(upstream.hits)==1;count+=1
-                upstream.hits=[];upstream.mode='postcommit'
-                status,raw=call({**BODY,'stream':True},rid='after-output')
-                assert status==200 and b'done' in raw and len(upstream.hits)==1;count+=1
+                for error in [ERROR, RELAY_ERROR]:
+                    upstream.error=error;upstream.hits=[];upstream.mode='http'
+                    status,_=call(BODY,key='gpt-only',path='/v1/chat/completions',rid=f'not-messages-{count}')
+                    assert status==400 and len(upstream.hits)==1;count+=1
+                    upstream.hits=[];upstream.mode='postcommit'
+                    status,raw=call({**BODY,'stream':True},rid=f'after-output-{count}')
+                    assert status==200 and b'done' in raw and len(upstream.hits)==1;count+=1
                 deadline=time.monotonic()+10
                 while time.monotonic()<deadline:
-                    if any(f.get('stage')=='thinking_signature_fallback' for f in upstream.facts) and any(f.get('kind')=='request' and f.get('request_id')=='signature-1' for f in upstream.facts):break
+                    if all(any(f.get('kind')=='request' and f.get('request_id')==rid for f in upstream.facts) for rid in ('signature-0', relay_rid)):break
                     time.sleep(.1)
-                selected=[f for f in upstream.facts if f.get('request_id')=='signature-0']
-                assert any(f.get('kind')=='billing' and f.get('status')==400 for f in selected),selected
-                assert any(f.get('stage')=='upstream_attempt' and f.get('trace_detail',{}).get('attempt_status_code')==400 for f in selected),selected
-                assert any(f.get('stage')=='thinking_signature_fallback' and f.get('trace_detail',{}).get('routing_status_code')==502 for f in selected),selected
-                assert any(f.get('kind')=='request' and f.get('status')==200 for f in selected),selected
+                for rid in ('signature-0', relay_rid):
+                    selected=[f for f in upstream.facts if f.get('request_id')==rid]
+                    assert any(f.get('kind')=='billing' and f.get('status')==400 for f in selected),selected
+                    assert any(f.get('stage')=='upstream_attempt' and f.get('trace_detail',{}).get('attempt_status_code')==400 for f in selected),selected
+                    assert any(f.get('stage')=='thinking_signature_fallback' and f.get('trace_detail',{}).get('routing_status_code')==502 for f in selected),selected
+                    assert any(f.get('kind')=='request' and f.get('status')==200 for f in selected),selected
                 encoded=json.dumps(upstream.facts)
                 for secret in ('opaque-signed-history','fixture reasoning','fixture-upstream'):assert secret not in encoded
                 print(f'PASS thinking signature fallback: {count} HTTP cases, intact history, raw400/routing502/final200, no cooldown or post-output retry')

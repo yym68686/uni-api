@@ -63,3 +63,26 @@ The isolated `verify_thinking_signature_retry.py` regression checks unchanged
 wire bodies, streaming/nonstreaming fallback, disabled/exhausted retries, strict
 validation boundaries, raw/final facts, no channel cooldown and no post-output
 retry. It never calls a real model provider.
+
+### Reindexed relay signature errors
+
+A separate narrow branch recognizes the observed relay envelope with
+`error.type="<nil>"` and the exact signature message followed by
+` (luban request id: req_<id>) (request id: <id>)`. Both IDs must be nonempty,
+at most 128 ASCII letters/digits/underscores/hyphens (including `req_` for the
+first), with no extra prose. Code and parameter must be absent or null.
+
+This relay reports positions after an internal transformation: the reported
+`messages.3.content.79` did not exist in the original Messages body, which another
+provider accepted unchanged. For this envelope only, the gateway therefore
+checks for actual assistant thinking history with string thinking and nonblank
+string signatures instead of interpreting the reported indices. At least one
+such block is required; any thinking block with a malformed/missing signature,
+non-string thinking, or non-assistant role keeps the client-error policy.
+
+The same 502 routing, raw 400 evidence, retry budget and no-global-cooldown policy
+applies. The request is never modified. Standard `invalid_request_error` messages
+retain their exact location check. Other `<nil>` errors, missing attribution
+suffixes, quoted text, prefix-binding guidance and non-Messages wire errors do
+not match. Existing nested error wrappers cannot override a specific validation
+code or parameter. This is not a blanket retry for arbitrary HTTP 400 errors.
