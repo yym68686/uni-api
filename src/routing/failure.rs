@@ -210,6 +210,16 @@ pub(crate) fn is_generic_upstream_error(error: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
     };
+    // This relay's generic failure uses an empty param, not a field name.
+    // Require both upstream_error markers; a Chinese validation message alone
+    // must not turn a client error into provider failover.
+    if matches("message", "上游错误") {
+        return matches("type", "upstream_error")
+            && matches("code", "upstream_error")
+            && error
+                .get("param")
+                .is_none_or(|value| value.is_null() || value.as_str() == Some(""));
+    }
     // Gateways sometimes replace all three fields with "upstream_error".
     // Only recognize the complete generic envelope; specific validation codes,
     // parameters and text echoed from input must keep their client-error policy.

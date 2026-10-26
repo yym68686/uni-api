@@ -1977,8 +1977,12 @@ async fn short_input_semantic_rejection_preserves_wire_status_and_retries_next_c
 
 #[tokio::test]
 async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
-    for message in ["Upstream request failed", "upstream_error"] {
-        let body = json!({"error": {"code": "upstream_error", "message": message, "type": "upstream_error"}}).to_string();
+    for message in ["Upstream request failed", "upstream_error", "上游错误"] {
+        let mut envelope = json!({"error": {"code": "upstream_error", "message": message, "type": "upstream_error"}});
+        if message == "上游错误" {
+            envelope["error"]["param"] = json!("");
+        }
+        let body = envelope.to_string();
         let mut first = provider();
         first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
         let mut route = native_route_for_test(Arc::new(first), 3).await;
@@ -2003,6 +2007,70 @@ async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
         assert!(route.next_plan().await.unwrap().is_none());
         assert_eq!(route.routing_skips, 1);
         assert_eq!(route.last_status(), 502);
+    }
+}
+
+#[test]
+fn chinese_upstream_failure_requires_complete_generic_error() {
+    let base = json!({"type":"upstream_error", "code":"upstream_error", "message":"上游错误"});
+    for param in [None, Some(Value::Null), Some(json!(""))] {
+        let mut error = base.clone();
+        if let Some(param) = param {
+            error["param"] = param;
+        }
+        let body = json!({"error":error}).to_string();
+        for detail in [body.clone(), json!({"error":{"message":body}}).to_string()] {
+            for endpoint in [
+                "/v1/chat/completions",
+                "/v1/responses",
+                "/v1/messages",
+                "/v1beta/models/test:generateContent",
+            ] {
+                for auto_retry in [true, false] {
+                    let policy =
+                        classify_provider_failure(400, &detail, None, endpoint, auto_retry, None);
+                    assert_eq!(
+                        (policy.status, policy.retryable, policy.request_scoped),
+                        (502, auto_retry, false)
+                    );
+                }
+            }
+            for status in [401, 403, 404, 413, 429, 500, 503] {
+                assert_eq!(remap_provider_status(status, &detail), status);
+            }
+        }
+    }
+    for (field, value) in [
+        ("code", Value::Null),
+        ("code", json!("invalid_type")),
+        ("code", json!(400)),
+        ("type", json!("invalid_request_error")),
+        ("param", json!("input")),
+        ("param", json!(" ")),
+        ("param", json!(0)),
+        ("message", json!("上游错误: invalid contents")),
+        ("message", json!("Invalid input: expected '上游错误'")),
+    ] {
+        let mut error = base.clone();
+        error[field] = value;
+        let policy = classify_provider_failure(
+            400,
+            &json!({"error":error}).to_string(),
+            None,
+            "/v1/chat/completions",
+            true,
+            None,
+        );
+        assert_eq!((policy.status, policy.retryable), (400, false), "{field}");
+    }
+    let mut missing_code = base.clone();
+    missing_code.as_object_mut().unwrap().remove("code");
+    for body in [
+        json!({"error":missing_code}),
+        base.clone(),
+        json!({"error":{"message":"Invalid input"}, "input":{"error":base}}),
+    ] {
+        assert_eq!(remap_provider_status(400, &body.to_string()), 400);
     }
 }
 

@@ -26,6 +26,9 @@ GENERIC_UPSTREAM_ERROR = {"error": {
 OPAQUE_UPSTREAM_ERROR = {"error": {
     "code": "upstream_error", "message": "upstream_error", "type": "upstream_error",
 }}
+CHINESE_UPSTREAM_ERROR = {"error": {
+    "code": "upstream_error", "message": "上游错误", "type": "upstream_error", "param": "",
+}}
 SUPPORT_ONLY_ERROR = {"error": {
     "code": "invalid_request_error", "type": "invalid_request_error",
     "message": "Request could not be completed. Contact support with the request ID.",
@@ -252,6 +255,16 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                      "retry", False, 400, ["limited"]),
                     ("support-only-echo", {"error": {"message": "Invalid input", "type": "invalid_request_error"},
                      "input": SUPPORT_ONLY_ERROR}, "retry", False, 400, ["limited"]),
+                    ("chinese-upstream", CHINESE_UPSTREAM_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                    ("chinese-upstream-escaped", CHINESE_UPSTREAM_ERROR, "retry", True, 200, ["limited", "fallback"]),
+                    ("chinese-upstream-wrapped", {"error": {"message": json.dumps(CHINESE_UPSTREAM_ERROR)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("chinese-upstream-no-retry", CHINESE_UPSTREAM_ERROR, "no-retry", False, 502, ["limited"]),
+                    ("chinese-upstream-exhausted", CHINESE_UPSTREAM_ERROR, "exhausted", False, 502, ["limited", "also-limited"] * 3),
+                    ("chinese-upstream-specific-code", {"error": {**CHINESE_UPSTREAM_ERROR["error"], "code": "invalid_type"}},
+                     "retry", False, 400, ["limited"]),
+                    ("chinese-upstream-param", {"error": {**CHINESE_UPSTREAM_ERROR["error"], "param": "input"}},
+                     "retry", False, 400, ["limited"]),
                     ("generic-upstream-opaque", OPAQUE_UPSTREAM_ERROR, "retry", False,
                      200, ["limited", "fallback"]),
                     ("generic-upstream-opaque-incident", OPAQUE_UPSTREAM_ERROR, "incident", False,
@@ -314,6 +327,10 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                 ]
                 if endpoint == "/v1/responses" and engine == "codex":
                     cases += [
+                        ("sse-error-chinese-retry", CHINESE_UPSTREAM_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                        ("sse-failed-chinese-exhausted", CHINESE_UPSTREAM_ERROR, "exhausted", False, 502, ["limited", "also-limited"] * 3),
+                        ("sse-error-chinese-no-retry", CHINESE_UPSTREAM_ERROR, "no-retry", False, 502, ["limited"]),
+                        ("sse-postcommit-chinese", CHINESE_UPSTREAM_ERROR, "retry", False, 200, ["limited"]),
                         ("sse-error-opaque-retry", OPAQUE_UPSTREAM_ERROR, "retry", False, 200, ["limited", "fallback"]),
                         ("sse-failed-opaque-retry", OPAQUE_UPSTREAM_ERROR, "retry", False, 200, ["limited", "fallback"]),
                         ("sse-error-opaque-no-retry", OPAQUE_UPSTREAM_ERROR, "no-retry", False, 502, ["limited"]),
@@ -352,6 +369,8 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                         inband_failure = label.startswith("sse-") and expected_status != 200
                         assert status == (200 if inband_failure else expected_status), context
                         assert server.hits == expected_hits, context
+                        if "chinese" in label:
+                            assert all(sent == server.payloads[0] for sent in server.payloads), "fallback mutated payload"
                         if label.startswith("model-mismatch"):
                             for sent in server.payloads:
                                 assert sent.get("reasoning", {}).get("effort") == "max" or sent.get("reasoning_effort") == "max", context
@@ -380,6 +399,8 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                             assert b"Unsupported value" in raw or b"Invalid input" in raw, context
                         elif label.startswith("gemini-platform"):
                             assert b"INVALID_ARGUMENT" in raw or b"Invalid input" in raw, context
+                        elif label.startswith("chinese-upstream"):
+                            assert b"upstream_error" in raw, context
                         elif label.startswith("generic-upstream"):
                             assert (b"upstream_error" if "opaque" in label else b"Upstream request failed") in raw, context
                         else:

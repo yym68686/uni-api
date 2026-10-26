@@ -3275,10 +3275,13 @@ mod tests {
 
     #[test]
     fn generic_semantic_upstream_failures_map_to_bad_gateway() {
-        for message in ["upstream_error", "Upstream request failed"] {
+        for message in ["upstream_error", "Upstream request failed", "上游错误"] {
             for event in ["error", "response.failed"] {
                 for wire_status in [None, Some(400), Some(401), Some(429), Some(503)] {
                     let mut error = json!({"code": "upstream_error", "type": "upstream_error", "message": message});
+                    if message == "上游错误" {
+                        error["param"] = json!("");
+                    }
                     if let Some(status) = wire_status {
                         error["status_code"] = json!(status);
                     }

@@ -175,6 +175,36 @@ def verify(binary):
                         upstream.platform_error = {'code':400,'message':'API key group platform is not gemini','status':'INVALID_ARGUMENT'}
                         platform_cases += 1
                 print(f'Gemini platform-mismatch retry matrix passed: {platform_cases} cases')
+                # The incident enters as Chat and is converted to Gemini wire.
+                # A generic relay 400 must retry that same wire body unchanged.
+                chinese_error = {'error': {'message':'上游错误', 'type':'upstream_error',
+                                           'param':'', 'code':'upstream_error'}}
+                chinese_cases = 0
+                for path, payload in [
+                    ('/v1/chat/completions', {'model':'platform','messages':[{'role':'user','content':'hello'}]}),
+                    ('/v1/responses', {'model':'platform','input':'hello'}),
+                    ('/v1beta/models/platform:generateContent', body),
+                    ('/v1beta/models/platform:streamGenerateContent?alt=sse', body),
+                ]:
+                    for key, expected, hits in [
+                        ('platform-retry',200,['limited','fallback']),
+                        ('platform-no-retry',502,['limited']),
+                        ('platform-exhausted',502,['limited','also-limited']*3),
+                    ]:
+                        upstream.platform_error = chinese_error
+                        upstream.hits.clear()
+                        status, _, raw = call(path,payload,'bearer',{'Authorization':'Bearer '+key})
+                        actual = [p.split('/models/platform-',1)[1].split(':',1)[0] for p,_,_ in upstream.hits]
+                        assert status == expected and actual == hits, (path,key,status,raw,actual)
+                        assert all(sent == upstream.hits[0][1] for _,sent,_ in upstream.hits), 'fallback mutated Gemini wire'
+                        chinese_cases += 1
+                    for field,value in [('param','contents'),('code','invalid_type')]:
+                        upstream.platform_error = {'error':{**chinese_error['error'],field:value}}
+                        upstream.hits.clear()
+                        status, _, raw = call(path,payload,'bearer',{'Authorization':'Bearer platform-retry'})
+                        assert status == 400 and len(upstream.hits) == 1, (path,status,raw)
+                        chinese_cases += 1
+                print(f'Gemini Chinese upstream-error matrix passed: {chinese_cases} cases')
                 assert all('fixture-client' not in path and headers.get('X-Goog-Api-Key') is None for path,_,headers in upstream.hits)
                 print('Gemini HTTP matrix passed: 30 generation combinations, auth, catalog, countTokens, idempotency, tools, failures, Responses reverse conversion')
             except Exception:
