@@ -27,6 +27,7 @@ pub(crate) fn record_log(log: &Value) {
         "routing_attempt"
             | "upstream_attempt"
             | "thinking_signature_fallback"
+            | "gemini_tool_part_fallback"
             | "rust_request_spool"
             | "responses_empty_name_repair"
             | "responses_missing_item_repair"

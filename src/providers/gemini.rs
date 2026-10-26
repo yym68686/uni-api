@@ -58,7 +58,7 @@ pub(crate) fn chat_to_gemini(
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user");
-        let mut parts = gemini_parts(message.get("content").unwrap_or(&Value::Null))?;
+        let mut parts = gemini_message_parts(message)?;
         if role == "system" {
             system_parts.extend(parts);
         } else if role == "tool" {
@@ -371,6 +371,65 @@ pub(crate) fn sanitize_gemini_schema(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+// Empty Chat text alongside a real assistant tool call is a placeholder, not
+// a Gemini data Part. Keep standalone/whitespace text, malformed inputs, native
+// Gemini payloads and explicit wire overrides under their existing validation.
+fn gemini_message_parts(message: &Value) -> Result<Vec<Value>, String> {
+    let content = message.get("content").unwrap_or(&Value::Null);
+    if content.as_str() != Some("")
+        && !content
+            .as_array()
+            .is_some_and(|items| items.iter().any(empty_chat_text_part))
+    {
+        return gemini_parts(content);
+    }
+    let tool_turn = message.get("role").and_then(Value::as_str) == Some("assistant")
+        && message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| {
+                !calls.is_empty()
+                    && calls.iter().all(|call| {
+                        call.get("type").and_then(Value::as_str) == Some("function")
+                            && call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty())
+                            && call
+                                .pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.trim().is_empty())
+                            && call
+                                .pointer("/function/arguments")
+                                .and_then(Value::as_str)
+                                .and_then(|args| serde_json::from_str::<Value>(args).ok())
+                                .is_some_and(|args| args.is_object())
+                    })
+            });
+    if tool_turn {
+        if content.as_str() == Some("") {
+            return Ok(Vec::new());
+        }
+        if let Some(items) = content.as_array() {
+            let filtered = Value::Array(
+                items
+                    .iter()
+                    .filter(|item| !empty_chat_text_part(item))
+                    .cloned()
+                    .collect(),
+            );
+            return gemini_parts(&filtered);
+        }
+    }
+    gemini_parts(content)
+}
+
+fn empty_chat_text_part(item: &Value) -> bool {
+    item.as_object().is_some_and(|object| object.len() == 2)
+        && item.get("type").and_then(Value::as_str) == Some("text")
+        && item.get("text").and_then(Value::as_str) == Some("")
 }
 
 pub(crate) fn gemini_parts(content: &Value) -> Result<Vec<Value>, String> {
@@ -819,6 +878,72 @@ mod gemini_model_turn_tests {
 
     fn assistant_text(text: &str) -> Value {
         json!({"role":"assistant","content":text})
+    }
+
+    #[test]
+    fn omits_only_empty_tool_text_and_preserves_signed_function_and_parameters() {
+        let id = super::gemini_call_id(Some("opaque-signature"), 0);
+        for content in [json!(""), json!([{"type":"text","text":""}])] {
+            let input = json!({"messages":[
+                {"role":"user","content":"start"},
+                {"role":"assistant","content":content,"tool_calls":[{"id":id,"type":"function","function":{"name":"lookup","arguments":"{\"text\":\"\"}"}}]},
+                {"role":"tool","tool_call_id":id,"content":""}],
+                "temperature":0.2,"top_p":0.8,"max_tokens":77});
+            let original = input.clone();
+            let wire = chat_to_gemini(&input, "gemini", true).unwrap();
+            assert_eq!(
+                wire["contents"][1]["parts"],
+                json!([{"functionCall":{"name":"lookup","args":{"text":""}},"thoughtSignature":"opaque-signature"}])
+            );
+            assert_eq!(
+                wire["contents"][2]["parts"][0]["functionResponse"]["response"]["result"],
+                ""
+            );
+            assert_eq!(
+                wire["generationConfig"],
+                json!({"temperature":0.2,"topP":0.8,"maxOutputTokens":77})
+            );
+            assert_eq!(input, original);
+        }
+    }
+
+    #[test]
+    fn does_not_remove_standalone_whitespace_or_malformed_text() {
+        let call =
+            json!({"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}});
+        for content in [
+            json!(" \n"),
+            json!("visible"),
+            json!([{"type":"text","text":null}]),
+            json!([{"type":"text"}]),
+            json!([{"type":"text","text":"","extra":"metadata"}]),
+        ] {
+            let message = json!({"role":"assistant","content":content,"tool_calls":[call]});
+            assert_eq!(
+                super::gemini_message_parts(&message).unwrap(),
+                super::gemini_parts(&content).unwrap()
+            );
+        }
+        for message in [
+            json!({"role":"assistant","content":""}),
+            json!({"role":"user","content":"","tool_calls":[call]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"bad json"}}]}),
+        ] {
+            assert_eq!(
+                super::gemini_message_parts(&message).unwrap(),
+                json!([{"text":""}]).as_array().unwrap().clone()
+            );
+        }
+        let message = json!({"role":"assistant","tool_calls":[call],"content":[
+            {"type":"text","text":""},{"type":"text","text":"visible"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]});
+        assert_eq!(
+            super::gemini_message_parts(&message).unwrap(),
+            vec![
+                json!({"text":"visible"}),
+                json!({"inlineData":{"mimeType":"image/png","data":"AAAA"}})
+            ]
+        );
     }
 
     #[test]

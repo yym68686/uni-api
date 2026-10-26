@@ -52,6 +52,20 @@ and unsupported Responses history items do not enable this normalization.
 Native Gemini requests and explicit provider body overrides retain their existing
 behavior. No status-code remapping or new retry policy is involved.
 
+Chat/Responses assistant function-call turns omit exactly empty text placeholders
+when converted to Gemini/Vertex. Function calls, signatures, tool results,
+non-empty or whitespace text and other parameters retain their existing behavior.
+Native Gemini bodies and explicit wire overrides are not cleaned.
+
+The observed relay HTTP 400 envelope (`type=upstream_error`, numeric `code=400`)
+reporting only masked `contents[N].parts[M].data` oneof errors can use the existing
+request-scoped retry policy with routing status 502. Every reported position must
+refer to a model tool turn containing a valid function call, and identify that
+call or an empty text sibling. Missing data, unrelated validation errors and
+errors after output remain under their existing handling. Attempts and billing
+retain the upstream 400; disabling retry or exhausting providers returns 502.
+The fallback sends the already-prepared payload without further repairs.
+
 ## Usage
 
 Gemini `promptTokenCount` includes cached input. `candidatesTokenCount` excludes

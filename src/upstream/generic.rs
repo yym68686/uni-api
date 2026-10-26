@@ -1210,7 +1210,11 @@ pub(crate) struct AttemptFailure {
 
 impl AttemptFailure {
     fn observed_status(&self) -> u16 {
-        if self.failure_reason == crate::routing::thinking_signature::FAILURE_REASON {
+        if matches!(
+            self.failure_reason.as_str(),
+            crate::routing::thinking_signature::FAILURE_REASON
+                | crate::routing::gemini_tool_part::FAILURE_REASON
+        ) {
             400
         } else {
             self.status.as_u16()
@@ -1224,8 +1228,12 @@ impl AttemptFailure {
         auto_retry: bool,
         upstream_model: Option<&str>,
     ) -> crate::routing::types::ProviderFailurePolicy {
-        if self.failure_reason == crate::routing::thinking_signature::FAILURE_REASON {
-            // Incompatible with this request's signed history, not evidence of
+        if matches!(
+            self.failure_reason.as_str(),
+            crate::routing::thinking_signature::FAILURE_REASON
+                | crate::routing::gemini_tool_part::FAILURE_REASON
+        ) {
+            // Incompatible with this request's history, not evidence of
             // a broken provider/key. Do not put unrelated requests on cooldown.
             crate::routing::types::ProviderFailurePolicy {
                 status: 502,
@@ -1332,16 +1340,26 @@ pub(crate) async fn send_attempt(
         request = request.timeout(timeout);
     }
     // Retain a shared byte view only until response headers/error validation.
-    // Parse it only for the exact signature error, not for successful requests.
+    // Parse it only for exact history compatibility errors, not successful requests.
     let messages_wire = Url::parse(&prepared.url)
         .ok()
         .is_some_and(|url| url.path().trim_end_matches('/').ends_with("/v1/messages"));
+    let gemini_wire = matches!(
+        provider.engine.to_ascii_lowercase().as_str(),
+        "gemini" | "vertex" | "vertex-gemini"
+    ) && Url::parse(&prepared.url).ok().is_some_and(|url| {
+        url.path().ends_with(":generateContent") || url.path().ends_with(":streamGenerateContent")
+    });
     let mut signature_request = None;
+    let mut gemini_request = None;
     request = match prepared.body {
         AttemptBody::Json(body) => {
             let body = Bytes::from(body);
             if messages_wire {
                 signature_request = Some(body.clone());
+            }
+            if gemini_wire {
+                gemini_request = Some(body.clone());
             }
             request.body(body)
         }
@@ -1486,8 +1504,28 @@ pub(crate) async fn send_attempt(
                 "attempt_status_code":400, "routing_status_code":502,
             }));
         }
+        let gemini_part_failure = gemini_request.as_ref().is_some_and(|request| {
+            crate::routing::gemini_tool_part::rejected_block(status.as_u16(), &detail, request)
+        });
+        if gemini_part_failure {
+            let request_id = prepared
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            crate::observability::telemetry::emit(json!({
+                "kind":"log", "fugue_table":"app_events", "event":"gemini_tool_part_fallback",
+                "event_type":"gemini_tool_part_fallback", "severity":"warn", "source":"uni-api-ember",
+                "message":"Gemini tool turn data rejected by provider", "request_id":request_id,
+                "provider":provider.name.as_ref(), "model":prepared.request_model,
+                "actual_model":prepared.original_model, "path":endpoint,
+                "attempt_status_code":400, "routing_status_code":502,
+            }));
+        }
         return Err(AttemptFailure {
-            failure_reason: if signature_failure {
+            failure_reason: if gemini_part_failure {
+                crate::routing::gemini_tool_part::FAILURE_REASON.into()
+            } else if signature_failure {
                 crate::routing::thinking_signature::FAILURE_REASON.into()
             } else {
                 format!("upstream_http_{}", status.as_u16())
@@ -1499,6 +1537,7 @@ pub(crate) async fn send_attempt(
         });
     }
     drop(signature_request);
+    drop(gemini_request);
     let collect_responses = (endpoint == "/v1/responses"
         || prepared.adapter == ResponseAdapter::ResponsesToChat)
         && prepared.upstream_stream
