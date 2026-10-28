@@ -61,6 +61,7 @@ def verify(binary):
             "store": True, "temperature": 0.2, "top_p": 0.2, "response_format": {"type": "text"},
             "public-model": {"__remove__": ["store"], "temperature": 0.9, "top_p": 0.9,
                              "response_format": {"type": "json_object"},
+                             "max_output_tokens": 64,
                              "metadata": {"model_override": True}}}},
         "gpt": {},
     }
@@ -150,9 +151,62 @@ def verify(binary):
                                     assert body["response_format"] == payload["response_format"], body
                             assert b"OK" in raw, raw
                             checked += 1
+
+                history = [
+                    {"role": "user", "content": "start"},
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "call-opaque", "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": "call-opaque", "content": "done"},
+                    {"role": "assistant", "content": " "},
+                ]
+                for provider in ["defaults", "gpt"]:
+                    for stream in [False, True]:
+                        upstream.hits.clear()
+                        status, raw = request("/v1/chat/completions", {
+                            "model": "public-model", "messages": history,
+                            "max_completion_tokens": 32768, "stream": stream,
+                        }, provider)
+                        assert status == 200 and b"OK" in raw, (status, raw)
+                        assert len(upstream.hits) == 1, upstream.hits
+                        body = upstream.hits[0][1]
+                        assert body["max_output_tokens"] == 32768, body
+                        assert body["input"] == [
+                            {"role": "user", "content": [{"type": "input_text", "text": "start"}]},
+                            {"type": "function_call", "call_id": "call-opaque", "name": "lookup", "arguments": "{}"},
+                            {"type": "function_call_output", "call_id": "call-opaque", "output": "done"},
+                            {"role": "assistant", "content": [{"type": "output_text", "text": " "}]},
+                        ], body
+                        checked += 1
+
+                upstream.hits.clear()
+                status, raw = request("/v1/chat/completions", {
+                    "model": "public-model", "messages": [{"role": "user", "content": "start"}],
+                    "max_completion_tokens": 32768, "stream": False,
+                }, "conflicting")
+                assert status == 200, (status, raw)
+                assert upstream.hits[0][1]["max_output_tokens"] == 64, upstream.hits
+                checked += 1
+
+                native_input = [
+                    {"role": "assistant", "content": ""},
+                    {"type": "function_call", "call_id": "call-native", "name": "lookup", "arguments": "{}"},
+                ]
+                upstream.hits.clear()
+                status, raw = request("/v1/responses", {
+                    "model": "public-model", "input": native_input,
+                    "max_output_tokens": 77, "stream": False,
+                }, "gpt")
+                assert status == 200, (status, raw)
+                assert upstream.hits[0][1]["input"] == native_input, upstream.hits
+                assert upstream.hits[0][1]["max_output_tokens"] == 77, upstream.hits
+                checked += 1
+
                 assert config_path.read_bytes() == original
                 print(f"PASS Codex defaults: {checked} HTTP cases; Responses, compact, Chat, streaming, "
-                      "top_p removal, legacy/conflicting overrides, nested tool schema, GPT isolation, config unchanged")
+                      "empty tool text cleanup, token-limit mapping, override precedence, native Responses passthrough, "
+                      "top_p removal, nested tool schema, GPT isolation, config unchanged")
             except Exception:
                 print((root / "log").read_text()[-8000:])
                 raise

@@ -217,7 +217,10 @@ pub(crate) fn chat_to_responses(input: &Value, original_model: &str) -> Result<V
             }));
             continue;
         }
-        if let Some(content) = message.get("content") {
+        if let Some(content) = message
+            .get("content")
+            .filter(|_| !is_empty_assistant_tool_placeholder(message))
+        {
             items.push(json!({"role":role,"content":responses_content(content, role)}));
         }
         for tool in message
@@ -239,7 +242,10 @@ pub(crate) fn chat_to_responses(input: &Value, original_model: &str) -> Result<V
     output.insert("input".into(), Value::Array(items));
     output.insert("stream".into(), Value::Bool(false));
     output.insert("store".into(), Value::Bool(false));
-    if let Some(max_tokens) = root.get("max_tokens") {
+    if let Some(max_tokens) = root
+        .get("max_completion_tokens")
+        .or_else(|| root.get("max_tokens"))
+    {
         output.insert("max_output_tokens".into(), max_tokens.clone());
     }
     if let Some(effort) = root.get("reasoning_effort") {
@@ -293,6 +299,36 @@ pub(crate) fn chat_to_responses(input: &Value, original_model: &str) -> Result<V
         output.insert("tool_choice".into(), chat_tool_choice_to_responses(choice));
     }
     Ok(Value::Object(output))
+}
+
+// Responses function calls are independent Items. Do not manufacture a
+// separate empty text message for an otherwise valid Chat tool-call turn.
+// Standalone/whitespace text and malformed calls retain their existing validation.
+fn is_empty_assistant_tool_placeholder(message: &Map<String, Value>) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("assistant")
+        && message.get("content").and_then(Value::as_str) == Some("")
+        && message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| {
+                !calls.is_empty()
+                    && calls.iter().all(|call| {
+                        call.get("type").and_then(Value::as_str) == Some("function")
+                            && call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty())
+                            && call
+                                .pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.trim().is_empty())
+                            && call
+                                .pointer("/function/arguments")
+                                .and_then(Value::as_str)
+                                .and_then(|args| serde_json::from_str::<Value>(args).ok())
+                                .is_some_and(|args| args.is_object())
+                    })
+            })
 }
 
 pub(crate) fn chat_tool_choice_to_responses(choice: &Value) -> Value {

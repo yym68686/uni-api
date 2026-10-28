@@ -187,6 +187,86 @@ fn codex_chat_is_compiled_to_responses_wire() {
 }
 
 #[test]
+fn chat_to_responses_omits_empty_tool_text_but_preserves_calls_results_and_order() {
+    let input = json!({"messages":[
+        {"role":"system","content":"rules"},
+        {"role":"user","content":"start"},
+        {"role":"assistant","content":"","tool_calls":[
+            {"id":"call-opaque-1","type":"function","function":{"name":"lookup","arguments":"{\"text\":\"\"}"}},
+            {"id":"call-opaque-2","type":"function","function":{"name":"now","arguments":"{}"}}
+        ]},
+        {"role":"tool","tool_call_id":"call-opaque-1","content":""},
+        {"role":"tool","tool_call_id":"call-opaque-2","content":"done"},
+        {"role":"assistant","content":"visible"}
+    ],"temperature":0.2,"top_p":0.8,"parallel_tool_calls":true});
+    let original = input.clone();
+    let output = chat_to_responses(&input, "upstream").unwrap();
+    assert_eq!(
+        output["input"],
+        json!([
+            {"role":"system","content":[{"type":"input_text","text":"rules"}]},
+            {"role":"user","content":[{"type":"input_text","text":"start"}]},
+            {"type":"function_call","call_id":"call-opaque-1","name":"lookup","arguments":"{\"text\":\"\"}"},
+            {"type":"function_call","call_id":"call-opaque-2","name":"now","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call-opaque-1","output":""},
+            {"type":"function_call_output","call_id":"call-opaque-2","output":"done"},
+            {"role":"assistant","content":[{"type":"output_text","text":"visible"}]}
+        ])
+    );
+    for field in ["temperature", "top_p", "parallel_tool_calls"] {
+        assert_eq!(output[field], input[field]);
+    }
+    assert_eq!(input, original);
+}
+
+#[test]
+fn chat_to_responses_preserves_empty_text_outside_valid_tool_placeholders() {
+    let valid =
+        json!({"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}});
+    for message in [
+        json!({"role":"assistant","content":""}),
+        json!({"role":"assistant","content":"","tool_calls":[]}),
+        json!({"role":"user","content":"","tool_calls":[valid]}),
+        json!({"role":"assistant","content":" \n","tool_calls":[valid]}),
+        json!({"role":"assistant","content":"visible","tool_calls":[valid]}),
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"bad JSON"}}]}),
+        json!({"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"{}"}}]}),
+        json!({"role":"assistant","content":"","tool_calls":[valid, {"id":"bad","type":"custom"}]}),
+    ] {
+        let output = chat_to_responses(&json!({"messages":[message]}), "upstream").unwrap();
+        assert_eq!(output["input"][0]["role"], message["role"]);
+        assert_eq!(output["input"][0]["content"][0]["text"], message["content"]);
+    }
+}
+
+#[test]
+fn chat_to_responses_maps_modern_token_limit_before_legacy_without_coercion() {
+    for (limits, expected) in [
+        (json!({"max_completion_tokens":32768}), Some(json!(32768))),
+        (json!({"max_tokens":42}), Some(json!(42))),
+        (
+            json!({"max_completion_tokens":99,"max_tokens":42}),
+            Some(json!(99)),
+        ),
+        (
+            json!({"max_completion_tokens":null,"max_tokens":42}),
+            Some(Value::Null),
+        ),
+        (
+            json!({"max_completion_tokens":"invalid","max_tokens":42}),
+            Some(json!("invalid")),
+        ),
+        (json!({"max_completion_tokens":0}), Some(json!(0))),
+        (json!({}), None),
+    ] {
+        let output = chat_to_responses(&limits, "upstream").unwrap();
+        assert_eq!(output.get("max_output_tokens"), expected.as_ref());
+        assert!(output.get("max_completion_tokens").is_none());
+        assert!(output.get("max_tokens").is_none());
+    }
+}
+
+#[test]
 fn chat_to_responses_preserves_tool_constraints() {
     let input = json!({
         "messages":[{"role":"user","content":"What time is it?"}],
