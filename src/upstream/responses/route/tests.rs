@@ -2085,6 +2085,119 @@ async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
 }
 
 #[test]
+fn basispoints_rejection_requires_the_exact_structured_error() {
+    let message = "Excel BPS rejected this request; account scheduling was not changed";
+    let base = json!({"type":"invalid_request_error", "code":"basispoints_upstream_error", "message":message});
+    for param in [None, Some(Value::Null)] {
+        let mut error = base.clone();
+        if let Some(param) = param {
+            error["param"] = param;
+        }
+        let body = json!({"error":error}).to_string();
+        for detail in [
+            body.clone(),
+            json!({"detail":error}).to_string(),
+            json!({"error":{"message":body}}).to_string(),
+        ] {
+            for endpoint in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/chat/completions",
+                "/v1/messages",
+                "/v1beta/models/test:generateContent",
+            ] {
+                for auto_retry in [true, false] {
+                    let policy =
+                        classify_provider_failure(400, &detail, None, endpoint, auto_retry, None);
+                    assert_eq!(
+                        (policy.status, policy.retryable, policy.request_scoped),
+                        (502, auto_retry, false)
+                    );
+                    assert!(!policy.provider_model_unavailable);
+                    assert!(!policy.force_quota_cooldown);
+                }
+            }
+            for status in [401, 403, 404, 413, 429, 500, 502, 503] {
+                assert_eq!(remap_provider_status(status, &detail), status);
+            }
+        }
+    }
+    for (field, value) in [
+        ("type", Value::Null),
+        ("type", json!("upstream_error")),
+        ("type", json!(" INVALID_REQUEST_ERROR ")),
+        ("code", Value::Null),
+        ("code", json!(400)),
+        ("code", json!("invalid_type")),
+        ("code", json!("basispoints_upstream_error_extra")),
+        ("param", json!("input")),
+        ("param", json!("")),
+        ("param", json!(0)),
+        ("param", json!({})),
+        ("message", json!(format!("{message}."))),
+        (
+            "message",
+            json!(format!("Invalid input: expected '{message}'")),
+        ),
+        ("message", json!("Excel BPS rejected this request")),
+        ("message", json!(message.to_uppercase())),
+    ] {
+        let mut error = base.clone();
+        error[field] = value;
+        let policy = classify_provider_failure(
+            400,
+            &json!({"error":error}).to_string(),
+            None,
+            "/v1/responses",
+            true,
+            None,
+        );
+        assert_eq!((policy.status, policy.retryable), (400, false), "{field}");
+    }
+    let mut missing = base.clone();
+    missing.as_object_mut().unwrap().remove("code");
+    for detail in [
+        message.to_owned(),
+        base.to_string(),
+        json!({"error":missing}).to_string(),
+        json!({"error":{"message":"Invalid input"}, "input":{"error":base}}).to_string(),
+        json!({"error":{"message":"Invalid input"}, "debug":{"error":base}}).to_string(),
+    ] {
+        assert_eq!(remap_provider_status(400, &detail), 400, "{detail}");
+    }
+}
+
+#[tokio::test]
+async fn basispoints_rejection_preserves_raw_400_and_retries_unchanged_body() {
+    let body = json!({"error":{"type":"invalid_request_error", "code":"basispoints_upstream_error",
+        "message":"Excel BPS rejected this request; account scheduling was not changed"}})
+    .to_string();
+    let mut first = provider();
+    first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+    let mut route = native_route_for_test(Arc::new(first), 3).await;
+    route.providers.insert(1, named_provider("fallback"));
+    let first_plan = route.next_plan().await.unwrap().unwrap();
+    let wire = first_plan.body.clone();
+    assert!(
+        route
+            .record_plan_failure(
+                first_plan,
+                &json!({"kind":"http_error", "status_code":400, "body":body})
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+    assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+    assert_eq!(route.upstream_ledger[0]["error_sha256"], sha256_hex(&body));
+    assert_eq!(route.routing_ledger[0]["status_code"], 502);
+    let fallback = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+    assert_eq!(fallback.body, wire);
+    assert!(route.next_plan().await.unwrap().is_none());
+    assert_eq!(route.routing_skips, 1); // The existing failed-route cooldown is unchanged.
+}
+
+#[test]
 fn chinese_upstream_failure_requires_complete_generic_error() {
     let base = json!({"type":"upstream_error", "code":"upstream_error", "message":"上游错误"});
     for param in [None, Some(Value::Null), Some(json!(""))] {

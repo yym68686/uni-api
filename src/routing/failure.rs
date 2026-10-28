@@ -276,6 +276,17 @@ pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) 
             if is_generic_upstream_error(error) {
                 return true;
             }
+            // BPS can reject an otherwise accepted request without identifying
+            // a bad client field. Require this complete structured rejection,
+            // not the code alone or text echoed in a validation error.
+            if error.get("type").and_then(Value::as_str) == Some("invalid_request_error")
+                && error.get("code").and_then(Value::as_str) == Some("basispoints_upstream_error")
+                && error.get("message").and_then(Value::as_str)
+                    == Some("Excel BPS rejected this request; account scheduling was not changed")
+                && error.get("param").is_none_or(Value::is_null)
+            {
+                return true;
+            }
             let matches = |field: &str, expected: &str| {
                 error
                     .get(field)

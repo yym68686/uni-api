@@ -40,6 +40,10 @@ MODEL_MISMATCH = {"error": {
                "Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.",
     "param": "reasoning.effort", "type": "invalid_request_error",
 }}
+BPS_ERROR = {"error": {
+    "type": "invalid_request_error", "code": "basispoints_upstream_error",
+    "message": "Excel BPS rejected this request; account scheduling was not changed",
+}}
 
 
 GEMINI_PLATFORM_ERROR = {"code": 400, "message": "API key group platform is not gemini",
@@ -319,6 +323,22 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                      "retry", False, 400, ["limited"]),
                 ]
                 cases += [
+                    ("bps-retry", BPS_ERROR, "retry", False, 200, ["limited", "fallback"]),
+                    ("bps-wrapped", {"error": {"message": json.dumps(BPS_ERROR)}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("bps-null-param", {"error": {**BPS_ERROR["error"], "param": None}},
+                     "retry", False, 200, ["limited", "fallback"]),
+                    ("bps-no-retry", BPS_ERROR, "no-retry", False, 502, ["limited"]),
+                    ("bps-exhausted", BPS_ERROR, "exhausted", False, 502, ["limited", "also-limited"] * 3),
+                    ("bps-bounded", BPS_ERROR, "bounded", False, 502, ["limited", "also-limited"]),
+                    ("bps-param", {"error": {**BPS_ERROR["error"], "param": "input"}}, "retry", False, 400, ["limited"]),
+                    ("bps-empty-param", {"error": {**BPS_ERROR["error"], "param": ""}}, "retry", False, 400, ["limited"]),
+                    ("bps-other-type", {"error": {**BPS_ERROR["error"], "type": "upstream_error"}}, "retry", False, 400, ["limited"]),
+                    ("bps-other-code", {"error": {**BPS_ERROR["error"], "code": "invalid_type"}}, "retry", False, 400, ["limited"]),
+                    ("bps-other-message", {"error": {**BPS_ERROR["error"], "message": "Excel BPS rejected this request"}},
+                     "retry", False, 400, ["limited"]),
+                    ("bps-echo", {"error": {"type": "invalid_request_error", "message": "Invalid input"}, "input": BPS_ERROR},
+                     "retry", False, 400, ["limited"]),
                     ("short-input-rejection", {"error": {"message": SHORT_INPUT_REJECTION}}, "retry", False, 200, ["limited", "fallback"]),
                     ("short-input-wrapped", json.dumps({"error": {"message": SHORT_INPUT_REJECTION}}), "retry", False, 200, ["limited", "fallback"]),
                     ("short-input-no-retry", SHORT_INPUT_REJECTION, "no-retry", False, 502, ["limited"]),
@@ -369,7 +389,7 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                         inband_failure = label.startswith("sse-") and expected_status != 200
                         assert status == (200 if inband_failure else expected_status), context
                         assert server.hits == expected_hits, context
-                        if "chinese" in label:
+                        if "chinese" in label or label.startswith("bps-"):
                             assert all(sent == server.payloads[0] for sent in server.payloads), "fallback mutated payload"
                         if label.startswith("model-mismatch"):
                             for sent in server.payloads:
@@ -403,6 +423,8 @@ def verify(binary, endpoint, hedging, engine="gpt"):
                             assert b"upstream_error" in raw, context
                         elif label.startswith("generic-upstream"):
                             assert (b"upstream_error" if "opaque" in label else b"Upstream request failed") in raw, context
+                        elif label.startswith("bps-"):
+                            assert server.error["error"]["message"].encode() in raw, context
                         else:
                             assert b"invalid_request_error" in raw, context
                         checked += 1
