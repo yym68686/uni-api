@@ -1976,6 +1976,80 @@ async fn short_input_semantic_rejection_preserves_wire_status_and_retries_next_c
 }
 
 #[tokio::test]
+async fn encrypted_channel_rejection_retries_unchanged_without_global_cooldown() {
+    let mut first = provider();
+    first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));
+    let mut route = native_route_for_test(Arc::new(first), 3).await;
+    route.providers.insert(1, named_provider("fallback"));
+    route.base_payload["input"] = json!([
+        {"type":"reasoning","encrypted_content":"gAAAAfixture"},
+        {"type":"compaction","encrypted_content":"c2c:fixture"},
+        {"role":"user","content":"continue"}
+    ]);
+    let original = route.base_payload.clone();
+    let plan = route.next_plan().await.unwrap().unwrap();
+    let detail = json!({"error":{"code":"invalid_encrypted_content","type":"invalid_request_error",
+        "message":"Upstream encrypted content error (details redacted)"}})
+    .to_string();
+    assert!(
+        route
+            .record_plan_failure(
+                plan,
+                &json!({
+                    "kind":"http_error","status_code":400,"upstream_status_code":400,
+                    "committed":false,"body":detail,
+                })
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+    assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+    assert_eq!(
+        route.upstream_ledger[0]["error_sha256"],
+        sha256_hex(&detail)
+    );
+    assert_eq!(route.routing_ledger[0]["status_code"], 502);
+    assert!(!route.history_repair_attempted);
+    assert!(route.pending_history_repair.is_none());
+    assert_eq!(route.base_payload, original);
+    let next = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(next.provider_name.as_deref(), Some("fallback"));
+    let next_body: Value = serde_json::from_str(&next.body).unwrap();
+    assert_eq!(next_body["input"], original["input"]);
+    // The first provider is still eligible for a later rotation/request.
+    assert!(route.next_plan().await.unwrap().is_some());
+    assert_eq!(route.routing_skips, 0);
+}
+
+#[tokio::test]
+async fn encrypted_channel_rejection_respects_no_retry_and_exhaustion() {
+    for retry in [false, true] {
+        let mut route = native_route_for_test(named_provider("first"), 1).await;
+        Arc::make_mut(&mut route.api_key).preferences =
+            Arc::new(Map::from_iter([("AUTO_RETRY".into(), json!(retry))]));
+        route.base_payload["input"] = json!([{"type":"compaction","encrypted_content":"c2c:keep"}]);
+        let plan = route.next_plan().await.unwrap().unwrap();
+        assert!(
+            !route
+                .record_plan_failure(
+                    plan,
+                    &json!({
+                        "kind":"http_error","status_code":400,"upstream_status_code":400,
+                        "committed":false,"body":json!({"error":{
+                            "code":"invalid_encrypted_content","type":"invalid_request_error",
+                            "message":"Upstream encrypted content error (details redacted)"
+                        }}).to_string()
+                    })
+                )
+                .await
+        );
+        assert_eq!(route.last_status(), 502);
+        assert!(route.pending_history_repair.is_none());
+        assert_eq!(route.final_message()["status_code"], 502);
+    }
+}
+
+#[tokio::test]
 async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
     for message in ["Upstream request failed", "upstream_error", "上游错误"] {
         let mut envelope = json!({"error": {"code": "upstream_error", "message": message, "type": "upstream_error"}});

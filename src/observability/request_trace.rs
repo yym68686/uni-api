@@ -32,6 +32,7 @@ pub(crate) fn record_log(log: &Value) {
             | "responses_empty_name_repair"
             | "responses_missing_item_repair"
             | "responses_encrypted_content_repair"
+            | "responses_encrypted_content_fallback"
             | "responses_heartbeat_repair"
     ) {
         return;

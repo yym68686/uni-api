@@ -1,4 +1,4 @@
-//! Recover visible summaries from a rejected, non-native Cursor envelope.
+//! Distinguish an opaque channel rejection from a repairable Cursor envelope.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
@@ -10,6 +10,55 @@ const ERROR_SUFFIX: &str =
     " could not be verified. Reason: Encrypted content could not be decrypted or parsed.";
 const ENVELOPE_PREFIX: &str = "cursor-sand-v1:";
 const MAX_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+
+/// This relay hides the rejected item. Nothing can be safely reconstructed or
+/// deleted: another channel may accept the identical encrypted history.
+pub(crate) fn is_channel_rejection(body: &str, outcome: &Value) -> bool {
+    if !super::empty_name::is_uncommitted_400(outcome) {
+        return false;
+    }
+    let Some(error) = outcome
+        .get("body")
+        .and_then(Value::as_str)
+        .and_then(|detail| serde_json::from_str::<Value>(detail).ok())
+        .and_then(|payload| payload.get("error").cloned())
+    else {
+        return false;
+    };
+    if error.get("type").and_then(Value::as_str) != Some("invalid_request_error")
+        || error.get("code").and_then(Value::as_str) != Some("invalid_encrypted_content")
+        || error.get("message").and_then(Value::as_str)
+            != Some("Upstream encrypted content error (details redacted)")
+        || !error.get("param").is_none_or(Value::is_null)
+    {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(items) = payload.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut encrypted_history = false;
+    for item in items {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("reasoning" | "compaction")
+        ) {
+            continue;
+        }
+        if let Some(encrypted) = item.get("encrypted_content") {
+            if encrypted
+                .as_str()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return false;
+            }
+            encrypted_history = true;
+        }
+    }
+    encrypted_history
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +223,93 @@ mod tests {
             {"type":"function_call_output","call_id":"call-real","output":"result"},
             {"role":"user","content":"continue"}],
             "tools":[{"type":"function","name":"real"}],"reasoning":{"effort":"high"}})
+    }
+
+    fn redacted_outcome() -> Value {
+        let mut result = outcome();
+        result["body"] = json!({"error":{
+            "type":"invalid_request_error", "code":"invalid_encrypted_content",
+            "message":"Upstream encrypted content error (details redacted)"
+        }})
+        .to_string()
+        .into();
+        result
+    }
+
+    #[test]
+    fn channel_rejection_preserves_opaque_reasoning_and_compaction() {
+        for kind in ["reasoning", "compaction"] {
+            let original = json!({"input":[{"type":kind,"encrypted_content":"opaque-history"}]});
+            let wire = original.to_string();
+            assert!(is_channel_rejection(&wire, &redacted_outcome()));
+            assert!(repair(&wire, &redacted_outcome()).is_none());
+            assert_eq!(wire, original.to_string());
+            let mut null_param = redacted_outcome();
+            let mut error: Value =
+                serde_json::from_str(null_param["body"].as_str().unwrap()).unwrap();
+            error["error"]["param"] = Value::Null;
+            null_param["body"] = error.to_string().into();
+            assert!(is_channel_rejection(&wire, &null_param));
+        }
+    }
+
+    #[test]
+    fn channel_rejection_requires_exact_error_and_real_encrypted_history() {
+        for (field, value) in [
+            ("type", json!("upstream_error")),
+            ("code", json!("other")),
+            ("code", Value::Null),
+            (
+                "message",
+                json!("Quoted: Upstream encrypted content error (details redacted)"),
+            ),
+            (
+                "message",
+                json!("Upstream encrypted content error (details redacted) "),
+            ),
+            ("param", json!("input[0].encrypted_content")),
+            ("param", json!("")),
+        ] {
+            let mut other = redacted_outcome();
+            let mut error: Value = serde_json::from_str(other["body"].as_str().unwrap()).unwrap();
+            error["error"][field] = value;
+            other["body"] = error.to_string().into();
+            assert!(!is_channel_rejection(&body().to_string(), &other));
+        }
+        for original in [
+            json!({"input":"plain"}),
+            json!({"input":[{"role":"user","content":"plain","encrypted_content":"echo"}]}),
+            json!({"input":[{"type":"reasoning"}]}),
+            json!({"input":[{"type":"reasoning","encrypted_content":""}]}),
+            json!({"input":[{"type":"reasoning","encrypted_content":"  "}]}),
+            json!({"input":[{"type":"compaction","encrypted_content":null}]}),
+            json!({"input":[{"type":"reasoning","encrypted_content":42}]}),
+            json!({"input":[{"type":"reasoning","encrypted_content":"valid"},
+                {"type":"compaction","encrypted_content":[]}]}),
+        ] {
+            assert!(!is_channel_rejection(
+                &original.to_string(),
+                &redacted_outcome()
+            ));
+        }
+        for (field, value) in [
+            ("kind", json!("semantic_error")),
+            ("status_code", json!(403)),
+            ("upstream_status_code", json!(200)),
+            ("committed", json!(true)),
+            ("committed", Value::Null),
+        ] {
+            let mut other = redacted_outcome();
+            other[field] = value;
+            assert!(!is_channel_rejection(&body().to_string(), &other));
+        }
+        assert!(!is_channel_rejection(&body().to_string(), &outcome()));
+        assert!(!is_channel_rejection("not json", &redacted_outcome()));
+        let mut wrapped = redacted_outcome();
+        wrapped["body"] = json!({"error":{"message":wrapped["body"]}})
+            .to_string()
+            .into();
+        assert!(!is_channel_rejection(&body().to_string(), &wrapped));
     }
 
     #[test]

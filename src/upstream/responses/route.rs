@@ -159,7 +159,21 @@ impl ResponsesRoute {
 
     pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
         self.set_current_plan(&plan);
-        let retryable = self.record_failure(outcome).await;
+        let encrypted_channel_rejection = matches!(
+            self.endpoint.as_str(),
+            "/v1/responses" | "/v1/responses/compact"
+        )
+            && crate::protocols::responses::encrypted_content::is_channel_rejection(
+                &plan.body, outcome,
+            );
+        let retryable = self
+            .record_failure_with_encrypted_rejection(outcome, encrypted_channel_rejection)
+            .await;
+        if encrypted_channel_rejection {
+            // Never repair/resend opaque encrypted history on this channel.
+            // Each fallback compiles the untouched original logical request.
+            return retryable;
+        }
         if !self.auto_retry()
             || !self.has_attempts_remaining()
             || self.request_headers.contains_key(TARGET_PROVIDER_HEADER)
@@ -516,6 +530,15 @@ impl ResponsesRoute {
     }
 
     pub async fn record_failure(&mut self, outcome: &Value) -> bool {
+        self.record_failure_with_encrypted_rejection(outcome, false)
+            .await
+    }
+
+    async fn record_failure_with_encrypted_rejection(
+        &mut self,
+        outcome: &Value,
+        encrypted_channel_rejection: bool,
+    ) -> bool {
         let original_status = outcome
             .get("status_code")
             .and_then(Value::as_u64)
@@ -526,7 +549,7 @@ impl ResponsesRoute {
             .or_else(|| outcome.get("body"))
             .and_then(Value::as_str)
             .unwrap_or("Responses upstream attempt failed");
-        let policy = classify_provider_failure(
+        let mut policy = classify_provider_failure(
             original_status,
             detail,
             self.last_provider.as_deref(),
@@ -536,6 +559,28 @@ impl ResponsesRoute {
                 .as_ref()
                 .and_then(|attempt| attempt.wire_model.as_deref()),
         );
+        if encrypted_channel_rejection {
+            // Compatibility is specific to this request's encrypted history,
+            // not evidence that the provider/key is broken for other traffic.
+            policy.status = 502;
+            policy.retryable = self.auto_retry();
+            policy.request_scoped = true;
+            policy.provider_model_unavailable = false;
+            policy.force_quota_cooldown = false;
+            crate::observability::request_trace::log(json!({
+                "kind":"log", "fugue_table":"app_events",
+                "event":"responses_encrypted_content_fallback",
+                "event_type":"responses_encrypted_content_fallback",
+                "severity":"warn", "source":"uni-api-ember",
+                "request_id":self.request_id,
+                "attempt_id":self.last_attempt.as_ref().map(|a| a.attempt_id.as_str()),
+                "provider":self.last_provider.as_ref().map(|p| p.name.as_ref()),
+                "model":self.request_model,
+                "path":self.endpoint, "streaming":self.stream,
+                "attempt_status_code":original_status, "routing_status_code":policy.status,
+                "error_sha256":sha256_hex(detail),
+            }));
+        }
         let status = policy.status;
         self.last_status = status;
         self.last_detail = detail.chars().take(4096).collect();
