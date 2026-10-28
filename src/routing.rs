@@ -1,4 +1,5 @@
 pub(crate) mod access;
+pub(crate) mod alpha_search;
 pub(crate) mod catalog;
 pub(crate) mod failure;
 pub(crate) mod filters;

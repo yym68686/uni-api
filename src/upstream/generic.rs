@@ -1214,6 +1214,7 @@ impl AttemptFailure {
             self.failure_reason.as_str(),
             crate::routing::thinking_signature::FAILURE_REASON
                 | crate::routing::gemini_tool_part::FAILURE_REASON
+                | crate::routing::alpha_search::FAILURE_REASON
         ) {
             400
         } else {
@@ -1232,8 +1233,9 @@ impl AttemptFailure {
             self.failure_reason.as_str(),
             crate::routing::thinking_signature::FAILURE_REASON
                 | crate::routing::gemini_tool_part::FAILURE_REASON
+                | crate::routing::alpha_search::FAILURE_REASON
         ) {
-            // Incompatible with this request's history, not evidence of
+            // Incompatible with this request, not evidence of
             // a broken provider/key. Do not put unrelated requests on cooldown.
             crate::routing::types::ProviderFailurePolicy {
                 status: 502,
@@ -1352,6 +1354,7 @@ pub(crate) async fn send_attempt(
     });
     let mut signature_request = None;
     let mut gemini_request = None;
+    let mut search_request = None;
     request = match prepared.body {
         AttemptBody::Json(body) => {
             let body = Bytes::from(body);
@@ -1360,6 +1363,9 @@ pub(crate) async fn send_attempt(
             }
             if gemini_wire {
                 gemini_request = Some(body.clone());
+            }
+            if endpoint == crate::providers::request::ALPHA_SEARCH_ENDPOINT {
+                search_request = Some(body.clone());
             }
             request.body(body)
         }
@@ -1522,8 +1528,28 @@ pub(crate) async fn send_attempt(
                 "attempt_status_code":400, "routing_status_code":502,
             }));
         }
+        let search_failure = search_request.as_ref().is_some_and(|request| {
+            crate::routing::alpha_search::rejected_input(status.as_u16(), &detail, request)
+        });
+        if search_failure {
+            let request_id = prepared
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            crate::observability::telemetry::emit(json!({
+                "kind":"log", "fugue_table":"app_events", "event":"alpha_search_text_fallback",
+                "event_type":"alpha_search_text_fallback", "severity":"warn", "source":"uni-api-ember",
+                "message":"text-only search input rejected by provider", "request_id":request_id,
+                "provider":provider.name.as_ref(), "model":prepared.request_model,
+                "actual_model":prepared.original_model, "path":endpoint,
+                "attempt_status_code":400, "routing_status_code":502,
+            }));
+        }
         return Err(AttemptFailure {
-            failure_reason: if gemini_part_failure {
+            failure_reason: if search_failure {
+                crate::routing::alpha_search::FAILURE_REASON.into()
+            } else if gemini_part_failure {
                 crate::routing::gemini_tool_part::FAILURE_REASON.into()
             } else if signature_failure {
                 crate::routing::thinking_signature::FAILURE_REASON.into()
@@ -1538,6 +1564,7 @@ pub(crate) async fn send_attempt(
     }
     drop(signature_request);
     drop(gemini_request);
+    drop(search_request);
     let collect_responses = (endpoint == "/v1/responses"
         || prepared.adapter == ResponseAdapter::ResponsesToChat)
         && prepared.upstream_stream
