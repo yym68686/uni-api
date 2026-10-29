@@ -1678,6 +1678,68 @@ fn provider_error_policy_matches_request_scoped_and_gateway_failures() {
 }
 
 #[test]
+fn ai_studio_examples_capability_policy_is_request_scoped() {
+    let body = json!({"error":{"message":"AI Studio 请求参数无效: 编码 function declaration 4: parameters: ***.properties.duration_min: AI Studio 协议能力尚无成功现场证据: JSON schema 字段 examples",
+        "type":"invalid_request_error","code":"invalid_request","param":""}}).to_string();
+    for endpoint in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/responses/compact",
+        "/v1/messages",
+    ] {
+        for auto_retry in [false, true] {
+            let policy = classify_provider_failure(400, &body, None, endpoint, auto_retry, None);
+            assert_eq!(
+                (policy.status, policy.retryable, policy.request_scoped),
+                (502, auto_retry, true)
+            );
+            assert!(!policy.force_quota_cooldown);
+            assert!(!policy.provider_model_unavailable);
+        }
+    }
+    assert_eq!(remap_provider_status(400, &body), 502);
+    for status in [200, 401, 403, 404, 413, 422, 429, 500, 502] {
+        assert_eq!(remap_provider_status(status, &body), status);
+    }
+}
+
+#[tokio::test]
+async fn ai_studio_examples_retries_unchanged_and_preserves_raw_status() {
+    let mut first = named_provider("first");
+    Arc::make_mut(&mut first).preferences =
+        Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));
+    let mut route = native_route_for_test(first, 3).await;
+    route.providers.insert(1, named_provider("fallback"));
+    route.base_payload["tools"] = json!([{"type":"function","name":"lookup","parameters":{
+        "type":"object","properties":{"duration_min":{"type":"integer","examples":[30,365]}}}}]);
+    let original = route.base_payload.clone();
+    let plan = route.next_plan().await.unwrap().unwrap();
+    let wire = serde_json::from_str::<Value>(&plan.body).unwrap();
+    let detail = json!({"error":{"message":"AI Studio 请求参数无效: 编码 function declaration 0: parameters: ***.properties.duration_min: AI Studio 协议能力尚无成功现场证据: JSON schema 字段 examples",
+        "type":"invalid_request_error","code":"invalid_request","param":""}}).to_string();
+    assert!(
+        route
+            .record_plan_failure(
+                plan,
+                &json!({"kind":"http_error","status_code":400,
+        "upstream_status_code":400,"committed":false,"body":detail})
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+    assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+    assert_eq!(route.routing_ledger[0]["status_code"], 502);
+    assert_eq!(route.base_payload, original);
+    assert!(!route.history_repair_attempted);
+    assert!(route.pending_history_repair.is_none());
+    let next = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(next.provider_name.as_deref(), Some("fallback"));
+    assert_eq!(serde_json::from_str::<Value>(&next.body).unwrap(), wire);
+    assert!(route.next_plan().await.unwrap().is_some());
+    assert_eq!(route.routing_skips, 0);
+}
+
+#[test]
 fn unavailable_model_message_is_a_retryable_channel_failure() {
     let body =
         r#"{"error":{"message":"This model is not available.","type":"invalid_request_error"}}"#;

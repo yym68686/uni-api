@@ -1,4 +1,5 @@
 pub(crate) mod access;
+pub(crate) mod ai_studio_schema;
 pub(crate) mod alpha_search;
 pub(crate) mod catalog;
 pub(crate) mod failure;

@@ -559,6 +559,18 @@ impl ResponsesRoute {
                 .as_ref()
                 .and_then(|attempt| attempt.wire_model.as_deref()),
         );
+        if crate::routing::ai_studio_schema::rejected_examples(original_status, detail) {
+            crate::observability::request_trace::log(json!({
+                "kind":"log", "fugue_table":"app_events",
+                "event":"ai_studio_examples_fallback", "event_type":"ai_studio_examples_fallback",
+                "severity":"warn", "source":"uni-api-ember", "request_id":self.request_id,
+                "attempt_id":self.last_attempt.as_ref().map(|a| a.attempt_id.as_str()),
+                "provider":self.last_provider.as_ref().map(|p| p.name.as_ref()),
+                "model":self.request_model, "path":self.endpoint, "streaming":self.stream,
+                "attempt_status_code":original_status, "routing_status_code":policy.status,
+                "error_sha256":sha256_hex(detail),
+            }));
+        }
         if encrypted_channel_rejection {
             // Compatibility is specific to this request's encrypted history,
             // not evidence that the provider/key is broken for other traffic.

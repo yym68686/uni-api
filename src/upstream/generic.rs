@@ -1215,6 +1215,7 @@ impl AttemptFailure {
             crate::routing::thinking_signature::FAILURE_REASON
                 | crate::routing::gemini_tool_part::FAILURE_REASON
                 | crate::routing::alpha_search::FAILURE_REASON
+                | crate::routing::ai_studio_schema::FAILURE_REASON
         ) {
             400
         } else {
@@ -1234,6 +1235,7 @@ impl AttemptFailure {
             crate::routing::thinking_signature::FAILURE_REASON
                 | crate::routing::gemini_tool_part::FAILURE_REASON
                 | crate::routing::alpha_search::FAILURE_REASON
+                | crate::routing::ai_studio_schema::FAILURE_REASON
         ) {
             // Incompatible with this request, not evidence of
             // a broken provider/key. Do not put unrelated requests on cooldown.
@@ -1546,8 +1548,22 @@ pub(crate) async fn send_attempt(
                 "attempt_status_code":400, "routing_status_code":502,
             }));
         }
+        let schema_failure =
+            crate::routing::ai_studio_schema::rejected_examples(status.as_u16(), &detail);
+        if schema_failure {
+            crate::observability::telemetry::emit(json!({
+                "kind":"log", "fugue_table":"app_events", "event":"ai_studio_examples_fallback",
+                "event_type":"ai_studio_examples_fallback", "severity":"warn", "source":"uni-api-ember",
+                "request_id":prepared.headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+                "provider":provider.name.as_ref(), "model":prepared.request_model,
+                "actual_model":prepared.original_model, "path":endpoint,
+                "attempt_status_code":400, "routing_status_code":502,
+            }));
+        }
         return Err(AttemptFailure {
-            failure_reason: if search_failure {
+            failure_reason: if schema_failure {
+                crate::routing::ai_studio_schema::FAILURE_REASON.into()
+            } else if search_failure {
                 crate::routing::alpha_search::FAILURE_REASON.into()
             } else if gemini_part_failure {
                 crate::routing::gemini_tool_part::FAILURE_REASON.into()

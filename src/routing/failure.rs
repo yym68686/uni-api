@@ -4,6 +4,9 @@ use serde_json::Value;
 use url::Url;
 
 pub(crate) fn remap_provider_status(status: u16, detail: &str) -> u16 {
+    if crate::routing::ai_studio_schema::rejected_examples(status, detail) {
+        return 502;
+    }
     if [
         "string_above_max_length",
         "must be less than max_seq_len",
@@ -74,12 +77,19 @@ pub(crate) fn classify_provider_failure(
             .to_ascii_lowercase()
             .contains("model is not supported when using codex with a chatgpt account");
     let missing_persisted_item = status == 404 && is_missing_persisted_item_error(detail);
-    let request_scoped = matches!(status, 400 | 413) || missing_persisted_item;
+    let schema_capability_rejection =
+        crate::routing::ai_studio_schema::rejected_examples(original_status, detail);
+    let request_scoped =
+        schema_capability_rejection || matches!(status, 400 | 413) || missing_persisted_item;
     let azure_request = matches!(status, 400 | 413)
         && provider.is_some_and(|provider| is_azure_provider(&provider.base_url));
     ProviderFailurePolicy {
         status,
-        retryable: auto_retry && (!request_scoped || codex_model_unsupported || azure_request),
+        retryable: auto_retry
+            && (schema_capability_rejection
+                || !request_scoped
+                || codex_model_unsupported
+                || azure_request),
         request_scoped,
         provider_model_unavailable,
         force_quota_cooldown: codex_model_unsupported,
