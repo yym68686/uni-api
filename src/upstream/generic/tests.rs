@@ -10,6 +10,7 @@ use crate::protocols::conversion::chat_to_responses_response;
 use crate::protocols::conversion::normalize_jina_embedding;
 use crate::protocols::conversion::normalize_search_response;
 use crate::protocols::conversion::openai_tts_to_minimax;
+use crate::protocols::conversion::responses_content;
 use crate::protocols::conversion::responses_to_chat;
 use crate::providers::anthropic::chat_to_claude;
 use crate::providers::anthropic::claude_to_chat;
@@ -217,6 +218,69 @@ fn chat_to_responses_omits_empty_tool_text_but_preserves_calls_results_and_order
         assert_eq!(output[field], input[field]);
     }
     assert_eq!(input, original);
+}
+
+#[test]
+fn chat_to_responses_omits_null_tool_text_without_changing_calls_or_source() {
+    let call = json!({"id":"call-null","type":"function","function":{
+        "name":"lookup","arguments":"{\"content\":null,\"text\":\"\"}"
+    }});
+    let input = json!({"messages":[
+        {"role":"user","content":"start"},
+        {"role":"assistant","content":null,"tool_calls":[call]},
+        {"role":"tool","tool_call_id":"call-null","content":""},
+        {"role":"assistant","content":"done"}
+    ],"max_tokens":65535,"reasoning_effort":"medium","parallel_tool_calls":false});
+    let original = input.clone();
+    let output = chat_to_responses(&input, "upstream").unwrap();
+    assert_eq!(
+        output["input"],
+        json!([
+            {"role":"user","content":[{"type":"input_text","text":"start"}]},
+            {"type":"function_call","call_id":"call-null","name":"lookup",
+             "arguments":"{\"content\":null,\"text\":\"\"}"},
+            {"type":"function_call_output","call_id":"call-null","output":""},
+            {"role":"assistant","content":[{"type":"output_text","text":"done"}]}
+        ])
+    );
+    assert_eq!(output["max_output_tokens"], 65535);
+    assert_eq!(output["reasoning"], json!({"effort":"medium"}));
+    assert_eq!(output["parallel_tool_calls"], false);
+    assert_eq!(input, original);
+    let mut absent = input.clone();
+    absent["messages"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("content");
+    assert_eq!(chat_to_responses(&absent, "upstream").unwrap(), output);
+}
+
+#[test]
+fn chat_to_responses_preserves_null_or_nontext_content_outside_valid_tool_placeholders() {
+    let valid =
+        json!({"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}});
+    for message in [
+        json!({"role":"assistant","content":null}),
+        json!({"role":"assistant","content":null,"tool_calls":[]}),
+        json!({"role":"user","content":null,"tool_calls":[valid]}),
+        json!({"role":"assistant","content":[],"tool_calls":[valid]}),
+        json!({"role":"assistant","content":[{"type":"text","text":""}],"tool_calls":[valid]}),
+        json!({"role":"assistant","content":false,"tool_calls":[valid]}),
+        json!({"role":"assistant","content":42,"tool_calls":[valid]}),
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"bad JSON"}}]}),
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"[]"}}]}),
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":{}}}]}),
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":" ","type":"function","function":{"name":"lookup","arguments":"{}"}}]}),
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":" ","arguments":"{}"}}]}),
+        json!({"role":"assistant","content":null,"tool_calls":[valid,{"id":"custom-1","type":"custom"}]}),
+    ] {
+        let output = chat_to_responses(&json!({"messages":[message]}), "upstream").unwrap();
+        assert_eq!(output["input"][0]["role"], message["role"]);
+        assert_eq!(
+            output["input"][0]["content"],
+            responses_content(&message["content"], message["role"].as_str().unwrap())
+        );
+    }
 }
 
 #[test]

@@ -302,11 +302,13 @@ pub(crate) fn chat_to_responses(input: &Value, original_model: &str) -> Result<V
 }
 
 // Responses function calls are independent Items. Do not manufacture a
-// separate empty text message for an otherwise valid Chat tool-call turn.
+// separate empty/null text message for an otherwise valid Chat tool-call turn.
 // Standalone/whitespace text and malformed calls retain their existing validation.
 fn is_empty_assistant_tool_placeholder(message: &Map<String, Value>) -> bool {
     message.get("role").and_then(Value::as_str) == Some("assistant")
-        && message.get("content").and_then(Value::as_str) == Some("")
+        && message
+            .get("content")
+            .is_some_and(|content| content.is_null() || content.as_str() == Some(""))
         && message
             .get("tool_calls")
             .and_then(Value::as_array)
