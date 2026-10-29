@@ -2112,6 +2112,88 @@ async fn encrypted_channel_rejection_respects_no_retry_and_exhaustion() {
 }
 
 #[tokio::test]
+async fn invalid_compaction_state_falls_back_without_mutating_history_or_cooling_channel() {
+    let mut first = provider();
+    first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));
+    let mut route = native_route_for_test(Arc::new(first), 3).await;
+    route.endpoint = "/v1/responses/compact".into();
+    route.providers.insert(1, named_provider("fallback"));
+    route.base_payload["input"] = json!([
+        {"type":"compaction","encrypted_content":"opaque-compaction-state"},
+        {"type":"reasoning","encrypted_content":"opaque-reasoning-state"},
+        {"role":"user","content":"continue"}
+    ]);
+    let original = route.base_payload.clone();
+    let plan = route.next_plan().await.unwrap().unwrap();
+    let wire = plan.body.clone();
+    let detail = json!({"error":{"type":"invalid_request_error",
+        "code":"invalid_compaction_state",
+        "message":"压缩状态无效或不属于当前调用方，请使用原调用凭据，或携带完整历史重试。"}})
+    .to_string();
+    assert!(
+        route
+            .record_plan_failure(
+                plan,
+                &json!({"kind":"http_error",
+        "status_code":400,"upstream_status_code":400,"committed":false,"body":detail})
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+    assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+    assert_eq!(route.routing_ledger[0]["status_code"], 502);
+    assert!(!route.history_repair_attempted);
+    assert!(route.pending_history_repair.is_none());
+    assert_eq!(route.base_payload, original);
+    let fallback = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+    assert_eq!(fallback.body, wire);
+    assert_eq!(
+        serde_json::from_str::<Value>(&fallback.body).unwrap()["input"],
+        original["input"]
+    );
+    assert!(route.next_plan().await.unwrap().is_some());
+    assert_eq!(route.routing_skips, 0);
+}
+
+#[tokio::test]
+async fn invalid_compaction_state_respects_retry_disable_and_committed_output() {
+    let detail = json!({"error":{"type":"invalid_request_error",
+        "code":"invalid_compaction_state",
+        "message":"压缩状态无效或不属于当前调用方，请使用原调用凭据，或携带完整历史重试。"}})
+    .to_string();
+    let mut route = native_route_for_test(named_provider("first"), 3).await;
+    route.base_payload["input"] = json!([{"type":"compaction","encrypted_content":"opaque"}]);
+    Arc::make_mut(&mut route.api_key).preferences =
+        Arc::new(Map::from_iter([("AUTO_RETRY".into(), json!(false))]));
+    let plan = route.next_plan().await.unwrap().unwrap();
+    assert!(
+        !route
+            .record_plan_failure(
+                plan,
+                &json!({"kind":"http_error",
+        "status_code":400,"upstream_status_code":400,"committed":false,"body":detail})
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+
+    let mut route = native_route_for_test(named_provider("first"), 3).await;
+    route.base_payload["input"] = json!([{"type":"compaction","encrypted_content":"opaque"}]);
+    let plan = route.next_plan().await.unwrap().unwrap();
+    assert!(
+        !route
+            .record_plan_failure(
+                plan,
+                &json!({"kind":"http_error",
+        "status_code":400,"upstream_status_code":400,"committed":true,"body":detail})
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 400);
+}
+
+#[tokio::test]
 async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
     for message in ["Upstream request failed", "upstream_error", "上游错误"] {
         let mut envelope = json!({"error": {"code": "upstream_error", "message": message, "type": "upstream_error"}});

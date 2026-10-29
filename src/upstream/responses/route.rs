@@ -159,17 +159,28 @@ impl ResponsesRoute {
 
     pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
         self.set_current_plan(&plan);
-        let encrypted_channel_rejection = matches!(
+        let history_endpoint = matches!(
             self.endpoint.as_str(),
             "/v1/responses" | "/v1/responses/compact"
-        )
+        );
+        let history_rejection_event = if history_endpoint
+            && crate::protocols::responses::compaction_state::is_channel_rejection(
+                &plan.body, outcome,
+            ) {
+            Some("responses_compaction_state_fallback")
+        } else if history_endpoint
             && crate::protocols::responses::encrypted_content::is_channel_rejection(
                 &plan.body, outcome,
-            );
+            )
+        {
+            Some("responses_encrypted_content_fallback")
+        } else {
+            None
+        };
         let retryable = self
-            .record_failure_with_encrypted_rejection(outcome, encrypted_channel_rejection)
+            .record_failure_with_history_rejection(outcome, history_rejection_event)
             .await;
-        if encrypted_channel_rejection {
+        if history_rejection_event.is_some() {
             // Never repair/resend opaque encrypted history on this channel.
             // Each fallback compiles the untouched original logical request.
             return retryable;
@@ -530,14 +541,14 @@ impl ResponsesRoute {
     }
 
     pub async fn record_failure(&mut self, outcome: &Value) -> bool {
-        self.record_failure_with_encrypted_rejection(outcome, false)
+        self.record_failure_with_history_rejection(outcome, None)
             .await
     }
 
-    async fn record_failure_with_encrypted_rejection(
+    async fn record_failure_with_history_rejection(
         &mut self,
         outcome: &Value,
-        encrypted_channel_rejection: bool,
+        history_rejection_event: Option<&'static str>,
     ) -> bool {
         let original_status = outcome
             .get("status_code")
@@ -571,7 +582,7 @@ impl ResponsesRoute {
                 "error_sha256":sha256_hex(detail),
             }));
         }
-        if encrypted_channel_rejection {
+        if let Some(event) = history_rejection_event {
             // Compatibility is specific to this request's encrypted history,
             // not evidence that the provider/key is broken for other traffic.
             policy.status = 502;
@@ -581,8 +592,8 @@ impl ResponsesRoute {
             policy.force_quota_cooldown = false;
             crate::observability::request_trace::log(json!({
                 "kind":"log", "fugue_table":"app_events",
-                "event":"responses_encrypted_content_fallback",
-                "event_type":"responses_encrypted_content_fallback",
+                "event":event,
+                "event_type":event,
                 "severity":"warn", "source":"uni-api-ember",
                 "request_id":self.request_id,
                 "attempt_id":self.last_attempt.as_ref().map(|a| a.attempt_id.as_str()),

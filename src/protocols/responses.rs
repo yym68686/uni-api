@@ -1,4 +1,5 @@
 pub(crate) mod collect;
+pub(crate) mod compaction_state;
 pub(crate) mod empty_name;
 pub(crate) mod encrypted_content;
 pub(crate) mod events;

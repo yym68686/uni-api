@@ -15,6 +15,8 @@ from verify_dispatch_timing import free_port
 
 ERROR = {'error': {'code': 'invalid_encrypted_content', 'type': 'invalid_request_error',
                    'message': 'Upstream encrypted content error (details redacted)'}}
+COMPACTION_ERROR = {'error': {'code': 'invalid_compaction_state', 'type': 'invalid_request_error',
+    'message': '压缩状态无效或不属于当前调用方，请使用原调用凭据，或携带完整历史重试。'}}
 RESPONSE = {'id': 'resp_fixture', 'object': 'response', 'status': 'completed', 'model': 'test-model',
             'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'OK'}]}],
             'usage': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12}}
@@ -34,7 +36,7 @@ class Upstream(BaseHTTPRequestHandler):
         if self.server.mode == 'postcommit' and reject:
             status, content_type = 200, 'text/event-stream'
             events = [{'type': 'response.output_text.delta', 'delta': 'started'},
-                      {'type': 'response.failed', 'response': {'status': 'failed', 'error': ERROR['error']}}]
+                      {'type': 'response.failed', 'response': {'status': 'failed', 'error': self.server.error['error']}}]
             raw = ''.join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
         elif body.get('stream') and not reject:
             content_type = 'text/event-stream'
@@ -60,9 +62,10 @@ def payload(stream):
             'reasoning': {'effort': 'high'}, 'include': ['reasoning.encrypted_content']}
 
 
-def verify(binary, engine):
+def verify(binary, engine, compaction=False):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
-    server.hits, server.facts, server.error, server.mode, server.status = [], [], ERROR, 'reject', 400
+    selected_error = COMPACTION_ERROR if compaction else ERROR
+    server.hits, server.facts, server.error, server.mode, server.status = [], [], selected_error, 'reject', 400
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='uni-encrypted-fallback-') as td:
         root, port = Path(td), free_port(); base = f'http://127.0.0.1:{server.server_port}'
@@ -117,16 +120,23 @@ def verify(binary, engine):
                             assert b'OK' in raw; billed.append((rid, path))
                         count += 1
                 # No encrypted history, malformed fields, unrelated errors/statuses keep ordinary policy.
-                negatives = [('no-history', None), ('empty-encrypted', None), ('invalid-encrypted-type', None),
+                negatives = ([('no-compaction', None), ('empty-compaction', None), ('invalid-compaction-type', None),
+                             ('duplicate-invalid-compaction', None), ('wrong-item-type', None),
+                             ('nonempty-param', {'param':'input'}), ('empty-param', {'param':''}),
+                             ('wrong-code', {'code':'invalid_type'}), ('wrong-type', {'type':'upstream_error'}),
+                             ('missing-code', {'code':None}), ('message-prefix', {'message':'Quoted: '+selected_error['error']['message']}),
+                             ('message-suffix', {'message':selected_error['error']['message']+' extra'})] if compaction else
+                            [('no-history', None), ('empty-encrypted', None), ('invalid-encrypted-type', None),
                              ('wrong-item-type', None), ('nonempty-param', {'param':'input'}), ('empty-param', {'param':''}),
                              ('wrong-code', {'code':'invalid_type'}), ('wrong-type', {'type':'upstream_error'}),
-                             ('missing-code', {'code':None}), ('message-prefix', {'message':'Quoted: '+ERROR['error']['message']}),
-                             ('message-suffix', {'message':ERROR['error']['message']+' extra'})]
+                             ('missing-code', {'code':None}), ('message-prefix', {'message':'Quoted: '+selected_error['error']['message']}),
+                             ('message-suffix', {'message':selected_error['error']['message']+' extra'})])
                 for label, patch in negatives:
-                    body = payload(False); error = copy.deepcopy(ERROR)
-                    if label == 'no-history': body['input'] = [{'role':'user','content':'continue'}]
-                    if label == 'empty-encrypted': body['input'][1]['encrypted_content'] = ''
-                    if label == 'invalid-encrypted-type': body['input'][2]['encrypted_content'] = 42
+                    body = payload(False); error = copy.deepcopy(selected_error)
+                    if label in ('no-history', 'no-compaction'): body['input'] = [{'role':'user','content':'continue'}]
+                    if label in ('empty-encrypted', 'empty-compaction'): body['input'][2 if compaction else 1]['encrypted_content'] = ''
+                    if label in ('invalid-encrypted-type', 'invalid-compaction-type'): body['input'][2 if compaction else 1]['encrypted_content'] = 42
+                    if label == 'duplicate-invalid-compaction': body['input'].append({'type':'compaction','encrypted_content':' '})
                     if label == 'wrong-item-type': body['input'] = [{'type':'message','role':'user','content':'plain','encrypted_content':'echo'}]
                     if patch: error['error'].update(patch)
                     server.hits, server.mode, server.error = [], 'reject', error
@@ -134,7 +144,7 @@ def verify(binary, engine):
                     assert status == 400 and len(server.hits) == 1, (engine, label, status)
                     count += 1
                 server.status, server.mode, server.hits = 400, 'postcommit', []
-                server.error = ERROR
+                server.error = selected_error
                 _, status, raw = call(payload(True))
                 assert status == 200 and b'started' in raw and len(server.hits) == 1, (status, raw)
                 count += 1
@@ -151,13 +161,15 @@ def verify(binary, engine):
                     facts = [f for f in server.facts if f.get('request_id')==rid]
                     assert any(f.get('kind')=='billing' and f.get('status')==400 for f in facts), (rid, path, facts)
                     assert any(f.get('kind')=='billing' and f.get('status')==200 for f in facts), (rid, path, facts)
-                    assert any(f.get('stage')=='responses_encrypted_content_fallback' and f.get('trace_detail',{}).get('routing_status_code')==502 for f in facts), (rid, facts)
+                    expected_event = 'responses_compaction_state_fallback' if compaction else 'responses_encrypted_content_fallback'
+                    assert any(f.get('stage')==expected_event and f.get('trace_detail',{}).get('routing_status_code')==502 for f in facts), (rid, facts)
                     assert any(f.get('stage')=='upstream_attempt' and f.get('trace_detail',{}).get('attempt_status_code')==400 for f in facts), (rid, facts)
                 encoded = json.dumps(server.facts)+(root/'log').read_text()
                 for secret in ['gAAAAopaque-do-not-log', 'c2c:opaque-do-not-log', 'fixture-upstream-secret', 'private-history', 'private-result']:
                     assert secret not in encoded, secret
                 assert (root/'api.json').read_bytes() == config_bytes
-                print(f'PASS encrypted channel fallback engine={engine}: {count} HTTP cases; raw400/routing502, no cooldown, unchanged wire')
+                kind = 'compaction state' if compaction else 'encrypted content'
+                print(f'PASS {kind} fallback engine={engine}: {count} HTTP cases; raw400/routing502, no cooldown, unchanged wire')
             finally:
                 proc.terminate()
                 try: proc.wait(timeout=10)
@@ -166,4 +178,6 @@ def verify(binary, engine):
 
 
 if __name__ == '__main__':
-    for engine in ['gpt', 'codex']: verify(Path(sys.argv[1]).resolve(), engine)
+    for engine in ['gpt', 'codex']:
+        verify(Path(sys.argv[1]).resolve(), engine)
+        verify(Path(sys.argv[1]).resolve(), engine, compaction=True)
