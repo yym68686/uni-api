@@ -25,11 +25,16 @@ pub(crate) fn is_channel_rejection(body: &str, outcome: &Value) -> bool {
     else {
         return false;
     };
+    let redacted = error.get("code").and_then(Value::as_str) == Some("invalid_encrypted_content")
+        && error.get("message").and_then(Value::as_str)
+            == Some("Upstream encrypted content error (details redacted)")
+        && error.get("param").is_none_or(Value::is_null);
+    let continuation = error.get("code").and_then(Value::as_str) == Some("encrypted_context_invalid")
+        && error.get("message").and_then(Value::as_str)
+            == Some("The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client.")
+        && error.get("param").and_then(Value::as_str) == Some("input");
     if error.get("type").and_then(Value::as_str) != Some("invalid_request_error")
-        || error.get("code").and_then(Value::as_str) != Some("invalid_encrypted_content")
-        || error.get("message").and_then(Value::as_str)
-            != Some("Upstream encrypted content error (details redacted)")
-        || !error.get("param").is_none_or(Value::is_null)
+        || !(redacted || continuation)
     {
         return false;
     }
@@ -46,6 +51,12 @@ pub(crate) fn is_channel_rejection(body: &str, outcome: &Value) -> bool {
             Some("reasoning" | "compaction")
         ) {
             continue;
+        }
+        if continuation
+            && item.get("type").and_then(Value::as_str) == Some("compaction")
+            && item.get("encrypted_content").is_none()
+        {
+            return false;
         }
         if let Some(encrypted) = item.get("encrypted_content") {
             if encrypted
@@ -234,6 +245,108 @@ mod tests {
         .to_string()
         .into();
         result
+    }
+
+    fn continuation_outcome() -> Value {
+        let mut result = outcome();
+        result["body"] = json!({"error":{
+            "type":"invalid_request_error", "code":"encrypted_context_invalid", "param":"input",
+            "message":"The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client."
+        }})
+        .to_string()
+        .into();
+        result
+    }
+
+    #[test]
+    fn continuation_rejection_requires_exact_error_and_opaque_history() {
+        let failure = continuation_outcome();
+        let detail: Value = serde_json::from_str(failure["body"].as_str().unwrap()).unwrap();
+        for kind in ["reasoning", "compaction"] {
+            let wire =
+                json!({"input":[{"type":kind,"encrypted_content":"opaque-keep"}]}).to_string();
+            assert!(is_channel_rejection(&wire, &failure));
+            assert!(repair(&wire, &failure).is_none());
+        }
+        for (field, value) in [
+            ("type", json!("upstream_error")),
+            ("code", json!("invalid_encrypted_content")),
+            ("code", Value::Null),
+            ("param", Value::Null),
+            ("param", json!("")),
+            ("param", json!("input[0].encrypted_content")),
+            ("param", json!(["input"])),
+            (
+                "message",
+                json!(format!(
+                    "Quoted: {}",
+                    detail["error"]["message"].as_str().unwrap()
+                )),
+            ),
+            (
+                "message",
+                json!(format!("{} ", detail["error"]["message"].as_str().unwrap())),
+            ),
+        ] {
+            let mut other = failure.clone();
+            let mut error = detail.clone();
+            error["error"][field] = value;
+            other["body"] = error.to_string().into();
+            assert!(
+                !is_channel_rejection(&body().to_string(), &other),
+                "{field}"
+            );
+        }
+        for field in ["type", "code", "param", "message"] {
+            let mut other = failure.clone();
+            let mut error = detail.clone();
+            error["error"].as_object_mut().unwrap().remove(field);
+            other["body"] = error.to_string().into();
+            assert!(!is_channel_rejection(&body().to_string(), &other));
+        }
+        for error in [
+            detail["error"].clone(),
+            json!({"error":{"message":detail.to_string()}}),
+            json!({"error":{"message":"Invalid input"},"debug":detail}),
+        ] {
+            let mut other = failure.clone();
+            other["body"] = error.to_string().into();
+            assert!(!is_channel_rejection(&body().to_string(), &other));
+        }
+        for input in [
+            json!("plain"),
+            json!([]),
+            json!([{"type":"reasoning"}]),
+            json!([{"role":"user","encrypted_content":"echo"}]),
+            json!([{"type":"compaction","encrypted_content":null}]),
+            json!([{"type":"reasoning","encrypted_content":" \n"}]),
+            json!([{"type":"reasoning","encrypted_content":42}]),
+            json!([{"type":"reasoning","encrypted_content":"valid"},
+                   {"type":"compaction","encrypted_content":false}]),
+            json!([{"type":"reasoning","encrypted_content":"valid"}, {"type":"compaction"}]),
+        ] {
+            assert!(!is_channel_rejection(
+                &json!({"input":input}).to_string(),
+                &failure
+            ));
+        }
+        assert!(!is_channel_rejection("{", &failure));
+        for (field, value) in [
+            ("kind", json!("semantic_error")),
+            ("status_code", json!(403)),
+            ("upstream_status_code", json!(200)),
+            ("committed", json!(true)),
+            ("committed", Value::Null),
+        ] {
+            let mut other = failure.clone();
+            other[field] = value;
+            assert!(!is_channel_rejection(&body().to_string(), &other));
+        }
+        for field in ["kind", "status_code", "upstream_status_code", "committed"] {
+            let mut other = failure.clone();
+            other.as_object_mut().unwrap().remove(field);
+            assert!(!is_channel_rejection(&body().to_string(), &other));
+        }
     }
 
     #[test]

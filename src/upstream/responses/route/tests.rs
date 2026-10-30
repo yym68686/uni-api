@@ -2112,6 +2112,80 @@ async fn encrypted_channel_rejection_respects_no_retry_and_exhaustion() {
 }
 
 #[tokio::test]
+async fn encrypted_continuation_retries_unchanged_without_global_cooldown() {
+    let mut first = provider();
+    first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));
+    let mut route = native_route_for_test(Arc::new(first), 3).await;
+    route.providers.insert(1, named_provider("fallback"));
+    route.base_payload["input"] = json!([
+        {"type":"reasoning","encrypted_content":"gAAAAfixture"},
+        {"type":"compaction","encrypted_content":"opaque-fixture"},
+        {"role":"user","content":"continue"}
+    ]);
+    let original = route.base_payload.clone();
+    let plan = route.next_plan().await.unwrap().unwrap();
+    let wire = plan.body.clone();
+    let detail = json!({"error":{"type":"invalid_request_error",
+        "code":"encrypted_context_invalid", "param":"input",
+        "message":"The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client."}})
+    .to_string();
+    assert!(
+        route
+            .record_plan_failure(
+                plan,
+                &json!({"kind":"http_error",
+        "status_code":400,"upstream_status_code":400,"committed":false,"body":detail})
+            )
+            .await
+    );
+    assert_eq!(route.last_status(), 502);
+    assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+    assert_eq!(
+        route.upstream_ledger[0]["error_sha256"],
+        sha256_hex(&detail)
+    );
+    assert_eq!(route.routing_ledger[0]["status_code"], 502);
+    assert!(!route.history_repair_attempted);
+    assert!(route.pending_history_repair.is_none());
+    assert_eq!(route.base_payload, original);
+    let next = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(next.provider_name.as_deref(), Some("fallback"));
+    assert_eq!(next.body, wire);
+    assert!(route.next_plan().await.unwrap().is_some());
+    assert_eq!(route.routing_skips, 0);
+}
+
+#[tokio::test]
+async fn encrypted_continuation_respects_retry_budget_and_committed_output() {
+    let detail = json!({"error":{"type":"invalid_request_error",
+        "code":"encrypted_context_invalid", "param":"input",
+        "message":"The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client."}})
+    .to_string();
+    for (retry, budget, committed, expected) in [
+        (false, 3, false, 502),
+        (true, 1, false, 502),
+        (true, 3, true, 400),
+    ] {
+        let mut route = native_route_for_test(named_provider("first"), budget).await;
+        Arc::make_mut(&mut route.api_key).preferences =
+            Arc::new(Map::from_iter([("AUTO_RETRY".into(), json!(retry))]));
+        route.base_payload["input"] = json!([{"type":"compaction","encrypted_content":"opaque"}]);
+        let plan = route.next_plan().await.unwrap().unwrap();
+        assert!(
+            !route
+                .record_plan_failure(
+                    plan,
+                    &json!({"kind":"http_error",
+            "status_code":400,"upstream_status_code":400,"committed":committed,"body":detail})
+                )
+                .await
+        );
+        assert_eq!(route.last_status(), expected);
+        assert!(route.pending_history_repair.is_none());
+    }
+}
+
+#[tokio::test]
 async fn invalid_compaction_state_falls_back_without_mutating_history_or_cooling_channel() {
     let mut first = provider();
     first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));

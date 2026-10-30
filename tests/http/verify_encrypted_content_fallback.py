@@ -15,6 +15,8 @@ from verify_dispatch_timing import free_port
 
 ERROR = {'error': {'code': 'invalid_encrypted_content', 'type': 'invalid_request_error',
                    'message': 'Upstream encrypted content error (details redacted)'}}
+CONTINUATION_ERROR = {'error': {'code': 'encrypted_context_invalid', 'type': 'invalid_request_error',
+    'param': 'input', 'message': 'The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client.'}}
 COMPACTION_ERROR = {'error': {'code': 'invalid_compaction_state', 'type': 'invalid_request_error',
     'message': '压缩状态无效或不属于当前调用方，请使用原调用凭据，或携带完整历史重试。'}}
 ENCRYPTED_COMPACTION_ID = 'cmp_01234567-89ab-cdef-0123-456789abcdef'
@@ -68,9 +70,9 @@ def payload(stream, identified_compaction=False):
             'reasoning': {'effort': 'high'}, 'include': ['reasoning.encrypted_content']}
 
 
-def verify(binary, engine, compaction=False, identified_compaction=False):
+def verify(binary, engine, compaction=False, identified_compaction=False, continuation=False):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
-    selected_error = ENCRYPTED_COMPACTION_ERROR if identified_compaction else COMPACTION_ERROR if compaction else ERROR
+    selected_error = CONTINUATION_ERROR if continuation else ENCRYPTED_COMPACTION_ERROR if identified_compaction else COMPACTION_ERROR if compaction else ERROR
     server.hits, server.facts, server.error, server.mode, server.status = [], [], selected_error, 'reject', 400
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='uni-encrypted-fallback-') as td:
@@ -154,6 +156,15 @@ def verify(binary, engine, compaction=False, identified_compaction=False):
                                  ('message-suffix', {'message':selected_error['error']['message']+' extra'}),
                                  ('missing-target', None), ('reasoning-target', None), ('bad-uuid', None),
                                  ('nested-error', None), ('bare-error', None)]
+                if continuation:
+                    negatives = [('no-history', None), ('empty-encrypted', None), ('invalid-encrypted-type', None),
+                                 ('wrong-item-type', None), ('whitespace-encrypted', None), ('null-encrypted', None), ('missing-encrypted', None),
+                                 ('invalid-other-compaction', None), ('nonempty-param', {'param':'input[0].encrypted_content'}),
+                                 ('empty-param', {'param':''}), ('null-param', {'param':None}), ('missing-param', None),
+                                 ('wrong-code', {'code':'invalid_encrypted_content'}), ('wrong-type', {'type':'upstream_error'}),
+                                 ('missing-code', {'code':None}), ('message-prefix', {'message':'Quoted: '+selected_error['error']['message']}),
+                                 ('message-suffix', {'message':selected_error['error']['message']+' extra'}),
+                                 ('nested-error', None), ('bare-error', None)]
                 for label, patch in negatives:
                     body = payload(False, identified_compaction); error = copy.deepcopy(selected_error)
                     if label in ('no-history', 'no-compaction'): body['input'] = [{'role':'user','content':'continue'}]
@@ -164,6 +175,7 @@ def verify(binary, engine, compaction=False, identified_compaction=False):
                     if label == 'missing-encrypted': del body['input'][2]['encrypted_content']
                     if label == 'whitespace-encrypted': body['input'][2]['encrypted_content'] = ' \n'
                     if label == 'null-encrypted': body['input'][2]['encrypted_content'] = None
+                    if label == 'missing-param': del error['error']['param']
                     if label == 'missing-id': del body['input'][2]['id']
                     if label in ('wrong-id', 'missing-target'): body['input'][2]['id'] = 'cmp_11111111-2222-3333-4444-555555555555'
                     if label == 'reasoning-target': body['input'][2]['type'] = 'reasoning'
@@ -209,7 +221,7 @@ def verify(binary, engine, compaction=False, identified_compaction=False):
                 for secret in ['gAAAAopaque-do-not-log', 'c2c:opaque-do-not-log', 'fixture-upstream-secret', 'private-history', 'private-result']:
                     assert secret not in encoded, secret
                 assert (root/'api.json').read_bytes() == config_bytes
-                kind = 'identified encrypted compaction' if identified_compaction else 'compaction state' if compaction else 'encrypted content'
+                kind = 'encrypted continuation' if continuation else 'identified encrypted compaction' if identified_compaction else 'compaction state' if compaction else 'encrypted content'
                 print(f'PASS {kind} fallback engine={engine}: {count} HTTP cases; raw400/routing502, no cooldown, unchanged wire')
             finally:
                 proc.terminate()
@@ -223,3 +235,4 @@ if __name__ == '__main__':
         verify(Path(sys.argv[1]).resolve(), engine)
         verify(Path(sys.argv[1]).resolve(), engine, compaction=True)
         verify(Path(sys.argv[1]).resolve(), engine, identified_compaction=True)
+        verify(Path(sys.argv[1]).resolve(), engine, continuation=True)
