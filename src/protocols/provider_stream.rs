@@ -1076,6 +1076,7 @@ struct StreamState {
     created: u64,
     next_tool_index: usize,
     tools: HashMap<String, usize>,
+    gemini_tools: crate::providers::gemini_tools::StreamTools,
     response_tool_output_indexes: HashMap<u64, usize>,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -1103,6 +1104,7 @@ impl StreamState {
             created,
             next_tool_index: 0,
             tools: HashMap::new(),
+            gemini_tools: Default::default(),
             response_tool_output_indexes: HashMap::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -1153,9 +1155,11 @@ impl StreamState {
             if self.output_protocol == OutputProtocol::Gemini {
                 return vec![crate::protocols::gemini::error(status, &detail)];
             }
-            return self.encode_chunks(vec![
-                json!({"error":{"status_code":status,"message":detail}}),
-            ]);
+            let mut preserved = error.clone();
+            if let Some(fields) = preserved.as_object_mut() {
+                fields.entry("status_code").or_insert(json!(status));
+            }
+            return self.encode_chunks(vec![json!({"error":preserved})]);
         }
         if protocol == Protocol::Gemini && self.output_protocol == OutputProtocol::Gemini {
             self.gemini(value);
@@ -1329,25 +1333,19 @@ impl StreamState {
                 };
                 output.push(self.chunk(json!({field:text}), None, None));
             }
-            if let Some(call) = part.get("functionCall") {
-                let call_id = call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        crate::providers::gemini::gemini_call_id(
-                            part.get("thoughtSignature")
-                                .or_else(|| part.get("thought_signature"))
-                                .and_then(Value::as_str),
-                            self.next_tool_index + 1,
-                        )
+            if self.output_protocol != OutputProtocol::Gemini && part.get("functionCall").is_some()
+            {
+                if let Err(detail) = self.gemini_tools.push(part) {
+                    self.terminal = true;
+                    self.failure = Some(PrecommitFailure {
+                        status_code: 502,
+                        detail: detail.clone(),
+                        failure_reason: Some("protocol_error"),
                     });
-                let index = self.tool_index(&call_id);
-                output.push(self.chunk(
-                    json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{"name":call.get("name").cloned().unwrap_or(Value::Null),"arguments":serde_json::to_string(call.get("args").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into())}}]}),
-                    None,
-                    None,
-                ));
+                    return vec![
+                        json!({"error":{"message":detail,"type":"upstream_protocol_error","code":"gemini_tool_stream","status_code":502}}),
+                    ];
+                }
             }
             if let Some(data) = part.pointer("/inlineData/data").and_then(Value::as_str) {
                 if let Some(signature) = part
@@ -1368,6 +1366,27 @@ impl StreamState {
                 ));
             }
         }
+        let finished = value
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .is_some()
+            || value.pointer("/promptFeedback/blockReason").is_some();
+        if finished {
+            for part in self.gemini_tools.take() {
+                let call = &part["functionCall"];
+                let call_id = crate::providers::gemini_tools::call_id(
+                    call.get("id").and_then(Value::as_str),
+                    part.get("thoughtSignature")
+                        .or_else(|| part.get("thought_signature"))
+                        .and_then(Value::as_str),
+                    self.next_tool_index + 1,
+                );
+                let index = self.tool_index(&call_id);
+                output.push(self.chunk(json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{
+                    "name":call.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments":serde_json::to_string(call.get("args").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into())}}]}), None, None));
+            }
+        }
         if let Some(usage) = value.get("usageMetadata") {
             self.prompt_tokens = number(usage.get("promptTokenCount"));
             self.completion_tokens =
@@ -1380,12 +1399,7 @@ impl StreamState {
             // Gemini may report its final usage after the candidate finish frame.
             output.push(json!({"choices":[],"usage":self.chat_usage}));
         }
-        if value
-            .pointer("/candidates/0/finishReason")
-            .and_then(Value::as_str)
-            .is_some()
-            || value.pointer("/promptFeedback/blockReason").is_some()
-        {
+        if finished {
             let finish = crate::protocols::gemini::chat_finish_reason(
                 value
                     .pointer("/candidates/0/finishReason")

@@ -11,6 +11,23 @@ pub(crate) fn responses_to_chat_request(
     input: &Value,
     original_model: &str,
 ) -> Result<Value, String> {
+    responses_to_chat_request_inner(input, original_model, false)
+}
+
+// Only the Gemini adapter needs adjacent Responses calls grouped into one
+// model turn. Do not change the Chat/Claude/GPT conversion contract globally.
+pub(crate) fn responses_to_gemini_chat_request(
+    input: &Value,
+    original_model: &str,
+) -> Result<Value, String> {
+    responses_to_chat_request_inner(input, original_model, true)
+}
+
+fn responses_to_chat_request_inner(
+    input: &Value,
+    original_model: &str,
+    gemini: bool,
+) -> Result<Value, String> {
     let root = input
         .as_object()
         .ok_or_else(|| "responses request body must be an object".to_owned())?;
@@ -25,21 +42,30 @@ pub(crate) fn responses_to_chat_request(
     match root.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role":"user","content":text})),
         Some(Value::Array(items)) => {
+            let mut previous_call = false;
             for item in items {
                 let item_type = item.get("type").and_then(Value::as_str);
                 match item_type {
-                    Some("function_call") => messages.push(json!({
-                        "role":"assistant",
-                        "content":Value::Null,
-                        "tool_calls":[{
+                    Some("function_call") => {
+                        let mut call = json!({
                             "id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
                             "type":"function",
                             "function":{
                                 "name":item.get("name").cloned().unwrap_or(Value::Null),
                                 "arguments":item.get("arguments").cloned().unwrap_or_else(|| Value::String("{}".into())),
                             }
-                        }]
-                    })),
+                        });
+                        if gemini {
+                            for key in ["extra_content", "thoughtSignature", "thought_signature"] {
+                                if let Some(value) = item.get(key) { call[key] = value.clone(); }
+                            }
+                        }
+                        if gemini && previous_call {
+                            messages.last_mut().unwrap()["tool_calls"].as_array_mut().unwrap().push(call);
+                        } else {
+                            messages.push(json!({"role":"assistant","content":null,"tool_calls":[call]}));
+                        }
+                    }
                     Some("function_call_output") => messages.push(json!({
                         "role":"tool",
                         "tool_call_id":item.get("call_id").cloned().unwrap_or(Value::Null),
@@ -54,6 +80,7 @@ pub(crate) fn responses_to_chat_request(
                     }
                     _ => {}
                 }
+                previous_call = item_type == Some("function_call");
             }
         }
         Some(value) if !value.is_null() => {

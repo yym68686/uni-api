@@ -26,86 +26,50 @@ pub(crate) fn chat_to_gemini(
         .ok_or_else(|| "chat request body must be an object".to_owned())?;
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
-    let mut tool_names = HashMap::new();
+    let mut batch = super::gemini_tools::Batch::default();
     let messages = root
         .get("messages")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
     let append_continuation = allow_continuation && should_append_gemini_continuation(messages);
-    for message in root
-        .get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        for tool in message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let (Some(id), Some(name)) = (
-                tool.get("id").and_then(Value::as_str),
-                tool.pointer("/function/name").and_then(Value::as_str),
-            ) {
-                tool_names.insert(id.to_owned(), name.to_owned());
-            }
-        }
-    }
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user");
-        let mut parts = gemini_message_parts(message)?;
+        let field = format!("messages[{message_index}]");
+        if role == "tool" {
+            if let Some(content) = batch.result(message, &format!("{field}.tool_call_id"))? {
+                contents.push(content);
+            }
+            continue;
+        }
+        if batch.pending() {
+            return Err(super::gemini_tools::error(
+                &field,
+                "missing tool results before the next message",
+            ));
+        }
+        let mut parts = gemini_message_parts(message)
+            .map_err(|message| format!("gemini_part: {field}.content: {message}"))?;
         if role == "system" {
             system_parts.extend(parts);
-        } else if role == "tool" {
-            let call_id = message
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let name = tool_names
-                .get(call_id)
-                .cloned()
-                .unwrap_or_else(|| "tool".into());
-            let response = message
-                .get("content")
-                .cloned()
-                .unwrap_or_else(|| Value::String(String::new()));
-            contents.push(json!({
-                "role":"user",
-                "parts":[{"functionResponse":{"name":name,"response":{"result":response}}}],
-            }));
         } else {
-            for tool in message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let arguments = tool
-                    .pointer("/function/arguments")
-                    .and_then(Value::as_str)
-                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
-                    .unwrap_or_else(|| json!({}));
-                let mut part = json!({
-                    "functionCall":{
-                        "name":tool.pointer("/function/name").cloned().unwrap_or(Value::Null),
-                        "args":arguments,
-                    }
-                });
-                if let Some(signature) = tool
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(decode_gemini_thought_signature)
-                {
-                    part.as_object_mut()
-                        .expect("Gemini function call part")
-                        .insert("thoughtSignature".into(), Value::String(signature));
+            if let Some(tools) = message.get("tool_calls").filter(|v| !v.is_null()) {
+                let tools = tools.as_array().ok_or_else(|| {
+                    super::gemini_tools::error(
+                        &format!("{field}.tool_calls"),
+                        "tool_calls must be an array",
+                    )
+                })?;
+                if !tools.is_empty() && role != "assistant" {
+                    return Err(super::gemini_tools::error(
+                        &format!("{field}.tool_calls"),
+                        "function calls require an assistant message",
+                    ));
                 }
-                parts.push(part);
+                parts.extend(batch.start(tools, &format!("{field}.tool_calls"))?);
             }
             if !parts.is_empty() {
                 contents.push(json!({
@@ -114,6 +78,12 @@ pub(crate) fn chat_to_gemini(
                 }));
             }
         }
+    }
+    if batch.pending() {
+        return Err(super::gemini_tools::error(
+            "messages",
+            "missing tool results at the end of history",
+        ));
     }
     if contents.is_empty() {
         contents.push(json!({"role":"user","parts":[{"text":"No messages"}]}));
@@ -437,16 +407,21 @@ pub(crate) fn gemini_parts(content: &Value) -> Result<Vec<Value>, String> {
         return Ok(vec![json!({"text":text})]);
     }
     let mut parts = Vec::new();
-    for item in content.as_array().into_iter().flatten() {
+    for (index, item) in content.as_array().into_iter().flatten().enumerate() {
         match item.get("type").and_then(Value::as_str) {
             Some("text") => parts.push(
                 json!({"text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
             ),
             Some("image_url") => {
-                if let Some(part) = item
+                let url = item
                     .pointer("/image_url/url")
                     .and_then(Value::as_str)
-                    .and_then(data_url_part)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        format!("content[{index}].image_url.url must be a non-empty data URL")
+                    })?;
+                if let Some(part) = validated_data_url_part(url)
+                    .map_err(|message| format!("content[{index}].image_url.url: {message}"))?
                 {
                     parts.push(part);
                 }
@@ -462,20 +437,38 @@ pub(crate) fn gemini_parts(content: &Value) -> Result<Vec<Value>, String> {
     Ok(parts)
 }
 
+#[cfg(test)]
 pub(crate) fn data_url_part(value: &str) -> Option<Value> {
-    let data = value.strip_prefix("data:")?;
-    let (metadata, body) = data.split_once(',')?;
+    validated_data_url_part(value).ok().flatten()
+}
+
+fn validated_data_url_part(value: &str) -> Result<Option<Value>, String> {
+    let Some(data) = value.strip_prefix("data:") else {
+        return Err("only image data URLs are supported by this adapter".into());
+    };
+    let (metadata, body) = data.split_once(',').ok_or("invalid image data URL")?;
     let mime = metadata
         .split(';')
         .next()
         .unwrap_or("application/octet-stream");
+    if !mime.starts_with("image/")
+        || mime.len() <= 6
+        || !metadata.split(';').any(|s| s == "base64")
+        || body.is_empty()
+        || body.len() > 16 * 1024 * 1024
+        || BASE64.decode(body).is_err()
+    {
+        return Err(
+            "image data URL requires an image MIME type and non-empty valid base64 data".into(),
+        );
+    }
     let mut part = json!({"inlineData":{"mimeType":mime,"data":body}});
     if let Some(signature) = gemini_image_thought_signature(body) {
         part.as_object_mut()
             .expect("Gemini image part")
             .insert("thoughtSignature".into(), Value::String(signature));
     }
-    Some(part)
+    Ok(Some(part))
 }
 
 pub(crate) fn input_audio_part(item: &Value) -> Result<Option<Value>, String> {
@@ -798,7 +791,8 @@ pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Value {
             }
         }
         if let Some(call) = part.get("functionCall") {
-            let call_id = gemini_call_id(
+            let call_id = super::gemini_tools::call_id(
+                call.get("id").and_then(Value::as_str),
                 part.get("thoughtSignature")
                     .or_else(|| part.get("thought_signature"))
                     .and_then(Value::as_str),
@@ -992,14 +986,17 @@ mod gemini_model_turn_tests {
         ]});
         assert!(responses_allow_gemini_continuation(&input));
         let chat =
-            crate::protocols::conversion::responses_to_chat_request(&input, "gemini-test").unwrap();
+            crate::protocols::conversion::responses_to_gemini_chat_request(&input, "gemini-test")
+                .unwrap();
         let wire = chat_to_gemini(&chat, "gemini-test", true).unwrap();
         let turns = wire["contents"].as_array().unwrap();
-        assert_eq!(turns.len(), 7);
+        assert_eq!(turns.len(), 5);
         assert_eq!(turns[1]["parts"][0]["thoughtSignature"], signature);
-        assert_eq!(turns[5]["parts"][0]["text"], "ready");
+        assert_eq!(turns[1]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(turns[2]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(turns[3]["parts"][0]["text"], "ready");
         assert_eq!(
-            turns[6],
+            turns[4],
             json!({"role":"user","parts":[{"text":"Continue."}]})
         );
     }

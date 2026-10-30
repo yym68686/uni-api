@@ -223,7 +223,14 @@ pub(crate) fn build_attempt(
 
     let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
     if downstream_protocol == DownstreamProtocol::ResponsesCompat {
-        payload = responses_to_chat_request(&payload, original_model)?;
+        payload = if matches!(engine.as_str(), "gemini" | "vertex" | "vertex-gemini") {
+            crate::protocols::conversion::responses_to_gemini_chat_request(
+                &payload,
+                original_model,
+            )?
+        } else {
+            responses_to_chat_request(&payload, original_model)?
+        };
         // Anthropic extensions must survive Responses -> Chat -> Claude, but
         // must not leak into unrelated provider adapters.
         if matches!(engine.as_str(), "claude" | "vertex-claude" | "aws") {

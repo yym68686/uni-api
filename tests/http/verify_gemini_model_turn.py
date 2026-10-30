@@ -131,9 +131,10 @@ def verify(binary):
                             # An unfinished batch followed by text must not be made successful by a fabricated user turn.
                             call_item = {'role': 'assistant', 'tool_calls': [{'id': 'pending', 'type': 'function', 'function': {'name': 'one', 'arguments': '{}'}}]} if chat else {'type': 'function_call', 'call_id': 'pending', 'name': 'one', 'arguments': '{}'}
                             bad = dict(fields, **{collection: [start, call_item, tail]})
+                            before = len(server.hits)
                             status, _ = call(endpoint, bad)
                             assert status == 400
-                            assert server.hits[-1][1]['contents'][-1]['role'] == 'model'
+                            assert len(server.hits) == before  # reject locally; do not invent a continuation
                             cases += 1
 
                         # Native Gemini requests bypass the conversion and retain signatures and last role.

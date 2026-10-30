@@ -66,10 +66,29 @@ pub(crate) fn is_hop_by_hop(name: &str) -> bool {
 }
 
 pub fn json_error(status: StatusCode, message: &str) -> Response<Body> {
+    let mut error = serde_json::json!({"message":message});
+    // These are fixed, gateway-generated conversion diagnostics. Do not invent
+    // field locations or codes for arbitrary upstream rejection messages.
+    if status == StatusCode::BAD_REQUEST {
+        if let Some((code @ ("gemini_tool_history" | "gemini_part"), rest)) =
+            message.split_once(": ")
+        {
+            if let Some((field, _)) = rest.split_once(": ") {
+                if field
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"[]._-".contains(&b))
+                {
+                    error["type"] = serde_json::json!("invalid_request_error");
+                    error["code"] = serde_json::json!(code);
+                    error["param"] = serde_json::json!(field);
+                }
+            }
+        }
+    }
     (
         status,
         [("content-type", "application/json")],
-        serde_json::json!({"error": {"message": message}}).to_string(),
+        serde_json::json!({"error":error}).to_string(),
     )
         .into_response()
 }

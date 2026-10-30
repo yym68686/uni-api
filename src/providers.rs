@@ -4,6 +4,7 @@ pub(crate) mod cloud;
 pub(crate) mod codex;
 pub(crate) mod endpoints;
 pub(crate) mod gemini;
+pub(crate) mod gemini_tools;
 pub(crate) mod overrides;
 pub(crate) mod request;
 pub(crate) mod stream_mode;

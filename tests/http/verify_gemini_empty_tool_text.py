@@ -123,7 +123,7 @@ def verify(binary):
                             wire = upstream.hits[0][1]
                             assert 'contents' in wire, (endpoint, key, upstream.hits)
                             parts = wire['contents'][1]['parts']
-                            assert parts == [{'functionCall': {'name': 'lookup', 'args': {'text': ''}}}], parts
+                            assert parts == [{'functionCall': {'id': 'call-1', 'name': 'lookup', 'args': {'text': ''}}}], parts
                             assert wire['generationConfig']['maxOutputTokens'] == 77
                             assert wire['generationConfig']['temperature'] == .2
                             assert wire['contents'][2]['parts'][0]['functionResponse']['response']['result'] == ''
