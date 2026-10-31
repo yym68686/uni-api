@@ -200,13 +200,18 @@ impl Coordinator {
         }
     }
 
-    async fn retry(&mut self, state: &AppState, outcome: Value) -> Result<RetryResolution, String> {
+    async fn retry(
+        &mut self,
+        state: &AppState,
+        plan: &Plan,
+        outcome: Value,
+    ) -> Result<RetryResolution, String> {
         match self {
             Self::Python { session_id } => {
                 retry_after_public_start_python(state, session_id, outcome).await
             }
             Self::Native { route } => {
-                let mut retryable = route.record_failure(&outcome).await;
+                let mut retryable = route.record_plan_failure(plan.clone(), &outcome).await;
                 loop {
                     if !retryable {
                         return Ok(RetryResolution::Final(route.final_message()));
@@ -219,12 +224,12 @@ impl Coordinator {
                             return Err(error);
                         }
                     };
-                    match preflight_attempt(state, plan, true).await {
+                    match preflight_attempt(state, plan.clone(), true).await {
                         Ok(PreflightResult::Started(active)) => {
                             return Ok(RetryResolution::Active(active));
                         }
                         Ok(PreflightResult::Retry(next)) => {
-                            retryable = route.record_failure(&next).await;
+                            retryable = route.record_plan_failure(plan, &next).await;
                         }
                         Ok(PreflightResult::HttpError(plan, next)) => {
                             retryable = route.record_plan_failure(*plan, &next).await;
@@ -379,7 +384,7 @@ pub async fn serve_native(
                 return json_error(StatusCode::BAD_REQUEST, &error);
             }
         };
-        match preflight_attempt(&state, plan, false).await {
+        match preflight_attempt(&state, plan.clone(), false).await {
             Ok(PreflightResult::Started(active)) => {
                 let mut control_headers = HeaderMap::new();
                 if let Ok(value) = HeaderValue::from_str(route.request_id()) {
@@ -395,7 +400,7 @@ pub async fn serve_native(
                 );
             }
             Ok(PreflightResult::Retry(outcome)) => {
-                if !route.record_failure(&outcome).await {
+                if !route.record_plan_failure(plan, &outcome).await {
                     let status = StatusCode::from_u16(route.last_status())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(status.as_u16(), "failed_before_commit");
@@ -1390,7 +1395,7 @@ async fn run_active_attempt(
         if let Some(terminal) = active.terminal.take() {
             if !active.business_committed {
                 let outcome = semantic_retry_outcome(&active, terminal);
-                match coordinator.retry(&state, outcome).await {
+                match coordinator.retry(&state, &active.plan, outcome).await {
                     Ok(RetryResolution::Active(next)) => {
                         active = next;
                         continue 'request;
@@ -1480,6 +1485,7 @@ async fn run_active_attempt(
                                 match coordinator
                                     .retry(
                                         &state,
+                                        &active.plan,
                                         failure_retry_outcome(&active, "protocol_error", &error),
                                     )
                                     .await
@@ -1519,6 +1525,7 @@ async fn run_active_attempt(
                             match coordinator
                                 .retry(
                                     &state,
+                                    &active.plan,
                                     failure_retry_outcome(&active, "protocol_error", detail),
                                 )
                                 .await
@@ -1553,6 +1560,7 @@ async fn run_active_attempt(
                             match coordinator
                                 .retry(
                                     &state,
+                                    &active.plan,
                                     failure_retry_outcome(&active, "protocol_error", &error),
                                 )
                                 .await
@@ -1589,6 +1597,7 @@ async fn run_active_attempt(
                         match coordinator
                             .retry(
                                 &state,
+                                &active.plan,
                                 failure_retry_outcome(&active, "transport_error", &detail),
                             )
                             .await
@@ -1623,6 +1632,7 @@ async fn run_active_attempt(
                         match coordinator
                             .retry(
                                 &state,
+                                &active.plan,
                                 failure_retry_outcome(&active, "transport_error", &error),
                             )
                             .await
@@ -1660,7 +1670,7 @@ async fn run_active_attempt(
                 ActiveFrameResult::Continue => {}
                 ActiveFrameResult::Done(cacheable) => break 'request cacheable,
                 ActiveFrameResult::Retry(outcome) => {
-                    match coordinator.retry(&state, outcome).await {
+                    match coordinator.retry(&state, &active.plan, outcome).await {
                         Ok(RetryResolution::Active(next)) => {
                             active = next;
                             continue 'request;

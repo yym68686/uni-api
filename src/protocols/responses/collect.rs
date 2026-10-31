@@ -60,7 +60,13 @@ impl Collector {
         } = terminal
         {
             let (status, detail) = responses_semantic_error(&payload, &event_type);
-            return Err(self.error(status, "semantic_failure", detail));
+            let mut failure = self.error(status, "semantic_failure", detail);
+            // Preserve the same structured pre-output evidence as native SSE.
+            // The routing classifier must not guess error fields from detail.
+            failure.outcome["payload"] = payload;
+            failure.outcome["event_type"] = event_type.into();
+            failure.outcome["committed"] = self.stats.first_output_ms.is_some().into();
+            return Err(failure);
         }
         let mut event: Value = serde_json::from_str(data.as_deref().unwrap_or_default())
             .map_err(|e| self.error(502, "protocol_error", e.to_string()))?;

@@ -2186,6 +2186,46 @@ async fn encrypted_continuation_respects_retry_budget_and_committed_output() {
 }
 
 #[tokio::test]
+async fn encrypted_continuation_semantic_rejection_keeps_raw_200_and_wire() {
+    for event in ["error", "response.failed"] {
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        route.base_payload["input"] = json!([{"type":"compaction","encrypted_content":"opaque"}]);
+        let plan = route.next_plan().await.unwrap().unwrap();
+        let wire = plan.body.clone();
+        let error = json!({"type":"invalid_request_error", "code":"encrypted_context_invalid",
+            "param":"input", "message":"The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client."});
+        let payload = if event == "error" {
+            json!({"error":error})
+        } else {
+            json!({"response":{"status":"failed","error":error}})
+        };
+        assert!(
+            route
+                .record_plan_failure(
+                    plan,
+                    &json!({"kind":"semantic_error",
+            "status_code":400,"upstream_status_code":200,"committed":false,
+            "event_type":event,"payload":payload,"detail":error["message"]})
+                )
+                .await
+        );
+        assert_eq!(route.last_status(), 502);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 200);
+        assert_eq!(route.routing_ledger[0]["status_code"], 502);
+        assert!(!route.history_repair_attempted);
+        assert!(route.pending_history_repair.is_none());
+        let next = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(next.provider_name.as_deref(), Some("fallback"));
+        assert_eq!(next.body, wire);
+        assert!(route.next_plan().await.unwrap().is_some());
+        assert_eq!(route.routing_skips, 0);
+    }
+}
+
+#[tokio::test]
 async fn invalid_compaction_state_falls_back_without_mutating_history_or_cooling_channel() {
     let mut first = provider();
     first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(300.0))]));

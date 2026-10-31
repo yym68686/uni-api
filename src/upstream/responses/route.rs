@@ -600,7 +600,8 @@ impl ResponsesRoute {
                 "provider":self.last_provider.as_ref().map(|p| p.name.as_ref()),
                 "model":self.request_model,
                 "path":self.endpoint, "streaming":self.stream,
-                "attempt_status_code":original_status, "routing_status_code":policy.status,
+                "attempt_status_code":outcome_status_from(outcome, "upstream_status_code", original_status),
+                "semantic_status_code":original_status, "routing_status_code":policy.status,
                 "error_sha256":sha256_hex(detail),
             }));
         }
