@@ -42,8 +42,9 @@ pub(crate) fn is_channel_rejection(body: &str, outcome: &Value) -> bool {
     let Some(error) = error else {
         return false;
     };
-    let redacted = http
-        && error.get("code").and_then(Value::as_str) == Some("invalid_encrypted_content")
+    // This exact relay signature can arrive as HTTP 400 or inside HTTP 200
+    // SSE. The literal display message alone is never enough to retry it.
+    let redacted = error.get("code").and_then(Value::as_str) == Some("invalid_encrypted_content")
         && error.get("message").and_then(Value::as_str)
             == Some("Upstream encrypted content error (details redacted)")
         && error.get("param").is_none_or(Value::is_null);
@@ -381,6 +382,95 @@ mod tests {
             error["error"]["param"] = Value::Null;
             null_param["body"] = error.to_string().into();
             assert!(is_channel_rejection(&wire, &null_param));
+        }
+    }
+
+    #[test]
+    fn redacted_semantic_rejection_requires_exact_structured_preoutput_error() {
+        let http = redacted_outcome();
+        let envelope: Value = serde_json::from_str(http["body"].as_str().unwrap()).unwrap();
+        let wire = body().to_string();
+        for event in ["error", "response.failed"] {
+            let payload = |error: Value| {
+                if event == "error" {
+                    json!({"error":error})
+                } else {
+                    json!({"response":{"status":"failed","error":error}})
+                }
+            };
+            let mut failure = json!({"kind":"semantic_error","status_code":400,
+                "upstream_status_code":200,"committed":false,"event_type":event,
+                "payload":payload(envelope["error"].clone()),
+                "detail":envelope["error"]["message"]});
+            for kind in ["semantic_error", "semantic_failure"] {
+                failure["kind"] = json!(kind);
+                assert!(is_channel_rejection(&wire, &failure));
+                assert!(repair(&wire, &failure).is_none());
+            }
+            let mut null_param = envelope["error"].clone();
+            null_param["param"] = Value::Null;
+            failure["payload"] = payload(null_param);
+            assert!(is_channel_rejection(&wire, &failure));
+            for (field, value) in [
+                ("type", json!("upstream_error")),
+                ("code", json!("other")),
+                (
+                    "message",
+                    json!("Upstream encrypted content error (details redacted) "),
+                ),
+                ("param", json!("input")),
+                ("param", json!("")),
+            ] {
+                let mut error = envelope["error"].clone();
+                error[field] = value;
+                failure["payload"] = payload(error);
+                assert!(!is_channel_rejection(&wire, &failure), "{event} {field}");
+            }
+            for field in ["code", "type", "message"] {
+                let mut error = envelope["error"].clone();
+                error.as_object_mut().unwrap().remove(field);
+                failure["payload"] = payload(error);
+                assert!(!is_channel_rejection(&wire, &failure), "missing {field}");
+            }
+            failure["payload"] = payload(envelope["error"].clone());
+            for (field, value) in [
+                ("kind", json!("http_error")),
+                ("status_code", json!(403)),
+                ("upstream_status_code", json!(400)),
+                ("committed", json!(true)),
+                ("committed", Value::Null),
+                ("event_type", json!("response.completed")),
+                ("payload", payload(json!({"message":envelope.to_string()}))),
+                ("payload", Value::Null),
+            ] {
+                let mut other = failure.clone();
+                other[field] = value;
+                assert!(!is_channel_rejection(&wire, &other), "{event} {field}");
+            }
+            for field in [
+                "kind",
+                "status_code",
+                "upstream_status_code",
+                "committed",
+                "event_type",
+                "payload",
+            ] {
+                let mut other = failure.clone();
+                other.as_object_mut().unwrap().remove(field);
+                assert!(!is_channel_rejection(&wire, &other), "missing {field}");
+            }
+            for input in [
+                json!([{"role":"user","content":"plain"}]),
+                json!([{"type":"reasoning","encrypted_content":""}]),
+                json!([{"type":"compaction","encrypted_content":null}]),
+                json!([{"type":"reasoning","encrypted_content":"valid"},
+                    {"type":"compaction","encrypted_content":false}]),
+            ] {
+                assert!(!is_channel_rejection(
+                    &json!({"input":input}).to_string(),
+                    &failure
+                ));
+            }
         }
     }
 

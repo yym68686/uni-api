@@ -2225,6 +2225,70 @@ async fn encrypted_continuation_retries_unchanged_without_global_cooldown() {
 }
 
 #[tokio::test]
+async fn redacted_semantic_rejection_retries_three_channels_without_unknown_budget() {
+    for event in ["error", "response.failed"] {
+        for unknown_limit in [0, 3] {
+            let mut route = native_route_for_test(named_provider("first"), 4).await;
+            route.providers = vec![
+                named_provider("first"),
+                named_provider("second"),
+                named_provider("third"),
+                named_provider("fallback"),
+            ];
+            route.base_payload["input"] =
+                json!([{"type":"compaction","encrypted_content":"opaque-keep"}]);
+            route.unknown_400 = crate::routing::unknown_400::Budget::new(
+                unknown_limit,
+                true,
+                "/v1/responses",
+                &route.base_payload,
+            );
+            let original = route.base_payload.clone();
+            let mut wire = None;
+            for expected in ["first", "second", "third"] {
+                let plan = route.next_plan().await.unwrap().unwrap();
+                assert_eq!(plan.provider_name.as_deref(), Some(expected));
+                assert_eq!(plan.body, *wire.get_or_insert_with(|| plan.body.clone()));
+                let error = json!({"type":"invalid_request_error","code":"invalid_encrypted_content",
+                    "message":"Upstream encrypted content error (details redacted)"});
+                let payload = if event == "error" {
+                    json!({"error":error})
+                } else {
+                    json!({"response":{"status":"failed","error":error}})
+                };
+                assert!(
+                    route
+                        .record_plan_failure(
+                            plan,
+                            &json!({"kind":"semantic_error",
+                    "status_code":400,"upstream_status_code":200,"committed":false,
+                    "event_type":event,"payload":payload,"detail":error["message"]})
+                        )
+                        .await
+                );
+                assert_eq!(route.last_status(), 502);
+                assert_eq!(route.unknown_400.used(), 0);
+            }
+            assert!(route
+                .upstream_ledger
+                .iter()
+                .all(|entry| entry["status_code"] == 200));
+            assert!(route
+                .routing_ledger
+                .iter()
+                .all(|entry| entry["status_code"] == 502));
+            let fallback = route.next_plan().await.unwrap().unwrap();
+            assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+            assert_eq!(fallback.body, wire.unwrap());
+            assert_eq!(route.base_payload, original);
+            assert!(route.pending_history_repair.is_none());
+            assert_eq!(route.routing_skips, 0);
+            assert!(route.next_plan().await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn encrypted_continuation_respects_retry_budget_and_committed_output() {
     let detail = json!({"error":{"type":"invalid_request_error",
         "code":"encrypted_context_invalid", "param":"input",

@@ -12,7 +12,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from fact_sink import accept_facts
 from verify_dispatch_timing import free_port
-from verify_encrypted_content_fallback import CONTINUATION_ERROR, RESPONSE, payload
+from verify_encrypted_content_fallback import CONTINUATION_ERROR, ERROR, RESPONSE, payload
 
 
 def frame(kind, **fields):
@@ -46,10 +46,11 @@ class Upstream(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError): pass
 
 
-def verify(binary, engine, collect, hedging=False):
+def verify(binary, engine, collect, hedging=False, redacted=False, unknown_retries=0):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
     server.hits, server.facts, server.mode, server.event = [], [], 'reject', 'error'
-    server.error = CONTINUATION_ERROR
+    selected_error = ERROR if redacted else CONTINUATION_ERROR
+    server.error = selected_error
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='uni-encrypted-semantic-') as td:
         root, port = Path(td), free_port()
@@ -65,7 +66,8 @@ def verify(binary, engine, collect, hedging=False):
             for name in ['first','fallback']],
             'api_keys':[{'api':key,'model':['first/*','fallback/*'], 'preferences':{'AUTO_RETRY':retry}}
                 for key,retry in [('retry',1),('no-retry',False)]],
-            'preferences':{'hedging':{'enabled':hedging,'max_inflight_attempts':2}}}
+            'preferences':{'hedging':{'enabled':hedging,'max_inflight_attempts':2},
+                'unknown_upstream_400_retries':unknown_retries}}
         original_config = json.dumps(config).encode()
         (root/'api.json').write_bytes(original_config)
         env = {k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','LANG','DYLD_LIBRARY_PATH')}
@@ -107,7 +109,7 @@ def verify(binary, engine, collect, hedging=False):
                     if engine == 'codex' or collect:
                         cases.append(('keepalive','retry',200,['first','fallback']))
                     for mode,key,expected,names in cases:
-                        server.hits,server.mode,server.error = [],mode,copy.deepcopy(CONTINUATION_ERROR)
+                        server.hits,server.mode,server.error = [],mode,copy.deepcopy(selected_error)
                         body = payload(not collect)
                         rid,status,raw = call(body,key,mode=='targeted')
                         assert status == expected,(engine,collect,event,mode,status,raw[:300])
@@ -119,9 +121,20 @@ def verify(binary, engine, collect, hedging=False):
                             successful.append(rid)
                         count += 1
                     # Ordinary validation and malformed history must still fail without fallback.
-                    for field,value in [('code','other'),('param',None),
-                        ('param',''),('param','input[1]'),('message','Quoted: '+CONTINUATION_ERROR['error']['message'])]:
-                        server.error = copy.deepcopy(CONTINUATION_ERROR)
+                    if redacted:
+                        server.error = copy.deepcopy(selected_error)
+                        server.error['error']['param'] = None
+                        server.mode,server.hits = 'reject',[]
+                        rid,status,raw = call(payload(not collect))
+                        assert status == 200 and [n for n,_ in server.hits] == ['first','fallback'],(event,status)
+                        successful.append(rid)
+                        count += 1
+                    bad_params = ['', 'input[1]'] if redacted else [None, '', 'input[1]']
+                    patches = [('code','other')] + [('param',v) for v in bad_params] + [
+                        ('message','Quoted: '+selected_error['error']['message']),
+                        ('message',selected_error['error']['message']+' extra')]
+                    for field,value in patches:
+                        server.error = copy.deepcopy(selected_error)
                         server.error['error'][field] = value
                         server.mode,server.hits = 'reject',[]
                         _,status,_ = call(payload(not collect))
@@ -129,19 +142,24 @@ def verify(binary, engine, collect, hedging=False):
                         count += 1
                     # Missing/wrong type can map to an ordinary retryable 500;
                     # strict type matching is covered by the classifier units.
-                    for field in ['code','param','message']:
-                        server.error = copy.deepcopy(CONTINUATION_ERROR)
+                    for field in (['code','message'] if redacted else ['code','param','message']):
+                        server.error = copy.deepcopy(selected_error)
                         del server.error['error'][field]
                         server.hits = []
                         _,status,_ = call(payload(not collect))
                         # Missing message is still invalid_request_error, not a recognized fallback.
                         assert status == 400 and len(server.hits) == 1,(event,field,status)
                         count += 1
-                    server.error = copy.deepcopy(CONTINUATION_ERROR)
-                    for items in [[{'role':'user','content':'plain'}],
+                    server.error = copy.deepcopy(selected_error)
+                    malformed_histories = [[{'role':'user','content':'plain'}],
                         [{'type':'reasoning','encrypted_content':''}],
                         [{'type':'compaction','encrypted_content':None}],
-                        [{'type':'reasoning','encrypted_content':'opaque'},{'type':'compaction'}]]:
+                        [{'type':'reasoning','encrypted_content':'opaque'},
+                         {'type':'compaction','encrypted_content':False}]]
+                    if not redacted:
+                        malformed_histories.append([{'type':'reasoning','encrypted_content':'opaque'},
+                                                    {'type':'compaction'}])
+                    for items in malformed_histories:
                         body = payload(not collect); body['input'] = items
                         server.hits = []
                         _,status,_ = call(body)
@@ -168,7 +186,8 @@ def verify(binary, engine, collect, hedging=False):
                 for secret in ['gAAAAopaque-do-not-log','c2c:opaque-do-not-log','fixture-secret','private-history','private-result']:
                     assert secret not in encoded,secret
                 assert (root/'api.json').read_bytes() == original_config
-                print(f'PASS exact continuation SSE engine={engine} collect={collect} hedging={hedging}: {count} HTTP cases; raw200/semantic400/routing502, unchanged body, no cooldown')
+                signature = 'redacted encrypted content' if redacted else 'continuation'
+                print(f'PASS exact {signature} SSE engine={engine} collect={collect} hedging={hedging} unknown_retries={unknown_retries}: {count} HTTP cases; raw200/semantic400/routing502, unchanged body, no cooldown')
             finally:
                 process.terminate(); process.wait(timeout=15)
                 server.shutdown(); server.server_close()
