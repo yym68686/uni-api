@@ -93,11 +93,28 @@ A second observed HTTP 400 envelope uses `error.type="<nil>"` and the exact
 message `***.***.content.0: Invalid \`signature\` in \`thinking\` block`
 followed by one ` (request id: <opaque-id>)` suffix. Only this literal mask and
 block index are accepted; the receipt uses the same bounded opaque-ID grammar.
-`code` and `param` must be absent/null. Numeric positions with only one receipt,
-other masks, extra prose, and specific validation codes retain their behavior.
+`code` and `param` must be absent/null. Other masks, extra prose, and specific
+validation codes retain their behavior.
 
 Because the masked position cannot locate an original block, this envelope uses
 the same complete signed-history validation as the reindexed relay. Requests
 and signatures remain unchanged. Raw attempt/billing status stays 400; routing
 uses 502 with the existing retry budget, no global cooldown, and no retry after
 output has been committed. This does not change ordinary parameter validation.
+
+### Numeric relay signature error with one receipt
+
+The observed `<nil>` envelope also occurs with a numeric
+`messages.<index>.content.<index>` location and one
+` (request id: <opaque-id>)` suffix. It uses the same bounded receipt grammar
+and absent/null code and parameter checks. This location must identify an actual
+assistant thinking block with string thinking and a nonblank string signature
+in the outgoing Messages request. Unlike the masked or reindexed variants,
+another signed block elsewhere does not satisfy this check.
+
+This branch uses the existing request-scoped 502 fallback without altering the
+body, signatures, retry budgets, raw 400 billing or provider cooldown. It applies
+independently of the optional unknown-400 allowance: that conservative policy
+continues to exclude signature validation failures and the `<nil>` error type.
+Setting that allowance to 3 is an upper bound on eligible additional dispatches,
+not a promise to retry every upstream 400 three times.

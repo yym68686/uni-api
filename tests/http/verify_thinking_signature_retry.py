@@ -21,6 +21,9 @@ RELAY_ERROR = {"error": {"type": "<nil>", "message":
 MASKED_ERROR = {"error": {"type": "<nil>", "message":
     "***.***.content.0: Invalid `signature` in `thinking` block "
     "(request id: fixture-request-3)"}}
+SINGLE_ERROR = {"error": {"type": "<nil>", "message":
+    "messages.1.content.0: Invalid `signature` in `thinking` block "
+    "(request id: fixture-request-4)"}}
 BODY = {"model": "claude-opus-5-5", "max_tokens": 32000, "thinking": {"type": "adaptive"},
         "output_config": {"effort": "high"}, "tools": [{"name": "read", "input_schema": {"type": "object"}}],
         "messages": [{"role": "user", "content": "fixture"},
@@ -80,10 +83,12 @@ def main(binary):
         # Non-Messages wire must not treat messages[] text in an unrelated body as signed history.
         providers.append({**providers[0], "provider": "gpt", "engine": "gpt",
                           "base_url": f"http://127.0.0.1:{upstream.server_port}/gpt/v1/chat/completions"})
-        config = {"providers": providers, "preferences": {"hedging": {"enabled": False}}, "api_keys": [
+        config = {"providers": providers, "preferences": {"hedging": {"enabled": False},
+                  "unknown_upstream_400_retries": 3}, "api_keys": [
             {"api": "retry", "model": ["first/*", "fallback/*"]},
             {"api": "no-retry", "model": ["first/*", "fallback/*"], "preferences": {"AUTO_RETRY": False}},
             {"api": "exhausted", "model": ["first/*", "also-reject/*"]},
+            {"api": "limited", "model": ["first/*", "also-reject/*"], "preferences": {"AUTO_RETRY": 3}},
             {"api": "gpt-only", "model": ["gpt/*"]}]}
         (root/'config.json').write_text(json.dumps(config))
         env = {k: v for k, v in os.environ.items() if k in ('PATH','HOME','TMPDIR','LANG','DYLD_LIBRARY_PATH')}
@@ -111,13 +116,16 @@ def main(binary):
                 else: raise AssertionError('not ready')
                 count=0
                 fact_rids = []
-                for error in [ERROR, RELAY_ERROR, MASKED_ERROR, {"error": {"message": json.dumps(RELAY_ERROR)}},
+                for error in [ERROR, RELAY_ERROR, MASKED_ERROR, SINGLE_ERROR,
+                              {"error": {"message": json.dumps(SINGLE_ERROR)}},
+                              {"error": {"message": json.dumps(RELAY_ERROR)}},
                               {"error": {"message": json.dumps(MASKED_ERROR)}}]:
                     upstream.error = error
                     fact_rids.append(f'signature-{count}')
                     for stream in [False,True]:
                         for key,expected,hits in [('retry',200,['first','fallback']),('no-retry',502,['first']),
-                                                  ('exhausted',502,['first','also-reject']*3),('retry',200,['first','fallback'])]:
+                                                  ('exhausted',502,['first','also-reject']*3),
+                                                  ('limited',502,['first','also-reject']*2),('retry',200,['first','fallback'])]:
                             upstream.hits=[];body={**copy.deepcopy(BODY),'stream':stream};rid=f'signature-{count}'
                             status,raw=call(body,key,rid)
                             assert status==expected,(key,status,raw)
@@ -128,7 +136,7 @@ def main(binary):
                             count+=1
                 # Same first provider is still selected immediately: no long global cooldown.
                 negatives=[('missing-signature',None),('empty-signature',''),('blank-signature',' \n'),('non-string',42)]
-                for error in [ERROR, RELAY_ERROR, MASKED_ERROR]:
+                for error in [ERROR, RELAY_ERROR, MASKED_ERROR, SINGLE_ERROR]:
                     upstream.error = error
                     for name,sig in negatives:
                         upstream.hits=[];body=copy.deepcopy(BODY);body['messages'][1]['content'][0]['signature']=sig
@@ -157,12 +165,21 @@ def main(binary):
                     {'code':'invalid_type'}, {'code':'invalid_request_error'}, {'param':'messages'},
                     {'type':'invalid_request_error'},
                     {'message':MASKED_ERROR['error']['message']+'. The block is bound to a different conversation.'},
-                    {'message':MASKED_ERROR['error']['message'].replace('***.***','messages.1')},
+                    {'message':MASKED_ERROR['error']['message'].replace('***.***','messages.99')},
                     {'message':MASKED_ERROR['error']['message'].replace('content.0','content.1')}]:
                     upstream.error={'error':{**MASKED_ERROR['error'],**patch}};upstream.hits=[]
                     status,_=call(BODY,rid=f'masked-negative-{count}')
                     assert status==400 and len(upstream.hits)==1;count+=1
-                for error in [ERROR, RELAY_ERROR, MASKED_ERROR]:
+                for patch in [
+                    {'code':'invalid_type'}, {'code':'invalid_request_error'}, {'param':'messages'},
+                    {'type':'invalid_request_error'},
+                    {'message':SINGLE_ERROR['error']['message'].replace('1.content.0','99.content.0')},
+                    {'message':SINGLE_ERROR['error']['message'].replace('1.content.0','1.content.1')},
+                    {'message':SINGLE_ERROR['error']['message']+'. Rebuild the conversation.'}]:
+                    upstream.error={'error':{**SINGLE_ERROR['error'],**patch}};upstream.hits=[]
+                    status,_=call(BODY,rid=f'single-negative-{count}')
+                    assert status==400 and len(upstream.hits)==1;count+=1
+                for error in [ERROR, RELAY_ERROR, MASKED_ERROR, SINGLE_ERROR]:
                     upstream.error=error;upstream.hits=[];upstream.mode='http'
                     status,_=call(BODY,key='gpt-only',path='/v1/chat/completions',rid=f'not-messages-{count}')
                     assert status==400 and len(upstream.hits)==1;count+=1

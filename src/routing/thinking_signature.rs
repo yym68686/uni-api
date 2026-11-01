@@ -70,8 +70,8 @@ enum Rejection {
     ReindexedRelay,
 }
 
-// Only the two observed attribution suffixes are accepted, with bounded opaque
-// IDs. Extra prose (including prefix-binding guidance) must not trigger failover.
+// Only observed attribution suffixes are accepted, with bounded opaque IDs.
+// Extra prose (including prefix-binding guidance) must not trigger failover.
 fn strip_relay_receipts(message: &str) -> Option<&str> {
     let (message, receipts) = message.split_once(" (luban request id: ")?;
     let (luban, request) = receipts.split_once(") (request id: ")?;
@@ -85,6 +85,11 @@ fn strip_relay_receipts(message: &str) -> Option<&str> {
     Some(message)
 }
 
+fn strip_request_receipt(message: &str) -> Option<&str> {
+    let (message, receipt) = message.split_once(" (request id: ")?;
+    valid_receipt_id(receipt.strip_suffix(')')?).then_some(message)
+}
+
 fn valid_receipt_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -93,7 +98,8 @@ fn valid_receipt_id(s: &str) -> bool {
 }
 
 // This observed relay masks the message position. Do not accept arbitrary
-// wildcards, unmasked single-receipt errors, or additional validation guidance.
+// wildcards or additional validation guidance. Numeric single-receipt errors
+// must instead locate the actual signed wire block.
 fn masked_relay_error(message: &str) -> bool {
     message
         .strip_prefix("***.***.content.0: Invalid `signature` in `thinking` block (request id: ")
@@ -128,16 +134,20 @@ fn error_location(detail: &str) -> Option<Rejection> {
             continue;
         }
         let relay = error.get("type").and_then(Value::as_str) == Some("<nil>");
-        let message = if relay {
+        let (message, reindexed) = if relay {
             if !error.get("code").is_none_or(Value::is_null) {
                 return None;
             }
             if masked_relay_error(message) {
                 return Some(Rejection::ReindexedRelay);
             }
-            strip_relay_receipts(message)?
+            if let Some(message) = strip_relay_receipts(message) {
+                (message, true)
+            } else {
+                (strip_request_receipt(message)?, false)
+            }
         } else if error.get("type").and_then(Value::as_str) == Some("invalid_request_error") {
-            message
+            (message, false)
         } else {
             return None;
         };
@@ -153,7 +163,7 @@ fn error_location(detail: &str) -> Option<Rejection> {
                 .flatten()
         };
         let (message_index, block_index) = (index(message)?, index(block)?);
-        return Some(if relay {
+        return Some(if reindexed {
             Rejection::ReindexedRelay
         } else {
             Rejection::Block(message_index, block_index)
@@ -331,6 +341,85 @@ mod tests {
             "***.***.content.0: Invalid `signature` in `thinking` block (request id: fixture-request-3)"}})
     }
 
+    fn single_receipt_error() -> Value {
+        json!({"error":{"type":"<nil>","message":
+            "messages.1.content.0: Invalid `signature` in `thinking` block (request id: fixture-request-4)"}})
+    }
+
+    #[test]
+    fn single_receipt_relay_requires_the_actual_signed_wire_location() {
+        let raw = request().to_string();
+        let original = single_receipt_error();
+        for body in [
+            original.clone(),
+            json!({"error":{"type":"upstream_error","message":original.to_string()}}),
+            json!({"detail":original["error"]}),
+            json!({"error": {"type":"<nil>","message":original["error"]["message"],"code":null,"param":null}}),
+        ] {
+            assert!(rejected_block(400, &body.to_string(), raw.as_bytes()));
+            for status in [200, 403, 422, 500] {
+                assert!(!rejected_block(status, &body.to_string(), raw.as_bytes()));
+            }
+        }
+        let message = original["error"]["message"].as_str().unwrap();
+        for changed in [
+            message.replace("fixture-request-4", ""),
+            message.replace("fixture-request-4", &"a".repeat(129)),
+            message.replace("fixture-request-4", "with space"),
+            message.replace("fixture-request-4", "https://example.com"),
+            message.replace("1.content.0", "99.content.0"),
+            message.replace("1.content.0", "1.content.1"),
+            message.replace("1.content.0", "-1.content.0"),
+            message.replace("1.content.0", "1.content.99999999999999999999999"),
+            message.replace("signature", "text"),
+            message.replace(" (request id: fixture-request-4)", ""),
+            format!("{message} (request id: second)"),
+            format!("Quoted input: {message}"),
+            format!("{message}. The block is bound to a different conversation."),
+        ] {
+            let mut other = original.clone();
+            other["error"]["message"] = json!(changed);
+            assert!(!rejected_block(400, &other.to_string(), raw.as_bytes()));
+        }
+        for (field, value) in [
+            ("type", json!("invalid_request_error")),
+            ("type", Value::Null),
+            ("code", json!("invalid_request_error")),
+            ("code", json!(400)),
+            ("param", json!("messages")),
+            ("param", json!("")),
+        ] {
+            let mut other = original.clone();
+            other["error"][field] = value;
+            assert!(!rejected_block(400, &other.to_string(), raw.as_bytes()));
+        }
+        for (path, value) in [
+            ("/messages/1/role", json!("user")),
+            ("/messages/1/content/0/type", json!("text")),
+            ("/messages/1/content/0/thinking", Value::Null),
+            ("/messages/1/content/0/signature", Value::Null),
+            ("/messages/1/content/0/signature", json!(" \n")),
+            ("/messages/1/content/0/signature", json!(42)),
+        ] {
+            let mut body = request();
+            *body.pointer_mut(path).unwrap() = value;
+            assert!(!rejected_block(
+                400,
+                &original.to_string(),
+                body.to_string().as_bytes()
+            ));
+        }
+        for (field, value) in [
+            ("type", "authentication_error"),
+            ("code", "invalid_type"),
+            ("param", "messages"),
+        ] {
+            let mut wrapper = json!({"error":{"message":original.to_string()}});
+            wrapper["error"][field] = json!(value);
+            assert!(!rejected_block(400, &wrapper.to_string(), raw.as_bytes()));
+        }
+    }
+
     #[test]
     fn masked_relay_accepts_only_the_observed_envelope() {
         let raw = request().to_string();
@@ -359,7 +448,7 @@ mod tests {
             message.replace("fixture-request-3", &"a".repeat(129)),
             message.replace("fixture-request-3", "with space"),
             message.replace("fixture-request-3", "https://example.com"),
-            message.replace("***.***", "messages.1"),
+            message.replace("***.***", "messages.99"),
             message.replace("***.***", "*.***"),
             message.replace("content.0", "content.1"),
             message.replace("signature", "text"),
