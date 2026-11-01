@@ -14,6 +14,10 @@ pub fn compile_snapshot_bytes(raw: &[u8], database_disabled: bool) -> Result<Vec
     let root = config
         .as_object()
         .ok_or_else(|| "uni-api configuration must be a mapping".to_owned())?;
+    crate::routing::unknown_400::validate(
+        root.get("preferences")
+            .and_then(|p| p.get(crate::routing::unknown_400::KEY)),
+    )?;
 
     let mut providers = root
         .get("providers")

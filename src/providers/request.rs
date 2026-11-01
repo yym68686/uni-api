@@ -203,6 +203,7 @@ pub(crate) fn build_attempt(
             AttemptBody::Replay(storage.clone_for_replay(), observation.clone())
         };
         return Ok(PreparedAttempt {
+            unknown_400_safe: false,
             dispatch: None,
             method: method.clone(),
             url,
@@ -688,6 +689,7 @@ pub(crate) fn build_attempt(
         AttemptBody::Json(body)
     };
     Ok(PreparedAttempt {
+        unknown_400_safe: false,
         dispatch: None,
         method: outgoing_method,
         url,

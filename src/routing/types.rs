@@ -27,6 +27,7 @@ pub(crate) struct ProviderFailurePolicy {
 pub(crate) struct ResolvedRoute {
     pub(crate) providers: Vec<Arc<Provider>>,
     pub(crate) hedging: HedgingConfig,
+    pub(crate) unknown_400_retries: u8,
 }
 
 pub(crate) struct RouteResolutionError {

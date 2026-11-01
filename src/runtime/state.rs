@@ -84,6 +84,9 @@ impl GatewayRuntime {
         };
         let raw: RawSnapshot = serde_json::from_slice(&bytes)
             .map_err(|error| format!("decode native Responses snapshot: {error}"))?;
+        crate::routing::unknown_400::validate(
+            raw.preferences.get(crate::routing::unknown_400::KEY),
+        )?;
         if raw.schema_version != SNAPSHOT_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported native Responses snapshot schema {}",

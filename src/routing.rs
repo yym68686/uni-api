@@ -10,3 +10,4 @@ pub(crate) mod retry;
 pub(crate) mod thinking_signature;
 pub(crate) mod timeouts;
 pub(crate) mod types;
+pub(crate) mod unknown_400;

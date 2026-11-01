@@ -378,7 +378,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
 }
 
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"supported":true,"global_settings":true,"create_provider":true,"automatic_engine":true,"upstream_stream_mode":1,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging"]}})
+    json!({"version":1,"supported":true,"global_settings":true,"unknown_upstream_400_retries":true,"create_provider":true,"automatic_engine":true,"upstream_stream_mode":1,"create_typesafe":true,"storage":"console_overlay","fields":supported_paths().iter().map(|(p,g,t)|json!({"path":format!("/{p}"),"group":g,"type":t,"hot_update":true})).collect::<Vec<_>>(),"engines":["typesafe","gpt","codex","claude","gemini","vertex","vertex-gemini","vertex-claude","aws","azure","azure-databricks","openrouter","cloudflare","cohere","jina","tavily","exa","doubao-translation"],"key_algorithms":["round_robin","fixed_priority","random","lottery"],"algorithm_note":"smart_round_robin 在本运行时按轮询执行，不能作为成功率策略","separate_scopes":{"api_key":["SCHEDULING_ALGORITHM","weights","AUTO_RETRY"],"global":["hedging","unknown_upstream_400_retries"]}})
 }
 
 pub(crate) fn valid_created_name(name: &str) -> bool {
@@ -977,7 +977,7 @@ impl GatewayRuntime {
                     let endpoint=input.sample.get("endpoint").and_then(Value::as_str).unwrap_or("/v1/responses");
                     let stream=input.sample.get("stream").and_then(Value::as_bool).unwrap_or(true);
                     let timeouts=crate::routing::timeouts::resolve_timeouts(&effective,p,model,upstream,&p.engine,stream,input.sample.get("request_type").and_then(Value::as_str),"",endpoint,"POST");
-                    json!({"scope":"global","provider":p.name.as_ref(),"model":model,"endpoint":endpoint,"stream":stream,"timeouts":timeouts,"hedging":crate::control::global_settings::resolved_hedging(&effective.preferences)})
+                    json!({"scope":"global","provider":p.name.as_ref(),"model":model,"endpoint":endpoint,"stream":stream,"timeouts":timeouts,"hedging":crate::control::global_settings::resolved_hedging(&effective.preferences),"unknown_upstream_400_retries":crate::routing::unknown_400::configured(&effective.preferences)})
                 }).unwrap_or(json!({"scope":"global"}));
                 previews.push(
                     json!({"provider":c.provider,"before":before,"after":after,"sample":sample}),
@@ -1256,6 +1256,7 @@ mod tests {
             "/preferences/model_timeout":120,
             "/preferences/cooldown_period":42,
             "/preferences/api_key_cooldown_period":7,
+            "/preferences/unknown_upstream_400_retries":2,
             "/preferences/hedging":{"enabled":true,"max_inflight_attempts":2,"winner_policy":"first_valid_success"},
             "/preferences/timeout_policy":{"default":{"connect":4},"rules":[{"match":{"endpoint":"/v1/responses","stream":true},"timeout":{"first_byte":8,"idle":15}},{"match":{"endpoint":"/v1/responses","stream":false},"timeout":{"total":180}}]}
         }}]})).unwrap();
@@ -1274,6 +1275,14 @@ mod tests {
             store.settings_change(mutation, true).await.unwrap()
         );
         let live = store.snapshot().await.unwrap();
+        assert_eq!(
+            crate::routing::unknown_400::configured(&live.preferences),
+            2
+        );
+        assert_eq!(
+            crate::routing::unknown_400::configured(&before.preferences),
+            0
+        );
         assert!(crate::upstream::hedging::parse_hedging(&live.preferences).active());
         assert_eq!(before.preferences.len(), 0);
         let channel = store.settings_view("one").await.unwrap();

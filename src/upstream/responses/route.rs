@@ -68,6 +68,7 @@ pub enum ResponsesPreparation {
 }
 
 pub struct ResponsesRoute {
+    pub(crate) unknown_400: crate::routing::unknown_400::Budget,
     pub(crate) store: GatewayRuntime,
     pub(crate) codex_oauth: CodexOAuthManager,
     pub(crate) persistence: Persistence,
@@ -157,7 +158,31 @@ impl ResponsesRoute {
         }
     }
 
-    pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
+    pub(crate) async fn record_plan_failure(&mut self, plan: Plan, outcome: &Value) -> bool {
+        let unknown = self.unknown_400.enabled()
+            && crate::routing::unknown_400::unknown_outcome(outcome)
+            && serde_json::from_str::<Value>(&plan.body)
+                .ok()
+                .is_some_and(|p| crate::routing::unknown_400::safe_request(&self.endpoint, &p));
+        // Existing exact fallbacks and proven repairs always get first refusal.
+        let retryable = self.record_plan_failure_inner(plan, outcome).await;
+        if unknown && !retryable {
+            self.unknown_400.set_cause(
+                outcome_status_from(outcome, "upstream_status_code", 400),
+                self.last_attempt
+                    .as_ref()
+                    .map(|a| a.attempt_id.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        self.unknown_400
+            .failure(retryable, unknown && self.last_status == 400)
+            // History repair reserves its physical attempt inside the old
+            // classifier. It may already be the final allowed attempt.
+            && (self.pending_history_repair.is_some() || self.has_attempts_remaining())
+    }
+
+    async fn record_plan_failure_inner(&mut self, mut plan: Plan, outcome: &Value) -> bool {
         self.set_current_plan(&plan);
         let history_endpoint = matches!(
             self.endpoint.as_str(),
@@ -342,11 +367,20 @@ impl ResponsesRoute {
             self.set_current_plan(&plan);
             return Ok(Some(plan));
         }
+        if !self.unknown_400.can_plan() {
+            return Ok(None);
+        }
         while self.has_attempts_remaining() {
             let attempt_number = self.routing_attempts;
             let provider = self.providers[self.cursor % self.providers.len()].clone();
             self.cursor += 1;
             self.routing_attempts = self.routing_attempts.saturating_add(1);
+            let upstream_url =
+                normalize_upstream_url(&provider.base_url, &provider.engine, self.wants_compact);
+            if !self.unknown_400.may_dispatch(&upstream_url) {
+                self.routing_skips = self.routing_skips.saturating_add(1);
+                continue;
+            }
             let original_model = provider
                 .models
                 .get(&self.request_model)
@@ -419,6 +453,14 @@ impl ResponsesRoute {
                 &engine,
                 self.wants_compact,
             )?;
+            if self.unknown_400.enabled()
+                && !self.unknown_400.may_dispatch_payload(
+                    crate::routing::unknown_400::safe_request(&self.endpoint, &payload),
+                )
+            {
+                self.routing_skips = self.routing_skips.saturating_add(1);
+                continue;
+            }
             let collect_stream = !self.stream
                 && !self.wants_compact
                 && crate::providers::stream_mode::stream_only(
@@ -458,6 +500,8 @@ impl ResponsesRoute {
                 &self.endpoint,
                 "POST",
             );
+            self.unknown_400
+                .dispatch(&upstream_url, &self.request_id, &attempt_id);
             self.upstream_attempts = self.upstream_attempts.saturating_add(1);
             let observation = NativeAttemptObservation {
                 request_id: self.request_id.clone(),
@@ -988,6 +1032,7 @@ impl ResponsesRoute {
             "routing_attempt_count": self.routing_attempts,
             "routing_skip_count": self.routing_skips,
             "upstream_attempt_count": self.upstream_attempts,
+            "unknown_400_retry_used": self.unknown_400.used(),
             "hedging": {
                 "enabled": self.hedging.enabled,
                 "max_inflight_attempts": self.hedging.max_inflight_attempts,

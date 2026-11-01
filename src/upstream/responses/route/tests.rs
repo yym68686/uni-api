@@ -101,6 +101,7 @@ async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> 
         .await
         .unwrap();
     ResponsesRoute {
+        unknown_400: Default::default(),
         store,
         codex_oauth: CodexOAuthManager::new(),
         persistence: Persistence::initialize(true).await.unwrap(),
@@ -147,6 +148,74 @@ async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> 
         final_emitted: false,
         _memory_reservation: memory_reservation,
     }
+}
+
+#[tokio::test]
+async fn final_reserved_history_repair_is_not_blocked_by_unknown_budget() {
+    for limit in [0, 2] {
+        let mut route = native_route_for_test(named_provider("first"), 2).await;
+        route.base_payload["input"] = json!([
+            {"type":"function_call","name":"","call_id":"bad","arguments":"{}"},
+            {"type":"function_call_output","call_id":"bad","output":"unsupported call: "}
+        ]);
+        route.unknown_400 = crate::routing::unknown_400::Budget::new(
+            limit,
+            true,
+            "/v1/responses",
+            &route.base_payload,
+        );
+        let first = route.next_plan().await.unwrap().unwrap();
+        let body = json!({"error":{"type":"invalid_request_error","code":"empty_string",
+            "param":"input[0].name",
+            "message":"Invalid 'input[0].name': empty string. Expected a string with minimum length 1, but got an empty string instead."}}).to_string();
+        assert!(
+            route
+                .record_plan_failure(
+                    first.clone(),
+                    &json!({
+                        "kind":"http_error","status_code":400,"upstream_status_code":400,
+                        "committed":false,"body":body,
+                    })
+                )
+                .await
+        );
+        assert!(!route.has_attempts_remaining()); // repair already reserved #2
+        let repair = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(repair.provider_name, first.provider_name);
+        assert_ne!(repair.body, first.body);
+        assert_eq!(route.unknown_400.used(), 0);
+        assert!(route.next_plan().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn unknown_400_rescue_trigger_preserves_remaining_cursor_and_budget() {
+    let mut route = native_route_for_test(Arc::new(provider()), 6).await;
+    route.providers = (0..3)
+        .map(|n| {
+            let mut p = provider();
+            p.name = format!("fixture-{n}").into();
+            p.base_url = format!("https://fixture-{n}.invalid/v1/responses").into();
+            Arc::new(p)
+        })
+        .collect();
+    route.unknown_400 =
+        crate::routing::unknown_400::Budget::new(2, true, "/v1/responses", &route.base_payload);
+    let error = json!({"kind":"http_error","status_code":400,"upstream_status_code":400,"committed":false,
+        "body":json!({"error":{"type":"invalid_request_error","message":"Relay backend hiccup"}}).to_string()});
+    let first = route.next_plan().await.unwrap().unwrap();
+    assert!(route.record_plan_failure(first, &error).await);
+    let second = route.next_plan().await.unwrap().unwrap();
+    let cursor = route.cursor;
+    assert!(route.next_plan().await.unwrap().is_none()); // speculative hedge trigger
+    assert_eq!(route.cursor, cursor);
+    assert_eq!(route.unknown_400.used(), 1);
+    assert!(route.record_plan_failure(second, &error).await);
+    let third = route.next_plan().await.unwrap().unwrap();
+    assert_eq!(route.unknown_400.used(), 2);
+    assert!(!route.record_plan_failure(third, &error).await);
+    assert_eq!(route.last_status, 400);
+    assert!(route.next_plan().await.unwrap().is_none());
 }
 
 async fn catalog_fixture() -> GatewayRuntime {

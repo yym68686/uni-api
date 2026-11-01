@@ -55,6 +55,7 @@ use std::time::Instant;
 use url::Url;
 
 pub(crate) struct AttemptLoop {
+    pub(crate) unknown_400: crate::routing::unknown_400::Budget,
     pub(crate) state: AppState,
     pub(crate) started: Instant,
     pub(crate) arrival: Option<crate::observability::timing::RequestArrival>,
@@ -121,14 +122,21 @@ pub(crate) struct GenericHedgeFailure {
 
 pub(crate) async fn next_generic_hedge_plan(
     execution: &AttemptLoop,
+    unknown_400: &mut crate::routing::unknown_400::Budget,
     cursor: &mut usize,
     last_status: &mut StatusCode,
     last_detail: &mut String,
 ) -> Option<GenericHedgePlan> {
+    if !unknown_400.can_plan() {
+        return None;
+    }
     while *cursor < execution.max_attempts {
         let attempt_index = *cursor;
         *cursor += 1;
         let provider = execution.providers[attempt_index % execution.providers.len()].clone();
+        if !unknown_400.may_dispatch(&provider.base_url) {
+            continue;
+        }
         let Some(original_model) = provider.models.get(&execution.request_model).cloned() else {
             continue;
         };
@@ -260,6 +268,15 @@ pub(crate) async fn next_generic_hedge_plan(
             }
         }
         let attempt_started = Instant::now();
+        prepared.unknown_400_safe =
+            unknown_400.enabled() && safe_unknown_400_wire(&execution.path, &prepared.body);
+        if !unknown_400.may_dispatch_payload(prepared.unknown_400_safe) {
+            continue;
+        }
+        if !unknown_400.may_dispatch(&prepared.url) {
+            continue;
+        }
+        unknown_400.dispatch(&prepared.url, &execution.request_id, &attempt_id);
         prepared.dispatch = execution.arrival.map(|arrival| {
             arrival.attempt(
                 crate::observability::metrics::MetricKey::new(
@@ -371,9 +388,10 @@ pub(crate) fn spawn_generic_hedge_attempt(
 }
 
 pub(crate) async fn run_hedged_attempt_loop(
-    execution: AttemptLoop,
+    mut execution: AttemptLoop,
     hedging: HedgingConfig,
 ) -> Response<Body> {
+    let mut unknown_400 = std::mem::take(&mut execution.unknown_400);
     let mut scheduler = HedgeScheduler::new(hedging.max_inflight_attempts);
     let mut pending = HashMap::<usize, GenericHedgeContext>::new();
     let mut cursor = 0usize;
@@ -383,8 +401,14 @@ pub(crate) async fn run_hedged_attempt_loop(
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
 
-    if let Some(plan) =
-        next_generic_hedge_plan(&execution, &mut cursor, &mut last_status, &mut last_detail).await
+    if let Some(plan) = next_generic_hedge_plan(
+        &execution,
+        &mut unknown_400,
+        &mut cursor,
+        &mut last_status,
+        &mut last_detail,
+    )
+    .await
     {
         pending.insert(plan.context.attempt_index, plan.context.clone());
         spawn_generic_hedge_attempt(&mut scheduler, &execution, plan);
@@ -398,6 +422,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                 if scheduler.has_capacity() {
                     if let Some(plan) = next_generic_hedge_plan(
                         &execution,
+                        &mut unknown_400,
                         &mut cursor,
                         &mut last_status,
                         &mut last_detail,
@@ -512,6 +537,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     completion_price: execution.completion_price,
                     timing_spans: json!({
                         "runtime": "rust",
+                        "unknown_400_retry_used": unknown_400.used(),
                         "stream_collection": collected_outcome,
                         "terminal": "hedge_winner",
                         "attempt_count": cursor,
@@ -566,9 +592,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     last_upstream_response = None;
                 } else {
                     last_detail = failure.detail.clone();
-                    if let Some(response) = failure.response.take() {
-                        last_upstream_response = Some(response);
-                    }
+                    last_upstream_response = failure.response.take();
                 }
                 execution.state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
@@ -631,12 +655,23 @@ pub(crate) async fn run_hedged_attempt_loop(
                     "failed",
                     Some(failure.observed_status()),
                 );
-                if policy.retryable
+                if failure.unknown_400() && !policy.retryable {
+                    unknown_400.set_cause(
+                        failure.observed_status(),
+                        format!("{}-r{}", execution.request_id, context.attempt_index + 1),
+                    );
+                }
+                let retryable = unknown_400.failure(
+                    policy.retryable,
+                    policy.status == 400 && failure.unknown_400(),
+                );
+                if retryable
                     && failure.failure_reason != "stream_collection_after_output"
                     && scheduler.has_capacity()
                 {
                     if let Some(plan) = next_generic_hedge_plan(
                         &execution,
+                        &mut unknown_400,
                         &mut cursor,
                         &mut last_status,
                         &mut last_detail,
@@ -651,6 +686,9 @@ pub(crate) async fn run_hedged_attempt_loop(
         }
     }
 
+    if let Some(response) = last_upstream_response.as_ref() {
+        last_status = response.status();
+    }
     execution.state.persistence.record_request(RequestStat {
         is_flagged: true,
         failure_reason: Some("no_successful_channel".into()),
@@ -665,6 +703,7 @@ pub(crate) async fn run_hedged_attempt_loop(
         timing_spans: json!({
             "runtime":"rust",
             "terminal":"hedge_exhausted",
+            "unknown_400_retry_used": unknown_400.used(),
             "attempt_count": cursor,
             "hedge_trigger_count": trigger_count,
             "hedge_cancelled_attempt_count": cancelled_count,
@@ -677,6 +716,7 @@ pub(crate) async fn run_hedged_attempt_loop(
 
 pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let AttemptLoop {
+        mut unknown_400,
         state,
         started,
         arrival,
@@ -707,6 +747,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
 
     for attempt_index in 0..max_attempts {
         let provider = providers[attempt_index % providers.len()].clone();
+        if !unknown_400.may_dispatch(&provider.base_url) {
+            continue;
+        }
         let Some(original_model) = provider.models.get(&request_model).cloned() else {
             continue;
         };
@@ -783,6 +826,19 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
         }
         let attempt_started = Instant::now();
+        prepared.unknown_400_safe =
+            unknown_400.enabled() && safe_unknown_400_wire(&path, &prepared.body);
+        if !unknown_400.may_dispatch_payload(prepared.unknown_400_safe) {
+            continue;
+        }
+        if !unknown_400.may_dispatch(&prepared.url) {
+            continue;
+        }
+        unknown_400.dispatch(
+            &prepared.url,
+            &request_id,
+            &format!("{request_id}-r{}", attempt_index + 1),
+        );
         prepared.dispatch = arrival.map(|arrival| {
             arrival.attempt(
                 crate::observability::metrics::MetricKey::new(
@@ -866,6 +922,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     completion_price,
                     timing_spans: json!({
                         "runtime": "rust",
+                        "unknown_400_retry_used": unknown_400.used(),
                         "stream_collection": collected_outcome,
                         "attempt_count": attempt_index + 1,
                         "upstream_ms": attempt_started.elapsed().as_millis(),
@@ -1089,9 +1146,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     last_upstream_response = None;
                 } else {
                     last_detail = failure.detail.clone();
-                    if let Some(response) = failure.response.take() {
-                        last_upstream_response = Some(response);
-                    }
+                    last_upstream_response = failure.response.take();
                 }
                 state.persistence.record_channel(ChannelStat {
                     terminal_kind: None,
@@ -1149,7 +1204,17 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     "failed",
                     Some(failure.observed_status()),
                 );
-                if !policy.retryable || failure.failure_reason == "stream_collection_after_output" {
+                if failure.unknown_400() && !policy.retryable {
+                    unknown_400.set_cause(
+                        failure.observed_status(),
+                        format!("{request_id}-r{}", attempt_index + 1),
+                    );
+                }
+                let retryable = unknown_400.failure(
+                    policy.retryable,
+                    policy.status == 400 && failure.unknown_400(),
+                );
+                if !retryable || failure.failure_reason == "stream_collection_after_output" {
                     break;
                 }
             }
@@ -1173,7 +1238,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         process_time: started.elapsed().as_secs_f64(),
         model: request_model,
         api_key,
-        timing_spans: json!({"runtime":"rust","terminal":"route_exhausted"}).to_string(),
+        timing_spans: json!({"runtime":"rust","terminal":"route_exhausted","unknown_400_retry_used":unknown_400.used()}).to_string(),
         ..RequestStat::default()
     });
     last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
@@ -1200,6 +1265,23 @@ pub(crate) fn copy_oaix_headers(source: &HeaderMap, target: &mut HeaderMap) {
     }
 }
 
+fn precommit_reason(reason: Option<&str>, safe: bool) -> String {
+    match reason {
+        Some("unknown_upstream_400") if !safe => "upstream_response_failed".into(),
+        Some("unknown_upstream_400") => "unknown_upstream_400_sse".into(),
+        other => other.unwrap_or("other").into(),
+    }
+}
+
+fn safe_unknown_400_wire(endpoint: &str, body: &AttemptBody) -> bool {
+    match body {
+        AttemptBody::Json(bytes) => serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .is_some_and(|p| crate::routing::unknown_400::safe_request(endpoint, &p)),
+        _ => false,
+    }
+}
+
 pub(crate) struct AttemptFailure {
     pub(crate) failure_reason: String,
     pub(crate) status: StatusCode,
@@ -1209,7 +1291,16 @@ pub(crate) struct AttemptFailure {
 }
 
 impl AttemptFailure {
+    fn unknown_400(&self) -> bool {
+        matches!(
+            self.failure_reason.as_str(),
+            "unknown_upstream_400" | "unknown_upstream_400_sse"
+        )
+    }
     fn observed_status(&self) -> u16 {
+        if self.failure_reason == "unknown_upstream_400_sse" {
+            return 200;
+        }
         if matches!(
             self.failure_reason.as_str(),
             crate::routing::thinking_signature::FAILURE_REASON
@@ -1268,6 +1359,7 @@ pub(crate) async fn send_attempt(
     keepalive_updates: Option<&crate::protocols::chat::stream::KeepaliveUpdates>,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
+    let unknown_400_safe = prepared.unknown_400_safe;
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
     let timeouts = state
@@ -1569,6 +1661,11 @@ pub(crate) async fn send_attempt(
                 crate::routing::gemini_tool_part::FAILURE_REASON.into()
             } else if signature_failure {
                 crate::routing::thinking_signature::FAILURE_REASON.into()
+            } else if status == StatusCode::BAD_REQUEST
+                && unknown_400_safe
+                && crate::routing::unknown_400::unknown_detail(&detail)
+            {
+                "unknown_upstream_400".into()
             } else {
                 format!("upstream_http_{}", status.as_u16())
             },
@@ -1599,6 +1696,10 @@ pub(crate) async fn send_attempt(
         .map_err(|failure| AttemptFailure {
             failure_reason: if failure.outcome["retry_allowed"] == false {
                 "stream_collection_after_output"
+            } else if unknown_400_safe
+                && crate::routing::unknown_400::unknown_outcome(&failure.outcome)
+            {
+                "unknown_upstream_400_sse"
             } else {
                 "protocol_error"
             }
@@ -1648,7 +1749,7 @@ pub(crate) async fn send_attempt(
                 )
                 .await
                 .map_err(|failure| AttemptFailure {
-                    failure_reason: failure.failure_reason.unwrap_or("other").into(),
+                    failure_reason: precommit_reason(failure.failure_reason, unknown_400_safe),
                     status: StatusCode::from_u16(failure.status_code)
                         .unwrap_or(StatusCode::BAD_GATEWAY),
                     detail: failure.detail,
@@ -1726,7 +1827,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|failure| AttemptFailure {
-                failure_reason: failure.failure_reason.unwrap_or("other").into(),
+                failure_reason: precommit_reason(failure.failure_reason, unknown_400_safe),
                 status: StatusCode::from_u16(failure.status_code)
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 detail: failure.detail,
@@ -1756,7 +1857,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|failure| AttemptFailure {
-                failure_reason: failure.failure_reason.unwrap_or("other").into(),
+                failure_reason: precommit_reason(failure.failure_reason, unknown_400_safe),
                 status: StatusCode::from_u16(failure.status_code)
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 detail: failure.detail,

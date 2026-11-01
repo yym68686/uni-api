@@ -13,13 +13,20 @@ pub(crate) const KEYS: &[&str] = &[
     "api_key_rate_limit_cooldown_period",
     "api_key_quota_cooldown_period",
     "hedging",
+    "unknown_upstream_400_retries",
 ];
 
 pub(crate) fn document(preferences: &Map<String, Value>) -> Value {
     json!({"preferences":preferences.iter().filter(|(k,_)|KEYS.contains(&k.as_str())).map(|(k,v)|(k.clone(),v.clone())).collect::<Map<_,_>>()})
 }
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"global_settings":true,"fields":KEYS.iter().map(|k|json!({"path":format!("/preferences/{k}"),"group":if *k=="hedging"{"并行请求"}else{"超时与冷却"},"type":if k.ends_with("cooldown_period"){"number"}else{"json"}})).collect::<Vec<_>>(),"engines":[],"key_algorithms":[]})
+    json!({"version":1,"global_settings":true,"unknown_upstream_400_retries":true,"fields":KEYS.iter().map(|k| {
+        if *k == crate::routing::unknown_400::KEY {
+            json!({"path":format!("/preferences/{k}"),"group":"重试保护","type":"integer","minimum":0,"maximum":3,"note":note(k)})
+        } else {
+            json!({"path":format!("/preferences/{k}"),"group":if *k=="hedging"{"并行请求"}else{"超时与冷却"},"type":if k.ends_with("cooldown_period"){"number"}else{"json"}})
+        }
+    }).collect::<Vec<_>>(),"engines":[],"key_algorithms":[]})
 }
 pub(crate) fn default_value(key: &str) -> Option<Value> {
     Some(match key {
@@ -32,6 +39,7 @@ pub(crate) fn default_value(key: &str) -> Option<Value> {
         "hedging" => {
             json!({"enabled":false,"max_inflight_attempts":1,"winner_policy":"first_valid_success"})
         }
+        "unknown_upstream_400_retries" => json!(0),
         _ => return None,
     })
 }
@@ -42,6 +50,9 @@ pub(crate) fn validate(raw: &Value) -> Result<(), String> {
         .ok_or("Invalid global preferences")?;
     let numeric = |v: &Value| v.as_f64().is_some_and(|n| n >= 0.0 && n.is_finite());
     for (k, v) in p {
+        if k == crate::routing::unknown_400::KEY {
+            crate::routing::unknown_400::validate(Some(v))?;
+        }
         if !KEYS.contains(&k.as_str()) {
             return Err(format!("Unsupported global preference: {k}"));
         }
@@ -158,6 +169,7 @@ pub(crate) fn note(key: &str) -> &'static str {
     match key {
         "model_timeout" => "支持统一秒数或按模型设置；条件超时策略优先，具体请求值可在预览中核对。",
         "timeout_policy" => "全局规则先匹配，渠道规则再覆盖；未填写的超时项继续继承。",
+        "unknown_upstream_400_retries" => "未知上游400的额外换渠道次数（0–3，默认0关闭），仍受调用API key的AUTO_RETRY总预算约束；不改变已有精确规则。仅未输出、非明确参数/安全错误且无已知副作用的请求，不改正文、不全局冷却，耗尽保留400。重试可能增加费用与延迟。",
         "keepalive_interval" => "0 或大于当前模型超时的间隔不发送心跳。",
         "api_key_rate_limit_cooldown_period" => {
             "配置为 0 时实际使用 1800 秒；站点 Retry-After 可延长冷却。"
@@ -169,7 +181,10 @@ pub(crate) fn note(key: &str) -> &'static str {
 
 pub(crate) fn field_values(channel: &Value, global: &Map<String, Value>) -> Value {
     let mut out = Map::new();
-    for k in KEYS.iter().filter(|k| **k != "hedging") {
+    for k in KEYS
+        .iter()
+        .filter(|k| !["hedging", crate::routing::unknown_400::KEY].contains(k))
+    {
         let path = format!("/preferences/{k}");
         let configured = channel.pointer(&path);
         let inherited = global
@@ -192,6 +207,36 @@ pub(crate) fn resolved_hedging(p: &Map<String, Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_400_policy_is_strict_global_only_and_defaults_off() {
+        let path = "/preferences/unknown_upstream_400_retries";
+        assert_eq!(
+            default_value("unknown_upstream_400_retries"),
+            Some(json!(0))
+        );
+        for n in 0..=3 {
+            assert!(validate(&json!({"preferences":{"unknown_upstream_400_retries":n}})).is_ok());
+        }
+        for bad in [
+            json!(4),
+            json!(-1),
+            json!(1.0),
+            json!("1"),
+            json!(true),
+            json!(null),
+        ] {
+            assert!(
+                validate(&json!({"preferences":{"unknown_upstream_400_retries":bad}})).is_err()
+            );
+        }
+        assert!(schema()["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["path"] == path && v["type"] == "integer" && v["maximum"] == 3));
+        assert!(field_values(&json!({}), &Map::new()).get(path).is_none());
+    }
 
     #[test]
     fn policy_validation_and_cooldown_resolution_match_runtime() {

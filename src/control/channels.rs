@@ -1032,6 +1032,7 @@ impl GatewayRuntime {
                     .get(&url)
                     .header("X-Uni-Channel-Settings-Version", "1")
                     .header("X-Uni-Upstream-Stream-Mode", "1")
+                    .header("X-Uni-Unknown-Upstream-400-Retries", "1")
                     .bearer_auth(&token)
                     .send()
                     .await

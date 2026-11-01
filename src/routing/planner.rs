@@ -140,7 +140,11 @@ impl GatewayRuntime {
         } else {
             parse_hedging(&snapshot.preferences)
         };
-        Ok(ResolvedRoute { providers, hedging })
+        Ok(ResolvedRoute {
+            providers,
+            hedging,
+            unknown_400_retries: crate::routing::unknown_400::configured(&snapshot.preferences),
+        })
     }
 
     pub(crate) async fn schedule_providers(

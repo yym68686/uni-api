@@ -37,6 +37,7 @@ pub(crate) fn record_log(log: &Value) {
             | "responses_encrypted_content_fallback"
             | "responses_compaction_state_fallback"
             | "responses_heartbeat_repair"
+            | "unknown_upstream_400_retry"
     ) {
         return;
     }
@@ -54,6 +55,8 @@ pub(crate) fn record_log(log: &Value) {
         "attempt_status_code",
         "routing_status_code",
         "semantic_status_code",
+        "unknown_400_retry_limit",
+        "unknown_400_retry_used",
         "skip_reason",
         "status_origin",
         "error_sha256",

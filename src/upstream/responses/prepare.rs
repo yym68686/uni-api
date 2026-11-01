@@ -391,6 +391,12 @@ pub async fn prepare_request(
     let retry_policy = RetryPolicy::from_value(api_key.preferences.get("AUTO_RETRY"));
     let max_attempts = retry_policy.max_attempts(&providers, targeted);
     ResponsesPreparation::Ready(ResponsesRoute {
+        unknown_400: crate::routing::unknown_400::Budget::new(
+            crate::routing::unknown_400::configured(&snapshot.preferences),
+            retry_policy.enabled() && !targeted && max_attempts > 1,
+            normalized_endpoint,
+            &payload,
+        ),
         store: store.clone(),
         codex_oauth,
         persistence,
