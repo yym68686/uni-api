@@ -29,6 +29,7 @@ pub(crate) fn record_log(log: &Value) {
             | "thinking_signature_fallback"
             | "gemini_tool_part_fallback"
             | "alpha_search_text_fallback"
+            | "service_tier_fallback"
             | "ai_studio_examples_fallback"
             | "rust_request_spool"
             | "responses_empty_name_repair"

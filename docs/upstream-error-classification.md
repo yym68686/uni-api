@@ -118,3 +118,20 @@ independently of the optional unknown-400 allowance: that conservative policy
 continues to exclude signature validation failures and the `<nil>` error type.
 Setting that allowance to 3 is an upper bound on eligible additional dispatches,
 not a promise to retry every upstream 400 three times.
+
+## A standard-only BPS relay rejects priority service
+
+An HTTP400 with `error.type=upstream_error`, `code=unsupported_service_tier`,
+absent/null `param`, and the exact message
+`oai-basispoints supports only the standard service tier; omit service_tier or use auto/default; Fast/priority is not supported`
+identifies this relay's capability limit when the actual outgoing Chat or
+Responses body has `service_tier="priority"`. Routing uses 502 and existing
+request-scoped next-channel retries. The tier, encrypted history, tools and
+other request fields are preserved. No automatic downgrade or global cooldown
+is introduced; raw attempt/billing status stays400.
+
+`service_tier_fallback` records raw400/routing502 without request content.
+Disabled/targeted/exhausted retries return502. Ordinary unsupported/invalid
+values, default/auto/absent tiers, other error envelopes, and failures after
+stream output keep their existing behavior. The unknown400 allowance is
+unchanged. Loopback coverage is in `verify_service_tier_retry.py`.

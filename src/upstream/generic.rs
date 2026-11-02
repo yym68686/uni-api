@@ -1307,6 +1307,7 @@ impl AttemptFailure {
                 | crate::routing::gemini_tool_part::FAILURE_REASON
                 | crate::routing::alpha_search::FAILURE_REASON
                 | crate::routing::ai_studio_schema::FAILURE_REASON
+                | crate::routing::service_tier::FAILURE_REASON
         ) {
             400
         } else {
@@ -1327,6 +1328,7 @@ impl AttemptFailure {
                 | crate::routing::gemini_tool_part::FAILURE_REASON
                 | crate::routing::alpha_search::FAILURE_REASON
                 | crate::routing::ai_studio_schema::FAILURE_REASON
+                | crate::routing::service_tier::FAILURE_REASON
         ) {
             // Incompatible with this request, not evidence of
             // a broken provider/key. Do not put unrelated requests on cooldown.
@@ -1449,6 +1451,7 @@ pub(crate) async fn send_attempt(
     let mut signature_request = None;
     let mut gemini_request = None;
     let mut search_request = None;
+    let mut tier_request = None;
     request = match prepared.body {
         AttemptBody::Json(body) => {
             let body = Bytes::from(body);
@@ -1460,6 +1463,12 @@ pub(crate) async fn send_attempt(
             }
             if endpoint == crate::providers::request::ALPHA_SEARCH_ENDPOINT {
                 search_request = Some(body.clone());
+            }
+            if matches!(endpoint, "/v1/responses" | "/v1/chat/completions")
+                && !messages_wire
+                && !gemini_wire
+            {
+                tier_request = Some(body.clone());
             }
             request.body(body)
         }
@@ -1642,6 +1651,20 @@ pub(crate) async fn send_attempt(
         }
         let schema_failure =
             crate::routing::ai_studio_schema::rejected_examples(status.as_u16(), &detail);
+        let tier_failure = tier_request.as_ref().is_some_and(|request| {
+            crate::routing::service_tier::rejected_request(status.as_u16(), &detail, request)
+        });
+        if tier_failure {
+            crate::observability::telemetry::emit(json!({
+                "kind":"log", "fugue_table":"app_events", "event":"service_tier_fallback",
+                "event_type":"service_tier_fallback", "severity":"warn", "source":"uni-api-ember",
+                "request_id":prepared.headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+                "attempt_id":prepared.headers.get("x-uni-api-attempt-id").and_then(|v| v.to_str().ok()),
+                "provider":provider.name.as_ref(), "model":prepared.request_model,
+                "actual_model":prepared.original_model, "path":endpoint,
+                "attempt_status_code":400, "routing_status_code":502,
+            }));
+        }
         if schema_failure {
             crate::observability::telemetry::emit(json!({
                 "kind":"log", "fugue_table":"app_events", "event":"ai_studio_examples_fallback",
@@ -1653,7 +1676,9 @@ pub(crate) async fn send_attempt(
             }));
         }
         return Err(AttemptFailure {
-            failure_reason: if schema_failure {
+            failure_reason: if tier_failure {
+                crate::routing::service_tier::FAILURE_REASON.into()
+            } else if schema_failure {
                 crate::routing::ai_studio_schema::FAILURE_REASON.into()
             } else if search_failure {
                 crate::routing::alpha_search::FAILURE_REASON.into()
@@ -1678,6 +1703,7 @@ pub(crate) async fn send_attempt(
     drop(signature_request);
     drop(gemini_request);
     drop(search_request);
+    drop(tier_request);
     let collect_responses = (endpoint == "/v1/responses"
         || prepared.adapter == ResponseAdapter::ResponsesToChat)
         && prepared.upstream_stream

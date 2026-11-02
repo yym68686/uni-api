@@ -7,6 +7,7 @@ pub(crate) mod filters;
 pub(crate) mod gemini_tool_part;
 pub(crate) mod planner;
 pub(crate) mod retry;
+pub(crate) mod service_tier;
 pub(crate) mod thinking_signature;
 pub(crate) mod timeouts;
 pub(crate) mod types;
