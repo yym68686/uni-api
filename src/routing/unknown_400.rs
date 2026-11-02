@@ -116,7 +116,10 @@ pub(crate) fn unknown_error(error: &Value) -> bool {
     }
     let lower = message.to_lowercase();
     !message.trim_start().starts_with(['{', '['])
-        && ![
+        // This generic envelope names no invalid field. Keep it behind the
+        // operator's opt-in budget rather than treating "invalid" as proof of
+        // a specific validation failure. Envelope guards still apply.
+        && (message == "Invalid request parameter" || ![
             "invalid",
             "validation",
             "required",
@@ -155,7 +158,7 @@ pub(crate) fn unknown_error(error: &Value) -> bool {
             "不支持",
         ]
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| lower.contains(marker)))
         && error
             .get("details")
             .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
@@ -350,6 +353,38 @@ mod tests {
         assert!(unknown_outcome(&outcome));
         outcome["committed"] = json!(true);
         assert!(!unknown_outcome(&outcome));
+    }
+
+    #[test]
+    fn generic_parameter_message_remains_unknown_without_field_evidence() {
+        let generic = json!({"type":"invalid_request_error","code":"invalid_request_error","message":"Invalid request parameter"});
+        assert!(unknown_error(&generic));
+        for param in [json!(null), json!("")] {
+            let mut error = generic.clone();
+            error["param"] = param;
+            assert!(unknown_error(&error));
+        }
+        for (field, value) in [
+            ("param", json!("input")),
+            ("code", json!("invalid_value")),
+            ("type", json!("safety_error")),
+            ("status", json!("INVALID_ARGUMENT")),
+            ("details", json!([{"field":"input"}])),
+            ("message", json!("Invalid request parameter: input")),
+            (
+                "message",
+                json!("Invalid request parameter (content policy)"),
+            ),
+            ("message", json!("Invalid request parameter\nMissing input")),
+        ] {
+            let mut error = generic.clone();
+            error[field] = value;
+            assert!(!unknown_error(&error), "{field}");
+        }
+        assert!(!unknown_detail("Invalid request parameter"));
+        assert!(!unknown_detail(
+            r#"{"error":{"message":"Invalid request parameter"}"#
+        ));
     }
 
     #[test]

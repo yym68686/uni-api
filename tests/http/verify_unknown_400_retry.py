@@ -65,8 +65,9 @@ class Upstream(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
 
 
-def verify(binary, native=True, semantic=False, hedging=False, collect=False):
-    shared = dict(hits=[],facts=[],error=ERROR,mode='reject',semantic=semantic,event='error')
+def verify(binary, native=True, semantic=False, hedging=False, collect=False, error=ERROR):
+    selected_error = error
+    shared = dict(hits=[],facts=[],error=error,mode='reject',semantic=semantic,event='error')
     servers = [ThreadingHTTPServer(('127.0.0.1',0),Upstream) for _ in range(4)]
     for server in servers:
         server.shared = shared
@@ -175,9 +176,13 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False):
                     {'error':{**ERROR['error'],'message':'Missing input'}},
                     {'error':{**ERROR['error'],'message':'Content policy rejected'}},
                     {'error':{**ERROR['error'],'type':'safety_error'}},
+                    {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter','param':'input'}},
+                    {'error':{'type':'invalid_request_error','code':'invalid_value','message':'Invalid request parameter'}},
+                    {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter','details':[{'field':'input'}]}},
+                    {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter: input'}},
                 ]:
                     shared['error']=error; check(400,('first',))
-                shared['error']=ERROR
+                shared['error']=selected_error
                 for patch in [{'store':True},{'background':True},{'tools':[{'type':'web_search'}]}]:
                     b=copy.deepcopy(body); b.update(patch); check(400,('first',),payload=b)
                 if native and semantic:
@@ -204,7 +209,7 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False):
                 encoded=json.dumps(shared['facts'])+(root/'log').read_text()
                 assert 'fixture-upstream-secret' not in encoded and 'fixture private input' not in encoded
                 assert (root/'config').read_bytes()==original
-                print(f'PASS unknown400 native={native} semantic={semantic} hedging={hedging} collect={collect}: {count} HTTP cases')
+                print(f'PASS unknown400 native={native} semantic={semantic} hedging={hedging} collect={collect} generic_parameter={selected_error["error"]["message"]=="Invalid request parameter"}: {count} HTTP cases')
             finally:
                 proc.terminate(); proc.wait(timeout=15)
                 for server in servers: server.shutdown(); server.server_close()
@@ -212,10 +217,11 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False):
 
 if __name__=='__main__':
     binary=Path(sys.argv[1]).resolve()
-    verify(binary,native=False)
-    verify(binary)
-    verify(binary,semantic=True)
-    verify(binary,semantic=True,collect=True)
-    verify(binary,semantic=True,hedging=True)
-    verify(binary,native=False,semantic=True,collect=True)
-    verify(binary,native=False,hedging=True)
+    for error in [ERROR, {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter'}}]:
+        verify(binary,native=False,error=error)
+        verify(binary,error=error)
+        verify(binary,semantic=True,error=error)
+        verify(binary,semantic=True,collect=True,error=error)
+        verify(binary,semantic=True,hedging=True,error=error)
+        verify(binary,native=False,semantic=True,collect=True,error=error)
+        verify(binary,native=False,hedging=True,error=error)

@@ -24,6 +24,12 @@ output and downstream commitment; opaque streams' existing immediate-commit
 contract is unchanged. Successful HTTP200 bodies are not reinterpreted by this
 policy.
 
+The exact message `Invalid request parameter` alone is generic, despite containing
+the word `invalid`: it identifies no field or constraint. It follows this
+configured 0–3 allowance when the same envelope guards pass. A nonempty `param`,
+specific code, validation details, or added field/error text still prevents rescue.
+This does not introduce an always-on exact rule or change exhaustion from 400.
+
 Only text inference endpoints are eligible. Known hosted tools, explicit
 storage/background jobs, server-side conversation references, image/video and
 other side-effect APIs are excluded. Both the incoming payload and final compiled
