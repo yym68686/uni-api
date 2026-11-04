@@ -279,13 +279,11 @@ fn real_output(event: &[u8]) -> Result<bool, PrecommitFailure> {
             .filter(|status| (400..=599).contains(status))
             .unwrap_or(502) as u16;
         return Err(PrecommitFailure {
-            failure_reason: Some(
-                if status == 400 && crate::routing::unknown_400::unknown_error(error) {
-                    "unknown_upstream_400"
-                } else {
-                    "upstream_response_failed"
-                },
-            ),
+            failure_reason: Some(if status == 400 {
+                "upstream_400"
+            } else {
+                "upstream_response_failed"
+            }),
             status_code: status,
             detail: error.to_string(),
         });
@@ -320,7 +318,7 @@ fn real_output(event: &[u8]) -> Result<bool, PrecommitFailure> {
                                 key != "role"
                                     && match value {
                                         Value::Null => false,
-                                        Value::String(text) => !text.is_empty(),
+                                        Value::String(text) => !text.trim().is_empty(),
                                         Value::Array(items) => !items.is_empty(),
                                         Value::Object(items) => !items.is_empty(),
                                         _ => true,

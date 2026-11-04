@@ -127,14 +127,14 @@ pub(crate) async fn next_generic_hedge_plan(
     last_status: &mut StatusCode,
     last_detail: &mut String,
 ) -> Option<GenericHedgePlan> {
-    if !unknown_400.can_plan() {
+    if !unknown_400.can_attempt(execution.max_attempts) {
         return None;
     }
-    while *cursor < execution.max_attempts {
+    while *cursor < unknown_400.scan_limit(execution.max_attempts, execution.providers.len()) {
         let attempt_index = *cursor;
         *cursor += 1;
         let provider = execution.providers[attempt_index % execution.providers.len()].clone();
-        if !unknown_400.may_dispatch(&provider.base_url) {
+        if !unknown_400.may_dispatch(provider.name.as_ref()) {
             continue;
         }
         let Some(original_model) = provider.models.get(&execution.request_model).cloned() else {
@@ -268,15 +268,7 @@ pub(crate) async fn next_generic_hedge_plan(
             }
         }
         let attempt_started = Instant::now();
-        prepared.unknown_400_safe =
-            unknown_400.enabled() && safe_unknown_400_wire(&execution.path, &prepared.body);
-        if !unknown_400.may_dispatch_payload(prepared.unknown_400_safe) {
-            continue;
-        }
-        if !unknown_400.may_dispatch(&prepared.url) {
-            continue;
-        }
-        unknown_400.dispatch(&prepared.url, &execution.request_id, &attempt_id);
+        unknown_400.dispatch(provider.name.as_ref(), &execution.request_id, &attempt_id);
         prepared.dispatch = execution.arrival.map(|arrival| {
             arrival.attempt(
                 crate::observability::metrics::MetricKey::new(
@@ -655,16 +647,13 @@ pub(crate) async fn run_hedged_attempt_loop(
                     "failed",
                     Some(failure.observed_status()),
                 );
-                if failure.unknown_400() && !policy.retryable {
+                if failure.unknown_400() {
                     unknown_400.set_cause(
                         failure.observed_status(),
                         format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     );
                 }
-                let retryable = unknown_400.failure(
-                    policy.retryable,
-                    policy.status == 400 && failure.unknown_400(),
-                );
+                let retryable = unknown_400.failure(policy.retryable, failure.unknown_400());
                 if retryable
                     && failure.failure_reason != "stream_collection_after_output"
                     && scheduler.has_capacity()
@@ -745,9 +734,14 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let mut last_upstream_response = None;
     let mut upstream_failed = false;
 
-    for attempt_index in 0..max_attempts {
+    let mut cursor = 0;
+    while cursor < unknown_400.scan_limit(max_attempts, providers.len())
+        && unknown_400.can_attempt(max_attempts)
+    {
+        let attempt_index = cursor;
+        cursor += 1;
         let provider = providers[attempt_index % providers.len()].clone();
-        if !unknown_400.may_dispatch(&provider.base_url) {
+        if !unknown_400.may_dispatch(provider.name.as_ref()) {
             continue;
         }
         let Some(original_model) = provider.models.get(&request_model).cloned() else {
@@ -826,16 +820,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
         }
         let attempt_started = Instant::now();
-        prepared.unknown_400_safe =
-            unknown_400.enabled() && safe_unknown_400_wire(&path, &prepared.body);
-        if !unknown_400.may_dispatch_payload(prepared.unknown_400_safe) {
-            continue;
-        }
-        if !unknown_400.may_dispatch(&prepared.url) {
-            continue;
-        }
         unknown_400.dispatch(
-            &prepared.url,
+            provider.name.as_ref(),
             &request_id,
             &format!("{request_id}-r{}", attempt_index + 1),
         );
@@ -1204,16 +1190,13 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     "failed",
                     Some(failure.observed_status()),
                 );
-                if failure.unknown_400() && !policy.retryable {
+                if failure.unknown_400() {
                     unknown_400.set_cause(
                         failure.observed_status(),
                         format!("{request_id}-r{}", attempt_index + 1),
                     );
                 }
-                let retryable = unknown_400.failure(
-                    policy.retryable,
-                    policy.status == 400 && failure.unknown_400(),
-                );
+                let retryable = unknown_400.failure(policy.retryable, failure.unknown_400());
                 if !retryable || failure.failure_reason == "stream_collection_after_output" {
                     break;
                 }
@@ -1265,20 +1248,10 @@ pub(crate) fn copy_oaix_headers(source: &HeaderMap, target: &mut HeaderMap) {
     }
 }
 
-fn precommit_reason(reason: Option<&str>, safe: bool) -> String {
+fn precommit_reason(reason: Option<&str>) -> String {
     match reason {
-        Some("unknown_upstream_400") if !safe => "upstream_response_failed".into(),
-        Some("unknown_upstream_400") => "unknown_upstream_400_sse".into(),
+        Some("upstream_400") => "upstream_400_sse".into(),
         other => other.unwrap_or("other").into(),
-    }
-}
-
-fn safe_unknown_400_wire(endpoint: &str, body: &AttemptBody) -> bool {
-    match body {
-        AttemptBody::Json(bytes) => serde_json::from_slice::<Value>(bytes)
-            .ok()
-            .is_some_and(|p| crate::routing::unknown_400::safe_request(endpoint, &p)),
-        _ => false,
     }
 }
 
@@ -1292,29 +1265,19 @@ pub(crate) struct AttemptFailure {
 
 impl AttemptFailure {
     fn unknown_400(&self) -> bool {
-        matches!(
-            self.failure_reason.as_str(),
-            "unknown_upstream_400" | "unknown_upstream_400_sse"
-        )
+        self.status == StatusCode::BAD_REQUEST
+            && matches!(
+                self.failure_reason.as_str(),
+                "upstream_http_400" | "upstream_400_sse"
+            )
     }
     fn observed_status(&self) -> u16 {
-        if self.failure_reason == "unknown_upstream_400_sse" {
-            return 200;
-        }
-        if matches!(
-            self.failure_reason.as_str(),
-            crate::routing::thinking_signature::FAILURE_REASON
-                | crate::routing::gemini_tool_part::FAILURE_REASON
-                | crate::routing::alpha_search::FAILURE_REASON
-                | crate::routing::ai_studio_schema::FAILURE_REASON
-                | crate::routing::service_tier::FAILURE_REASON
-        ) {
-            400
+        if self.failure_reason == "upstream_400_sse" {
+            200
         } else {
             self.status.as_u16()
         }
     }
-
     fn policy(
         &self,
         provider: Option<&Provider>,
@@ -1322,33 +1285,14 @@ impl AttemptFailure {
         auto_retry: bool,
         upstream_model: Option<&str>,
     ) -> crate::routing::types::ProviderFailurePolicy {
-        if matches!(
-            self.failure_reason.as_str(),
-            crate::routing::thinking_signature::FAILURE_REASON
-                | crate::routing::gemini_tool_part::FAILURE_REASON
-                | crate::routing::alpha_search::FAILURE_REASON
-                | crate::routing::ai_studio_schema::FAILURE_REASON
-                | crate::routing::service_tier::FAILURE_REASON
-        ) {
-            // Incompatible with this request, not evidence of
-            // a broken provider/key. Do not put unrelated requests on cooldown.
-            crate::routing::types::ProviderFailurePolicy {
-                status: 502,
-                retryable: auto_retry,
-                request_scoped: true,
-                provider_model_unavailable: false,
-                force_quota_cooldown: false,
-            }
-        } else {
-            classify_provider_failure(
-                self.status.as_u16(),
-                &self.detail,
-                provider,
-                endpoint,
-                auto_retry,
-                upstream_model,
-            )
-        }
+        classify_provider_failure(
+            self.status.as_u16(),
+            &self.detail,
+            provider,
+            endpoint,
+            auto_retry,
+            upstream_model,
+        )
     }
 }
 
@@ -1361,7 +1305,6 @@ pub(crate) async fn send_attempt(
     keepalive_updates: Option<&crate::protocols::chat::stream::KeepaliveUpdates>,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
-    let unknown_400_safe = prepared.unknown_400_safe;
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
     let timeouts = state
@@ -1437,41 +1380,8 @@ pub(crate) async fn send_attempt(
     if let Some(timeout) = request_timeout {
         request = request.timeout(timeout);
     }
-    // Retain a shared byte view only until response headers/error validation.
-    // Parse it only for exact history compatibility errors, not successful requests.
-    let messages_wire = Url::parse(&prepared.url)
-        .ok()
-        .is_some_and(|url| url.path().trim_end_matches('/').ends_with("/v1/messages"));
-    let gemini_wire = matches!(
-        provider.engine.to_ascii_lowercase().as_str(),
-        "gemini" | "vertex" | "vertex-gemini"
-    ) && Url::parse(&prepared.url).ok().is_some_and(|url| {
-        url.path().ends_with(":generateContent") || url.path().ends_with(":streamGenerateContent")
-    });
-    let mut signature_request = None;
-    let mut gemini_request = None;
-    let mut search_request = None;
-    let mut tier_request = None;
     request = match prepared.body {
-        AttemptBody::Json(body) => {
-            let body = Bytes::from(body);
-            if messages_wire {
-                signature_request = Some(body.clone());
-            }
-            if gemini_wire {
-                gemini_request = Some(body.clone());
-            }
-            if endpoint == crate::providers::request::ALPHA_SEARCH_ENDPOINT {
-                search_request = Some(body.clone());
-            }
-            if matches!(endpoint, "/v1/responses" | "/v1/chat/completions")
-                && !messages_wire
-                && !gemini_wire
-            {
-                tier_request = Some(body.clone());
-            }
-            request.body(body)
-        }
+        AttemptBody::Json(body) => request.body(Bytes::from(body)),
         AttemptBody::Replay(storage, observation) => {
             let body = storage
                 .into_body(&observation)
@@ -1595,115 +1505,14 @@ pub(crate) async fn send_attempt(
         output
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
-        let signature_failure = signature_request.as_ref().is_some_and(|request| {
-            crate::routing::thinking_signature::rejected_block(status.as_u16(), &detail, request)
-        });
-        if signature_failure {
-            let request_id = prepared
-                .headers
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            crate::observability::telemetry::emit(json!({
-                "kind":"log", "fugue_table":"app_events", "event":"thinking_signature_fallback",
-                "event_type":"thinking_signature_fallback", "severity":"warn", "source":"uni-api-ember",
-                "message":"signed thinking history rejected by provider", "request_id":request_id,
-                "provider":provider.name.as_ref(), "model":prepared.request_model,
-                "actual_model":prepared.original_model, "path":endpoint,
-                "attempt_status_code":400, "routing_status_code":502,
-            }));
-        }
-        let gemini_part_failure = gemini_request.as_ref().is_some_and(|request| {
-            crate::routing::gemini_tool_part::rejected_block(status.as_u16(), &detail, request)
-        });
-        if gemini_part_failure {
-            let request_id = prepared
-                .headers
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            crate::observability::telemetry::emit(json!({
-                "kind":"log", "fugue_table":"app_events", "event":"gemini_tool_part_fallback",
-                "event_type":"gemini_tool_part_fallback", "severity":"warn", "source":"uni-api-ember",
-                "message":"Gemini tool turn data rejected by provider", "request_id":request_id,
-                "provider":provider.name.as_ref(), "model":prepared.request_model,
-                "actual_model":prepared.original_model, "path":endpoint,
-                "attempt_status_code":400, "routing_status_code":502,
-            }));
-        }
-        let search_failure = search_request.as_ref().is_some_and(|request| {
-            crate::routing::alpha_search::rejected_input(status.as_u16(), &detail, request)
-        });
-        if search_failure {
-            let request_id = prepared
-                .headers
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            crate::observability::telemetry::emit(json!({
-                "kind":"log", "fugue_table":"app_events", "event":"alpha_search_text_fallback",
-                "event_type":"alpha_search_text_fallback", "severity":"warn", "source":"uni-api-ember",
-                "message":"text-only search input rejected by provider", "request_id":request_id,
-                "provider":provider.name.as_ref(), "model":prepared.request_model,
-                "actual_model":prepared.original_model, "path":endpoint,
-                "attempt_status_code":400, "routing_status_code":502,
-            }));
-        }
-        let schema_failure =
-            crate::routing::ai_studio_schema::rejected_examples(status.as_u16(), &detail);
-        let tier_failure = tier_request.as_ref().is_some_and(|request| {
-            crate::routing::service_tier::rejected_request(status.as_u16(), &detail, request)
-        });
-        if tier_failure {
-            crate::observability::telemetry::emit(json!({
-                "kind":"log", "fugue_table":"app_events", "event":"service_tier_fallback",
-                "event_type":"service_tier_fallback", "severity":"warn", "source":"uni-api-ember",
-                "request_id":prepared.headers.get("x-request-id").and_then(|v| v.to_str().ok()),
-                "attempt_id":prepared.headers.get("x-uni-api-attempt-id").and_then(|v| v.to_str().ok()),
-                "provider":provider.name.as_ref(), "model":prepared.request_model,
-                "actual_model":prepared.original_model, "path":endpoint,
-                "attempt_status_code":400, "routing_status_code":502,
-            }));
-        }
-        if schema_failure {
-            crate::observability::telemetry::emit(json!({
-                "kind":"log", "fugue_table":"app_events", "event":"ai_studio_examples_fallback",
-                "event_type":"ai_studio_examples_fallback", "severity":"warn", "source":"uni-api-ember",
-                "request_id":prepared.headers.get("x-request-id").and_then(|v| v.to_str().ok()),
-                "provider":provider.name.as_ref(), "model":prepared.request_model,
-                "actual_model":prepared.original_model, "path":endpoint,
-                "attempt_status_code":400, "routing_status_code":502,
-            }));
-        }
         return Err(AttemptFailure {
-            failure_reason: if tier_failure {
-                crate::routing::service_tier::FAILURE_REASON.into()
-            } else if schema_failure {
-                crate::routing::ai_studio_schema::FAILURE_REASON.into()
-            } else if search_failure {
-                crate::routing::alpha_search::FAILURE_REASON.into()
-            } else if gemini_part_failure {
-                crate::routing::gemini_tool_part::FAILURE_REASON.into()
-            } else if signature_failure {
-                crate::routing::thinking_signature::FAILURE_REASON.into()
-            } else if status == StatusCode::BAD_REQUEST
-                && unknown_400_safe
-                && crate::routing::unknown_400::unknown_detail(&detail)
-            {
-                "unknown_upstream_400".into()
-            } else {
-                format!("upstream_http_{}", status.as_u16())
-            },
+            failure_reason: format!("upstream_http_{}", status.as_u16()),
             status,
             detail: truncate_detail(&detail),
             upstream_url: prepared.url,
             response: Some(output),
         });
     }
-    drop(signature_request);
-    drop(gemini_request);
-    drop(search_request);
-    drop(tier_request);
     let collect_responses = (endpoint == "/v1/responses"
         || prepared.adapter == ResponseAdapter::ResponsesToChat)
         && prepared.upstream_stream
@@ -1722,10 +1531,8 @@ pub(crate) async fn send_attempt(
         .map_err(|failure| AttemptFailure {
             failure_reason: if failure.outcome["retry_allowed"] == false {
                 "stream_collection_after_output"
-            } else if unknown_400_safe
-                && crate::routing::unknown_400::unknown_outcome(&failure.outcome)
-            {
-                "unknown_upstream_400_sse"
+            } else if crate::routing::unknown_400::upstream_outcome(&failure.outcome) {
+                "upstream_400_sse"
             } else {
                 "protocol_error"
             }
@@ -1775,7 +1582,7 @@ pub(crate) async fn send_attempt(
                 )
                 .await
                 .map_err(|failure| AttemptFailure {
-                    failure_reason: precommit_reason(failure.failure_reason, unknown_400_safe),
+                    failure_reason: precommit_reason(failure.failure_reason),
                     status: StatusCode::from_u16(failure.status_code)
                         .unwrap_or(StatusCode::BAD_GATEWAY),
                     detail: failure.detail,
@@ -1853,7 +1660,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|failure| AttemptFailure {
-                failure_reason: precommit_reason(failure.failure_reason, unknown_400_safe),
+                failure_reason: precommit_reason(failure.failure_reason),
                 status: StatusCode::from_u16(failure.status_code)
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 detail: failure.detail,
@@ -1883,7 +1690,7 @@ pub(crate) async fn send_attempt(
             )
             .await
             .map_err(|failure| AttemptFailure {
-                failure_reason: precommit_reason(failure.failure_reason, unknown_400_safe),
+                failure_reason: precommit_reason(failure.failure_reason),
                 status: StatusCode::from_u16(failure.status_code)
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 detail: failure.detail,

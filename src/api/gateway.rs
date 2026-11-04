@@ -208,11 +208,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let mut execution = AttemptLoop {
         unknown_400: crate::routing::unknown_400::Budget::new(
             resolved.unknown_400_retries,
-            auto_retry
-                && max_attempts > 1
-                && !headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
-            &path,
-            input.payload.as_ref().unwrap_or(&Value::Null),
+            !headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
         ),
         state,
         started,

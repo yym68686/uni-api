@@ -178,7 +178,7 @@ impl StreamStats {
             && payload
                 .get("delta")
                 .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
+                .is_some_and(|s| !s.trim().is_empty())
         {
             self.first_text_ms = Some(elapsed);
         }

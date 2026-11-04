@@ -4,8 +4,8 @@ use serde_json::Value;
 use url::Url;
 
 pub(crate) fn remap_provider_status(status: u16, detail: &str) -> u16 {
-    if crate::routing::ai_studio_schema::rejected_examples(status, detail) {
-        return 502;
+    if status == 400 {
+        return 400;
     }
     if [
         "string_above_max_length",
@@ -32,14 +32,8 @@ pub(crate) fn remap_provider_status(status: u16, detail: &str) -> u16 {
     if is_provider_model_unavailable(status, detail) {
         return 503;
     }
-    if is_provider_request_processing_failure(status, detail) {
-        return 502;
-    }
     if detail.contains("<center><h1>400 Bad Request</h1></center>")
         || detail.contains("Provider API error: bad response status code 400")
-        || status == 400
-            && (is_model_pricing_unconfigured(detail)
-                || is_provider_minimum_input_restriction(detail))
     {
         return 502;
     }
@@ -58,102 +52,35 @@ pub(crate) fn classify_provider_failure(
     original_status: u16,
     detail: &str,
     provider: Option<&Provider>,
-    endpoint: &str,
+    _endpoint: &str,
     auto_retry: bool,
-    upstream_model: Option<&str>,
+    _upstream_model: Option<&str>,
 ) -> ProviderFailurePolicy {
+    if original_status == 400 {
+        return ProviderFailurePolicy {
+            status: 400,
+            retryable: false,
+            request_scoped: true,
+            provider_model_unavailable: false,
+            force_quota_cooldown: false,
+        };
+    }
     let provider_model_unavailable = is_provider_model_unavailable(original_status, detail);
-    let status = if original_status == 400
-        && upstream_model.is_some_and(|model| is_provider_error_model_mismatch(detail, model))
-    {
-        502
-    } else {
-        remap_provider_status(original_status, detail)
-    };
-    let codex_model_unsupported = status == 400
-        && matches!(endpoint, "/v1/responses" | "/v1/responses/compact")
-        && provider.is_some_and(|provider| provider.engine.eq_ignore_ascii_case("codex"))
-        && detail
-            .to_ascii_lowercase()
-            .contains("model is not supported when using codex with a chatgpt account");
+    let status = remap_provider_status(original_status, detail);
     let missing_persisted_item = status == 404 && is_missing_persisted_item_error(detail);
-    let schema_capability_rejection =
-        crate::routing::ai_studio_schema::rejected_examples(original_status, detail);
-    let request_scoped =
-        schema_capability_rejection || matches!(status, 400 | 413) || missing_persisted_item;
-    let azure_request = matches!(status, 400 | 413)
-        && provider.is_some_and(|provider| is_azure_provider(&provider.base_url));
+    let request_scoped = status == 413 || missing_persisted_item;
+    let azure_request = status == 413 && provider.is_some_and(|p| is_azure_provider(&p.base_url));
     ProviderFailurePolicy {
         status,
-        retryable: auto_retry
-            && (schema_capability_rejection
-                || !request_scoped
-                || codex_model_unsupported
-                || azure_request),
+        retryable: auto_retry && (!request_scoped || azure_request),
         request_scoped,
         provider_model_unavailable,
-        force_quota_cooldown: codex_model_unsupported,
+        force_quota_cooldown: false,
     }
-}
-
-pub(crate) fn is_provider_error_model_mismatch(detail: &str, upstream_model: &str) -> bool {
-    let upstream_model = upstream_model.trim();
-    if upstream_model.is_empty() {
-        return false;
-    }
-    let mut candidate = detail.to_owned();
-    for _ in 0..3 {
-        let Ok(payload) = serde_json::from_str::<Value>(&candidate) else {
-            return false;
-        };
-        let Some(error) = payload
-            .get("error")
-            .or_else(|| payload.get("detail"))
-            .filter(|error| error.is_object())
-        else {
-            return false;
-        };
-        let Some(message) = error.get("message").and_then(Value::as_str) else {
-            return false;
-        };
-        if message.trim_start().starts_with('{') {
-            candidate = message.to_owned();
-            continue;
-        }
-        if error.get("code").and_then(Value::as_str) != Some("unsupported_value")
-            || error.get("type").and_then(Value::as_str) != Some("invalid_request_error")
-            || error
-                .get("param")
-                .and_then(Value::as_str)
-                .is_none_or(|param| param.trim().is_empty())
-        {
-            return false;
-        }
-        // Only this explicit model-specific validation message identifies a
-        // mismatched backend. Never search echoed input or arbitrary prose.
-        let Some(rest) = message.strip_prefix("Unsupported value: '") else {
-            return false;
-        };
-        let Some((value, rest)) = rest.split_once("' is not supported with the '") else {
-            return false;
-        };
-        let Some((model, supported)) = rest.split_once("' model. Supported values are: ") else {
-            return false;
-        };
-        return !value.is_empty()
-            && !model.is_empty()
-            && model
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"-_.:/".contains(&c))
-            && supported.starts_with('\'')
-            && supported.ends_with("'.")
-            && !model.eq_ignore_ascii_case(upstream_model);
-    }
-    false
 }
 
 pub(crate) fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
-    if !matches!(status, 400 | 404) {
+    if status != 404 {
         return false;
     }
 
@@ -239,125 +166,6 @@ pub(crate) fn is_generic_upstream_error(error: &Value) -> bool {
         && error.get("param").is_none_or(Value::is_null)
 }
 
-pub(crate) fn is_provider_request_processing_failure(status: u16, detail: &str) -> bool {
-    if status != 400 {
-        return false;
-    }
-
-    let mut candidate = detail.to_owned();
-    for _ in 0..3 {
-        let parsed = serde_json::from_str::<Value>(&candidate).ok();
-        // A provider key assigned to the wrong platform cannot serve this
-        // request. Require its complete structured error, not a generic Gemini
-        // INVALID_ARGUMENT or a phrase echoed from user input.
-        let platform_error = parsed.as_ref().and_then(|payload| {
-            payload
-                .get("error")
-                .filter(|value| value.is_object())
-                .or_else(|| payload.get("detail").filter(|value| value.is_object()))
-                .or_else(|| payload.is_object().then_some(payload))
-        });
-        if platform_error.is_some_and(|error| {
-            error.get("code").and_then(Value::as_u64) == Some(400)
-                && error
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("INVALID_ARGUMENT"))
-                && error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| {
-                        v.trim()
-                            .eq_ignore_ascii_case("API key group platform is not gemini")
-                    })
-                && error.get("param").is_none_or(Value::is_null)
-                && error
-                    .get("details")
-                    .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
-        }) {
-            return true;
-        }
-        if let Some(error) = parsed.as_ref().and_then(|payload| {
-            payload
-                .get("error")
-                .filter(|value| value.is_object())
-                .or_else(|| payload.get("detail").filter(|value| value.is_object()))
-        }) {
-            if is_generic_upstream_error(error) {
-                return true;
-            }
-            // BPS can reject an otherwise accepted request without identifying
-            // a bad client field. Require this complete structured rejection,
-            // not the code alone or text echoed in a validation error.
-            if error.get("type").and_then(Value::as_str) == Some("invalid_request_error")
-                && error.get("code").and_then(Value::as_str) == Some("basispoints_upstream_error")
-                && error.get("message").and_then(Value::as_str)
-                    == Some("Excel BPS rejected this request; account scheduling was not changed")
-                && error.get("param").is_none_or(Value::is_null)
-            {
-                return true;
-            }
-            let matches = |field: &str, expected: &str| {
-                error
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
-            };
-            // Some upstream gateways keep the OpenAI error type while replacing
-            // the standard processing message. Require the complete envelope
-            // and an absent/null code so ordinary validation errors stay 400.
-            if matches("type", "invalid_request_error")
-                && matches("message", "Upstream rejected the request")
-                && error.get("code").is_none_or(Value::is_null)
-            {
-                return true;
-            }
-            // This generic support-only rejection carries no actionable client
-            // validation. Match only the structured error, ignoring its opaque
-            // request_id; never reinterpret a specific code or parameter error.
-            if matches("type", "invalid_request_error")
-                && matches(
-                    "message",
-                    "Request could not be completed. Contact support with the request ID.",
-                )
-                && (error.get("code").is_none_or(Value::is_null)
-                    || matches("code", "invalid_request_error"))
-                && error.get("param").is_none_or(Value::is_null)
-            {
-                return true;
-            }
-        }
-        let message = match parsed.as_ref() {
-            Some(payload) => payload
-                .pointer("/error/message")
-                .or_else(|| payload.pointer("/detail/message"))
-                .or_else(|| payload.get("message"))
-                .or_else(|| payload.get("error"))
-                .or_else(|| payload.get("detail"))
-                .unwrap_or(payload)
-                .as_str(),
-            None => Some(candidate.as_str()),
-        };
-        let Some(message) = message else {
-            return false;
-        };
-        if message.trim_start().starts_with('{') {
-            candidate = message.to_owned();
-            continue;
-        }
-        // Responses streams expose only the extracted semantic error message.
-        // Match the entire channel rejection, including in that plain-text form;
-        // an echoed phrase in a client validation message must stay a 400.
-        return [
-            "The upstream service could not process this request.",
-            "Upstream rejected illegal short-input distillation or heartbeat probing.",
-        ]
-        .iter()
-        .any(|expected| message.trim().eq_ignore_ascii_case(expected));
-    }
-    false
-}
-
 pub(crate) fn is_azure_provider(base_url: &str) -> bool {
     let Ok(url) = Url::parse(base_url) else {
         return false;
@@ -366,71 +174,6 @@ pub(crate) fn is_azure_provider(base_url: &str) -> bool {
         && url.port().is_none()
         && url.username().is_empty()
         && url.password().is_none()
-}
-
-pub(crate) fn is_model_pricing_unconfigured(detail: &str) -> bool {
-    let lower = detail.to_ascii_lowercase();
-    [
-        "model_not_priced",
-        "model_price_not_configured",
-        "model_pricing_not_configured",
-        "model_price_unconfigured",
-        "model_pricing_missing",
-        "has not been priced by the administrator",
-        "has not been priced by administrator",
-        "price has not been configured by the administrator",
-        "pricing has not been configured by the administrator",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-        || lower
-            .split_whitespace()
-            .collect::<String>()
-            .contains("价格尚未由管理员配置")
-}
-
-pub(crate) fn is_provider_minimum_input_restriction(detail: &str) -> bool {
-    // A channel key's minimum-input policy is not a malformed client request.
-    // Read only error messages (including JSON-escaped/wrapped messages), never
-    // echoed request fields. Neither the provider nor the numeric limit matters.
-    let mut candidate = detail.to_owned();
-    for _ in 0..3 {
-        let parsed = serde_json::from_str::<Value>(&candidate).ok();
-        let message = match parsed.as_ref() {
-            Some(payload) => payload
-                .pointer("/error/message")
-                .or_else(|| payload.pointer("/detail/message"))
-                .or_else(|| payload.get("message"))
-                .or_else(|| payload.get("error"))
-                .or_else(|| payload.get("detail"))
-                .unwrap_or(payload)
-                .as_str(),
-            None => Some(candidate.as_str()),
-        };
-        let Some(message) = message else {
-            return false;
-        };
-        if message.trim_start().starts_with('{') {
-            candidate = message.to_owned();
-            continue;
-        }
-        let compact = message
-            .split_whitespace()
-            .collect::<String>()
-            .to_ascii_lowercase();
-        return [
-            ("该令牌不接受输入少于", "token的请求"),
-            ("thiskeydoesnotacceptrequestswithfewerthan", "inputtokens"),
-        ]
-        .iter()
-        .any(|(prefix, suffix)| {
-            compact.split_once(prefix).is_some_and(|(_, tail)| {
-                let after_number = tail.trim_start_matches(|c: char| c.is_ascii_digit());
-                after_number.len() < tail.len() && after_number.starts_with(suffix)
-            })
-        });
-    }
-    false
 }
 
 pub(crate) fn is_missing_persisted_item_error(detail: &str) -> bool {

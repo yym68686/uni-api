@@ -3284,7 +3284,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_semantic_upstream_failures_map_to_bad_gateway() {
+    fn generic_semantic_upstream_failures_preserve_explicit_status() {
         for message in ["upstream_error", "Upstream request failed", "上游错误"] {
             for event in ["error", "response.failed"] {
                 for wire_status in [None, Some(400), Some(401), Some(429), Some(503)] {
@@ -3300,10 +3300,7 @@ mod tests {
                     } else {
                         json!({"type": event, "response": {"status": "failed", "error": error}})
                     };
-                    let expected = match wire_status {
-                        None | Some(400) => 502,
-                        Some(status) => status,
-                    };
+                    let expected = wire_status.unwrap_or(502);
                     assert_eq!(
                         responses_semantic_error(&payload, event),
                         (expected, message.into())

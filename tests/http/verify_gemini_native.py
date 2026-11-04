@@ -83,7 +83,7 @@ def verify(binary):
                 {'api':'platform-retry','model':['platform-limited/*','platform-fallback/*']},
                 {'api':'platform-no-retry','model':['platform-limited/*','platform-fallback/*'], 'preferences':{'AUTO_RETRY':False}},
                 {'api':'platform-exhausted','model':['platform-limited/*','platform-also-limited/*']}]
-        (root/'config.json').write_text(json.dumps({'providers':providers,'api_keys':keys}))
+        (root/'config.json').write_text(json.dumps({'providers':providers,'api_keys':keys,'preferences':{'unknown_upstream_400_retries':1}}))
         env={k:v for k,v in os.environ.items() if not k.startswith(('FACTS_','UNI_API_CONTROL_RESTORE_','OTEL_','FUGUE_OTEL_')) and k!='CONFIG_URL'}
         env.update(PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'config.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0',NO_PROXY='127.0.0.1,localhost',PROVIDER_MODEL_CIRCUIT_FAILURE_THRESHOLD='1000')
         def call(path,body=None,auth='header',extra=None):
@@ -156,8 +156,8 @@ def verify(binary):
                     for action in ['generateContent', 'streamGenerateContent?alt=sse', 'countTokens']:
                         for key, expected, hits in [
                             ('platform-retry', 200, ['limited', 'fallback']),
-                            ('platform-no-retry', 502, ['limited']),
-                            ('platform-exhausted', 502, ['limited', 'also-limited'] * 3),
+                            ('platform-no-retry', 200, ['limited', 'fallback']),
+                            ('platform-exhausted', 400, ['limited', 'also-limited']),
                         ]:
                             upstream.hits.clear()
                             status, _, raw = call(f'/{version}/models/platform:{action}', body,
@@ -171,7 +171,7 @@ def verify(binary):
                         upstream.hits.clear()
                         status, _, raw = call(f'/{version}/models/platform:{action}', body,
                                               extra={'x-goog-api-key':'platform-retry'})
-                        assert status == 400 and len(upstream.hits) == 1, (status,raw,upstream.hits)
+                        assert status == 200 and len(upstream.hits) == 2, (status,raw,upstream.hits)
                         upstream.platform_error = {'code':400,'message':'API key group platform is not gemini','status':'INVALID_ARGUMENT'}
                         platform_cases += 1
                 print(f'Gemini platform-mismatch retry matrix passed: {platform_cases} cases')
@@ -188,8 +188,8 @@ def verify(binary):
                 ]:
                     for key, expected, hits in [
                         ('platform-retry',200,['limited','fallback']),
-                        ('platform-no-retry',502,['limited']),
-                        ('platform-exhausted',502,['limited','also-limited']*3),
+                        ('platform-no-retry',200,['limited','fallback']),
+                        ('platform-exhausted',400,['limited','also-limited']),
                     ]:
                         upstream.platform_error = chinese_error
                         upstream.hits.clear()
@@ -202,7 +202,7 @@ def verify(binary):
                         upstream.platform_error = {'error':{**chinese_error['error'],field:value}}
                         upstream.hits.clear()
                         status, _, raw = call(path,payload,'bearer',{'Authorization':'Bearer platform-retry'})
-                        assert status == 400 and len(upstream.hits) == 1, (path,status,raw)
+                        assert status == 200 and len(upstream.hits) == 2, (path,status,raw)
                         chinese_cases += 1
                 print(f'Gemini Chinese upstream-error matrix passed: {chinese_cases} cases')
                 assert all('fixture-client' not in path and headers.get('X-Goog-Api-Key') is None for path,_,headers in upstream.hits)

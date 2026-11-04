@@ -25,7 +25,6 @@ pub(crate) enum DownstreamProtocol {
 }
 
 pub(crate) struct PreparedAttempt {
-    pub(crate) unknown_400_safe: bool,
     pub(crate) dispatch: Option<crate::observability::timing::AttemptDispatch>,
     pub(crate) method: Method,
     pub(crate) url: String,

@@ -1,4 +1,4 @@
-"""Opt-in unknown400 rescue: independent origins, no production requests."""
+"""Every upstream 400: one budget, unchanged requests, loopback only."""
 import copy
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,7 +12,9 @@ import threading
 import time
 from fact_sink import accept_facts
 from verify_dispatch_timing import free_port
-from verify_encrypted_content_fallback import RESPONSE
+RESPONSE = {'id':'resp_fixture','object':'response','status':'completed','model':'test-model',
+ 'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'OK'}]}],
+ 'usage':{'input_tokens':10,'output_tokens':2,'total_tokens':12}}
 
 ERROR = {'error': {'type': 'invalid_request_error', 'code': 'invalid_request_error',
                    'message': 'Relay backend hiccup', 'status_code': 400}}
@@ -37,35 +39,41 @@ class Upstream(BaseHTTPRequestHandler):
         if name=='first' and shared['mode']=='hold':
             shared['entered'].set()
             assert shared['release'].wait(10), 'in-flight fixture not released'
-        if name=='second' and shared['mode']=='hedge_probe': time.sleep(.12)
+        if name=='second' and shared['mode']=='hedge_probe': time.sleep(.8)
         body = json.loads(raw)
-        reject = (name in ['first','alias'] or shared['mode'] in ['exhausted','postcommit','mixed']
+        reject = (name=='first' or shared['mode'] in ['exhausted','postcommit','mixed','toolcommit']
                   or (name=='second' and shared['mode']=='hedge_probe'))
         status, kind = (400 if reject else 200), 'application/json'
         if shared['mode'] == 'mixed' and name == 'second': status = 500
         error = copy.deepcopy(shared['error'])
         if shared['mode'] == 'exact':
-            error = {'error':{'message':'上游错误','type':'upstream_error','code':'upstream_error','param':''}}
+            error = {'error':{'message':'上游错误','type':'upstream_error','code':'upstream_error','param':'','status_code':400}}
         value = error if reject else (RESPONSE if 'input' in body else CHAT)
-        if shared['mode'] != 'http' and (shared['semantic'] or shared['mode'] == 'postcommit'):
+        if shared['mode'] != 'http' and (shared['semantic'] or shared['mode'] in ['postcommit','toolcommit']):
             status, kind = 200, 'text/event-stream'
             if reject:
-                data = (frame('error',error=error['error']) if shared['event']=='error' else
-                        frame('response.failed',response={'status':'failed','error':error['error']}))
-                if shared['mode'] == 'postcommit': data = frame('response.output_text.delta',delta='started') + data
+                terminal = (frame('error',error=error['error']) if shared['event']=='error' else
+                            frame('response.failed',response={'status':'failed','error':error['error']}))
+                data = terminal
+                if shared['mode'] == 'postcommit':
+                    data = frame('response.output_text.delta',delta='started') + data
+                elif shared['mode'] == 'toolcommit':
+                    data = frame('response.output_item.done',item={'type':'function_call','name':'lookup','call_id':'c1','arguments':'{}'}) + data
+                elif shared['mode'] != 'hedge_probe':
+                    data = frame('response.created',response={'id':'failed-channel','status':'in_progress','output':[]}) + frame('response.output_text.delta',delta=' \n\t') + data
             else:
                 data = frame('response.output_text.delta',delta='OK') + frame('response.completed',response=RESPONSE)
         elif not reject and body.get('stream'):
             kind = 'text/event-stream'
             data = frame('response.output_text.delta',delta='OK') + frame('response.completed',response=RESPONSE)
-        else: data = json.dumps(value).encode()
+        else: data = b'<html>arbitrary non-JSON 400</html>' if reject and shared['mode']=='plain' else json.dumps(value).encode()
         self.send_response(status); self.send_header('Content-Type',kind)
         self.send_header('Content-Length',str(len(data))); self.end_headers()
         try: self.wfile.write(data)
         except (BrokenPipeError,ConnectionResetError): pass
 
 
-def verify(binary, native=True, semantic=False, hedging=False, collect=False, error=ERROR):
+def verify(binary, native=True, semantic=False, hedging=False, collect=False, error=ERROR, normalize=False):
     selected_error = error
     shared = dict(hits=[],facts=[],error=error,mode='reject',semantic=semantic,event='error')
     servers = [ThreadingHTTPServer(('127.0.0.1',0),Upstream) for _ in range(4)]
@@ -74,15 +82,17 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
         threading.Thread(target=server.serve_forever,daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='unknown400-') as td:
         root,port = Path(td),free_port()
-        preferences = {'cooldown_period':0,'api_key_cooldown_period':0}
-        if native or semantic:
+        preferences = {'cooldown_period':0,'api_key_cooldown_period':0,'keepalive_interval':0}
+        if normalize:
             preferences['normalize_responses_custom_tool_call_ids'] = True
         if collect: preferences['upstream_stream_mode'] = 'stream_only'
-        if hedging: preferences['timeout_policy']={'default':{'first_byte':.03,'total':5}}
+        # Leave enough scheduling margin for ordinary loopback responses; the
+        # explicit slow probe above still crosses this hedge boundary.
+        if hedging: preferences['timeout_policy']={'default':{'first_byte':.3,'total':5}}
         providers = [{'provider':name,'engine':'gpt','api':'fixture-upstream-secret',
             'base_url':f'http://127.0.0.1:{servers[index].server_port}/{name}/v1/'+('responses' if native or semantic else 'chat/completions'),
             'model':['test-model'],'preferences':preferences}
-            for name,index in [('first',0),('alias',0),('second',1),('third',2),('fourth',3)]]
+            for name,index in [('first',0),('second',0),('third',0),('fourth',0),('fifth',0)]]
         chain = [p['provider']+'/*' for p in providers]
         config = {'providers':providers,'api_keys':[
             {'api':key,'role':'admin' if key=='admin' else 'user','model':chain,
@@ -117,7 +127,7 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
             assert code==200,(code,raw)
             code,raw=call('PATCH','/v1/channel-settings',mutation)
             assert code==200,(code,raw)
-        def check(want=200,names=('first','second'),key='retry',payload=None,target=False,flip=False):
+        def check(want=200,names=('first','second'),key='retry',payload=None,target=False,flip=False,rescues=None):
             nonlocal count
             shared['hits']=[]
             rid=f'unknown400-{count}'
@@ -135,13 +145,17 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                 assert not worker.is_alive() and len(result)==1
                 code,raw=result[0]
             else: code,raw=invoke()
-            assert code==want,(native,semantic,hedging,collect,count,code,raw[:200])
+            # With the policy disabled, native GPT keeps its existing opaque
+            # HTTP200 stream contract; the semantic final/billing stay distinct.
+            wire_want = 200 if native and semantic and not collect else want
+            assert code==wire_want,(native,semantic,hedging,collect,count,code,raw[:200])
             assert [n for n,_ in shared['hits']]==list(names),(count,[n for n,_ in shared['hits']],names)
             if len(names)>1:
                 assert all(w==shared['hits'][0][1] for _,w in shared['hits']),'retry changed wire bytes'
-            if want==200 and shared['mode']!='postcommit': assert b'OK' in raw
-            rescues = 0 if shared['mode']=='exact' else 1 if shared['mode']=='mixed' else max(0,len(names)-1)
-            if names: expected.append((rid,400 if shared['mode']=='postcommit' else want,len(names),rescues))
+            if want==200 and shared['mode'] not in ['postcommit','toolcommit']: assert b'OK' in raw
+            if shared['mode']=='toolcommit' and not collect: assert b'c1' in raw
+            if rescues is None: rescues = max(0,len(names)-1)
+            if names: expected.append((rid,400 if shared['mode'] in ['postcommit','toolcommit'] else want,len(names),rescues))
             count+=1
         with (root/'log').open('w') as log:
             proc=subprocess.Popen([str(binary)],cwd=root,env=env,stdout=log,stderr=log)
@@ -155,10 +169,10 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                 check(400,('first',)) # missing config defaults to zero
                 limit(1)
                 check(); check() # no provider-wide cooldown
-                check(400,('first',),key='disabled')
+                check(key='disabled')
                 check(400,('first',) if native else (),key='admin',target=True)
-                # AUTO_RETRY total budget is not increased; alias cannot rescue.
-                check(400,('first',),key='one')
+                # Global 400 allowance does not depend on the key's other-error budget.
+                check(key='one')
                 shared['mode']='hold'; check(flip=True) # policy snapshot captured before request starts
                 shared['mode']='reject'; check(400,('first',)) # following request sees zero
                 for credits in [1,2,3]:
@@ -168,7 +182,7 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                     limit(2); shared['mode']='hedge_probe'
                     check(200,('first','second','third')) # a rescue's hedge trigger cannot burn the route cursor
                 limit(1); shared['mode']='mixed'
-                if not semantic: check(400,('first','second','third')) # 500 does not refill unknown credits
+                if not semantic: check(400,('first','second','third'),rescues=1) # 500 uses the ordinary budget
                 shared['mode']='reject'
                 for error in [
                     {'error':{**ERROR['error'],'param':'input'}},
@@ -181,17 +195,20 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                     {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter','details':[{'field':'input'}]}},
                     {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter: input'}},
                 ]:
-                    shared['error']=error; check(400,('first',))
+                    shared['error']=error; check()
                 shared['error']=selected_error
                 for patch in [{'store':True},{'background':True},{'tools':[{'type':'web_search'}]}]:
-                    b=copy.deepcopy(body); b.update(patch); check(400,('first',),payload=b)
+                    b=copy.deepcopy(body); b.update(patch); check(payload=b)
                 if native and semantic:
                     shared['event']='response.failed'; check()
-                    shared['mode']='postcommit'; check(400 if collect else 200,('first',))
+                    for mode in ['postcommit','toolcommit']:
+                        shared['mode']=mode; check(400 if collect else 200,('first',))
+                if not semantic:
+                    shared['mode']='plain'; check()
                 shared['event']='error'; shared['mode']='reject'
                 limit(0); check(400,('first',))
-                # Old exact behavior remains enabled even with zero unknown credits.
-                shared['mode']='exact'; check(200,('first','alias','second'))
+                # The same global zero disables former special-case errors too.
+                shared['mode']='exact'; check(400,('first',))
                 deadline=time.monotonic()+10
                 while time.monotonic()<deadline:
                     if all(any(f.get('kind')=='request' and f.get('request_id')==rid for f in shared['facts']) for rid,_,_,_ in expected): break
@@ -202,14 +219,14 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                     bills=[f for f in facts if f.get('kind')=='billing']
                     assert len(bills)==n,(rid,n,[f.get('status') for f in bills])
                     if semantic: assert all(f.get('status')==200 for f in bills),rid
-                    events=[f for f in facts if f.get('stage')=='unknown_upstream_400_retry']
+                    events=[f for f in facts if f.get('stage')=='upstream_400_retry']
                     assert len(events)==rescues,(rid,rescues,len(events))
-                    assert [f['trace_detail']['unknown_400_retry_used'] for f in events]==list(range(1,rescues+1)),rid
+                    assert [f['trace_detail']['upstream_400_retry_used'] for f in events]==list(range(1,rescues+1)),rid
                     assert all(f['trace_detail']['attempt_status_code']==(200 if semantic else 400) for f in events),rid
                 encoded=json.dumps(shared['facts'])+(root/'log').read_text()
                 assert 'fixture-upstream-secret' not in encoded and 'fixture private input' not in encoded
                 assert (root/'config').read_bytes()==original
-                print(f'PASS unknown400 native={native} semantic={semantic} hedging={hedging} collect={collect} generic_parameter={selected_error["error"]["message"]=="Invalid request parameter"}: {count} HTTP cases')
+                print(f'PASS all-upstream-400 native={native} semantic={semantic} hedging={hedging} collect={collect} generic_parameter={selected_error["error"]["message"]=="Invalid request parameter"}: {count} HTTP cases')
             finally:
                 proc.terminate(); proc.wait(timeout=15)
                 for server in servers: server.shutdown(); server.server_close()
@@ -217,11 +234,12 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
 
 if __name__=='__main__':
     binary=Path(sys.argv[1]).resolve()
-    for error in [ERROR, {'error':{'type':'invalid_request_error','code':'invalid_request_error','message':'Invalid request parameter'}}]:
+    for error in [ERROR, {'error':{'type':'invalid_request_error','code':'unsupported_service_tier','param':'service_tier','message':'Invalid request parameter'}}]:
         verify(binary,native=False,error=error)
         verify(binary,error=error)
         verify(binary,semantic=True,error=error)
         verify(binary,semantic=True,collect=True,error=error)
         verify(binary,semantic=True,hedging=True,error=error)
+        verify(binary,semantic=True,error=error,normalize=True)
         verify(binary,native=False,semantic=True,collect=True,error=error)
         verify(binary,native=False,hedging=True,error=error)

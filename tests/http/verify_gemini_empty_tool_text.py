@@ -1,4 +1,4 @@
-"""Empty assistant-tool text normalization and exact Gemini data fallback; loopback only."""
+"""Empty assistant-tool text normalization with the global 400 policy; loopback only."""
 import copy
 import http.client
 import json
@@ -90,7 +90,7 @@ def verify(binary):
                 {'api': 'no-retry', 'model': ['first/*', 'fallback/*'], 'preferences': {'AUTO_RETRY': False}},
                 {'api': 'exhausted', 'model': ['first/*', 'also-reject/*'], 'preferences': {'AUTO_RETRY': 1}}]
         keys += [{'api': n+'-key', 'model': [n+'/*'], 'preferences': {'AUTO_RETRY': False}} for n in ['vertex', 'gpt', 'override']]
-        (root/'config.json').write_text(json.dumps({'providers': providers, 'api_keys': keys, 'preferences': {'hedging': {'enabled': False}}}))
+        (root/'config.json').write_text(json.dumps({'providers': providers, 'api_keys': keys, 'preferences': {'hedging': {'enabled': False}, 'unknown_upstream_400_retries': 1}}))
         env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'TMPDIR', 'LANG', 'DYLD_LIBRARY_PATH')}
         env.update(PORT=str(port), DISABLE_DATABASE='true', UNI_API_CONFIG_PATH=str(root/'config.json'),
                    RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot'), UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),
@@ -128,8 +128,8 @@ def verify(binary):
                             assert wire['generationConfig']['temperature'] == .2
                             assert wire['contents'][2]['parts'][0]['functionResponse']['response']['result'] == ''
                             count += 1
-                        for key, want, names in [('retry', 200, ['first','fallback']), ('no-retry', 502, ['first']),
-                                                 ('exhausted', 502, ['first','also-reject']), ('retry', 200, ['first','fallback'])]:
+                        for key, want, names in [('retry', 200, ['first','fallback']), ('no-retry', 200, ['first','fallback']),
+                                                 ('exhausted', 400, ['first','also-reject']), ('retry', 200, ['first','fallback'])]:
                             upstream.mode, upstream.hits = 'reject', []
                             rid = f'fallback-{count}'; status, raw = call(endpoint, body, key, rid)
                             assert status == want, (endpoint, key, status, raw)
@@ -142,7 +142,7 @@ def verify(binary):
                             status, raw = call(endpoint, body, rid=f'post-output-{count}')
                             assert status == 200 and len(upstream.hits) == 1 and b'fixture complete' in raw, (status, raw, upstream.hits)
                             count += 1
-                # Native Gemini retains its payload and signature, but can use the exact fallback.
+                # Native Gemini retains its payload and signature during fallback.
                 for stream in [False, True]:
                     action = 'streamGenerateContent?alt=sse' if stream else 'generateContent'
                     path = '/v1beta/models/gemini-test:'+action
@@ -162,14 +162,14 @@ def verify(binary):
                 count += 1
                 upstream.hits = []
                 status, _ = call('/v1/messages', body_for('/v1/messages', False))
-                assert status == 400 and len(upstream.hits) == 1 and 'contents' not in upstream.hits[0][1]
+                assert status == 200 and len(upstream.hits) == 2 and 'contents' not in upstream.hits[0][1]
                 count += 1
                 for patch in [{'code':'400'}, {'code':'invalid_type'}, {'type':'invalid_request_error'}, {'param':'contents'},
                               {'message':MESSAGE+'invalid arguments'}, {'message':MESSAGE.replace('contents[1]','contents[99]')},
                               {'message':MESSAGE.replace('contents[1]','contents[0]')}]:
                     upstream.error, upstream.hits = {'error': {**ERROR['error'], **patch}}, []
                     status, _ = call('/v1/chat/completions', body_for('/v1/chat/completions', False), rid=f'negative-{count}')
-                    assert status == 400 and len(upstream.hits) == 1
+                    assert status == 200 and len(upstream.hits) == 2
                     count += 1
                 upstream.error = ERROR
                 for part in [{}, {'thoughtSignature':'opaque-signature'}, {'text': None}, {'text':''},
@@ -177,7 +177,7 @@ def verify(binary):
                     native = copy.deepcopy(NATIVE); native['contents'][1]['parts'] = [part]
                     upstream.hits = []
                     status, _ = call('/v1beta/models/gemini-test:generateContent', native, rid=f'malformed-{count}')
-                    assert status == 400 and len(upstream.hits) == 1
+                    assert status == 200 and len(upstream.hits) == 2
                     count += 1
                 deadline = time.monotonic()+10
                 while time.monotonic()<deadline:
@@ -187,11 +187,11 @@ def verify(binary):
                     facts = [f for f in upstream.facts if f.get('request_id')==rid]
                     assert any(f.get('kind')=='billing' and f.get('status')==400 for f in facts), (rid, facts)
                     assert any(f.get('stage')=='upstream_attempt' and f.get('trace_detail',{}).get('attempt_status_code')==400 for f in facts)
-                    assert any(f.get('stage')=='gemini_tool_part_fallback' and f.get('trace_detail',{}).get('routing_status_code')==502 for f in facts)
+                    assert any(f.get('stage')=='upstream_400_retry' and f.get('trace_detail',{}).get('upstream_400_retry_used')==1 for f in facts)
                     assert any(f.get('kind')=='billing' and f.get('status')==200 for f in facts)
                 encoded = json.dumps(upstream.facts)
                 for secret in ['opaque-signature', 'fixture-upstream']: assert secret not in encoded
-                print(f'PASS Gemini empty tool text: {count} HTTP cases, raw400/routing502, payload/signatures preserved on fallback')
+                print(f'PASS Gemini empty tool text: {count} HTTP cases, global400 budget, payload/signatures preserved on fallback')
             finally:
                 proc.terminate()
                 try: proc.wait(timeout=10)

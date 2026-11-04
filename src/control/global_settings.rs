@@ -20,7 +20,7 @@ pub(crate) fn document(preferences: &Map<String, Value>) -> Value {
     json!({"preferences":preferences.iter().filter(|(k,_)|KEYS.contains(&k.as_str())).map(|(k,v)|(k.clone(),v.clone())).collect::<Map<_,_>>()})
 }
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"global_settings":true,"unknown_upstream_400_retries":true,"fields":KEYS.iter().map(|k| {
+    json!({"version":1,"global_settings":true,"unknown_upstream_400_retries":true,"all_upstream_400_retries":true,"fields":KEYS.iter().map(|k| {
         if *k == crate::routing::unknown_400::KEY {
             json!({"path":format!("/preferences/{k}"),"group":"重试保护","type":"integer","minimum":0,"maximum":3,"note":note(k)})
         } else {
@@ -169,7 +169,7 @@ pub(crate) fn note(key: &str) -> &'static str {
     match key {
         "model_timeout" => "支持统一秒数或按模型设置；条件超时策略优先，具体请求值可在预览中核对。",
         "timeout_policy" => "全局规则先匹配，渠道规则再覆盖；未填写的超时项继续继承。",
-        "unknown_upstream_400_retries" => "未知上游400的额外换渠道次数（0–3，默认0关闭），仍受调用API key的AUTO_RETRY总预算约束；不改变已有精确规则。仅未输出、非明确参数/安全错误且无已知副作用的请求，不改正文、不全局冷却，耗尽保留400。重试可能增加费用与延迟。",
+        "unknown_upstream_400_retries" => "所有上游400的额外换渠道次数（0–3，默认0关闭），HTTP400与尚未提交实质输出的SSE语义400统一计数，不区分错误内容或请求类型。此400预算独立于调用API key的AUTO_RETRY；不改正文、不全局冷却，成功即停，耗尽保留400。定向请求及本地校验不重试；无其他可用渠道时结束。重试可能增加费用与延迟。",
         "keepalive_interval" => "0 或大于当前模型超时的间隔不发送心跳。",
         "api_key_rate_limit_cooldown_period" => {
             "配置为 0 时实际使用 1800 秒；站点 Retry-After 可延长冷却。"

@@ -1,70 +1,37 @@
-# Bounded unknown upstream 400 rescue
+# All upstream HTTP 400 fallback
 
-`preferences.unknown_upstream_400_retries` is a **source-global**, opt-in integer
-from `0` to `3` (default `0`, disabled). It is hot-updatable through the reserved
-`__uni_console_global_preferences__` settings scope and participates in atomic
-validation, encrypted console retention and bootstrap restore. It is not a
-provider or caller-key setting. New requests capture the policy; in-flight
-requests keep their original budget. No production setting is enabled by a code
-release.
+`preferences.unknown_upstream_400_retries` is the source-global 0–3 extra-channel
+allowance. The persisted name remains unchanged for compatibility; it now
+applies uniformly to upstream HTTP 400s rather than an error-message allowlist.
+The default remains 0, so a release does not change production intent. An
+attempt that succeeds ends fallback early; 3 is a maximum, not a promise to
+dispatch three more requests. This budget is independent of the caller key's
+`AUTO_RETRY` setting, although existing total attempt and provider availability
+limits still apply.
 
-The allowance covers additional dispatches authorized by an otherwise terminal,
-unknown upstream HTTP400 or uncommitted SSE semantic400. It does **not** increase
-the caller key's `AUTO_RETRY` total attempt budget, targeted request limit or
-existing hard cap. Existing exact classifiers and proven history repairs run
-first and retain their existing budgets and status mappings. An ordinary 500
-between unknown400s does not refill this request's rescue allowance.
+The policy uses upstream/protocol outcome status and the response commit
+boundary, not error text, envelope fields, model, tool names, encrypted history,
+or request-body features. It covers any upstream HTTP 400 and recognized SSE
+semantic 400 that fails before substantive output is committed. The original
+logical request is not repaired, stripped, truncated, or otherwise rewritten
+for a retry. Each channel still uses its normal request compiler.
 
-This first version is deliberately conservative: an actual structured error
-envelope with a nonempty message, absent/null/generic code, and no field `param`
-is required. Known validation codes/messages, safety/refusal errors and structured
-validation details are excluded. Truncated JSON, flattened diagnostic messages
-and unstructured text are not enough evidence. SSE must fail before business
-output and downstream commitment; opaque streams' existing immediate-commit
-contract is unchanged. Successful HTTP200 bodies are not reinterpreted by this
-policy.
+No retry occurs for local gateway validation, an explicitly targeted provider,
+or a failure after substantive text/tool output has been committed; replaying
+after output could duplicate work and cannot replace an already-started client
+response. Existing opaque native streams retain their established commit
+contract. Cooling or unavailable channels do not consume the extra allowance,
+and a failed channel is not revisited under a second key. This policy does not
+add a global provider/key cooldown or convert 400 into 502. Raw attempt and
+billing status remain 400 (an SSE semantic 400 may have upstream HTTP 200); if
+no eligible channel succeeds, the request ends with 400.
 
-The exact message `Invalid request parameter` alone is generic, despite containing
-the word `invalid`: it identifies no field or constraint. It follows this
-configured 0–3 allowance when the same envelope guards pass. A nonempty `param`,
-specific code, validation details, or added field/error text still prevents rescue.
-This does not introduce an always-on exact rule or change exhaustion from 400.
+The console exposes this setting only when the gateway advertises
+`all_upstream_400_retries`; it will not silently restore nonzero intent to an
+older gateway. Existing persisted settings are preserved. The bootstrap header
+`X-Uni-All-Upstream-400-Retries: 1` signals that capability during restore.
 
-Only text inference endpoints are eligible. Known hosted tools, explicit
-storage/background jobs, server-side conversation references, image/video and
-other side-effect APIs are excluded. Both the incoming payload and final compiled
-wire request are checked, including provider overrides. This is not an
-idempotency guarantee: an upstream may execute work before reporting failure.
-Operators accepting this risk can choose a small allowance at the cost of extra
-latency, load and possible billing.
-
-The original logical request is retained; this policy adds no payload repair,
-truncation, field removal or encrypted-history transformation. Each fallback
-continues through the existing per-channel compiler. Failed attempts retain raw
-HTTP/billing status (400 for HTTP, 200 for SSE/semantic400); unknown errors remain
-400 for routing/final exhaustion, rather than being falsely reclassified as502.
-No global provider/key cooldown is introduced by an unknown400.
-
-Only an actual scheduled outbound attempt consumes rescue credit. Cooling,
-missing-key, invalid-build and duplicate-backend skips do not. Once rescuing, the
-same host+effective port is not revisited under a different provider name/key.
-Distinct DNS aliases cannot in general be proven to share a backend; this is a
-conservative best-effort identity, not network topology discovery. Speculative
-hedges cannot launch additional rescue requests without another failure
-authorization, and cannot consume the remaining route cursor while waiting.
-
-The `unknown_upstream_400_retry` event records request/attempt IDs and limit/used
-counts only. Final timing summaries include `unknown_400_retry_used`. Never put
-request bodies, credentials, encrypted history or full errors into this event.
-
-Deploy a supporting gateway first, then the console editor. A gateway advertises
-`unknown_upstream_400_retries` in its settings schema and sends
-`X-Uni-Unknown-Upstream-400-Retries: 1` during retained-control restore. The console
-must reject unsupported gateways restoring nonzero intent, instead of silently
-dropping the policy; it must preserve the previous saved configuration/LKG.
-
-Regression: `tests/http/verify_unknown_400_retry.py` uses loopback servers on
-distinct ports, never model providers. It verifies 0–3 credits, total retry cap,
-same-backend aliases, hot updates, known-rule compatibility, validation/refusal
-exclusions, SSE and collectors, post-output guards, hedging, unchanged wire and
-raw billing/final facts. No customer request replay is needed for rollout.
+All former content-, provider-, and message-specific 400 retries and request
+repairs are retired. Non-400 fallback policy and the independent 404 persisted
+item recovery are unchanged. Regression coverage uses loopback providers only;
+it does not replay customer traffic or call paid model providers.

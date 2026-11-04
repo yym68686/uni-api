@@ -26,20 +26,9 @@ pub(crate) fn record_log(log: &Value) {
         stage,
         "routing_attempt"
             | "upstream_attempt"
-            | "thinking_signature_fallback"
-            | "gemini_tool_part_fallback"
-            | "alpha_search_text_fallback"
-            | "service_tier_fallback"
-            | "ai_studio_examples_fallback"
             | "rust_request_spool"
-            | "responses_empty_name_repair"
             | "responses_missing_item_repair"
-            | "responses_encrypted_content_repair"
-            | "responses_encrypted_content_fallback"
-            | "responses_compaction_state_fallback"
-            | "responses_item_ids_fallback"
-            | "responses_heartbeat_repair"
-            | "unknown_upstream_400_retry"
+            | "upstream_400_retry"
     ) {
         return;
     }
@@ -57,8 +46,8 @@ pub(crate) fn record_log(log: &Value) {
         "attempt_status_code",
         "routing_status_code",
         "semantic_status_code",
-        "unknown_400_retry_limit",
-        "unknown_400_retry_used",
+        "upstream_400_retry_limit",
+        "upstream_400_retry_used",
         "skip_reason",
         "status_origin",
         "error_sha256",

@@ -90,9 +90,7 @@ pub struct ResponsesRoute {
     pub(crate) attempt_contexts: HashMap<String, NativeAttemptObservation>,
     pub(crate) history_repair_attempted: bool,
     pub(crate) pending_history_repair: Option<Plan>,
-    pub(crate) empty_name_repair_attempt_id: Option<String>,
     pub(crate) missing_item_repair_attempt_id: Option<String>,
-    pub(crate) encrypted_content_repair_attempt_id: Option<String>,
     pub(crate) hedge_trigger_count: usize,
     pub(crate) hedge_cancelled_attempt_count: usize,
     pub(crate) last_provider: Option<Arc<Provider>>,
@@ -158,67 +156,19 @@ impl ResponsesRoute {
         }
     }
 
-    pub(crate) async fn record_plan_failure(&mut self, plan: Plan, outcome: &Value) -> bool {
-        let unknown = self.unknown_400.enabled()
-            && crate::routing::unknown_400::unknown_outcome(outcome)
-            && serde_json::from_str::<Value>(&plan.body)
-                .ok()
-                .is_some_and(|p| crate::routing::unknown_400::safe_request(&self.endpoint, &p));
-        // Existing exact fallbacks and proven repairs always get first refusal.
-        let retryable = self.record_plan_failure_inner(plan, outcome).await;
-        if unknown && !retryable {
+    pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
+        self.set_current_plan(&plan);
+        let retryable = self.record_failure(outcome).await;
+        if crate::routing::unknown_400::upstream_outcome(outcome) {
             self.unknown_400.set_cause(
                 outcome_status_from(outcome, "upstream_status_code", 400),
-                self.last_attempt
-                    .as_ref()
-                    .map(|a| a.attempt_id.clone())
-                    .unwrap_or_default(),
+                plan.attempt_id,
             );
+            return self.unknown_400.failure(false, true) && self.has_attempts_remaining();
         }
-        self.unknown_400
-            .failure(retryable, unknown && self.last_status == 400)
-            // History repair reserves its physical attempt inside the old
-            // classifier. It may already be the final allowed attempt.
-            && (self.pending_history_repair.is_some() || self.has_attempts_remaining())
-    }
-
-    async fn record_plan_failure_inner(&mut self, mut plan: Plan, outcome: &Value) -> bool {
-        self.set_current_plan(&plan);
-        let history_endpoint = matches!(
-            self.endpoint.as_str(),
-            "/v1/responses" | "/v1/responses/compact"
-        );
-        let history_rejection_event = if self.endpoint == "/v1/responses"
-            && crate::routing::service_tier::rejected_outcome(&plan.body, outcome)
-        {
-            Some(crate::routing::service_tier::EVENT)
-        } else if history_endpoint
-            && crate::protocols::responses::compaction_state::is_channel_rejection(
-                &plan.body, outcome,
-            )
-        {
-            Some("responses_compaction_state_fallback")
-        } else if history_endpoint
-            && crate::protocols::responses::encrypted_content::is_channel_rejection(
-                &plan.body, outcome,
-            )
-        {
-            Some("responses_encrypted_content_fallback")
-        } else if self.endpoint == "/v1/responses"
-            && crate::protocols::responses::item_ids::rejected_outcome(&plan.body, outcome)
-        {
-            Some(crate::protocols::responses::item_ids::EVENT)
-        } else {
-            None
-        };
-        let retryable = self
-            .record_failure_with_history_rejection(outcome, history_rejection_event)
-            .await;
-        if history_rejection_event.is_some() {
-            // Never rewrite a Responses request for a channel capability mismatch.
-            // Each fallback compiles the untouched original logical request.
-            return retryable;
-        }
+        self.unknown_400.failure(retryable, false);
+        // The separate 404 persisted-item repair remains unchanged. A 400
+        // never rewrites history or gets an independent special-case resend.
         if !self.auto_retry()
             || !self.has_attempts_remaining()
             || self.request_headers.contains_key(TARGET_PROVIDER_HEADER)
@@ -226,49 +176,16 @@ impl ResponsesRoute {
         {
             return retryable;
         }
-        // The repaired request was already tried on this exact channel/key.
-        // A second HTTP 400 must not suppress the user's configured fallback
-        // chain. Preserve the original failure status and normal retry budget.
-        if self.empty_name_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
-            && crate::protocols::responses::empty_name::is_uncommitted_400(outcome)
+        if self.missing_item_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
+            && crate::protocols::responses::missing_item::is_uncommitted_404(outcome)
         {
             return self.has_attempts_remaining();
         }
-        if (self.missing_item_repair_attempt_id.as_deref() == Some(plan.attempt_id.as_str())
-            || self.encrypted_content_repair_attempt_id.as_deref()
-                == Some(plan.attempt_id.as_str()))
-            && (crate::protocols::responses::missing_item::is_uncommitted_404(outcome)
-                || crate::protocols::responses::empty_name::is_uncommitted_400(outcome))
-        {
-            return self.has_attempts_remaining();
-        }
-        let empty_name = crate::protocols::responses::empty_name::repair(&plan.body, outcome);
         let missing_item = crate::protocols::responses::missing_item::repair(&plan.body, outcome);
-        let encrypted_content =
-            crate::protocols::responses::encrypted_content::repair(&plan.body, outcome);
         if self.history_repair_attempted {
-            // Later channels still get their own compilation of the original
-            // input. Recognize the same confirmed bad history, without another
-            // repair resend or an unbounded loop.
-            return retryable
-                || (self.empty_name_repair_attempt_id.is_some()
-                    && empty_name.is_some()
-                    && self.has_attempts_remaining())
-                || (self.missing_item_repair_attempt_id.is_some()
-                    && missing_item.is_some()
-                    && self.has_attempts_remaining())
-                || (self.encrypted_content_repair_attempt_id.is_some()
-                    && encrypted_content.is_some()
-                    && self.has_attempts_remaining());
+            return retryable || (missing_item.is_some() && self.has_attempts_remaining());
         }
-        let is_empty_name = empty_name.is_some();
-        let is_missing_item = missing_item.is_some();
-        let is_encrypted_content = encrypted_content.is_some();
-        let Some((body, changed)) = empty_name
-            .or(missing_item)
-            .or(encrypted_content)
-            .or_else(|| crate::protocols::responses::heartbeat::repair(&plan.body, outcome))
-        else {
+        let Some((body, changed)) = missing_item else {
             return retryable;
         };
         let Some(mut observation) = self.last_attempt.clone() else {
@@ -278,15 +195,7 @@ impl ResponsesRoute {
         let original_attempt_id = plan.attempt_id.clone();
         plan.body = body;
         plan.attempt_id = native_attempt_id(&self.request_id, self.routing_attempts);
-        if is_empty_name {
-            self.empty_name_repair_attempt_id = Some(plan.attempt_id.clone());
-        }
-        if is_missing_item {
-            self.missing_item_repair_attempt_id = Some(plan.attempt_id.clone());
-        }
-        if is_encrypted_content {
-            self.encrypted_content_repair_attempt_id = Some(plan.attempt_id.clone());
-        }
+        self.missing_item_repair_attempt_id = Some(plan.attempt_id.clone());
         for (name, value) in &mut plan.headers {
             if name.eq_ignore_ascii_case("x-oaix-routing-attempt-id") {
                 *value = plan.attempt_id.clone();
@@ -320,30 +229,14 @@ impl ResponsesRoute {
             &self.endpoint,
             self.stream,
         );
-        let event = if is_empty_name {
-            "responses_empty_name_repair"
-        } else if is_missing_item {
-            "responses_missing_item_repair"
-        } else if is_encrypted_content {
-            "responses_encrypted_content_repair"
-        } else {
-            "responses_heartbeat_repair"
-        };
-        let mut log = json!({
-            "kind":"log", "event":event, "event_type":event, "severity":"info",
+        crate::observability::request_trace::log(json!({
+            "kind":"log", "event":"responses_missing_item_repair",
+            "event_type":"responses_missing_item_repair", "severity":"info",
             "source":"uni-api-ember", "fugue_table":"app_events",
             "request_id":self.request_id, "original_attempt_id":original_attempt_id,
             "attempt_id":plan.attempt_id, "provider":observation.provider,
-            "model":self.request_model,
-        });
-        log[if is_empty_name {
-            "tool_pairs_converted"
-        } else if is_missing_item || is_encrypted_content {
-            "reasoning_items_converted"
-        } else {
-            "heartbeat_items_converted"
-        }] = json!(changed);
-        crate::observability::request_trace::log(log);
+            "model":self.request_model, "reasoning_items_converted":changed,
+        }));
         self.pending_history_repair = Some(plan);
         true
     }
@@ -368,7 +261,12 @@ impl ResponsesRoute {
     }
 
     pub fn has_attempts_remaining(&self) -> bool {
-        self.cursor < self.max_attempts && self.upstream_attempts < self.max_attempts
+        self.upstream_attempts < 100
+            && self.cursor
+                < self
+                    .unknown_400
+                    .scan_limit(self.max_attempts, self.providers.len())
+            && (self.upstream_attempts < self.max_attempts || self.unknown_400.pending())
     }
 
     pub async fn next_plan(&mut self) -> Result<Option<Plan>, String> {
@@ -384,9 +282,7 @@ impl ResponsesRoute {
             let provider = self.providers[self.cursor % self.providers.len()].clone();
             self.cursor += 1;
             self.routing_attempts = self.routing_attempts.saturating_add(1);
-            let upstream_url =
-                normalize_upstream_url(&provider.base_url, &provider.engine, self.wants_compact);
-            if !self.unknown_400.may_dispatch(&upstream_url) {
+            if !self.unknown_400.may_dispatch(provider.name.as_ref()) {
                 self.routing_skips = self.routing_skips.saturating_add(1);
                 continue;
             }
@@ -462,14 +358,6 @@ impl ResponsesRoute {
                 &engine,
                 self.wants_compact,
             )?;
-            if self.unknown_400.enabled()
-                && !self.unknown_400.may_dispatch_payload(
-                    crate::routing::unknown_400::safe_request(&self.endpoint, &payload),
-                )
-            {
-                self.routing_skips = self.routing_skips.saturating_add(1);
-                continue;
-            }
             let collect_stream = !self.stream
                 && !self.wants_compact
                 && crate::providers::stream_mode::stream_only(
@@ -510,7 +398,7 @@ impl ResponsesRoute {
                 "POST",
             );
             self.unknown_400
-                .dispatch(&upstream_url, &self.request_id, &attempt_id);
+                .dispatch(provider.name.as_ref(), &self.request_id, &attempt_id);
             self.upstream_attempts = self.upstream_attempts.saturating_add(1);
             let observation = NativeAttemptObservation {
                 request_id: self.request_id.clone(),
@@ -564,7 +452,7 @@ impl ResponsesRoute {
                 proxy: preference_string(&provider.preferences, "proxy")
                     .or_else(|| preference_string(&self.snapshot.preferences, "proxy")),
                 engine: engine.clone(),
-                precommit_semantic_guard: Some(engine == "codex"),
+                precommit_semantic_guard: Some(engine == "codex" || self.unknown_400.enabled()),
                 http1_only: engine == "codex",
                 commit_policy: preference_string(
                     &provider.preferences,
@@ -594,15 +482,6 @@ impl ResponsesRoute {
     }
 
     pub async fn record_failure(&mut self, outcome: &Value) -> bool {
-        self.record_failure_with_history_rejection(outcome, None)
-            .await
-    }
-
-    async fn record_failure_with_history_rejection(
-        &mut self,
-        outcome: &Value,
-        history_rejection_event: Option<&'static str>,
-    ) -> bool {
         let original_status = outcome
             .get("status_code")
             .and_then(Value::as_u64)
@@ -613,7 +492,7 @@ impl ResponsesRoute {
             .or_else(|| outcome.get("body"))
             .and_then(Value::as_str)
             .unwrap_or("Responses upstream attempt failed");
-        let mut policy = classify_provider_failure(
+        let policy = classify_provider_failure(
             original_status,
             detail,
             self.last_provider.as_deref(),
@@ -623,41 +502,6 @@ impl ResponsesRoute {
                 .as_ref()
                 .and_then(|attempt| attempt.wire_model.as_deref()),
         );
-        if crate::routing::ai_studio_schema::rejected_examples(original_status, detail) {
-            crate::observability::request_trace::log(json!({
-                "kind":"log", "fugue_table":"app_events",
-                "event":"ai_studio_examples_fallback", "event_type":"ai_studio_examples_fallback",
-                "severity":"warn", "source":"uni-api-ember", "request_id":self.request_id,
-                "attempt_id":self.last_attempt.as_ref().map(|a| a.attempt_id.as_str()),
-                "provider":self.last_provider.as_ref().map(|p| p.name.as_ref()),
-                "model":self.request_model, "path":self.endpoint, "streaming":self.stream,
-                "attempt_status_code":original_status, "routing_status_code":policy.status,
-                "error_sha256":sha256_hex(detail),
-            }));
-        }
-        if let Some(event) = history_rejection_event {
-            // Compatibility is specific to this request's declared feature,
-            // not evidence that the provider/key is broken for other traffic.
-            policy.status = 502;
-            policy.retryable = self.auto_retry();
-            policy.request_scoped = true;
-            policy.provider_model_unavailable = false;
-            policy.force_quota_cooldown = false;
-            crate::observability::request_trace::log(json!({
-                "kind":"log", "fugue_table":"app_events",
-                "event":event,
-                "event_type":event,
-                "severity":"warn", "source":"uni-api-ember",
-                "request_id":self.request_id,
-                "attempt_id":self.last_attempt.as_ref().map(|a| a.attempt_id.as_str()),
-                "provider":self.last_provider.as_ref().map(|p| p.name.as_ref()),
-                "model":self.request_model,
-                "path":self.endpoint, "streaming":self.stream,
-                "attempt_status_code":outcome_status_from(outcome, "upstream_status_code", original_status),
-                "semantic_status_code":original_status, "routing_status_code":policy.status,
-                "error_sha256":sha256_hex(detail),
-            }));
-        }
         let status = policy.status;
         self.last_status = status;
         self.last_detail = detail.chars().take(4096).collect();

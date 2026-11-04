@@ -655,18 +655,11 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             let (status_code, detail) =
                 crate::protocols::responses::events::responses_semantic_error(&payload, event_type);
             Err(PrecommitFailure {
-                failure_reason: Some(
-                    if status_code == 400
-                        && payload
-                            .get("error")
-                            .or_else(|| payload.pointer("/response/error"))
-                            .is_some_and(crate::routing::unknown_400::unknown_error)
-                    {
-                        "unknown_upstream_400"
-                    } else {
-                        "upstream_response_failed"
-                    },
-                ),
+                failure_reason: Some(if status_code == 400 {
+                    "upstream_400"
+                } else {
+                    "upstream_response_failed"
+                }),
                 status_code,
                 detail,
             })

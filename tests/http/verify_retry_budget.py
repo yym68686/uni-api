@@ -11,7 +11,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from verify_dispatch_timing import free_port
-from verify_empty_name_retry import ERROR as REPAIR_ERROR, payload as repair_payload
+REPAIR_ERROR = {"error": {"type":"invalid_request_error","code":"empty_string","param":"input[0].name","message":"Invalid empty tool name"}}
+def repair_payload(stream):
+    return {"stream":stream,"input":[{"type":"function_call","name":"","call_id":"bad","arguments":"{}"},{"type":"function_call_output","call_id":"bad","output":"unsupported call: "}]}
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -124,9 +126,6 @@ def verify(binary, hedging):
                 context = (hedging, endpoint, stream, key, model, mode, status, len(hits), raw[:200])
                 assert len(hits) == expected, context
                 assert status in ((502, 503, 504) if mode == "slow" else (400, 503)), context
-                if mode == "repair" and expected > 1:
-                    assert hits[0][0] == hits[1][0], context
-                    assert hits[0][1]["input"] != hits[1][1]["input"], context
                 return 1
 
             with (root / "log").open("w+") as log:
@@ -158,7 +157,7 @@ def verify(binary, hedging):
                                 count += check(endpoint, stream, key, expected=expected, mode="slow")
                     for stream in (False, True):
                         for key, expected in (("three", 4), ("one", 2), ("false", 1), ("string-false", 1)):
-                            count += check("/v1/responses", stream, key, expected=expected, mode="repair")
+                            count += check("/v1/responses", stream, key, expected=1, mode="repair")
                     for stream in (False, True):
                         count += check("/v1/responses", stream, "three", mode="late-repair")
                     count += check("/v1/responses/compact", False, "three")

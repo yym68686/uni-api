@@ -393,9 +393,7 @@ pub async fn prepare_request(
     ResponsesPreparation::Ready(ResponsesRoute {
         unknown_400: crate::routing::unknown_400::Budget::new(
             crate::routing::unknown_400::configured(&snapshot.preferences),
-            retry_policy.enabled() && !targeted && max_attempts > 1,
-            normalized_endpoint,
-            &payload,
+            !targeted,
         ),
         store: store.clone(),
         codex_oauth,
@@ -422,9 +420,7 @@ pub async fn prepare_request(
         attempt_contexts: HashMap::new(),
         history_repair_attempted: false,
         pending_history_repair: None,
-        empty_name_repair_attempt_id: None,
         missing_item_repair_attempt_id: None,
-        encrypted_content_repair_attempt_id: None,
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
         last_provider: None,

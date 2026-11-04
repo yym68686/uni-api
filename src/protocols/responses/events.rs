@@ -41,21 +41,8 @@ pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u1
             .as_u64()
             .or_else(|| candidate.as_str()?.parse::<u64>().ok());
         if let Some(status @ 400..=599) = parsed {
-            // Classify before dropping the structured envelope. Otherwise a
-            // generic upstream failure carrying status 400 suppresses failover.
-            return (
-                if status == 400 && generic_upstream_error {
-                    502
-                } else {
-                    status as u16
-                },
-                detail,
-            );
+            return (status as u16, detail);
         }
-    }
-
-    if generic_upstream_error {
-        return (502, detail);
     }
 
     let code = error
@@ -108,6 +95,10 @@ pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u1
     };
     if let Some(status) = status {
         return (status, detail);
+    }
+
+    if generic_upstream_error {
+        return (502, detail);
     }
 
     let message = detail.to_ascii_lowercase();

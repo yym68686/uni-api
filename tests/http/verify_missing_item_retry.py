@@ -214,6 +214,11 @@ def verify(binary, hedging):
                         expected_status = 200 if success else 404
                         if label == "later-unrelated-400":
                             success, expected_status = False, 400
+                        if label in ("repair-then-400", "repair-then-empty-name"):
+                            # The 404 repair remains, but a subsequent 400 has
+                            # no special retry allowance when the global is 0.
+                            expected = ["first", "first"]
+                            success, expected_status = False, 400
                         if label == "exhausted":
                             # Three providers + automatic key budget (capped 10), including repair.
                             expected = (["first", "first"] + ["fallback", "third", "first"] * 4)[:13]

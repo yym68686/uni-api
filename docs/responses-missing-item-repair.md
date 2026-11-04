@@ -51,20 +51,15 @@ only in the summary; conversion to an assistant message preserved that marker.
 ## Retry and observation
 
 The repair resend retains the same provider, URL, key, model, proxy and options,
-with a new attempt ID. It shares the **one historical repair resend per incoming
-request** limit with heartbeat, empty-name and
-[rejected encrypted-envelope repair](responses-encrypted-content-repair.md),
-including under hedging.
-It does not consume an ordinary provider-selection slot.
+with a new attempt ID. It does not consume an ordinary provider-selection slot.
 
-If the repair resend fails with an uncommitted HTTP 404 or 400, ordinary channel
-selection continues within its existing budget. Other failures use existing
-classification. Each later channel compiles the original request independently;
-it does not inherit another provider's request overrides or repaired body. A
-later rejection of the same safely repairable history can advance to the next
-channel without another repair resend. An unrelated parameter 400 on a later
-channel retains its normal stop behavior. Exhaustion reports the actual last
-failure; upstream facts keep the original HTTP status.
+If the repair resend fails with an uncommitted HTTP 404, ordinary channel
+selection continues within its existing budget. Any resulting upstream HTTP
+400 is handled only by the common configured policy in
+[all upstream 400 fallback](unknown-upstream-400-retry.md). Each later channel
+compiles the original request independently; it does not inherit another
+provider's request overrides or repaired body. Exhaustion reports the actual
+last failure; upstream facts keep the original HTTP status.
 
 `AUTO_RETRY=false`, administrator-targeted diagnostics, compact requests and
 errors after committed business output do not trigger repair. A different
@@ -79,5 +74,4 @@ Tests live in `responses_missing_item.rs` and
 `tests/http/verify_missing_item_retry.py`. The HTTP suite covers strict matching,
 same-key preservation, one-item replacement, negative eligibility cases,
 streaming/nonstreaming, retry after repair, exhaustion, no cross-repair loops,
-postcommit behavior and a hedge race. Existing heartbeat/empty-name regressions
-continue to run in CI.
+postcommit behavior and a hedge race.
