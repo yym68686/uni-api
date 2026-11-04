@@ -204,6 +204,10 @@ impl ResponsesRoute {
             )
         {
             Some("responses_encrypted_content_fallback")
+        } else if self.endpoint == "/v1/responses"
+            && crate::protocols::responses::item_ids::rejected_outcome(&plan.body, outcome)
+        {
+            Some(crate::protocols::responses::item_ids::EVENT)
         } else {
             None
         };
@@ -211,7 +215,7 @@ impl ResponsesRoute {
             .record_failure_with_history_rejection(outcome, history_rejection_event)
             .await;
         if history_rejection_event.is_some() {
-            // Never repair/resend an incompatible tier or opaque history on this channel.
+            // Never rewrite a Responses request for a channel capability mismatch.
             // Each fallback compiles the untouched original logical request.
             return retryable;
         }
@@ -632,7 +636,7 @@ impl ResponsesRoute {
             }));
         }
         if let Some(event) = history_rejection_event {
-            // Compatibility is specific to this request's tier or encrypted history,
+            // Compatibility is specific to this request's declared feature,
             // not evidence that the provider/key is broken for other traffic.
             policy.status = 502;
             policy.retryable = self.auto_retry();

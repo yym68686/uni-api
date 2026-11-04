@@ -2,6 +2,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
+pub(crate) const EVENT: &str = "responses_item_ids_fallback";
+const MESSAGE: &str = "This request does not support user-supplied input item IDs.";
+
 const MAX_ITEM_ID_LENGTH: usize = 64;
 
 const HASHED_ITEM_ID_HEX_LENGTH: usize = 40;
@@ -157,6 +160,51 @@ pub(crate) fn event_item_id_needs_normalization(event_type: &[u8], item_id: &[u8
         || !suffix.iter().all(u8::is_ascii_alphanumeric)
 }
 
+/// Some Responses relays reject otherwise valid history solely because they
+/// do not accept caller-supplied item IDs. Keep the wire request unchanged and
+/// fail over only for the complete, uncommitted upstream envelope.
+pub(crate) fn rejected_outcome(body: &str, outcome: &Value) -> bool {
+    if outcome.get("kind").and_then(Value::as_str) != Some("http_error")
+        || outcome.get("status_code").and_then(Value::as_u64) != Some(400)
+        || outcome.get("upstream_status_code").and_then(Value::as_u64) != Some(400)
+        || outcome.get("committed").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+    let Some(error) = outcome
+        .get("body")
+        .and_then(Value::as_str)
+        .and_then(|detail| serde_json::from_str::<Value>(detail).ok())
+        .and_then(|payload| payload.get("error").cloned())
+        .and_then(|error| error.as_object().cloned())
+    else {
+        return false;
+    };
+    if error.get("type").and_then(Value::as_str) != Some("invalid_request_error")
+        || error.get("code").and_then(Value::as_str) != Some("unsupported_parameter")
+        || error.get("param").and_then(Value::as_str) != Some("input")
+        || error.get("message").and_then(Value::as_str) != Some(MESSAGE)
+        || !error
+            .get("details")
+            .is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty))
+    {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    payload
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty())
+            })
+        })
+}
+
 fn normalized_id(original: &str, prefix: &str) -> Option<String> {
     let canonical_prefix = format!("{prefix}_");
     if let Some(suffix) = original.strip_prefix(&canonical_prefix) {
@@ -274,6 +322,62 @@ fn collect_item_ids(root: &Map<String, Value>) -> HashSet<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn item_id_error() -> Value {
+        json!({"error": {
+            "type":"invalid_request_error", "code":"unsupported_parameter",
+            "param":"input", "message":MESSAGE
+        }})
+    }
+
+    fn item_id_outcome() -> Value {
+        json!({"kind":"http_error", "status_code":400,
+            "upstream_status_code":400, "committed":false,
+            "body":item_id_error().to_string()})
+    }
+
+    #[test]
+    fn item_id_rejection_requires_actual_wire_ids_and_exact_error() {
+        let body = json!({"input":[{"type":"message","id":"msg_abc","role":"user",
+            "content":[{"type":"input_text","text":"keep"}]}]})
+        .to_string();
+        assert!(rejected_outcome(&body, &item_id_outcome()));
+        for body in [
+            json!({"input":[{"type":"message","role":"user"}]}).to_string(),
+            json!({"input":[{"type":"message","id":"  "}]}).to_string(),
+            "not-json".to_owned(),
+        ] {
+            assert!(!rejected_outcome(&body, &item_id_outcome()));
+        }
+        for (field, value) in [
+            ("type", json!("upstream_error")),
+            ("code", json!("invalid_value")),
+            ("param", json!("messages")),
+            ("param", json!("")),
+            (
+                "message",
+                json!("This request does not support user-supplied input item IDs"),
+            ),
+            ("details", json!([{"reason":"validation"}])),
+        ] {
+            let mut error = item_id_error();
+            error["error"][field] = value;
+            let outcome = json!({"kind":"http_error", "status_code":400,
+                "upstream_status_code":400, "committed":false,
+                "body":error.to_string()});
+            assert!(!rejected_outcome(&body, &outcome));
+        }
+        for (field, value) in [
+            ("kind", json!("semantic_error")),
+            ("status_code", json!(502)),
+            ("upstream_status_code", json!(200)),
+            ("committed", json!(true)),
+        ] {
+            let mut outcome = item_id_outcome();
+            outcome[field] = value;
+            assert!(!rejected_outcome(&body, &outcome));
+        }
+    }
 
     #[test]
     fn normalizes_type_prefixes_wrong_prefixes_and_long_ids() {
