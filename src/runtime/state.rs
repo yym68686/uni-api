@@ -20,6 +20,7 @@ pub(crate) struct SnapshotStamp {
 
 #[derive(Clone)]
 pub struct GatewayRuntime {
+    pub(crate) explicit_cache: crate::runtime::explicit_cache::Guard,
     pub(crate) scheduling: crate::runtime::scheduling::SchedulingState,
     pub(crate) channel_controls: Arc<RwLock<crate::control::channels::Controls>>,
     pub(crate) path: Arc<PathBuf>,
@@ -32,6 +33,7 @@ impl GatewayRuntime {
         let path = std::env::var("RUST_RESPONSES_CONFIG_SNAPSHOT_PATH")
             .unwrap_or_else(|_| "/tmp/uni-api-rust-responses-config-v1.json".into());
         Self {
+            explicit_cache: crate::runtime::explicit_cache::Guard::default(),
             scheduling: crate::runtime::scheduling::SchedulingState::default(),
             channel_controls: Arc::new(RwLock::new(crate::control::channels::Controls::default())),
             path: Arc::new(PathBuf::from(path)),

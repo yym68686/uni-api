@@ -362,6 +362,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
             "json",
         ),
         ("preferences/upstream_stream_mode", "网络与适配", "json"),
+        ("preferences/explicit_cache_guard", "请求规则", "boolean"),
         ("tools", "网络与适配", "boolean"),
         ("image", "网络与适配", "boolean"),
         ("preferences/proxy", "网络与适配", "secret"),
@@ -462,6 +463,11 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
     }
     if let Some(p) = raw.get("preferences") {
         let p = p.as_object().ok_or(field_error("/preferences"))?;
+        if p.get("explicit_cache_guard")
+            .is_some_and(|v| !v.is_boolean())
+        {
+            return Err(field_error("/preferences/explicit_cache_guard"));
+        }
         if let Some(mode) = p.get("upstream_stream_mode") {
             crate::providers::stream_mode::validate(mode)?;
         }

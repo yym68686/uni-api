@@ -316,6 +316,30 @@ pub(crate) async fn next_generic_hedge_plan(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_cache_routing(
+    request: &str,
+    trace: &str,
+    index: usize,
+    provider: &Provider,
+    model: &str,
+    upstream: &str,
+    path: &str,
+    stream: bool,
+    outcome: &str,
+    detail: Value,
+) {
+    let mut event = json!({"kind":"log","fugue_table":"app_events","event":"routing_attempt",
+        "event_type":"routing_attempt","severity":"info","request_id":request,"trace_id":trace,
+        "attempt_id":format!("{request}-r{}",index+1),"attempt_index":index+1,
+        "provider":provider.name.as_ref(),"model":model,"actual_model":upstream,"path":path,
+        "streaming":stream,"attempt_outcome":outcome});
+    if let (Some(event), Some(detail)) = (event.as_object_mut(), detail.as_object()) {
+        event.extend(detail.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    crate::observability::telemetry::emit(event);
+}
+
 pub(crate) fn emit_routing_skip(
     execution: &AttemptLoop,
     attempt_index: usize,
@@ -455,6 +479,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     status,
                     usage,
                     fact_usage,
+                    cache_completed: _,
                     stream_outcome,
                     collected_outcome,
                     upstream_url,
@@ -742,13 +767,21 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         &path,
     ) == Some("compaction");
     let mut compaction_visited = HashSet::new();
-    while cursor < unknown_400.scan_limit(max_attempts, providers.len())
+    let mut scan_limit = unknown_400.scan_limit(max_attempts, providers.len());
+    let mut cache_fallback = None;
+    let mut dispatched = 0usize;
+    while (cursor < scan_limit || cache_fallback.is_some())
         && unknown_400.can_attempt(max_attempts)
         && (!compaction_request || cursor < providers.len())
     {
         let attempt_index = cursor;
+        let cache_last_resort = cursor >= scan_limit;
+        let provider = if cache_last_resort {
+            cache_fallback.take().unwrap()
+        } else {
+            providers[attempt_index % providers.len()].clone()
+        };
         cursor += 1;
-        let provider = providers[attempt_index % providers.len()].clone();
         if compaction_request && compaction_visited.contains(provider.name.as_ref()) {
             continue;
         }
@@ -830,6 +863,38 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 prepared.headers.insert("chatgpt-account-id", value);
             }
         }
+        let cache_candidate = state
+            .runtime
+            .explicit_cache
+            .candidate(&api_key, &provider, &prepared, &path);
+        if let Some(mut detail) = cache_candidate
+            .as_ref()
+            .and_then(|c| state.runtime.explicit_cache.avoidance(c))
+        {
+            let skip = !cache_last_resort && providers.len() > 1;
+            if skip {
+                cache_fallback.get_or_insert_with(|| provider.clone());
+                scan_limit = scan_limit.max(providers.len());
+                detail["skip_reason"] = json!("explicit_cache_prefix_rewrite");
+            } else {
+                detail["cache_guard_action"] = json!("availability_fallback");
+            }
+            emit_cache_routing(
+                &request_id,
+                &trace_id,
+                attempt_index,
+                &provider,
+                &request_model,
+                &original_model,
+                &path,
+                prepared.downstream_stream,
+                if skip { "skipped" } else { "fallback" },
+                detail,
+            );
+            if skip {
+                continue;
+            }
+        }
         let attempt_started = Instant::now();
         if compaction_request {
             compaction_visited.insert(provider.name.to_string());
@@ -839,6 +904,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             &request_id,
             &format!("{request_id}-r{}", attempt_index + 1),
         );
+        dispatched += 1;
         prepared.dispatch = arrival.map(|arrival| {
             arrival.attempt(
                 crate::observability::metrics::MetricKey::new(
@@ -887,6 +953,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     status,
                     usage,
                     fact_usage,
+                    cache_completed,
                     stream_outcome,
                     collected_outcome,
                     upstream_url,
@@ -924,7 +991,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         "runtime": "rust",
                         "unknown_400_retry_used": unknown_400.used(),
                         "stream_collection": collected_outcome,
-                        "attempt_count": attempt_index + 1,
+                        "attempt_count": dispatched,
                         "upstream_ms": attempt_started.elapsed().as_millis(),
                     })
                     .to_string(),
@@ -958,6 +1025,25 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 first_text_ms: None,
                             }
                         });
+                        if let Some(detail) = outcome_state.runtime.explicit_cache.observe(
+                            cache_candidate.as_ref(),
+                            &outcome.fact_usage,
+                            outcome.success,
+                            &outcome_request_id,
+                        ) {
+                            emit_cache_routing(
+                                &outcome_request_id,
+                                &outcome_trace_id,
+                                attempt_index,
+                                &outcome_provider,
+                                &outcome_model,
+                                &outcome_original_model,
+                                &outcome_path,
+                                downstream_stream,
+                                "observed",
+                                detail,
+                            );
+                        }
                         let mut request_stat = request_stat;
                         request_stat.process_time = started.elapsed().as_secs_f64();
                         request_stat.prompt_tokens = outcome.usage.0;
@@ -972,7 +1058,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.failure_reason = outcome.failure_reason.map(str::to_owned);
                         request_stat.timing_spans = json!({
                             "runtime": "rust",
-                            "attempt_count": attempt_index + 1,
+                            "attempt_count": dispatched,
                             "upstream_ms": attempt_started.elapsed().as_millis(),
                             "terminal": if outcome.success { "stream_completed" } else { "stream_failed" },
                             "status_code": outcome.status_code,
@@ -1074,6 +1160,25 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         );
                     });
                     return response;
+                }
+                if let Some(detail) = state.runtime.explicit_cache.observe(
+                    cache_candidate.as_ref(),
+                    &request_stat.fact_usage,
+                    cache_completed,
+                    &request_id,
+                ) {
+                    emit_cache_routing(
+                        &request_id,
+                        &trace_id,
+                        attempt_index,
+                        &provider,
+                        &request_model,
+                        &original_model,
+                        &path,
+                        downstream_stream,
+                        "observed",
+                        detail,
+                    );
                 }
                 state.persistence.record_channel(ChannelStat {
                     terminal_kind: collected_outcome
@@ -1244,6 +1349,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
 }
 
 pub(crate) struct AttemptSuccess {
+    pub(crate) cache_completed: bool,
     pub(crate) response: Response<Body>,
     pub(crate) status: StatusCode,
     pub(crate) usage: (i64, i64, i64),
@@ -1607,6 +1713,7 @@ pub(crate) async fn send_attempt(
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
         return Ok(AttemptSuccess {
+            cache_completed: false,
             response: output,
             status,
             usage,
@@ -1699,6 +1806,7 @@ pub(crate) async fn send_attempt(
                 .headers_mut()
                 .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
             return Ok(AttemptSuccess {
+                cache_completed: false,
                 response: translation.response,
                 status,
                 usage: (0, 0, 0),
@@ -1719,6 +1827,7 @@ pub(crate) async fn send_attempt(
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
         return Ok(AttemptSuccess {
+            cache_completed: false,
             response: output,
             status,
             usage: (0, 0, 0),
@@ -1808,6 +1917,7 @@ pub(crate) async fn send_attempt(
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
         return Ok(AttemptSuccess {
+            cache_completed: false,
             response: translation.response,
             status,
             usage: (0, 0, 0),
@@ -1836,6 +1946,23 @@ pub(crate) async fn send_attempt(
             response: None,
         })?;
         let parsed = serde_json::from_slice::<Value>(&body).ok();
+        let cache_completed = status.is_success()
+            && endpoint == "/v1/messages"
+            && parsed.as_ref().is_some_and(|p| {
+                p.get("error").is_none()
+                    && p["type"] == "message"
+                    && p["stop_reason"].as_str().is_some_and(|r| {
+                        [
+                            "end_turn",
+                            "max_tokens",
+                            "stop_sequence",
+                            "tool_use",
+                            "pause_turn",
+                            "refusal",
+                        ]
+                        .contains(&r)
+                    })
+            });
         let fact_usage = crate::observability::usage::FactUsage::from_usage(
             parsed.as_ref().and_then(|v| v.get("usage")),
         );
@@ -1847,6 +1974,7 @@ pub(crate) async fn send_attempt(
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
         return Ok(AttemptSuccess {
+            cache_completed,
             response: output,
             status,
             usage,
@@ -2001,6 +2129,7 @@ pub(crate) async fn send_attempt(
         .headers_mut()
         .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
     Ok(AttemptSuccess {
+        cache_completed: false,
         response: output,
         status: StatusCode::OK,
         usage,
