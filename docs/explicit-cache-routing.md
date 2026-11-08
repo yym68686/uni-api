@@ -39,7 +39,9 @@ channel is available as a last resort. A sole channel is served directly.
 Evidence expires with the requested TTL, measured from request start. Rewrites
 do not extend it; observed healthy reads can refresh it. State is process-local,
 resets at restart, and is bounded to 2,048 scopes / 16 recently observed variants
-per scope. Lock contention or unclassifiable data leaves routing unchanged.
+per scope. A full variant history also leaves routing unchanged, since an evicted
+exact repeat cannot safely be identified as a new suffix. Lock contention or
+unclassifiable data leaves routing unchanged.
 No probes, cross-caller learning or supplier-wide bans are involved.
 
 Set `UNI_API_EXPLICIT_CACHE_GUARD=false` to disable the feature for a process, or

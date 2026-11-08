@@ -208,6 +208,9 @@ impl Guard {
         if now >= entry.expires
             || candidate.started < entry.completed
             || entry.misses < MISS_THRESHOLD
+            // Once the bounded history fills, an older exact repeat may have
+            // been evicted. Preserve routing rather than misclassify it as new.
+            || entry.variants.len() >= MAX_VARIANTS
             || entry
                 .variants
                 .iter()
@@ -530,5 +533,23 @@ mod tests {
             e.expires = Instant::now() - Duration::from_secs(1);
         }
         assert!(expired.avoidance(&candidate(&expired, "D")).is_none());
+    }
+
+    #[test]
+    fn full_history_cannot_avoid_an_older_exact_repeat() {
+        let g = Guard::default();
+        learn(&g);
+        // A sole eligible provider can keep serving rewrites as a fallback.
+        // Adding alternatives later must not classify an evicted warm A as new.
+        for i in 0..MAX_VARIANTS {
+            g.observe(
+                Some(&candidate(&g, &format!("later-{i}"))),
+                &usage(650, 4100),
+                true,
+                "fallback",
+            );
+        }
+        assert!(g.avoidance(&candidate(&g, "A")).is_none());
+        assert!(g.avoidance(&candidate(&g, "new-question")).is_none());
     }
 }
