@@ -11,6 +11,7 @@ use crate::routing::filters::detect_request_type;
 use crate::routing::filters::parse_byte_limit;
 use crate::routing::filters::provider_accepts_request_rules;
 use crate::routing::filters::provider_accepts_request_type;
+use crate::routing::filters::request_type_for_endpoint;
 use crate::routing::planner::diagnostic_key;
 use crate::routing::planner::matching_providers;
 use crate::routing::planner::weighted_provider_sequence;
@@ -1626,6 +1627,36 @@ fn request_type_detection_and_provider_filters_match_python_semantics() {
     assert_eq!(
         detect_request_type(compact.as_object().unwrap()),
         Some("compaction")
+    );
+
+    for endpoint in ["/v1/responses", "/v1/responses/"] {
+        assert_eq!(
+            request_type_for_endpoint(Some(regular.as_object().unwrap()), endpoint),
+            None
+        );
+        assert_eq!(
+            request_type_for_endpoint(Some(compact.as_object().unwrap()), endpoint),
+            Some("compaction")
+        );
+    }
+    for endpoint in ["/v1/responses/compact", "/v1/responses/compact/"] {
+        assert_eq!(
+            request_type_for_endpoint(None, endpoint),
+            Some("compaction")
+        );
+        assert_eq!(
+            request_type_for_endpoint(Some(regular.as_object().unwrap()), endpoint),
+            Some("compaction")
+        );
+    }
+    assert_eq!(
+        request_type_for_endpoint(Some(compact.as_object().unwrap()), "/v1/chat/completions"),
+        None
+    );
+    let history = json!({"input": [{"type":"compaction","encrypted_content":"fixture"}]});
+    assert_eq!(
+        request_type_for_endpoint(Some(history.as_object().unwrap()), "/v1/responses"),
+        None
     );
 
     let mut provider = provider();

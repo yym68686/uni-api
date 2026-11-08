@@ -35,6 +35,17 @@ pub(crate) fn detect_request_type(payload: &Map<String, Value>) -> Option<&'stat
     is_compaction.then_some("compaction")
 }
 
+pub(crate) fn request_type_for_endpoint(
+    payload: Option<&Map<String, Value>>,
+    endpoint: &str,
+) -> Option<&'static str> {
+    match endpoint.trim_end_matches('/') {
+        "/v1/responses/compact" => Some("compaction"),
+        "/v1/responses" => payload.and_then(detect_request_type),
+        _ => None,
+    }
+}
+
 pub(crate) fn provider_accepts_request_type(
     provider: &Provider,
     request_type: Option<&str>,

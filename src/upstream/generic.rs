@@ -1323,6 +1323,7 @@ pub(crate) async fn send_attempt(
             } else {
                 prepared.upstream_stream
             },
+            prepared.request_type,
             endpoint,
             prepared.method.as_str(),
         )

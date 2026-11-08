@@ -213,6 +213,10 @@ pub(crate) fn build_attempt(
             upstream_stream: false,
             request_model: request_model.to_owned(),
             original_model: original_model.to_owned(),
+            request_type: crate::routing::filters::request_type_for_endpoint(
+                input.payload.as_ref().and_then(Value::as_object),
+                path,
+            ),
             wire_model: None,
             downstream_protocol,
             chat_stream_include_usage,
@@ -698,6 +702,10 @@ pub(crate) fn build_attempt(
         upstream_stream,
         request_model: request_model.to_owned(),
         original_model: original_model.to_owned(),
+        request_type: crate::routing::filters::request_type_for_endpoint(
+            input.payload.as_ref().and_then(Value::as_object),
+            path,
+        ),
         wire_model: payload
             .get("model")
             .and_then(Value::as_str)

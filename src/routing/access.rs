@@ -288,6 +288,7 @@ impl GatewayRuntime {
         original_model: &str,
         engine: &str,
         stream: bool,
+        request_type: Option<&str>,
         endpoint: &str,
         method: &str,
     ) -> Timeouts {
@@ -305,7 +306,7 @@ impl GatewayRuntime {
             original_model,
             engine,
             stream,
-            None,
+            request_type,
             &role,
             endpoint,
             method,

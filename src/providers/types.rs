@@ -35,6 +35,7 @@ pub(crate) struct PreparedAttempt {
     pub(crate) upstream_stream: bool,
     pub(crate) request_model: String,
     pub(crate) original_model: String,
+    pub(crate) request_type: Option<&'static str>,
     pub(crate) wire_model: Option<String>,
     pub(crate) downstream_protocol: DownstreamProtocol,
     pub(crate) chat_stream_include_usage: bool,

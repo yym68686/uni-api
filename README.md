@@ -1148,7 +1148,7 @@ providers:
               first_byte: 180
 ```
 
-Supported `match` keys are `endpoint`, `stream`, `request_type`, `method`, `engine`, `provider`, `model`, `request_model`, `upstream_model`, and `role`. `request_type: compaction` matches a Responses request whose `input` contains `{ "type": "compaction_trigger" }`. `model` matches either the request model or upstream model. `*` matches any value, and a value ending in `*` is treated as a prefix match.
+Supported `match` keys are `endpoint`, `stream`, `request_type`, `method`, `engine`, `provider`, `model`, `request_model`, `upstream_model`, and `role`. `request_type: compaction` matches `/v1/responses/compact` or a `/v1/responses` request whose `input` contains `{ "type": "compaction_trigger" }`, in both native and generic routing. `model` matches either the request model or upstream model. `*` matches any value, and a value ending in `*` is treated as a prefix match.
 
 Supported timeout keys are `connect`, `write`, `pool`, `first_byte`, `idle`, and `total`, in seconds. The Rust runtime and channel-settings preview use one resolved policy. `model_timeout` supplies the first-byte fallback (provider, then global, then 100 seconds); it never supplies a hidden total deadline. Native `/v1/messages` applies this first-byte budget to response headers. Chat and Responses also preserve their protocol-specific precommit output checks. `idle` limits the wait between upstream body chunks; `total` limits the complete attempt from dispatch through the final body byte. These rules apply to native and translated streams. No implicit 200-second total or default idle limit is installed.
 

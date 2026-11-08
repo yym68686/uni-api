@@ -4,6 +4,7 @@ use crate::providers::request::ALPHA_SEARCH_ENDPOINT;
 use crate::providers::types::PreparedInput;
 use crate::providers::video::video_task_route_for_path;
 use crate::routing::access::extract_api_key;
+use crate::routing::filters::request_type_for_endpoint;
 use crate::runtime::context::AppState;
 use crate::runtime::scheduling::ProviderKeySelection;
 use crate::transport::http::json_error;
@@ -154,7 +155,8 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         }
     }
     let body_bytes = input.observation.body_bytes;
-    let request_type = (path == "/v1/responses/compact").then_some("compaction");
+    let request_type =
+        request_type_for_endpoint(input.payload.as_ref().and_then(Value::as_object), &path);
     let mut resolved = match state
         .runtime
         .resolve_route(

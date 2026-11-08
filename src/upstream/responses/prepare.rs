@@ -1,8 +1,8 @@
 use crate::observability::context::request_id;
 use crate::providers::codex::oauth::CodexOAuthManager;
 use crate::routing::access::extract_api_key;
-use crate::routing::filters::detect_request_type;
 use crate::routing::filters::request_reasoning_effort;
+use crate::routing::filters::request_type_for_endpoint;
 use crate::routing::planner::diagnostic_key;
 use crate::routing::planner::matching_providers;
 use crate::routing::planner::TARGET_PROVIDER_HEADER;
@@ -237,7 +237,7 @@ pub async fn prepare_request(
             json!({"detail": "Request body requires input"}),
         ));
     }
-    let request_type = detect_request_type(object);
+    let request_type = request_type_for_endpoint(Some(object), endpoint);
     let reasoning_effort = request_reasoning_effort(object);
     let normalized_endpoint = endpoint.trim_end_matches('/');
     let wants_compact = normalized_endpoint == "/v1/responses/compact";
