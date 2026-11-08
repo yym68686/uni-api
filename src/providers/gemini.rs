@@ -317,29 +317,250 @@ fn plain_text_content(content: Option<&Value>, types: &[&str]) -> bool {
 }
 
 pub(crate) fn sanitize_gemini_schema(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("additionalProperties");
-            if let Some(default) = object.remove("default") {
-                let description = object
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                object.insert(
-                    "description".into(),
-                    Value::String(format!("{description}\nDefault: {default}")),
-                );
-            }
-            for value in object.values_mut() {
-                sanitize_gemini_schema(value);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.get("$schema").is_some_and(Value::is_string) {
+        object.remove("$schema");
+    }
+    // Gemini's typed Schema supports string enum values. Preserve malformed,
+    // non-string and contradictory constraints for normal upstream validation.
+    if object.get("type").and_then(Value::as_str) == Some("string") {
+        if let Some(constant) = object.get("const").and_then(Value::as_str) {
+            let compatible = match object.get("enum") {
+                None => true,
+                Some(Value::Array(items)) => {
+                    items.iter().all(Value::is_string)
+                        && items.iter().any(|v| v.as_str() == Some(constant))
+                }
+                _ => false,
+            };
+            if compatible {
+                let constant = Value::String(constant.to_owned());
+                object.remove("const");
+                object.insert("enum".into(), Value::Array(vec![constant]));
             }
         }
-        Value::Array(items) => {
-            for value in items {
-                sanitize_gemini_schema(value);
+    }
+    object.remove("additionalProperties");
+    if let Some(default) = object.remove("default") {
+        let description = object
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        object.insert(
+            "description".into(),
+            Value::String(format!("{description}\nDefault: {default}")),
+        );
+    }
+    // Only descend through schema-bearing keywords. Property names and literal
+    // values in enum/const/examples must never be treated as schema keywords.
+    for key in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                sanitize_gemini_schema(child);
             }
         }
-        _ => {}
+    }
+    for key in [
+        "items",
+        "additionalItems",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            if key == "items" && child.is_array() {
+                for item in child.as_array_mut().expect("tuple items") {
+                    sanitize_gemini_schema(item);
+                }
+            } else {
+                sanitize_gemini_schema(child);
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for child in children {
+                sanitize_gemini_schema(child);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::sanitize_gemini_schema;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_schema_nodes_without_editing_property_names_or_literal_data() {
+        let literal = json!({"$schema":"literal", "const":"literal", "default":1,
+            "additionalProperties":false, "properties":{"x":{"type":"string","const":"literal"}}});
+        let mut schema = json!({"$schema":"https://json-schema.org/draft/2020-12/schema",
+            "type":"object", "required":["$schema","const","default","additionalProperties"],
+            "properties":{
+                "$schema":{"type":"string","const":"dialect"},
+                "const":{"type":"string","enum":["a","b"],"const":"a"},
+                "default":{"type":"array","items":{"type":"string","const":"item"}},
+                "additionalProperties":{"anyOf":[{"type":"string","const":"off"},{"type":"string","const":"worktree"}]},
+                "args":{"description":"Arbitrary JSON"},
+                "data":{"enum":[literal.clone()],"const":literal.clone(),"examples":[literal.clone()]}
+            },
+            "$defs":{"node":{"type":"string","const":"definition"}},
+            "examples":[literal.clone()], "customAnnotation":literal.clone()});
+        let literals = schema["properties"]["data"].clone();
+        sanitize_gemini_schema(&mut schema);
+        assert!(schema.get("$schema").is_none());
+        assert_eq!(
+            schema["properties"]["$schema"],
+            json!({"type":"string","enum":["dialect"]})
+        );
+        assert_eq!(
+            schema["properties"]["const"],
+            json!({"type":"string","enum":["a"]})
+        );
+        assert_eq!(
+            schema["properties"]["default"]["items"],
+            json!({"type":"string","enum":["item"]})
+        );
+        assert_eq!(
+            schema["properties"]["additionalProperties"]["anyOf"][1],
+            json!({"type":"string","enum":["worktree"]})
+        );
+        assert_eq!(
+            schema["properties"]["args"],
+            json!({"description":"Arbitrary JSON"})
+        );
+        assert_eq!(schema["properties"]["data"], literals);
+        assert_eq!(
+            schema["$defs"]["node"],
+            json!({"type":"string","enum":["definition"]})
+        );
+        assert_eq!(schema["examples"], json!([literal.clone()]));
+        assert_eq!(schema["customAnnotation"], literal);
+        assert_eq!(
+            schema["required"],
+            json!(["$schema", "const", "default", "additionalProperties"])
+        );
+        let once = schema.clone();
+        sanitize_gemini_schema(&mut schema);
+        assert_eq!(schema, once);
+    }
+
+    #[test]
+    fn preserves_conflicting_malformed_and_non_string_constraints() {
+        for mut schema in [
+            json!({"type":"string","const":"a","enum":["b"]}),
+            json!({"type":"string","const":"a","enum":[]}),
+            json!({"type":"string","const":"a","enum":["a",1]}),
+            json!({"type":"string","const":"a","enum":"a"}),
+            json!({"type":"string","const":null}),
+            json!({"type":"number","const":1}),
+            json!({"type":"boolean","const":true}),
+            json!({"type":["string","null"],"const":"a"}),
+            json!({"const":"a"}),
+            json!({"$schema":false}),
+            json!([{"type":"string","const":"a"}]),
+            json!(false),
+        ] {
+            let original = schema.clone();
+            sanitize_gemini_schema(&mut schema);
+            assert_eq!(schema, original);
+        }
+        let mut empty = json!({"type":"string","const":"","enum":["","other"],"minLength":1});
+        sanitize_gemini_schema(&mut empty);
+        assert_eq!(empty, json!({"type":"string","enum":[""],"minLength":1}));
+    }
+
+    #[test]
+    fn visits_schema_applicators_and_keeps_existing_default_conversion() {
+        let mut schema = json!({"type":"object", "additionalProperties":false,
+            "default":{"const":"literal","additionalProperties":true},
+            "description":"Parameters", "dependentRequired":{"default":["const"]}});
+        let object = schema.as_object_mut().unwrap();
+        for keyword in [
+            "patternProperties",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            object.insert(
+                keyword.into(),
+                json!({"const":{"type":"string","const":"map"}}),
+            );
+        }
+        for keyword in [
+            "items",
+            "additionalItems",
+            "contains",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        ] {
+            object.insert(keyword.into(), json!({"type":"string","const":"single"}));
+        }
+        for keyword in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            object.insert(keyword.into(), json!([{"type":"string","const":"array"}]));
+        }
+        sanitize_gemini_schema(&mut schema);
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema.get("default").is_none());
+        assert_eq!(
+            schema["description"],
+            "Parameters\nDefault: {\"additionalProperties\":true,\"const\":\"literal\"}"
+        );
+        assert_eq!(schema["dependentRequired"], json!({"default":["const"]}));
+        for keyword in [
+            "patternProperties",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            assert_eq!(
+                schema[keyword]["const"],
+                json!({"type":"string","enum":["map"]})
+            );
+        }
+        for keyword in [
+            "items",
+            "additionalItems",
+            "contains",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        ] {
+            assert_eq!(schema[keyword], json!({"type":"string","enum":["single"]}));
+        }
+        for keyword in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            assert_eq!(schema[keyword], json!([{"type":"string","enum":["array"]}]));
+        }
+        let mut legacy = json!({"items":[{"type":"string","const":"tuple"}],"dependencies":{"x":["const","default"]}});
+        sanitize_gemini_schema(&mut legacy);
+        assert_eq!(
+            legacy,
+            json!({"items":[{"type":"string","enum":["tuple"]}],"dependencies":{"x":["const","default"]}})
+        );
     }
 }
 
