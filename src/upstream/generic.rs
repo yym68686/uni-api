@@ -49,7 +49,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
@@ -741,6 +741,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         input.payload.as_ref().and_then(Value::as_object),
         &path,
     ) == Some("compaction");
+    let mut compaction_visited = HashSet::new();
     while cursor < unknown_400.scan_limit(max_attempts, providers.len())
         && unknown_400.can_attempt(max_attempts)
         && (!compaction_request || cursor < providers.len())
@@ -748,6 +749,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         let attempt_index = cursor;
         cursor += 1;
         let provider = providers[attempt_index % providers.len()].clone();
+        if compaction_request && compaction_visited.contains(provider.name.as_ref()) {
+            continue;
+        }
         if !unknown_400.may_dispatch(provider.name.as_ref()) {
             continue;
         }
@@ -827,6 +831,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
         }
         let attempt_started = Instant::now();
+        if compaction_request {
+            compaction_visited.insert(provider.name.to_string());
+        }
         unknown_400.dispatch(
             provider.name.as_ref(),
             &request_id,

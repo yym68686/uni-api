@@ -294,9 +294,9 @@ impl ResponsesRoute {
             self.cursor += 1;
             if self.request_type.as_deref() == Some("compaction")
                 && self
-                    .upstream_ledger
-                    .iter()
-                    .any(|entry| entry["provider"] == provider.name.as_ref())
+                    .attempt_contexts
+                    .values()
+                    .any(|attempt| attempt.provider == provider.name.as_ref())
             {
                 continue;
             }

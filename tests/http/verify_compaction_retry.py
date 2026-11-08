@@ -84,7 +84,10 @@ def verify(binary, mode):
                     "base_url": f"http://127.0.0.1:{upstream.server_port}/{p}/v1/responses",
                     "model": ["model-a"]} for p in ("bad", "good")],
                   "api_keys": [{"api": "fixture-admin", "role": "admin", "model": ["all"]},
-                               {"api":"fixture-disabled", "model":["all"], "preferences":{"AUTO_RETRY":False}}],
+                               {"api":"fixture-disabled", "model":["all"], "preferences":{"AUTO_RETRY":False}},
+                               {"api":"fixture-weighted", "model":["all"],
+                                "weights":{"bad/model-a":3,"good/model-a":1},
+                                "preferences":{"AUTO_RETRY":8,"SCHEDULING_ALGORITHM":"weighted_round_robin"}}],
                   "preferences": {"AUTO_RETRY": True, "MAX_RETRIES": 8, "SCHEDULING_ALGORITHM": "fixed_priority"}}
         (root / "api.json").write_text(json.dumps(config))
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR", "LANG")}
@@ -138,6 +141,14 @@ def verify(binary, mode):
                                 events = [json.loads(line[6:]) for line in raw.decode().splitlines() if line.startswith("data: {")]
                                 assert sum(e["type"] == "response.completed" for e in events) == 1, events
                                 assert sum(e["type"] == "response.output_item.done" for e in events) == 1, events
+                # Weighted sequences repeat candidates, but compression must not
+                # spend another paid attempt on an already-failed channel.
+                for stream in (False, True):
+                    upstream.hits.clear()
+                    conn, response = call("/v1/responses", {"model":"model-a", "input":[{"type":"compaction_trigger"}],
+                        "stream":stream, "metadata":{"case":"exhausted"}}, "fixture-weighted")
+                    response.read(); conn.close()
+                    assert sorted(upstream.hits) == ["bad","good"], (mode, upstream.hits)
                 # Explicit target and disabled AUTO_RETRY each remain one attempt.
                 for key, target in (("fixture-disabled",None), ("fixture-admin","bad")):
                     for stream in (False,True):

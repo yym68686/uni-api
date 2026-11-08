@@ -148,6 +148,31 @@ async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> 
 }
 
 #[tokio::test]
+async fn compaction_does_not_revisit_channels_beyond_the_trace_ledger_limit() {
+    let mut route = native_route_for_test(Arc::new(provider()), 100).await;
+    route.request_type = Some("compaction".into());
+    route.providers = (0..65)
+        .map(|n| named_provider(&format!("compaction-large-{n}")))
+        .collect();
+    // Weighted scheduling can repeat a provider in the candidate sequence.
+    route.providers.push(route.providers[64].clone());
+    let failure = json!({"kind":"protocol_error", "status_code":502,
+        "upstream_status_code":200, "committed":false,
+        "detail":"compaction_invalid_output: missing compaction done event"});
+    for n in 0..65 {
+        let plan = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(
+            plan.provider_name.as_deref(),
+            Some(format!("compaction-large-{n}").as_str())
+        );
+        route.record_plan_failure(plan, &failure).await;
+    }
+    assert_eq!(route.upstream_ledger.len(), 64);
+    assert!(route.next_plan().await.unwrap().is_none());
+    assert_eq!(route.upstream_attempts, 65);
+}
+
+#[tokio::test]
 async fn unknown_400_rescue_trigger_preserves_remaining_cursor_and_budget() {
     let mut route = native_route_for_test(Arc::new(provider()), 6).await;
     route.providers = (0..3)
