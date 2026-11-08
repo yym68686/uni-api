@@ -25,6 +25,7 @@ pub(crate) struct CollectionFailure {
 struct Collector {
     processor: ResponsesProcessor,
     stats: StreamStats,
+    compaction: bool,
 }
 
 impl Collector {
@@ -34,7 +35,9 @@ impl Collector {
             detail: detail.clone(),
             outcome: json!({
                 "kind":kind, "status_code":status, "upstream_status_code":200, "detail":detail,
-                "retry_allowed":self.stats.first_output_ms.is_none(), "usage":self.stats.usage,
+                "retry_allowed":self.compaction || self.stats.first_output_ms.is_none(), "usage":self.stats.usage,
+                "committed":!self.compaction && self.stats.first_output_ms.is_some(),
+                "failure_reason":self.compaction.then(|| super::compaction::failure_reason(&detail)),
                 "upstream_stream":true, "downstream_stream":false,
                 "first_output_ms":self.stats.first_output_ms, "first_text_ms":self.stats.first_text_ms,
                 "response_created_ms":self.stats.response_created_ms,
@@ -113,11 +116,16 @@ pub(crate) async fn collect(
     started: tokio::time::Instant,
     idle: Option<Duration>,
     normalize_ids: bool,
+    compaction: bool,
 ) -> Result<Collected, CollectionFailure> {
     let mut collector = Collector {
         processor: ResponsesProcessor::new("real_output".into(), normalize_ids),
         stats: StreamStats::new("nonstream-collection"),
+        compaction,
     };
+    if compaction {
+        collector.processor.require_compaction();
+    }
     collector.stats.started_at = started;
     if !response
         .headers()

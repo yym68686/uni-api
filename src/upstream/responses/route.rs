@@ -120,7 +120,7 @@ impl ResponsesRoute {
     }
 
     pub(crate) fn hedging_enabled(&self) -> bool {
-        self.hedging.active()
+        self.request_type.as_deref() != Some("compaction") && self.hedging.active()
     }
 
     pub(crate) fn hedge_slots(&self) -> usize {
@@ -157,6 +157,17 @@ impl ResponsesRoute {
     }
 
     pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
+        let mut classified = outcome.clone();
+        if plan.compaction
+            && classified["failure_reason"].as_str().is_none()
+            && classified["kind"] != "http_error"
+        {
+            classified["failure_reason"] = crate::protocols::responses::compaction::failure_reason(
+                classified["detail"].as_str().unwrap_or_default(),
+            )
+            .into();
+        }
+        let outcome = &classified;
         self.set_current_plan(&plan);
         let retryable = self.record_failure(outcome).await;
         if crate::routing::unknown_400::upstream_outcome(outcome) {
@@ -281,6 +292,14 @@ impl ResponsesRoute {
             let attempt_number = self.routing_attempts;
             let provider = self.providers[self.cursor % self.providers.len()].clone();
             self.cursor += 1;
+            if self.request_type.as_deref() == Some("compaction")
+                && self
+                    .upstream_ledger
+                    .iter()
+                    .any(|entry| entry["provider"] == provider.name.as_ref())
+            {
+                continue;
+            }
             self.routing_attempts = self.routing_attempts.saturating_add(1);
             if !self.unknown_400.may_dispatch(provider.name.as_ref()) {
                 self.routing_skips = self.routing_skips.saturating_add(1);
@@ -449,6 +468,7 @@ impl ResponsesRoute {
                 headers,
                 body,
                 collect_stream,
+                compaction: self.request_type.as_deref() == Some("compaction"),
                 proxy: preference_string(&provider.preferences, "proxy")
                     .or_else(|| preference_string(&self.snapshot.preferences, "proxy")),
                 engine: engine.clone(),
@@ -533,7 +553,11 @@ impl ResponsesRoute {
                 status: Some(status),
             });
         }
-        if !policy.request_scoped || policy.force_quota_cooldown {
+        // Semantic compaction failures affect this request, not ordinary chat routing.
+        let compaction_failure = outcome["failure_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("compaction_"));
+        if !compaction_failure && (!policy.request_scoped || policy.force_quota_cooldown) {
             if let (Some(provider), Some(key), Some(original_model)) = (
                 self.last_provider.as_ref(),
                 self.last_provider_key.as_deref(),
@@ -812,6 +836,7 @@ impl ResponsesRoute {
             "semantic_status_code": outcome.get("status_code").and_then(Value::as_u64),
             "attempt_success": success,
             "attempt_outcome": attempt_outcome,
+            "failure_reason": if success { None } else { metric_failure_reason(attempt_outcome, outcome) },
             "provider_model_unavailable": provider_model_unavailable,
             "status_origin": failure_origin(outcome),
             "error": crate::observability::request_trace::error_fields(detail.as_bytes(), &[self.last_provider_key.as_deref().unwrap_or_default(), self.api_key.token.as_ref()]),
@@ -1319,6 +1344,14 @@ pub(crate) fn outcome_status_from(outcome: &Value, key: &str, fallback: u16) -> 
 }
 
 pub(crate) fn metric_failure_reason(kind: &str, outcome: &Value) -> Option<String> {
+    if let Some(
+        reason @ ("compaction_invalid_output"
+        | "compaction_stream_failed"
+        | "compaction_unsupported"),
+    ) = outcome["failure_reason"].as_str()
+    {
+        return Some(reason.to_owned());
+    }
     let reason = match kind {
         "completed" => return None,
         "incomplete" => match outcome.get("incomplete_reason").and_then(Value::as_str) {

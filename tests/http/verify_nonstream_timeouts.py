@@ -31,6 +31,8 @@ class Upstream(BaseHTTPRequestHandler):
                     "role": "assistant", "status": "completed", "content": [
                         {"type": "output_text", "text": channel}]}],
                     "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
+        if self.path.rstrip("/").endswith("/compact"):
+            response["output"].append({"type":"compaction", "encrypted_content":"fixture-state"})
         raw = json.dumps(response).encode()
         content_type = "application/json"
         if payload.get("stream"):

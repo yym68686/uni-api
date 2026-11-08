@@ -37,6 +37,8 @@ class Upstream(BaseHTTPRequestHandler):
                             'input_tokens_details':{'cached_tokens':4},'output_tokens_details':{'reasoning_tokens':2}},
                   'vendor_extension': {'preserve': True}}
         if self.path.endswith('/compact') or model == 'follow':
+            if self.path.endswith('/compact'):
+                result['output'].append({'type':'compaction','encrypted_content':'fixture-state'})
             raw = json.dumps(result).encode(); content_type = 'application/json'; status = 200
         elif not p.get('stream'):
             raw = b'{"error":{"code":"stream_only_mode","type":"stream_required","message":"Set stream true"}}'

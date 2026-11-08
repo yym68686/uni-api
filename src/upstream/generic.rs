@@ -606,7 +606,9 @@ pub(crate) async fn run_hedged_attempt_loop(
                     endpoint: execution.path.clone(),
                     stream: context.downstream_stream,
                 });
-                if !policy.request_scoped || policy.force_quota_cooldown {
+                if !failure.failure_reason.starts_with("compaction_")
+                    && (!policy.request_scoped || policy.force_quota_cooldown)
+                {
                     execution
                         .state
                         .runtime
@@ -735,8 +737,13 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let mut upstream_failed = false;
 
     let mut cursor = 0;
+    let compaction_request = crate::routing::filters::request_type_for_endpoint(
+        input.payload.as_ref().and_then(Value::as_object),
+        &path,
+    ) == Some("compaction");
     while cursor < unknown_400.scan_limit(max_attempts, providers.len())
         && unknown_400.can_attempt(max_attempts)
+        && (!compaction_request || cursor < providers.len())
     {
         let attempt_index = cursor;
         cursor += 1;
@@ -1154,7 +1161,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     endpoint: path.clone(),
                     stream: downstream_stream,
                 });
-                if !policy.request_scoped || policy.force_quota_cooldown {
+                if !failure.failure_reason.starts_with("compaction_")
+                    && (!policy.request_scoped || policy.force_quota_cooldown)
+                {
                     state
                         .runtime
                         .cool_failed_route(FailedRoute {
@@ -1305,6 +1314,7 @@ pub(crate) async fn send_attempt(
     keepalive_updates: Option<&crate::protocols::chat::stream::KeepaliveUpdates>,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
+    let compaction = prepared.request_type == Some("compaction");
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
     let timeouts = state
@@ -1500,6 +1510,17 @@ pub(crate) async fn send_attempt(
             dispatch.billing.error_body(status.as_u16(), &body);
         }
         let detail = String::from_utf8_lossy(&body).into_owned();
+        if compaction
+            && crate::protocols::responses::compaction::unsupported(status.as_u16(), &detail)
+        {
+            return Err(AttemptFailure {
+                failure_reason: "compaction_unsupported".into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail: "compaction_unsupported: upstream does not support this request".into(),
+                upstream_url: prepared.url,
+                response: None,
+            });
+        }
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
@@ -1514,6 +1535,80 @@ pub(crate) async fn send_attempt(
             response: Some(output),
         });
     }
+    if compaction {
+        // The generic compatibility path has no resumable streaming coordinator.
+        // Collect only the authoritative object under the existing response cap;
+        // expose a single validated response, never an invalid attempt's state.
+        let (payload, collected_outcome) = if prepared.upstream_stream {
+            let done = crate::protocols::responses::collect::collect(
+                response,
+                started,
+                positive_duration(timeouts.idle),
+                false,
+                true,
+            )
+            .await
+            .map_err(|failure| AttemptFailure {
+                failure_reason: crate::protocols::responses::compaction::failure_reason(
+                    &failure.detail,
+                )
+                .into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail: failure.detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+            (done.payload, Some(done.outcome))
+        } else {
+            let bytes = read_limited_upstream_body_with_idle(
+                response,
+                upstream_response_max_bytes(),
+                positive_duration(timeouts.idle),
+            )
+            .await
+            .map_err(|_| AttemptFailure {
+                failure_reason: "compaction_stream_failed".into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail: "compaction_stream_failed: failed reading response".into(),
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+            let payload: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            crate::protocols::responses::compaction::validate_response(
+                &payload,
+                endpoint.trim_end_matches('/').ends_with("/compact"),
+            )
+            .map_err(|detail| AttemptFailure {
+                failure_reason: crate::protocols::responses::compaction::failure_reason(&detail)
+                    .into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+            (payload, None)
+        };
+        let fact_usage = crate::observability::usage::FactUsage::from_usage(payload.get("usage"));
+        let usage = usage(&payload);
+        let mut output = if prepared.downstream_stream {
+            crate::protocols::responses::compaction::replay(payload)
+        } else {
+            json_response(status, payload)
+        };
+        copy_oaix_headers(&attribution_headers, output.headers_mut());
+        output
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            response: output,
+            status,
+            usage,
+            fact_usage,
+            collected_outcome,
+            stream_outcome: None,
+            upstream_url: prepared.url,
+        });
+    }
     let collect_responses = (endpoint == "/v1/responses"
         || prepared.adapter == ResponseAdapter::ResponsesToChat)
         && prepared.upstream_stream
@@ -1526,6 +1621,7 @@ pub(crate) async fn send_attempt(
             response.take().unwrap(),
             started,
             positive_duration(timeouts.idle),
+            false,
             false,
         )
         .await

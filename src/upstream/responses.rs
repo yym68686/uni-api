@@ -65,6 +65,8 @@ pub(crate) struct Plan {
     pub(crate) body: String,
     #[serde(default)]
     pub(crate) collect_stream: bool,
+    #[serde(default)]
+    pub(crate) compaction: bool,
     pub(crate) proxy: Option<String>,
     pub(crate) engine: String,
     #[serde(default)]
@@ -121,6 +123,7 @@ fn precommit_semantic_guard(plan: &Plan) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamMode {
+    Compaction,
     OpaqueRaw,
     GuardedThenRaw,
     SelectiveRewrite,
@@ -128,7 +131,9 @@ enum StreamMode {
 
 impl StreamMode {
     fn for_plan(plan: &Plan) -> Self {
-        if plan.normalize_custom_tool_call_ids {
+        if plan.compaction {
+            Self::Compaction
+        } else if plan.normalize_custom_tool_call_ids {
             Self::SelectiveRewrite
         } else if precommit_semantic_guard(plan) {
             Self::GuardedThenRaw
@@ -139,6 +144,7 @@ impl StreamMode {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::Compaction => "compaction",
             Self::OpaqueRaw => "opaque_raw",
             Self::GuardedThenRaw => "guarded_then_raw",
             Self::SelectiveRewrite => "selective_rewrite",
@@ -241,7 +247,7 @@ impl Coordinator {
                                 "detail": error,
                                 "committed": false,
                             });
-                            retryable = route.record_failure(&outcome).await;
+                            retryable = route.record_plan_failure(plan, &outcome).await;
                         }
                     }
                 }
@@ -424,7 +430,7 @@ pub async fn serve_native(
                     "detail": error,
                     "committed": false,
                 });
-                if !route.record_failure(&outcome).await {
+                if !route.record_plan_failure(plan, &outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
                     return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
@@ -458,6 +464,24 @@ async fn serve_native_nonstream(
         match send_native_nonstream_attempt(&state, &plan).await {
             Ok((status, mut headers, mut body, elapsed_ms, collected)) if status.is_success() => {
                 let mut payload = serde_json::from_slice::<Value>(&body).ok();
+                if plan.compaction {
+                    let validation = crate::protocols::responses::compaction::validate_response(
+                        payload.as_ref().unwrap_or(&Value::Null),
+                        plan.url.trim_end_matches('/').ends_with("/compact"),
+                    );
+                    if let Err(detail) = validation {
+                        let outcome = json!({"kind":"protocol_error", "status_code":502,
+                            "upstream_status_code":status.as_u16(), "detail":detail,
+                            "failure_reason":crate::protocols::responses::compaction::failure_reason(&detail),
+                            "committed":false, "retry_allowed":true});
+                        if route.record_plan_failure(plan, &outcome).await {
+                            continue;
+                        }
+                        route.emit_final_response(502, "failed_before_commit");
+                        release_owner(&mut idempotency_owner).await;
+                        return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
+                    }
+                }
                 if let Some(payload) = payload.as_mut() {
                     let mut changed =
                         crate::protocols::responses::usage::normalize_payload(payload);
@@ -529,7 +553,7 @@ async fn serve_native_nonstream(
                     .chars()
                     .take(4096)
                     .collect::<String>();
-                let outcome = collected.unwrap_or_else(|| {
+                let mut outcome = collected.unwrap_or_else(|| {
                     json!({
                         "kind": "http_error",
                         "status_code": status.as_u16(),
@@ -540,6 +564,17 @@ async fn serve_native_nonstream(
                         "downstream_stream": false,
                     })
                 });
+                if plan.compaction
+                    && crate::protocols::responses::compaction::unsupported(
+                        status.as_u16(),
+                        &detail,
+                    )
+                {
+                    outcome["failure_reason"] = "compaction_unsupported".into();
+                    outcome["status_code"] = 502.into();
+                    outcome["body"] =
+                        "compaction_unsupported: upstream does not support this request".into();
+                }
                 let retry_allowed = outcome["retry_allowed"].as_bool().unwrap_or(true);
                 if !route.record_plan_failure(plan, &outcome).await || !retry_allowed {
                     let final_status = StatusCode::from_u16(route.last_status())
@@ -558,7 +593,7 @@ async fn serve_native_nonstream(
                     "upstream_stream": plan.collect_stream,
                     "downstream_stream": false,
                 });
-                if !route.record_failure(&outcome).await {
+                if !route.record_plan_failure(plan, &outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
                     return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
@@ -637,6 +672,7 @@ async fn send_native_nonstream_attempt(
             observation_started,
             positive_duration(plan.idle_timeout_seconds),
             plan.normalize_custom_tool_call_ids,
+            plan.compaction,
         )
         .await;
         headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -671,6 +707,9 @@ async fn send_native_nonstream_attempt(
         let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|error| format!("read upstream non-streaming body: {error}"))?;
         body.extend_from_slice(&chunk);
+        if plan.compaction && body.len() > plan.max_precommit_bytes {
+            return Err("compaction_invalid_output: response size limit exceeded".into());
+        }
     }
     if let Some(dispatch) = &plan.dispatch {
         dispatch.billing.error_body(status.as_u16(), &body);
@@ -922,17 +961,20 @@ async fn preflight_attempt_with_trigger(
                 .billing
                 .error_body(status.as_u16(), body.as_bytes());
         }
-        return Ok(PreflightResult::HttpError(
-            Box::new(plan),
-            json!({
-                "kind": "http_error",
-                "status_code": status.as_u16(),
-                "upstream_status_code": status.as_u16(),
-                "body": body,
-                "transport_timing": stats.transport_timing(),
-                "committed": false,
-            }),
-        ));
+        let mut outcome = json!({
+            "kind":"http_error", "status_code":status.as_u16(),
+            "upstream_status_code":status.as_u16(), "body":body,
+            "transport_timing":stats.transport_timing(), "committed":false,
+        });
+        if plan.compaction
+            && crate::protocols::responses::compaction::unsupported(status.as_u16(), &body)
+        {
+            outcome["failure_reason"] = "compaction_unsupported".into();
+            outcome["status_code"] = 502.into();
+            outcome["body"] =
+                "compaction_unsupported: upstream does not support this request".into();
+        }
+        return Ok(PreflightResult::HttpError(Box::new(plan), outcome));
     }
     if unsupported_encoding {
         return Ok(PreflightResult::Retry(json!({
@@ -969,6 +1011,13 @@ async fn preflight_attempt_with_trigger(
         precommit_keepalive_sent: keepalive_already_sent,
         business_committed: false,
     };
+
+    if plan.compaction {
+        active.processor.require_compaction();
+        active.decoder.max_event_bytes = plan.max_precommit_bytes;
+        active.commit_reason = "compaction_pending";
+        return Ok(PreflightResult::Started(active));
+    }
 
     if active.mode == StreamMode::OpaqueRaw {
         active.commit_reason = "upstream_http_200";
@@ -1462,7 +1511,7 @@ async fn run_active_attempt(
                 earlier_deadline(next_deadline, active.precommit_deadline)
             };
             let next = tokio::select! {
-                _ = cancellation.cancelled(), if output.capture.is_none() => {
+                _ = cancellation.cancelled(), if output.capture.is_none() || active.plan.compaction => {
                     complete_disconnect(
                         &state,
                         &mut coordinator,
@@ -2197,6 +2246,11 @@ fn failure_retry_outcome(active: &ActiveAttempt, kind: &str, detail: &str) -> Va
     outcome["upstream_status_code"] = Value::from(active.status.as_u16());
     outcome["detail"] = Value::String(detail.chars().take(4096).collect());
     outcome["committed"] = Value::Bool(false);
+    if active.plan.compaction {
+        let reason = crate::protocols::responses::compaction::failure_reason(detail);
+        outcome["failure_reason"] = reason.into();
+        outcome["compaction_committed"] = false.into();
+    }
     outcome
 }
 
@@ -2321,6 +2375,69 @@ async fn process_active_frames(
                 return ActiveFrameResult::Done(false);
             }
         };
+        if active.plan.compaction {
+            // Receiving progress/body bytes is not committing a compaction result.
+            if processed.event_type.is_some() {
+                active.precommit_deadline = None;
+            }
+            if let Some(wire) = processed.wire {
+                if processed.hold {
+                    if precommit_buffer_exceeded(active, wire.len()) {
+                        return ActiveFrameResult::Retry(failure_retry_outcome(
+                            active,
+                            "protocol_error",
+                            "compaction_invalid_output: held event limit exceeded",
+                        ));
+                    }
+                    active.buffered.push(wire);
+                } else {
+                    active.stats.observe_wire(&wire);
+                    if output.send_wire(wire).await.is_err() {
+                        complete_disconnect(
+                            state,
+                            coordinator,
+                            active.plan.attempt_id.clone(),
+                            active.status,
+                            &mut active.stats,
+                        )
+                        .await;
+                        return ActiveFrameResult::Done(false);
+                    }
+                }
+            }
+            if processed.commits {
+                active.business_committed = true;
+                if coordinator
+                    .commit(state, &commit_observation(active, "compaction_validated"))
+                    .await
+                    .is_err()
+                {
+                    return ActiveFrameResult::Done(false);
+                }
+                if flush_initial_output(active, output).await.is_err() {
+                    complete_disconnect(
+                        state,
+                        coordinator,
+                        active.plan.attempt_id.clone(),
+                        active.status,
+                        &mut active.stats,
+                    )
+                    .await;
+                    return ActiveFrameResult::Done(false);
+                }
+                finish_terminal(
+                    state,
+                    coordinator,
+                    active.plan.attempt_id.clone(),
+                    active.status,
+                    &mut active.stats,
+                    Terminal::Completed,
+                )
+                .await;
+                return ActiveFrameResult::Done(true);
+            }
+            continue;
+        }
         if let Some(Terminal::SemanticFailure {
             event_type,
             payload,
@@ -2725,6 +2842,7 @@ mod tests {
             headers: HashMap::new(),
             body: "{}".into(),
             collect_stream: false,
+            compaction: false,
             proxy: None,
             engine: engine.into(),
             precommit_semantic_guard: None,

@@ -16,6 +16,7 @@ use serde_json::Value;
 
 #[derive(Debug)]
 pub(crate) struct ProcessedEvent {
+    pub(crate) hold: bool,
     pub(crate) wire: Option<Bytes>,
     pub(crate) event_type: Option<String>,
     pub(crate) commits: bool,
@@ -24,6 +25,7 @@ pub(crate) struct ProcessedEvent {
 }
 
 pub(crate) struct ResponsesProcessor {
+    pub(crate) compaction: Option<super::compaction::CompactionValidator>,
     pub(crate) commit_policy: String,
     pub(crate) normalizer: Option<ResponsesItemIdNormalizer>,
 }
@@ -35,9 +37,14 @@ impl ResponsesProcessor {
             _ => "real_output".to_owned(),
         };
         Self {
+            compaction: None,
             commit_policy,
             normalizer: normalize_ids.then(ResponsesItemIdNormalizer::default),
         }
+    }
+
+    pub(crate) fn require_compaction(&mut self) {
+        self.compaction = Some(Default::default());
     }
 
     pub(crate) fn process(
@@ -54,6 +61,7 @@ impl ResponsesProcessor {
         if parsed.comment_only {
             if parsed.raw.starts_with(": oaix-terminal-flush-v1 ") {
                 return Ok(ProcessedEvent {
+                    hold: false,
                     wire: None,
                     event_type: None,
                     commits: false,
@@ -62,6 +70,7 @@ impl ResponsesProcessor {
                 });
             }
             return Ok(ProcessedEvent {
+                hold: false,
                 wire: Some(frame.canonical_wire()),
                 event_type: None,
                 commits: false,
@@ -71,6 +80,7 @@ impl ResponsesProcessor {
         }
         let Some(data) = parsed.data else {
             return Ok(ProcessedEvent {
+                hold: false,
                 wire: None,
                 event_type: None,
                 commits: false,
@@ -100,6 +110,11 @@ impl ResponsesProcessor {
                 ));
             }
         }
+        let hold = if let Some(validator) = self.compaction.as_mut() {
+            validator.observe(&event_type, &payload)?
+        } else {
+            false
+        };
         validate_terminal(&event_type, &payload)?;
 
         let normalized = if let Some(normalizer) = self.normalizer.as_mut() {
@@ -137,13 +152,18 @@ impl ResponsesProcessor {
         };
         let canonical_keepalive = event_type == "keepalive" && is_canonical_keepalive(&payload);
         stats.observe_semantic_output(&event_type, &payload);
-        let commits = terminal.is_some()
-            || (!matches!(
-                event_type.as_str(),
-                "response.created" | "response.in_progress" | "response.queued" | "keepalive"
-            ) && self.commit_policy != "completed_usage"
-                && has_real_output(&event_type, &payload));
+        let commits = if self.compaction.is_some() {
+            matches!(terminal, Some(Terminal::Completed))
+        } else {
+            terminal.is_some()
+                || (!matches!(
+                    event_type.as_str(),
+                    "response.created" | "response.in_progress" | "response.queued" | "keepalive"
+                ) && self.commit_policy != "completed_usage"
+                    && has_real_output(&event_type, &payload))
+        };
         Ok(ProcessedEvent {
+            hold,
             wire: Some(wire),
             event_type: Some(event_type),
             commits,

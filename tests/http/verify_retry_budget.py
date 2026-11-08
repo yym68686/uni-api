@@ -160,7 +160,8 @@ def verify(binary, hedging):
                             count += check("/v1/responses", stream, key, expected=1, mode="repair")
                     for stream in (False, True):
                         count += check("/v1/responses", stream, "three", mode="late-repair")
-                    count += check("/v1/responses/compact", False, "three")
+                    # Compression does not revisit a failed provider in one request.
+                    count += check("/v1/responses/compact", False, "three", expected=3)
                     assert config_path.read_bytes() == original
                     print(f"PASS retry budget: {count} cases, hedging={hedging}")
                 except Exception:

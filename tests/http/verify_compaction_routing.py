@@ -31,12 +31,19 @@ class Upstream(BaseHTTPRequestHandler):
                 {"type": "output_text", "text": "OK"}]}],
             "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
         }
+        compact = self.path.rstrip("/").endswith("/compact") or any(
+            item.get("type") == "compaction_trigger" for item in payload.get("input", [])
+        )
+        if compact:
+            response["output"] = [{"type": "compaction", "encrypted_content": "fixture-state"}]
         if payload.get("stream"):
             events = [
                 {"type": "response.created", "response": {"status": "in_progress"}},
                 {"type": "response.output_text.delta", "delta": "OK"},
                 {"type": "response.completed", "response": response},
             ]
+            if compact:
+                events.insert(-1, {"type": "response.output_item.done", "item": response["output"][0], "output_index": 0})
             raw = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
         else:
             raw = json.dumps(response).encode()

@@ -31,6 +31,7 @@ class Upstream(BaseHTTPRequestHandler):
         }
         if self.path.endswith("/compact"):
             response["object"] = "response.compaction"
+            response["output"].append({"type":"compaction", "encrypted_content":"OK-fixture-state"})
         content_type = "application/json"
         if payload.get("stream"):
             content_type = "text/event-stream"
