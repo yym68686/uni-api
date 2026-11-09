@@ -18,7 +18,9 @@ pub(crate) fn observe(
     idle: Option<Duration>,
 ) -> Translation {
     let status = response.status();
-    let headers = crate::transport::http::filtered_response_headers(response.headers());
+    let mut headers = crate::transport::http::filtered_response_headers(response.headers());
+    // A logical SSE terminal can finish before the upstream HTTP body does.
+    headers.remove("content-length");
     let (tx, rx) = oneshot::channel();
     let mut observer = Observer::new();
     observer.start = started;
@@ -30,6 +32,9 @@ pub(crate) fn observe(
             observer,
         ),
         move |(mut upstream, mut observer)| async move {
+            if observer.ended {
+                return None;
+            }
             let next = upstream.next().await;
             match next {
                 Some(result) => {
@@ -70,6 +75,7 @@ struct Observer {
     first_text_ms: Option<f64>,
     start: Instant,
     terminal: bool,
+    pending_terminal: bool,
     failed: bool,
     failure_detail: Option<String>,
     failure_reason: Option<&'static str>,
@@ -89,6 +95,7 @@ impl Observer {
             first_text_ms: None,
             start: Instant::now(),
             terminal: false,
+            pending_terminal: false,
             failed: false,
             failure_detail: None,
             failure_reason: None,
@@ -98,6 +105,9 @@ impl Observer {
     }
     fn feed(&mut self, bytes: &[u8]) {
         for piece in bytes.split_inclusive(|b| *b == b'\n') {
+            if self.ended {
+                break;
+            }
             if !self.overflow {
                 if self.line.len().saturating_add(piece.len()) > MAX_LINE {
                     self.line.clear();
@@ -119,11 +129,17 @@ impl Observer {
         let Ok(line) = std::str::from_utf8(&self.line) else {
             return;
         };
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            // Wait for the SSE delimiter, including when split across reads.
+            self.ended |= self.pending_terminal;
+            return;
+        }
         let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
             return;
         };
         if data == "[DONE]" {
             self.terminal = true;
+            self.pending_terminal = true;
             return;
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -156,6 +172,7 @@ impl Observer {
         {
             self.failed = true;
             self.failure_reason = Some("upstream_response_failed");
+            self.pending_terminal = true;
         }
         if matches!(
             kind,
@@ -165,6 +182,14 @@ impl Observer {
             .is_some_and(|v| !v.is_null())
         {
             self.terminal = true;
+        }
+        // Chat finish_reason can precede a separate usage chunk. Keep reading
+        // until [DONE] or HTTP EOF; Messages has a final message_stop instead.
+        if matches!(
+            kind,
+            "message_stop" | "response.completed" | "response.incomplete"
+        ) {
+            self.pending_terminal = true;
         }
         let semantic = [
             "/delta/text",
@@ -206,8 +231,18 @@ impl Observer {
             first_text_ms: self.first_text_ms,
             success,
             observational_only: self.observational_only,
-            terminal_kind: None,
-            response_completed: None,
+            terminal_kind: Some(if !self.ended {
+                "cancelled"
+            } else if self.failed && self.failure_reason == Some("upstream_response_failed") {
+                "semantic_failure"
+            } else if success {
+                "completed"
+            } else if self.failure_reason == Some("transport_error") {
+                "transport_error"
+            } else {
+                "protocol_error"
+            }),
+            response_completed: Some(success),
             status_code: if success {
                 200
             } else if !self.ended {
@@ -312,16 +347,16 @@ mod tests {
         assert!(result.response_created_ms.is_none());
         assert!(o.line.is_empty());
         o.feed(b"data: {\"type\":\"error\",\"error\":{\"message\":\"bad\"}}\n\n");
-        assert!(!o.outcome().success);
+        assert!(o.outcome().success);
     }
     #[test]
     fn oversized_lines_and_cancelled_streams_stay_bounded() {
         let mut o = Observer::new();
         o.feed(&vec![b'a'; MAX_LINE + 1]);
         assert!(o.line.is_empty());
-        o.feed(b"\ndata: [DONE]\n\n");
+        o.feed(b"\ndata: [DONE]\n");
         assert_eq!(o.outcome().status_code, 499);
-        o.ended = true;
+        o.feed(b"\n");
         assert!(o.outcome().success);
     }
 }
