@@ -718,7 +718,10 @@ fn validate_responses_terminal(event_type: &str, payload: &Value) -> Result<(), 
             detail: format!("upstream Responses {event_type} event is missing response"),
         });
     }
-    if event_type == "error" && payload.get("error").is_none_or(Value::is_null) {
+    if event_type == "error"
+        && payload.get("error").is_none_or(Value::is_null)
+        && !payload.get("message").is_some_and(Value::is_string)
+    {
         return Err(PrecommitFailure {
             failure_reason: Some("protocol_error"),
             status_code: 502,

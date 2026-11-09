@@ -52,8 +52,15 @@ class Upstream(BaseHTTPRequestHandler):
         if shared['mode'] != 'http' and (shared['semantic'] or shared['mode'] in ['postcommit','toolcommit']):
             status, kind = 200, 'text/event-stream'
             if reject:
-                terminal = (frame('error',error=error['error']) if shared['event']=='error' else
-                            frame('response.failed',response={'status':'failed','error':error['error']}))
+                if shared['event']=='error':
+                    terminal = (frame('error',code=error['error'].get('code'),message=error['error']['message'],
+                                      param=error['error'].get('param'),sequence_number=1)
+                                # Preserve relay-specific status/type metadata in
+                                # nested fixtures; the standard code alone is 400.
+                                if shared['flat'] and error['error'].get('code')=='invalid_request_error'
+                                else frame('error',error=error['error']))
+                else:
+                    terminal = frame('response.failed',response={'status':'failed','error':error['error']})
                 data = terminal
                 if shared['mode'] == 'postcommit':
                     data = frame('response.output_text.delta',delta='started') + data
@@ -73,9 +80,9 @@ class Upstream(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
 
 
-def verify(binary, native=True, semantic=False, hedging=False, collect=False, error=ERROR, normalize=False):
+def verify(binary, native=True, semantic=False, hedging=False, collect=False, error=ERROR, normalize=False, flat=False):
     selected_error = error
-    shared = dict(hits=[],facts=[],error=error,mode='reject',semantic=semantic,event='error')
+    shared = dict(hits=[],facts=[],error=error,mode='reject',semantic=semantic,event='error',flat=flat)
     servers = [ThreadingHTTPServer(('127.0.0.1',0),Upstream) for _ in range(4)]
     for server in servers:
         server.shared = shared
@@ -225,7 +232,7 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                 encoded=json.dumps(shared['facts'])+(root/'log').read_text()
                 assert 'fixture-upstream-secret' not in encoded and 'fixture private input' not in encoded
                 assert (root/'config').read_bytes()==original
-                print(f'PASS all-upstream-400 native={native} semantic={semantic} hedging={hedging} collect={collect} generic_parameter={selected_error["error"]["message"]=="Invalid request parameter"}: {count} HTTP cases')
+                print(f'PASS all-upstream-400 native={native} semantic={semantic} hedging={hedging} collect={collect} flat={flat} generic_parameter={selected_error["error"]["message"]=="Invalid request parameter"}: {count} HTTP cases')
             finally:
                 proc.terminate(); proc.wait(timeout=15)
                 for server in servers: server.shutdown(); server.server_close()
@@ -242,3 +249,5 @@ if __name__=='__main__':
         verify(binary,semantic=True,error=error,normalize=True)
         verify(binary,native=False,semantic=True,collect=True,error=error)
         verify(binary,native=False,hedging=True,error=error)
+    verify(binary,semantic=True,flat=True)
+    verify(binary,native=False,semantic=True,collect=True,flat=True)

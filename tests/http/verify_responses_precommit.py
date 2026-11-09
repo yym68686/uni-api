@@ -15,10 +15,10 @@ import time
 
 RETRY = {"failed", "coalesced", "eof", "whitespace-failed", "empty-completed",
          "whitespace-completed", "empty-incomplete", "malformed", "wrong-type",
-         "wrong-content-type", "done-only", "multiline-failed", "timeout", "overflow"}
-NO_RETRY = {"text-failed", "tool-failed", "custom-tool-failed", "reasoning-failed", "partial-incomplete"}
+         "wrong-content-type", "done-only", "multiline-failed", "timeout", "overflow", "flat-error"}
+NO_RETRY = {"text-failed", "tool-failed", "custom-tool-failed", "reasoning-failed", "partial-incomplete", "flat-error-after-output"}
 SUCCESS = {"tool-only", "terminal-only", "whitespace-success", "opaque-reasoning", "refusal"}
-CASES = sorted(RETRY | NO_RETRY | SUCCESS | {"semantic-400", "exhausted"})
+CASES = sorted(RETRY | NO_RETRY | SUCCESS | {"semantic-400", "flat-400", "exhausted"})
 VARIANTS = [("gpt", False, 0, False), ("codex", False, 0, True),
             ("gpt", True, 0, False), ("gpt", True, 3, False), ("codex", True, 3, False)]
 
@@ -42,6 +42,11 @@ def fixture(case, role):
     ok = created + event("response.output_text.delta", delta="OK") + complete([text])
     if role != "first" and case != "exhausted":
         return [ok]
+    if case in ("flat-error", "flat-400", "flat-error-after-output"):
+        flat = event("error", code="invalid_request_error" if case == "flat-400" else "rate_limit_exceeded",
+                     message="synthetic flat error", param=None, sequence_number=2)
+        prefix = created + event("response.output_text.delta", delta="OK") if case == "flat-error-after-output" else created
+        return [prefix, flat]
     if case in ("failed", "semantic-400", "exhausted", "wrong-content-type"):
         return [created, failure]
     if case == "coalesced": return [created + failure]
@@ -161,7 +166,7 @@ def verify(binary, engine, mixed, budget, hedging, converted=False):
                         except http.client.IncompleteRead as error: wire = error.partial
                         conn.close()
                         hits = [role for model, role, _ in server.hits if model == case]
-                        retried = case in RETRY or case == "exhausted" or case == "semantic-400" and budget > 0
+                        retried = case in RETRY or case == "exhausted" or case in ("semantic-400", "flat-400") and budget > 0
                         assert hits == (["first", "fallback"] if retried else ["first"]), (label, case, hits, wire)
                         if not converted:
                             assert len({sha for model, _, sha in server.hits if model == case}) == 1, (label, case, "request mutated")
@@ -187,6 +192,9 @@ def verify(binary, engine, mixed, budget, hedging, converted=False):
                     if not converted:
                         fact = next(f for f in server.facts if f.get("kind") == "request" and f.get("request_id") == "partial-incomplete")
                         assert fact["outcome"] == "failed" and fact["failure_reason"] == "responses_max_output_tokens", (label, fact)
+                        for case in ("flat-error", "flat-400", "flat-error-after-output"):
+                            fact = next(f for f in server.facts if f.get("kind") == "attempt" and f.get("request_id") == case and f.get("provider") == "first")
+                            assert fact["failure_reason"] in ("upstream_response_failed", "upstream_400_sse"), (label, case, fact)
                     print(f"PASS {label}: {len(cases)} failover, commit, wire, timing and budget contracts", flush=True)
                 except Exception:
                     print((root / "runtime.log").read_text()[-10000:], file=sys.stderr)

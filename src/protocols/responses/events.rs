@@ -8,11 +8,14 @@ pub(crate) enum Terminal {
     SemanticFailure { event_type: String, payload: Value },
 }
 
-pub(crate) fn responses_semantic_error(payload: &Value, _event_type: &str) -> (u16, String) {
+pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u16, String) {
     let error = payload
         .pointer("/response/error")
         .filter(|error| !error.is_null())
-        .or_else(|| payload.get("error").filter(|error| !error.is_null()));
+        .or_else(|| payload.get("error").filter(|error| !error.is_null()))
+        // The standard SSE error event has top-level code/message/param.
+        // Relays may instead wrap the same object in an error field.
+        .or_else(|| (event_type == "error").then_some(payload));
     let generic_upstream_error =
         error.is_some_and(crate::routing::failure::is_generic_upstream_error);
     let detail = error
@@ -148,7 +151,10 @@ pub(crate) fn validate_terminal(event_type: &str, payload: &Value) -> Result<(),
             "Responses upstream {event_type} payload is missing response"
         ));
     }
-    if event_type == "error" && object.get("error").is_none_or(Value::is_null) {
+    if event_type == "error"
+        && object.get("error").is_none_or(Value::is_null)
+        && !object.get("message").is_some_and(Value::is_string)
+    {
         return Err("Responses upstream error payload is missing error".into());
     }
     Ok(())
