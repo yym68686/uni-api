@@ -1,4 +1,4 @@
-"""Only loopback fixtures: heartbeat, split event, and delayed semantic event."""
+"""Guarded precommit heartbeat and split events, followed by a timed raw tail."""
 from fact_sink import accept_facts
 import http.client
 import json
@@ -74,20 +74,25 @@ try:
                 deadline=time.monotonic()+8
                 while time.monotonic()<deadline and not any(f['kind']=='attempt' for f in facts):time.sleep(.1)
                 attempt=next(f for f in facts if f['kind']=='attempt')
-                t=attempt['transport_timing'];raw=t['raw_stream'];snapshot=raw['at_response_created']
+                t=attempt['transport_timing'];raw=t['raw_stream'];tail=raw['totals']
                 assert t['upstream_http_version'] == 'HTTP/1.0', t
                 assert t['connection']['remote_addr'] == f'127.0.0.1:{server.server_port}', t
                 assert t['connection']['local_addr'] == f'{observed_peers[0][0]}:{observed_peers[0][1]}', t
                 assert attempt['response_created_ms']>=450, attempt
-                assert snapshot['upstream_read_wait_ms']>=450, snapshot
-                assert snapshot['output_send_ms']<snapshot['upstream_read_wait_ms'], snapshot
-                assert snapshot['process_ms']<snapshot['upstream_read_wait_ms'], snapshot
-                assert snapshot['comment_frames']==1 and snapshot['frames']>=2, snapshot
-                assert snapshot['max_pending_frame_bytes']>=30, snapshot
-                assert snapshot['upstream_read_calls']>=3, snapshot
-                assert raw['at_first_text'] is not None
+                assert attempt['first_text_ms']>=450, attempt
+                assert t['public_stream_ready_ms']<400, t
+                # The semantic milestones are observed while validating the
+                # candidate. Raw timing starts only after substantive output;
+                # do not attribute precommit waits to raw stage snapshots.
+                assert raw['at_response_created'] is None, raw
+                assert raw['at_first_text'] is None, raw
+                assert raw['entered_ms']>=attempt['first_text_ms'], raw
+                assert tail['upstream_read_wait_ms']>=30, tail
+                assert tail['output_send_ms']<tail['upstream_read_wait_ms'], tail
+                assert tail['process_ms']<tail['upstream_read_wait_ms'], tail
+                assert tail['frames']==1 and tail['upstream_read_calls']>=1, tail
                 assert 'PRIVATE_FIXTURE_TEXT' not in json.dumps(attempt)
-                print('PASS raw wire unchanged, heartbeat forwarded early, split-event wait separated:',json.dumps({'client_first_ms':first_ms,'response_created_ms':attempt['response_created_ms'],'raw_stream':raw}))
+                print('PASS raw wire unchanged, heartbeat forwarded early, guarded milestones separated from raw tail:',json.dumps({'client_first_ms':first_ms,'response_created_ms':attempt['response_created_ms'],'raw_stream':raw}))
             finally:
                 p.terminate();p.wait(timeout=5)
 finally:

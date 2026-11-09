@@ -1093,7 +1093,10 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                     .await;
                             }
                             status.as_u16()
-                        } else if outcome.observational_only || outcome.status_code == 499 {
+                        } else if outcome.observational_only
+                            || outcome.status_code < 400
+                            || outcome.status_code == 499
+                        {
                             outcome.status_code
                         } else {
                             let policy = classify_provider_failure(
@@ -1758,6 +1761,41 @@ pub(crate) async fn send_attempt(
     } else {
         None
     };
+    if endpoint == "/v1/responses"
+        && prepared.adapter == ResponseAdapter::Passthrough
+        && prepared.downstream_protocol == DownstreamProtocol::Native
+        && prepared.upstream_stream
+        && !collect_responses
+    {
+        let mut translation = crate::protocols::responses::passthrough::prepare(
+            response.take().unwrap(),
+            started,
+            positive_duration(timeouts.first_byte).map(|duration| started + duration),
+            positive_duration(timeouts.idle),
+        )
+        .await
+        .map_err(|failure| AttemptFailure {
+            failure_reason: precommit_reason(failure.failure_reason),
+            status: StatusCode::from_u16(failure.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            detail: failure.detail,
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
+        translation
+            .response
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            cache_completed: false,
+            response: translation.response,
+            status,
+            usage: (0, 0, 0),
+            fact_usage: Default::default(),
+            collected_outcome: None,
+            stream_outcome: Some(translation.outcome),
+            upstream_url: prepared.url,
+        });
+    }
     if prepared.adapter == ResponseAdapter::Passthrough
         && prepared.downstream_protocol == DownstreamProtocol::Native
         && prepared.upstream_stream
@@ -1892,6 +1930,24 @@ pub(crate) async fn send_attempt(
                 remaining_timeout(timeouts.total, send_started.elapsed()),
             )
         };
+        if endpoint == "/v1/responses"
+            && prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat
+        {
+            translation = crate::protocols::responses::passthrough::preflight_translation(
+                translation,
+                started,
+                positive_duration(timeouts.first_byte).map(|duration| started + duration),
+            )
+            .await
+            .map_err(|failure| AttemptFailure {
+                failure_reason: precommit_reason(failure.failure_reason),
+                status: StatusCode::from_u16(failure.status_code)
+                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                detail: failure.detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+        }
         if (endpoint == "/v1/chat/completions"
             || prepared.downstream_protocol == DownstreamProtocol::Gemini)
             && prepared.adapter != ResponseAdapter::ResponsesToChat

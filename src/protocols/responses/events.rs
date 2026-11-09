@@ -8,13 +8,11 @@ pub(crate) enum Terminal {
     SemanticFailure { event_type: String, payload: Value },
 }
 
-pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u16, String) {
-    let error = if event_type.eq_ignore_ascii_case("response.failed") {
-        payload.pointer("/response/error")
-    } else {
-        payload.get("error")
-    }
-    .or_else(|| payload.get("error"));
+pub(crate) fn responses_semantic_error(payload: &Value, _event_type: &str) -> (u16, String) {
+    let error = payload
+        .pointer("/response/error")
+        .filter(|error| !error.is_null())
+        .or_else(|| payload.get("error").filter(|error| !error.is_null()));
     let generic_upstream_error =
         error.is_some_and(crate::routing::failure::is_generic_upstream_error);
     let detail = error
@@ -168,6 +166,9 @@ pub(crate) fn semantic_failure(event_type: &str, payload: &Value) -> bool {
     status.is_some_and(|value| value.eq_ignore_ascii_case("failed"))
         || response_status.is_some_and(|value| value.eq_ignore_ascii_case("failed"))
         || payload.get("error").is_some_and(Value::is_object)
+        || payload
+            .pointer("/response/error")
+            .is_some_and(|error| !error.is_null())
 }
 
 pub(crate) fn is_canonical_keepalive(payload: &Value) -> bool {
@@ -192,16 +193,21 @@ pub(crate) fn has_real_output(event_type: &str, payload: &Value) -> bool {
     ) {
         return payload.get("part").is_some_and(part_has_text);
     }
-    if event_type == "response.output_item.done" {
+    if matches!(
+        event_type,
+        "response.output_item.added" | "response.output_item.done"
+    ) {
         return payload.get("item").is_some_and(item_has_output);
     }
     if event_type.starts_with("response.") && event_type.ends_with(".done") {
-        return ["text", "refusal", "arguments"].iter().any(|field| {
-            payload
-                .get(*field)
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-        });
+        return ["text", "refusal", "arguments", "input"]
+            .iter()
+            .any(|field| {
+                payload
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            });
     }
     false
 }
@@ -222,17 +228,53 @@ pub(crate) fn item_has_output(item: &Value) -> bool {
     {
         return true;
     }
-    if !matches!(
-        item.get("type").and_then(Value::as_str),
-        Some("function_call" | "tool_call")
-    ) {
+    if item.get("type").and_then(Value::as_str) == Some("message") {
         return false;
     }
-    ["name", "arguments", "call_id"].iter().any(|field| {
-        item.get(*field)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+        return item.get("encrypted_content").is_some_and(output_value)
+            || item
+                .get("summary")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| parts.iter().any(part_has_text));
+    }
+    // Opaque reasoning and non-text/tool results are also substantive output.
+    // Empty containers and structural IDs/status alone do not qualify.
+    item.as_object().is_some_and(|object| {
+        object.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "name"
+                    | "arguments"
+                    | "input"
+                    | "call_id"
+                    | "output"
+                    | "result"
+                    | "results"
+                    | "action"
+                    | "code"
+                    | "queries"
+                    | "query"
+                    | "audio"
+                    | "transcript"
+                    | "image_url"
+                    | "tools"
+                    | "approval_request_id"
+            ) && output_value(value)
+        })
     })
+}
+
+fn output_value(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(values) => values.iter().any(output_value),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            !matches!(key.as_str(), "id" | "type" | "status") && output_value(value)
+        }),
+        Value::Number(_) | Value::Bool(_) => true,
+        Value::Null => false,
+    }
 }
 
 pub(crate) fn extract_usage(payload: &Value) -> Option<&Value> {

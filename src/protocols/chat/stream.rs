@@ -39,7 +39,28 @@ fn next_tick(interval: Option<Duration>) -> Option<Instant> {
 /// the complete retry loop still runs, and a terminal failure becomes an SSE error.
 pub async fn with_keepalive<F>(
     future: F,
+    updates: watch::Receiver<Option<Duration>>,
+) -> Response<Body>
+where
+    F: Future<Output = Response<Body>> + Send + 'static,
+{
+    with_keepalive_inner(future, updates, false).await
+}
+
+pub async fn with_responses_keepalive<F>(
+    future: F,
+    updates: watch::Receiver<Option<Duration>>,
+) -> Response<Body>
+where
+    F: Future<Output = Response<Body>> + Send + 'static,
+{
+    with_keepalive_inner(future, updates, true).await
+}
+
+async fn with_keepalive_inner<F>(
+    future: F,
     mut updates: watch::Receiver<Option<Duration>>,
+    responses: bool,
 ) -> Response<Body>
 where
     F: Future<Output = Response<Body>> + Send + 'static,
@@ -109,6 +130,9 @@ where
             payload = json!({"error":{"message":payload.to_string()}});
         }
         payload["error"]["status_code"] = json!(status);
+        if responses {
+            payload["type"] = json!("error");
+        }
         let _ = tx
             .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
             .await;

@@ -145,10 +145,9 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                 assert not worker.is_alive() and len(result)==1
                 code,raw=result[0]
             else: code,raw=invoke()
-            # With the policy disabled, native GPT keeps its existing opaque
-            # HTTP200 stream contract; the semantic final/billing stay distinct.
-            wire_want = 200 if native and semantic and not collect else want
-            assert code==wire_want,(native,semantic,hedging,collect,count,code,raw[:200])
+            # A precommit semantic failure retains its HTTP error status even
+            # when the 400 rescue budget is zero; committed output stays 200.
+            assert code==want,(native,semantic,hedging,collect,count,code,raw[:200])
             assert [n for n,_ in shared['hits']]==list(names),(count,[n for n,_ in shared['hits']],names)
             if len(names)>1:
                 assert all(w==shared['hits'][0][1] for _,w in shared['hits']),'retry changed wire bytes'

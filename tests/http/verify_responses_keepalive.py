@@ -20,7 +20,7 @@ CASES = ["success", "normalized", "canonical", "noncanonical", "retry", "same-ch
          "eof", "malformed", "first-timeout", "idle-timeout", "total-timeout",
          "overflow", "empty-terminal", "exhausted", "postcommit"]
 RETRIES = {"retry", "same-chunk", "eof", "malformed", "first-timeout",
-           "idle-timeout", "total-timeout", "overflow"}
+           "idle-timeout", "total-timeout", "overflow", "empty-terminal"}
 
 
 def event(kind, **extra):
@@ -84,7 +84,7 @@ class Upstream(BaseHTTPRequestHandler):
                 if not self.server.release[case].wait(3):
                     return
                 self.wfile.write(prefix + KEEPALIVE)
-            if case == "empty-terminal":
+            if case == "empty-terminal" and role == "first":
                 self.wfile.write(event("response.completed", response={"id": response_id, "status": "completed", "output": []}))
                 return
             self.wfile.write(event("response.output_text.delta", delta="OK"))

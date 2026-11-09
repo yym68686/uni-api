@@ -646,50 +646,46 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             ),
         });
     }
+    if crate::protocols::responses::events::semantic_failure(event_type, &payload) {
+        validate_responses_terminal(event_type, &payload)?;
+        let (status_code, detail) =
+            crate::protocols::responses::events::responses_semantic_error(&payload, event_type);
+        return Err(PrecommitFailure {
+            failure_reason: Some(if status_code == 400 {
+                "upstream_400"
+            } else {
+                "upstream_response_failed"
+            }),
+            status_code,
+            detail,
+        });
+    }
     match event_type {
         "response.created" | "response.in_progress" | "response.queued" | "keepalive" => {
             Ok(PrecommitDecision::Ignore)
         }
-        "response.failed" | "error" => {
-            validate_responses_terminal(event_type, &payload)?;
-            let (status_code, detail) =
-                crate::protocols::responses::events::responses_semantic_error(&payload, event_type);
-            Err(PrecommitFailure {
-                failure_reason: Some(if status_code == 400 {
-                    "upstream_400"
-                } else {
-                    "upstream_response_failed"
-                }),
-                status_code,
-                detail,
-            })
-        }
         "response.completed" => {
             validate_responses_terminal(event_type, &payload)?;
             if !responses_completed_is_valid(&payload) {
-                if payload
-                    .pointer("/response/error")
-                    .is_some_and(|error| !error.is_null())
-                    || payload
-                        .pointer("/response/status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
-                {
-                    let (status_code, detail) =
-                        crate::protocols::responses::events::responses_semantic_error(
-                            &payload,
-                            "response.failed",
-                        );
-                    return Err(PrecommitFailure {
-                        failure_reason: Some("protocol_error"),
-                        status_code,
-                        detail,
-                    });
-                }
                 return Err(PrecommitFailure {
                     failure_reason: Some("protocol_error"),
                     status_code: 502,
                     detail: "upstream Responses completed terminal is not valid".into(),
+                });
+            }
+            if !payload
+                .pointer("/response/output")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(crate::protocols::responses::events::item_has_output)
+                })
+            {
+                return Err(PrecommitFailure {
+                    failure_reason: Some("protocol_error"),
+                    status_code: 502,
+                    detail: "upstream Responses completed without substantive output".into(),
                 });
             }
             Ok(PrecommitDecision::Commit)
@@ -733,7 +729,7 @@ fn validate_responses_terminal(event_type: &str, payload: &Value) -> Result<(), 
 }
 
 fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
-    responses_event_has_output(event_type, payload, |value| !value.trim().is_empty())
+    crate::protocols::responses::events::has_real_output(event_type, payload)
 }
 
 fn responses_event_has_nonempty_output(event_type: &str, payload: &Value) -> bool {
@@ -871,7 +867,10 @@ pub(crate) fn text_output_value(protocol: Protocol, value: &Value) -> bool {
     match protocol {
         Protocol::Responses => {
             value.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
-                && text(value.get("delta"))
+                && value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
         }
         Protocol::Chat => value
             .get("choices")
@@ -2530,7 +2529,7 @@ mod tests {
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}",
             "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"hello\"}",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}}",
-            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"name\":\"lookup\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}]}}",
         ] {
             assert_eq!(
                 classify_responses_precommit_event(event.as_bytes()).unwrap(),

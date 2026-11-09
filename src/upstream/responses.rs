@@ -117,8 +117,9 @@ fn default_max_precommit_bytes() -> usize {
 }
 
 fn precommit_semantic_guard(plan: &Plan) -> bool {
-    plan.precommit_semantic_guard
-        .unwrap_or_else(|| plan.engine.eq_ignore_ascii_case("codex"))
+    plan.precommit_semantic_guard.unwrap_or_else(|| {
+        plan.engine.eq_ignore_ascii_case("gpt") || plan.engine.eq_ignore_ascii_case("codex")
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1147,6 +1148,7 @@ fn process_preflight_frames_inner(
             !active.precommit_keepalive_sent && processed.canonical_keepalive && semantic_guard;
         let synthetic_keepalive = !active.precommit_keepalive_sent
             && semantic_guard
+            && active.plan.engine.eq_ignore_ascii_case("codex")
             && processed.event_type.as_deref() == Some("response.created");
         let suppress_repeated_keepalive =
             active.precommit_keepalive_sent && processed.event_type.as_deref() == Some("keepalive");
@@ -2981,7 +2983,7 @@ mod tests {
     #[test]
     fn stream_modes_match_engine_and_normalization_contract() {
         let gpt = test_active("gpt");
-        assert_eq!(gpt.mode, StreamMode::OpaqueRaw);
+        assert_eq!(gpt.mode, StreamMode::GuardedThenRaw);
 
         let codex = test_active("codex");
         assert_eq!(codex.mode, StreamMode::GuardedThenRaw);
@@ -3204,7 +3206,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_preflight_commits_response_created_without_synthetic_keepalive() {
+    fn gpt_preflight_keeps_created_private_until_substantive_output() {
         let mut active = test_active("gpt");
         let frames = active
             .decoder
@@ -3212,14 +3214,10 @@ mod tests {
                 b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
             )
             .unwrap();
-        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+        assert!(process_preflight_frames(&mut active, frames)
             .unwrap()
-            .unwrap()
-        else {
-            panic!("expected response.created to commit the transparent stream");
-        };
-        assert!(active.business_committed);
-        assert_eq!(active.commit_reason, "response_created");
+            .is_none());
+        assert!(!active.business_committed);
         assert!(active.early_output.is_empty());
         assert_eq!(active.buffered.len(), 1);
         assert!(active.buffered[0].starts_with(b"event: response.created\n"));
@@ -3255,7 +3253,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_failure_after_response_created_remains_in_band() {
+    fn gpt_failure_after_response_created_remains_retryable() {
         let mut active = test_active("gpt");
         let frames = active
             .decoder
@@ -3264,19 +3262,16 @@ mod tests {
                   event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"forward me\"}}}\n\n",
             )
             .unwrap();
-        let PreflightResult::Started(active) = process_preflight_frames(&mut active, frames)
+        let PreflightResult::Retry(outcome) = process_preflight_frames(&mut active, frames)
             .unwrap()
             .unwrap()
         else {
-            panic!("expected the transparent stream to remain committed");
+            panic!("expected a retry before business commit");
         };
-        assert!(active.business_committed);
+        assert_eq!(outcome["committed"], false);
+        assert!(!active.business_committed);
         assert_eq!(active.buffered.len(), 1);
         assert!(active.buffered[0].starts_with(b"event: response.created\n"));
-        assert!(matches!(
-            active.terminal,
-            Some(Terminal::SemanticFailure { .. })
-        ));
     }
 
     #[test]

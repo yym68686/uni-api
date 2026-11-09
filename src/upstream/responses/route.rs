@@ -472,7 +472,7 @@ impl ResponsesRoute {
                 proxy: preference_string(&provider.preferences, "proxy")
                     .or_else(|| preference_string(&self.snapshot.preferences, "proxy")),
                 engine: engine.clone(),
-                precommit_semantic_guard: Some(engine == "codex" || self.unknown_400.enabled()),
+                precommit_semantic_guard: Some(true),
                 http1_only: engine == "codex",
                 commit_policy: preference_string(
                     &provider.preferences,

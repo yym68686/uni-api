@@ -74,7 +74,7 @@ impl ResponsesProcessor {
                 wire: Some(frame.canonical_wire()),
                 event_type: None,
                 commits: false,
-                canonical_keepalive: false,
+                canonical_keepalive: true,
                 terminal: None,
             });
         }
@@ -152,6 +152,12 @@ impl ResponsesProcessor {
         };
         let canonical_keepalive = event_type == "keepalive" && is_canonical_keepalive(&payload);
         stats.observe_semantic_output(&event_type, &payload);
+        if self.compaction.is_none()
+            && matches!(terminal, Some(Terminal::Completed | Terminal::Incomplete))
+            && stats.first_output_ms.is_none()
+        {
+            return Err("Responses upstream ended without substantive output".into());
+        }
         let commits = if self.compaction.is_some() {
             matches!(terminal, Some(Terminal::Completed))
         } else {

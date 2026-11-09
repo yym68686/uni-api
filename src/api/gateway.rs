@@ -200,7 +200,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         Err((status, detail)) => return json_error(status, &detail),
     };
     let (prompt_price, completion_price) = state.runtime.prices_for_model(&request_model).await;
-    let use_chat_stream = path == "/v1/chat/completions"
+    let use_guarded_stream = matches!(path.as_str(), "/v1/chat/completions" | "/v1/responses")
         && input
             .payload
             .as_ref()
@@ -235,9 +235,16 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         completion_price,
         keepalive_updates: None,
     };
-    if use_chat_stream {
+    if use_guarded_stream {
         let (tx, rx) = tokio::sync::watch::channel(None);
         execution.keepalive_updates = Some(tx);
+        if execution.path == "/v1/responses" {
+            return crate::protocols::chat::stream::with_responses_keepalive(
+                run_attempt_loop(execution),
+                rx,
+            )
+            .await;
+        }
         return crate::protocols::chat::stream::with_keepalive(run_attempt_loop(execution), rx)
             .await;
     }

@@ -109,10 +109,14 @@ def main():
                         time.sleep(61 - gauge_time % 60)
                     for case in cases:
                         status, raw = call("POST", "/v1/responses", {"model": "gpt-6-astra", "input": case, "stream": True}, provider, provider + "-" + case)
-                        assert status == 200, (provider, case, status, raw)
-                        if "incomplete" in case:
+                        expected_status = 502 if provider == "gpt" and case == "blank-incomplete" else 200
+                        assert status == expected_status, (provider, case, status, raw)
+                        if case == "blank-incomplete":
+                            assert b"response.incomplete" not in raw and b"resp_fixture" not in raw, raw
+                            assert b"substantive output" in raw, raw
+                        if case == "partial-incomplete":
                             assert b"response.incomplete" in raw and b"response.completed" not in raw
-                        if provider == "gpt" and case in ("completed", "tool", "blank-incomplete", "partial-incomplete"):
+                        if provider == "gpt" and case in ("completed", "tool", "partial-incomplete"):
                             assert raw == wire_by_case[case], (provider, case, "wire changed")
                     status, raw = call("GET", metrics_path)
                     assert status == 200
@@ -132,11 +136,18 @@ def main():
                             fact = rows[0]
                             assert fact["response_completed"] is complete, fact
                             assert fact["outcome"] == ("success" if complete else "failed"), fact
-                            if "incomplete" in case:
+                            if case == "blank-incomplete":
+                                assert fact["first_text_ms"] is None, fact
+                                if kind == "attempt":
+                                    assert fact["failure_reason"] == "protocol_error", fact
+                                else:
+                                    assert fact["failure_reason"] in ("protocol_error", "no_successful_channel"), fact
+                                    assert fact["status"] == 502, fact
+                            if case == "partial-incomplete":
                                 assert fact["terminal_kind"] == "incomplete", fact
                                 assert fact["failure_reason"] == "responses_max_output_tokens", fact
                                 if kind == "request": assert fact["status"] == 200, fact
-                print("PASS: 18 real SSE cases; HTTP 200, tool completion, incomplete, EOF, [DONE], live metrics, HTTP-ingested request/attempt facts, unchanged passthrough")
+                print("PASS: 18 real SSE cases; tool completion, empty precommit rejection, partial incomplete, EOF, [DONE], live metrics, immutable facts, unchanged winning wire")
             except Exception:
                 print((root / "runtime.log").read_text()[-18000:], file=sys.stderr)
                 raise
