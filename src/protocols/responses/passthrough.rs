@@ -23,12 +23,34 @@ fn failure(reason: &'static str, status: u16, detail: impl Into<String>) -> Prec
     }
 }
 
+/// Stable diagnostics without retaining malformed JSON or upstream text.
+pub(crate) fn protocol_error_code(detail: &str) -> &'static str {
+    if detail.contains("without a terminal response event") {
+        if detail.contains("[DONE]") {
+            "done_without_terminal"
+        } else {
+            "eof_without_terminal"
+        }
+    } else if detail.starts_with("Responses upstream event JSON is invalid:") {
+        "invalid_event_json"
+    } else if detail.starts_with("Responses event field ") {
+        "event_type_mismatch"
+    } else if detail == "Responses upstream SSE event is not valid UTF-8" {
+        "invalid_event_utf8"
+    } else if detail == "Responses upstream event payload is missing a string type" {
+        "missing_event_type"
+    } else {
+        "other_protocol_error"
+    }
+}
+
 struct Observer {
     decoder: SseDecoder,
     processor: ResponsesProcessor,
     stats: StreamStats,
     committed: bool,
     terminal: bool,
+    terminal_kind: Option<&'static str>,
     ended: bool,
     failure: Option<PrecommitFailure>,
     sender: Option<oneshot::Sender<StreamOutcome>>,
@@ -44,6 +66,7 @@ impl Observer {
             stats,
             committed: false,
             terminal: false,
+            terminal_kind: None,
             ended: false,
             failure: None,
             sender: None,
@@ -59,6 +82,17 @@ impl Observer {
                 .processor
                 .process(frame, &mut self.stats)
                 .map_err(|detail| failure("protocol_error", 502, detail))?;
+            if let Some(terminal) = event.terminal.as_ref() {
+                self.terminal = true;
+                self.terminal_kind = Some(match terminal {
+                    Terminal::Completed => "completed",
+                    Terminal::Incomplete => "incomplete",
+                    Terminal::SemanticFailure { .. } => "semantic_failure",
+                });
+                // A validated Responses terminal ends the logical stream.
+                // HTTP EOF and later client cancellation cannot override it.
+                self.ended = true;
+            }
             if let Some(Terminal::SemanticFailure {
                 event_type,
                 payload,
@@ -76,7 +110,6 @@ impl Observer {
                 ));
             }
             self.committed |= event.commits;
-            self.terminal |= event.terminal.is_some();
             if matches!(event.terminal, Some(Terminal::Incomplete)) {
                 return Err(failure(
                     match self.stats.incomplete_reason {
@@ -161,6 +194,18 @@ impl Drop for Observer {
             } else {
                 self.failure.as_ref().and_then(|f| f.failure_reason)
             },
+            terminal_kind: self.terminal_kind.or_else(|| {
+                Some(if !self.ended {
+                    "cancelled"
+                } else if self.failure.as_ref().and_then(|f| f.failure_reason)
+                    == Some("transport_error")
+                {
+                    "transport_error"
+                } else {
+                    "protocol_error"
+                })
+            }),
+            response_completed: Some(self.terminal_kind == Some("completed")),
             first_output_ms: self.stats.first_output_ms,
             response_created_ms: self.stats.response_created_ms,
             first_text_ms: self.stats.first_text_ms,
@@ -239,6 +284,9 @@ pub(crate) async fn prepare(
     let tail = stream::unfold(
         (upstream, observer),
         |(mut upstream, mut observer)| async move {
+            if observer.terminal {
+                return None;
+            }
             match upstream.next().await {
                 Some(result) => {
                     let inspected = match &result {

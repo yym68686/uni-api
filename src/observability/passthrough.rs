@@ -206,6 +206,8 @@ impl Observer {
             first_text_ms: self.first_text_ms,
             success,
             observational_only: self.observational_only,
+            terminal_kind: None,
+            response_completed: None,
             status_code: if success {
                 200
             } else if !self.ended {

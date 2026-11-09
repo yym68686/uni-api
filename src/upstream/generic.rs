@@ -1020,6 +1020,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 status_code: 502,
                                 detail: "provider stream outcome was canceled".into(),
                                 failure_reason: Some("other"),
+                                terminal_kind: None,
+                                response_completed: None,
                                 first_output_ms: None,
                                 response_created_ms: None,
                                 first_text_ms: None,
@@ -1056,6 +1058,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.status = outcome.status_code;
                         request_stat.is_flagged = !outcome.success;
                         request_stat.failure_reason = outcome.failure_reason.map(str::to_owned);
+                        request_stat.terminal_kind = outcome.terminal_kind.map(str::to_owned);
+                        request_stat.response_completed = outcome.response_completed;
                         request_stat.timing_spans = json!({
                             "runtime": "rust",
                             "attempt_count": dispatched,
@@ -1066,9 +1070,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         })
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
-                            terminal_kind: None,
+                            terminal_kind: outcome.terminal_kind.map(str::to_owned),
                             failure_reason: outcome.failure_reason.map(str::to_owned),
-                            response_completed: None,
+                            response_completed: outcome.response_completed,
                             transport_timing: None,
                             duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
                             first_output_ms: outcome.first_output_ms,
@@ -1160,6 +1164,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             },
                             Some(recorded_status),
                             outcome.first_output_ms,
+                            Some(&outcome),
                         );
                     });
                     return response;
@@ -2281,6 +2286,7 @@ pub(crate) fn emit_attempt(
         outcome,
         status,
         None,
+        None,
     );
 }
 
@@ -2300,6 +2306,7 @@ pub(crate) fn emit_attempt_with_first_output(
     outcome: &str,
     status: Option<u16>,
     first_output_ms: Option<f64>,
+    stream_outcome: Option<&provider_stream::StreamOutcome>,
 ) {
     let metrics = crate::observability::metrics::global();
     let upstream_model = original_model;
@@ -2367,6 +2374,17 @@ pub(crate) fn emit_attempt_with_first_output(
             "outcome": outcome,
             "status_code": status,
             "rust_generic_data_plane": true,
+            "failure_reason": stream_outcome.and_then(|o| o.failure_reason),
+            "terminal_kind": stream_outcome.and_then(|o| o.terminal_kind),
+            "response_completed": stream_outcome.and_then(|o| o.response_completed),
+            "first_output_ms": first_output_ms,
+            "response_created_ms": stream_outcome.and_then(|o| o.response_created_ms),
+            "first_text_ms": stream_outcome.and_then(|o| o.first_text_ms),
+            // Hash only: detail can contain arbitrary upstream text.
+            "error_sha256": stream_outcome.filter(|o| !o.success && !o.detail.is_empty())
+                .map(|o| crate::upstream::responses::route::sha256_hex(&o.detail)),
+            "stream_error_code": stream_outcome.filter(|o| o.failure_reason == Some("protocol_error"))
+                .map(|o| crate::protocols::responses::passthrough::protocol_error_code(&o.detail)),
         }
     ));
 }
