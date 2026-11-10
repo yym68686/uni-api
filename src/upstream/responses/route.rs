@@ -192,6 +192,22 @@ impl ResponsesRoute {
         let Some((body, changed)) = missing_item else {
             return retryable;
         };
+        // Repair retains the original wire plan and key, but is still a new
+        // send. Honor live controls and cooldowns before reserving its attempt.
+        if let (Some(provider), Some(model), Some(key)) = (
+            self.last_provider.as_ref(),
+            self.last_original_model.as_deref(),
+            self.last_provider_key.as_deref(),
+        ) {
+            if !self
+                .store
+                .channel_enabled(&self.api_key.token, &self.request_model, &provider.name)
+                .await
+                || !self.store.admit_provider_repair(provider, model, key).await
+            {
+                return self.has_attempts_remaining();
+            }
+        }
         let Some(mut observation) = self.last_attempt.clone() else {
             return retryable;
         };

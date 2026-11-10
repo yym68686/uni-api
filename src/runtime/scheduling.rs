@@ -24,6 +24,54 @@ mod admission_tests {
         assert!(!runtime.admit_rate_batch(&[global.clone(), child]).await);
         assert!(runtime.admit_rate_batch(&[global]).await);
     }
+
+    #[tokio::test]
+    async fn prepared_request_admits_repairs_against_live_limits_without_rotating_keys() {
+        let runtime = GatewayRuntime::new();
+        let request = runtime.for_request().await;
+        let provider = crate::config::snapshot::runtime_provider(
+            serde_json::from_value(serde_json::json!({
+                "name":"repair-provider", "base_url":"https://example.invalid", "models":{}, "api":"key"
+            }))
+            .unwrap(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let available = || request.admit_provider_repair(&provider, "model", "key");
+        assert!(available().await);
+        runtime.scheduling.channel_cooldowns.lock().await.insert(
+            ("repair-provider".into(), "model".into()),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
+        assert!(!available().await);
+        runtime.scheduling.channel_cooldowns.lock().await.clear();
+        runtime.scheduling.key_cooldowns.lock().await.insert(
+            ("repair-provider".into(), "key".into()),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
+        assert!(!available().await);
+        assert!(
+            request
+                .admit_provider_repair(&provider, "model", "other")
+                .await
+        );
+        assert_eq!(provider.cursor.load(Ordering::Relaxed), 0);
+        let mut rated = (*provider).clone();
+        rated.preferences = Arc::new(serde_json::Map::from_iter([(
+            "api_key_rate_limit".into(),
+            serde_json::json!("1/min"),
+        )]));
+        assert!(
+            request
+                .admit_provider_repair(&rated, "model", "rated-key")
+                .await
+        );
+        assert!(
+            !request
+                .admit_provider_repair(&rated, "model", "rated-key")
+                .await
+        );
+        assert_eq!(rated.cursor.load(Ordering::Relaxed), 0);
+    }
 }
 
 pub(crate) type RouteKey = (String, String);
@@ -40,6 +88,43 @@ pub(crate) enum ProviderKeySelection {
 }
 
 impl GatewayRuntime {
+    /// A same-key protocol repair is a new send, but must not advance key scheduling.
+    pub(crate) async fn admit_provider_repair(
+        &self,
+        provider: &Provider,
+        original_model: &str,
+        key: &str,
+    ) -> bool {
+        let now = tokio::time::Instant::now();
+        let channel_cooling = self
+            .scheduling
+            .channel_cooldowns
+            .lock()
+            .await
+            .get(&(provider.name.to_string(), original_model.to_owned()))
+            .is_some_and(|until| *until > now);
+        if channel_cooling {
+            return false;
+        }
+        let key_available = self
+            .scheduling
+            .key_cooldowns
+            .lock()
+            .await
+            .get(&(provider.name.to_string(), key.to_owned()))
+            .is_none_or(|until| *until <= now);
+        if !key_available {
+            return false;
+        }
+        match parse_rate_limits(
+            provider.preferences.get("api_key_rate_limit"),
+            Some(original_model),
+        ) {
+            Some(rules) => self.admit_provider_rate(provider, key, &rules).await,
+            None => true,
+        }
+    }
+
     pub(crate) async fn select_provider_key(
         &self,
         provider: &Provider,

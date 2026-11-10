@@ -21,7 +21,7 @@ from fact_sink import accept_facts
 from verify_dispatch_timing import free_port
 
 os.umask(0o077)
-CASES = ['ok', 'incomplete', 'done-only', 'tool-start-fail', 'rules', 'codex-fields']
+CASES = ['ok', 'incomplete', 'done-only', 'tool-start-fail', 'rules', 'codex-fields', 'missing-item']
 
 
 def event(kind, **fields):
@@ -50,6 +50,15 @@ class Peer(BaseHTTPRequestHandler):
                                  'header_names': sorted(self.headers.keys())})
         hook = getattr(self.server, 'on_request', None)
         if hook: hook(role, case)
+        if case == 'missing-item' and role == 'first':
+            raw = json.dumps({'error': {'code': None, 'type': 'invalid_request_error', 'param': 'input',
+                'message': "Item with id 'rs_fixture' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input."}}).encode()
+            self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if case == 'omni-moderation-latest':
             chunks, kind = [json.dumps({'results': [{'flagged': False}]}).encode()], 'application/json'
         elif not body.get('stream'):
@@ -174,7 +183,7 @@ def gateway(name, engine='gpt', mixed=False, moderation=False, nested=False, alg
                     pass
                 time.sleep(.05)
             else:
-                raise RuntimeError(f'{name}: gateway did not start')
+                raise RuntimeError(f'{name}: gateway did not start: ' + (root/'runtime.log').read_text()[-2000:])
             peer.root, peer.port = root, port
             yield call, peer
             deadline = time.monotonic() + 3

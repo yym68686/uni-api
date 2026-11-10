@@ -18,6 +18,8 @@ execution retains protocol conversion and other endpoint transports.
 * Every attempt checks current channel disable rules, channel/key cooldown and
   provider-key rate limits. These facts remain dynamic. An emergency disable
   prevents a later dispatch; it does not cancel an already dispatched request.
+  A missing-item protocol repair retains its original key and wire plan, while
+  checking these live gates and charging the provider-key rate for its new send.
 * `ResolvedAttemptPolicy` resolves proxy, HTTP version, timeouts, keepalive and
   Responses commit/normalization limits from the fixed snapshot. Codex OAuth
   refresh uses the same proxy selection. `providers::responses` constructs the

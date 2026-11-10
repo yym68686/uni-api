@@ -116,6 +116,20 @@ def verify():
         native, generic = wires[(False, engine)], wires[(True, engine)]
         assert native['body'] == generic['body'], (native['body'], generic['body'])
         assert native['header_names'] == generic['header_names'], (native['header_names'], generic['header_names'])
+    with gateway('native-repair-disable') as (call, peer):
+        def disable_repair(role, case):
+            if role == 'first':
+                state = control(peer, 'GET', '/v1/channel-controls')
+                control(peer, 'POST', '/v1/channel-controls', {'revision': state['revision'],
+                    'action': 'set', 'disabled': ['first'], 'order': [], 'api_key_id': '', 'model': ''})
+        peer.on_request = disable_repair
+        row = call('missing-item', extra={'store': False, 'input': [
+            {'type': 'reasoning', 'id': 'rs_fixture', 'summary': [{'type': 'summary_text', 'text': 'history'}]}]})
+        assert roles(row) == ['first', 'fallback'] and row['wire_completed'], row
+    with gateway('native-repair-rate', provider_preferences={'api_key_rate_limit': '1/min'}) as (call, _):
+        row = call('missing-item', extra={'store': False, 'input': [
+            {'type': 'reasoning', 'id': 'rs_fixture', 'summary': [{'type': 'summary_text', 'text': 'history'}]}]})
+        assert roles(row) == ['first', 'fallback'] and row['wire_completed'], row
     with gateway('round-robin', algorithm='round_robin', mismatch=True) as (call, _):
         assert [roles(call('ok')) for _ in range(6)] == [['first'], ['fallback']]*3
     with gateway('synthetic-replay', mismatch=True, wire_chat=True) as (call, _):
