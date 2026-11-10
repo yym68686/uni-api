@@ -24,127 +24,138 @@ use std::sync::Arc;
 pub(crate) static SCHEDULING_NONCE: AtomicU64 = AtomicU64::new(1);
 
 impl GatewayRuntime {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resolve_route(
         &self,
         persistence: &Persistence,
         headers: &HeaderMap,
-        request_model: &str,
-        endpoint: &str,
-        request_body_bytes: u64,
-        request_type: Option<&str>,
+        facts: crate::routing::context::RequestFacts,
         admit_rate: bool,
-    ) -> Result<ResolvedRoute, RouteResolutionError> {
-        let snapshot = self.snapshot().await.ok_or_else(|| RouteResolutionError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Runtime configuration is not ready".into(),
+    ) -> Result<Arc<crate::routing::context::RequestContext>, RouteResolutionError> {
+        use crate::routing::context::{AdmissionReceipt, RequestContext};
+        let reject = |status, message: &str| RouteResolutionError {
+            status,
+            message: message.into(),
+        };
+        let snapshot = self.snapshot().await.ok_or_else(|| {
+            reject(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
         })?;
-        let token = extract_api_key(headers).ok_or_else(|| RouteResolutionError {
-            status: StatusCode::FORBIDDEN,
-            message: "Invalid or missing API Key".into(),
-        })?;
-        let api_key =
-            snapshot
-                .api_keys
-                .get(&token)
-                .cloned()
-                .ok_or_else(|| RouteResolutionError {
-                    status: StatusCode::FORBIDDEN,
-                    message: "Invalid or missing API Key".into(),
-                })?;
+        let token = extract_api_key(headers)
+            .ok_or_else(|| reject(StatusCode::FORBIDDEN, "Invalid or missing API Key"))?;
+        let api_key = snapshot
+            .api_keys
+            .get(&token)
+            .cloned()
+            .ok_or_else(|| reject(StatusCode::FORBIDDEN, "Invalid or missing API Key"))?;
         if !api_key.native_supported {
-            return Err(RouteResolutionError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "API key contains an unsupported model rule".into(),
-            });
+            return Err(reject(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "API key contains an unsupported model rule",
+            ));
         }
         self.ensure_paid_balance(persistence, &api_key).await?;
         let global_rules = parse_rate_limits(snapshot.preferences.get("rate_limit"), None)
-            .ok_or_else(|| RouteResolutionError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: "Invalid global rate-limit configuration".into(),
+            .ok_or_else(|| {
+                reject(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid global rate-limit configuration",
+                )
             })?;
         let client_rules =
-            parse_rate_limits(api_key.preferences.get("rate_limit"), Some(request_model))
-                .ok_or_else(|| RouteResolutionError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: "Invalid client rate-limit configuration".into(),
+            parse_rate_limits(api_key.preferences.get("rate_limit"), Some(&facts.model))
+                .ok_or_else(|| {
+                    reject(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid client rate-limit configuration",
+                    )
                 })?;
-        let estimated_tokens = (request_body_bytes / 4).max(1) as usize;
+        let estimated_tokens = (facts.body_bytes / 4).max(1) as usize;
         if tpr_exceeded(&client_rules, estimated_tokens) {
-            return Err(RouteResolutionError {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: "Tokens per request limit exceeded".into(),
-            });
+            return Err(reject(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Tokens per request limit exceeded",
+            ));
         }
+        let mut buckets = vec![
+            ("__global__".to_owned(), global_rules),
+            (format!("client:{}", api_key.token), client_rules),
+        ];
         if admit_rate {
-            for child in nested_keys_for_model(&snapshot, &api_key, request_model) {
-                if let Some(rules) =
-                    parse_rate_limits(child.preferences.get("rate_limit"), Some(request_model))
-                {
-                    if tpr_exceeded(&rules, estimated_tokens)
-                        || !self
-                            .admit_rate(&format!("client:{}", child.token), &rules)
-                            .await
-                    {
-                        return Err(RouteResolutionError {
-                            status: StatusCode::TOO_MANY_REQUESTS,
-                            message: "Nested API-key rate limit exceeded".into(),
-                        });
-                    }
+            for child in nested_keys_for_model(&snapshot, &api_key, &facts.model) {
+                let rules =
+                    parse_rate_limits(child.preferences.get("rate_limit"), Some(&facts.model))
+                        .ok_or_else(|| {
+                            reject(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Invalid nested API-key rate-limit configuration",
+                            )
+                        })?;
+                if tpr_exceeded(&rules, estimated_tokens) {
+                    return Err(reject(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Nested API-key rate limit exceeded",
+                    ));
                 }
+                buckets.push((format!("client:{}", child.token), rules));
+            }
+            if !self.admit_rate_batch(&buckets).await {
+                return Err(reject(StatusCode::TOO_MANY_REQUESTS, "Too many requests"));
             }
         }
-        if admit_rate
-            && (!self.admit_rate("__global__", &global_rules).await
-                || !self
-                    .admit_rate(&format!("client:{}", api_key.token), &client_rules)
-                    .await)
-        {
-            return Err(RouteResolutionError {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: "Too many requests".into(),
-            });
-        }
-        let route_key = diagnostic_key(&snapshot, &api_key, headers, endpoint)?;
+        let route_key = diagnostic_key(&snapshot, &api_key, headers, &facts.endpoint)?;
         let providers = matching_providers(
             &snapshot,
             &route_key,
-            request_model,
-            request_body_bytes,
-            request_type,
-            None,
-            endpoint.trim_end_matches('/'),
+            &facts.model,
+            facts.body_bytes,
+            facts.request_type,
+            facts.reasoning_effort.as_deref(),
+            &facts.endpoint,
         )
-        .map_err(|_| RouteResolutionError {
-            status: StatusCode::NOT_IMPLEMENTED,
-            message: "Nested runtime provider is not available".into(),
+        .map_err(|_| {
+            reject(
+                StatusCode::NOT_IMPLEMENTED,
+                "Nested runtime provider is not available",
+            )
         })?;
         if providers.is_empty() {
             return Err(RouteResolutionError {
                 status: StatusCode::NOT_FOUND,
-                message: format!("No available providers at the moment: {request_model}"),
+                message: format!("No available providers at the moment: {}", facts.model),
             });
         }
         let providers = self
-            .schedule_providers(&api_key, request_model, providers)
+            .schedule_providers(&api_key, &facts.model, providers)
             .await;
         if providers.is_empty() {
-            return Err(RouteResolutionError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "All matching channels are temporarily disabled".into(),
-            });
+            return Err(reject(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "All matching channels are temporarily disabled",
+            ));
         }
         let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) {
             HedgingConfig::default()
         } else {
             parse_hedging(&snapshot.preferences)
         };
-        Ok(ResolvedRoute {
+        let route = ResolvedRoute {
             providers,
             hedging,
             unknown_400_retries: crate::routing::unknown_400::configured(&snapshot.preferences),
-        })
+        };
+        Ok(Arc::new(RequestContext {
+            snapshot,
+            caller: api_key,
+            facts,
+            admission: if admit_rate {
+                AdmissionReceipt::Request
+            } else {
+                AdmissionReceipt::Internal
+            },
+            route,
+        }))
     }
 
     pub(crate) async fn schedule_providers(
@@ -153,7 +164,10 @@ impl GatewayRuntime {
         request_model: &str,
         providers: Vec<Arc<Provider>>,
     ) -> Vec<Arc<Provider>> {
-        let controls = self.channel_controls.read().await.routing_rules();
+        let controls = match &self.request_rules {
+            Some(rules) => rules.clone(),
+            None => Arc::new(self.channel_controls.read().await.routing_rules()),
+        };
         let key = crate::routing::catalog::key_id(&api_key.token);
         if controls.order(&key, request_model).is_some() {
             return controls.apply(&key, request_model, providers);
@@ -247,11 +261,12 @@ pub(crate) fn nested_keys_for_model(
             };
             if (requested == "*" || requested == model) && snapshot.api_keys.get(alias).is_some() {
                 let child = snapshot.api_keys.get(alias).unwrap();
-                out.push(child.clone());
-                walk(snapshot, child, model, out, seen);
+                if !seen.contains(alias) {
+                    out.push(child.clone());
+                    walk(snapshot, child, model, out, seen);
+                }
             }
         }
-        seen.remove(key.token.as_ref());
     }
     let mut out = Vec::new();
     walk(

@@ -1,6 +1,7 @@
 pub(crate) mod billing;
 pub(crate) mod context;
 pub(crate) mod metrics;
+pub(crate) mod outcome;
 pub(crate) mod passthrough;
 pub(crate) mod request_trace;
 pub(crate) mod stream;

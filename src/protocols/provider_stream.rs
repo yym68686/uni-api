@@ -356,7 +356,7 @@ fn spawn_translation(
             () = tx.closed() => Ok(StreamOutcome {
                 usage: (0, 0, 0), fact_usage: Default::default(), success: false,
                 observational_only: false, status_code: 499,
-                terminal_kind: None, response_completed: None,
+                terminal_kind: Some("downstream_disconnected"), response_completed: (protocol == Protocol::Responses || output_protocol == OutputProtocol::Responses).then_some(false),
                 failure_reason: Some("downstream_disconnected"), detail: "downstream disconnected".into(), first_output_ms: None, response_created_ms: None, first_text_ms: None,
             }),
             result = run_translation(
@@ -391,8 +391,14 @@ fn spawn_translation(
                     observational_only: false,
                     status_code: 502,
                     failure_reason: Some(stream_failure_reason(&error)),
-                    terminal_kind: None,
-                    response_completed: None,
+                    terminal_kind: Some(if stream_failure_reason(&error) == "transport_error" {
+                        "transport_error"
+                    } else {
+                        "protocol_error"
+                    }),
+                    response_completed: (protocol == Protocol::Responses
+                        || output_protocol == OutputProtocol::Responses)
+                        .then_some(false),
                     detail: error,
                     first_output_ms: None,
                     response_created_ms: None,
@@ -431,6 +437,7 @@ async fn run_translation(
     options: TranslationOptions,
 ) -> Result<StreamOutcome, String> {
     let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
+    state.source_protocol = Some(protocol);
     state.timing = options.timing;
     let timeouts = options.timeouts;
     for event in state.start_chunks() {
@@ -1082,6 +1089,7 @@ async fn send_wire(
 }
 
 struct StreamState {
+    source_protocol: Option<Protocol>,
     id: String,
     model: String,
     created: u64,
@@ -1110,6 +1118,7 @@ impl StreamState {
             .unwrap_or_default()
             .as_secs();
         Self {
+            source_protocol: None,
             id: format!("chatcmpl-{created}"),
             model: model.to_owned(),
             created,
@@ -1718,8 +1727,15 @@ impl StreamState {
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
                 failure_reason: failure.failure_reason,
-                terminal_kind: None,
-                response_completed: None,
+                terminal_kind: Some(match failure.failure_reason {
+                    Some("upstream_response_failed") => "semantic_failure",
+                    Some("transport_error") => "transport_error",
+                    Some("downstream_disconnected") => "downstream_disconnected",
+                    _ => "protocol_error",
+                }),
+                response_completed: (self.source_protocol == Some(Protocol::Responses)
+                    || self.output_protocol == OutputProtocol::Responses)
+                    .then_some(false),
                 first_output_ms: self.timing.first_output_ms,
                 response_created_ms: self.timing.response_created_ms,
                 first_text_ms: self.timing.first_text_ms,
@@ -1732,8 +1748,10 @@ impl StreamState {
                 status_code: 200,
                 detail: String::new(),
                 failure_reason: None,
-                terminal_kind: None,
-                response_completed: None,
+                terminal_kind: self.terminal.then_some("completed"),
+                response_completed: (self.source_protocol == Some(Protocol::Responses)
+                    || self.output_protocol == OutputProtocol::Responses)
+                    .then_some(self.terminal),
                 first_output_ms: self.timing.first_output_ms,
                 response_created_ms: self.timing.response_created_ms,
                 first_text_ms: self.timing.first_text_ms,
@@ -1755,6 +1773,7 @@ impl StreamState {
             for chunk in self.responses.finish() {
                 send_wire(tx, &chunk, self.output_protocol).await?;
             }
+            self.terminal = true;
             return Ok(());
         }
         for chunk in self.finish_chunks_for_output(if self.tools.is_empty() {

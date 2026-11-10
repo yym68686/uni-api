@@ -1,5 +1,7 @@
 pub(crate) mod access;
+pub(crate) mod attempt_policy;
 pub(crate) mod catalog;
+pub(crate) mod context;
 pub(crate) mod failure;
 pub(crate) mod filters;
 pub(crate) mod planner;

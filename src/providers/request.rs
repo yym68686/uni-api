@@ -595,6 +595,21 @@ pub(crate) fn build_attempt(
             root.insert("stream".into(), Value::Bool(upstream_stream));
         }
     }
+    let shared_responses_wire = !is_alpha_search
+        && !is_systemone
+        && matches!(engine.as_str(), "gpt" | "codex")
+        && crate::providers::stream_mode::responses_wire(&engine, &url)
+        && matches!(path, "/v1/responses" | "/v1/responses/compact");
+    if shared_responses_wire {
+        crate::providers::responses::compile_payload(
+            &mut payload,
+            provider,
+            request_model,
+            original_model,
+            &engine,
+            path == "/v1/responses/compact",
+        )?;
+    }
     if let Some(root) = payload.as_object_mut() {
         if gemini.is_some()
             && !native_gemini
@@ -606,7 +621,9 @@ pub(crate) fn build_attempt(
         if is_alpha_search {
             sanitize_alpha_search_payload(root);
         } else {
-            apply_overrides(root, provider, request_model);
+            if !shared_responses_wire {
+                apply_overrides(root, provider, request_model);
+            }
             if path == "/v1/responses/compact" {
                 root.remove("store");
             }
@@ -657,15 +674,35 @@ pub(crate) fn build_attempt(
     } else {
         upstream_stream
     };
-    let mut headers = provider_headers(
-        provider,
-        provider_key,
-        incoming_headers,
-        request_id,
-        &engine,
-        upstream_stream,
-        None,
-    )?;
+    let mut headers = if shared_responses_wire {
+        let headers = crate::providers::responses::build_headers(
+            incoming_headers,
+            provider,
+            provider_key,
+            &engine,
+            upstream_stream,
+            request_id,
+            request_id,
+        )?;
+        let mut result = HeaderMap::new();
+        for (name, value) in headers {
+            result.insert(
+                HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?,
+                HeaderValue::from_str(&value).map_err(|e| e.to_string())?,
+            );
+        }
+        result
+    } else {
+        provider_headers(
+            provider,
+            provider_key,
+            incoming_headers,
+            request_id,
+            &engine,
+            upstream_stream,
+            None,
+        )?
+    };
     if is_alpha_search && engine == "codex" {
         apply_alpha_search_headers(&mut headers, incoming_headers, &payload)?;
     }

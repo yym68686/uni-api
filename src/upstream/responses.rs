@@ -109,11 +109,11 @@ fn default_max_event_bytes() -> usize {
 }
 
 fn default_max_precommit_items() -> usize {
-    128
+    crate::routing::attempt_policy::MAX_PRECOMMIT_ITEMS
 }
 
 fn default_max_precommit_bytes() -> usize {
-    8 * 1024 * 1024 + 128 * 266
+    crate::routing::attempt_policy::MAX_PRECOMMIT_BYTES
 }
 
 fn precommit_semantic_guard(plan: &Plan) -> bool {
@@ -1268,15 +1268,8 @@ fn start_public_stream(
     );
 
     let capture_headers = headers.clone();
-    let capture = idempotency_owner.map(|owner| IdempotencyCapture {
-        max_bytes: owner.max_response_bytes(),
-        owner,
-        status,
-        headers: capture_headers,
-        chunks: Vec::new(),
-        bytes: 0,
-        overflowed: false,
-    });
+    let capture = idempotency_owner
+        .map(|owner| crate::runtime::replay::ReplayCapture::new(owner, status, capture_headers));
     if capture.is_some() {
         idempotency::executed_header(&mut headers);
     }
@@ -1302,21 +1295,11 @@ fn start_public_stream(
     response
 }
 
-struct IdempotencyCapture {
-    owner: idempotency::Owner,
-    status: StatusCode,
-    headers: HeaderMap,
-    chunks: Vec<Bytes>,
-    bytes: usize,
-    max_bytes: usize,
-    overflowed: bool,
-}
-
 struct OutputSink {
     sender: mpsc::Sender<Result<Bytes, io::Error>>,
     cancellation: CancellationToken,
     downstream_open: bool,
-    capture: Option<IdempotencyCapture>,
+    capture: Option<crate::runtime::replay::ReplayCapture>,
 }
 
 struct ActiveRuntime {
@@ -1329,7 +1312,7 @@ impl OutputSink {
     fn new(
         sender: mpsc::Sender<Result<Bytes, io::Error>>,
         cancellation: CancellationToken,
-        capture: Option<IdempotencyCapture>,
+        capture: Option<crate::runtime::replay::ReplayCapture>,
     ) -> Self {
         Self {
             sender,
@@ -1344,20 +1327,7 @@ impl OutputSink {
             let end = (offset + DOWNSTREAM_SEGMENT_BYTES).min(wire.len());
             let segment = wire.slice(offset..end);
             if let Some(capture) = self.capture.as_mut() {
-                if !capture.overflowed {
-                    let next_bytes = capture.bytes.saturating_add(segment.len());
-                    if next_bytes > capture.max_bytes
-                        || !capture.owner.try_reserve_inflight_response(segment.len())
-                    {
-                        capture.owner.release_inflight_response(capture.bytes);
-                        capture.overflowed = true;
-                        capture.chunks.clear();
-                        capture.bytes = 0;
-                    } else {
-                        capture.bytes = next_bytes;
-                        capture.chunks.push(segment.clone());
-                    }
-                }
+                capture.push(&segment);
             }
             if !self.downstream_open {
                 continue;
@@ -1396,22 +1366,7 @@ impl OutputSink {
         let Some(capture) = self.capture.take() else {
             return;
         };
-        capture.owner.release_inflight_response(capture.bytes);
-        if !cacheable {
-            capture.owner.release().await;
-        } else if capture.overflowed {
-            capture.owner.nonreplayable("response_too_large").await;
-        } else {
-            capture
-                .owner
-                .complete(
-                    capture.status,
-                    capture.headers,
-                    capture.chunks,
-                    capture.bytes,
-                )
-                .await;
-        }
+        capture.finish(cacheable).await;
     }
 }
 

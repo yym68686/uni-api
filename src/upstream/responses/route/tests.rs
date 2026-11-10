@@ -100,6 +100,22 @@ async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> 
         .await
         .unwrap();
     ResponsesRoute {
+        context: Arc::new(crate::routing::context::RequestContext {
+            snapshot: snapshot.clone(),
+            caller: api_key.clone(),
+            facts: crate::routing::context::RequestFacts::new(
+                "gpt-public",
+                "/v1/responses",
+                64,
+                Some(&json!({"stream":true})),
+            ),
+            admission: crate::routing::context::AdmissionReceipt::Request,
+            route: crate::routing::types::ResolvedRoute {
+                providers: vec![provider.clone()],
+                hedging: HedgingConfig::default(),
+                unknown_400_retries: 0,
+            },
+        }),
         unknown_400: Default::default(),
         store,
         codex_oauth: CodexOAuthManager::new(),

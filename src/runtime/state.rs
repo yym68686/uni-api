@@ -20,6 +20,9 @@ pub(crate) struct SnapshotStamp {
 
 #[derive(Clone)]
 pub struct GatewayRuntime {
+    // Only request-local clones pin configuration. Scheduling and controls remain shared.
+    pub(crate) request_snapshot: Option<Option<Arc<Snapshot>>>,
+    pub(crate) request_rules: Option<Arc<crate::control::channels::Controls>>,
     pub(crate) explicit_cache: crate::runtime::explicit_cache::Guard,
     pub(crate) scheduling: crate::runtime::scheduling::SchedulingState,
     pub(crate) channel_controls: Arc<RwLock<crate::control::channels::Controls>>,
@@ -33,6 +36,8 @@ impl GatewayRuntime {
         let path = std::env::var("RUST_RESPONSES_CONFIG_SNAPSHOT_PATH")
             .unwrap_or_else(|_| "/tmp/uni-api-rust-responses-config-v1.json".into());
         Self {
+            request_snapshot: None,
+            request_rules: None,
             explicit_cache: crate::runtime::explicit_cache::Guard::default(),
             scheduling: crate::runtime::scheduling::SchedulingState::default(),
             channel_controls: Arc::new(RwLock::new(crate::control::channels::Controls::default())),
@@ -187,8 +192,31 @@ impl GatewayRuntime {
     }
 
     pub(crate) async fn snapshot(&self) -> Option<Arc<Snapshot>> {
+        if let Some(snapshot) = &self.request_snapshot {
+            return snapshot.clone();
+        }
         let base = self.current.read().await.clone()?;
         Some(self.channel_controls.read().await.overlay(base))
+    }
+
+    pub(crate) async fn for_request(&self) -> Self {
+        if self.request_snapshot.is_some() {
+            return self.clone();
+        }
+        let mut runtime = self.clone();
+        let base = self.current.read().await.clone();
+        let controls = self.channel_controls.read().await;
+        runtime.request_snapshot = Some(base.map(|snapshot| controls.overlay(snapshot)));
+        runtime.request_rules = Some(Arc::new(controls.routing_rules()));
+        runtime
+    }
+
+    pub(crate) async fn channel_enabled(&self, caller: &str, model: &str, provider: &str) -> bool {
+        !self.channel_controls.read().await.disabled(
+            &crate::routing::catalog::key_id(caller),
+            model,
+            provider,
+        )
     }
 
     pub async fn is_ready(&self) -> bool {

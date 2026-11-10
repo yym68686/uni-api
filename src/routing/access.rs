@@ -1,11 +1,6 @@
 use crate::config::snapshot::ApiKey;
 use crate::config::snapshot::Provider;
 use crate::routing::filters::provider_accepts_endpoint;
-use crate::routing::retry::RetryPolicy;
-use crate::routing::timeouts::model_preference;
-use crate::routing::timeouts::model_timeout;
-use crate::routing::timeouts::resolve_timeouts;
-use crate::routing::timeouts::Timeouts;
 use crate::routing::types::AuthContext;
 use crate::routing::types::RouteResolutionError;
 use crate::runtime::state::GatewayRuntime;
@@ -14,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 impl GatewayRuntime {
     pub async fn models_for_headers(&self, headers: &HeaderMap) -> Result<Vec<String>, u16> {
@@ -234,82 +229,6 @@ impl GatewayRuntime {
         }
         Ok(
             json!({"data":crate::routing::catalog::keys(&snapshot, caller),"snapshot_revision":snapshot.revision.as_ref(),"can_inspect_all":true}),
-        )
-    }
-
-    pub(crate) async fn prices_for_model(&self, model: &str) -> (f64, f64) {
-        self.snapshot()
-            .await
-            .map(|snapshot| model_prices(&snapshot.preferences, model))
-            .unwrap_or((0.3, 1.0))
-    }
-
-    pub(crate) async fn keepalive_interval(
-        &self,
-        provider: &Provider,
-        request_model: &str,
-        original_model: &str,
-    ) -> Option<Duration> {
-        let snapshot = self.snapshot().await?;
-        let interval = model_preference(
-            provider,
-            &snapshot.preferences,
-            request_model,
-            original_model,
-            "keepalive_interval",
-        )
-        .unwrap_or(99999.0);
-        let timeout = model_timeout(
-            provider,
-            &snapshot.preferences,
-            request_model,
-            original_model,
-        );
-        (interval.is_finite() && interval > 0.0 && interval <= timeout)
-            .then(|| Duration::from_secs_f64(interval))
-    }
-
-    pub(crate) async fn retry_policy(&self, headers: &HeaderMap) -> RetryPolicy {
-        let Some(snapshot) = self.snapshot().await else {
-            return RetryPolicy::default();
-        };
-        let value = extract_api_key(headers)
-            .and_then(|token| snapshot.api_keys.get(&token))
-            .and_then(|key| key.preferences.get("AUTO_RETRY"));
-        RetryPolicy::from_value(value)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn generic_timeouts(
-        &self,
-        headers: &HeaderMap,
-        provider: &Provider,
-        request_model: &str,
-        original_model: &str,
-        engine: &str,
-        stream: bool,
-        request_type: Option<&str>,
-        endpoint: &str,
-        method: &str,
-    ) -> Timeouts {
-        let Some(snapshot) = self.snapshot().await else {
-            return Timeouts::default();
-        };
-        let role = extract_api_key(headers)
-            .and_then(|token| snapshot.api_keys.get(&token).cloned())
-            .map(|key| key.role.to_string())
-            .unwrap_or_default();
-        resolve_timeouts(
-            &snapshot,
-            provider,
-            request_model,
-            original_model,
-            engine,
-            stream,
-            request_type,
-            &role,
-            endpoint,
-            method,
         )
     }
 

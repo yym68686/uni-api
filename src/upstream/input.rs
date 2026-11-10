@@ -369,12 +369,24 @@ pub(crate) fn skip_gif_subblocks(bytes: &[u8], cursor: &mut usize) -> Option<()>
 
 pub(crate) async fn prepare_input(
     state: &AppState,
-    request: Request,
+    mut request: Request,
     method: &Method,
     uri: &Uri,
     path: &str,
     resource_wait: Duration,
 ) -> Result<PreparedInput, Response<Body>> {
+    if let Some(prepared) = request
+        .extensions_mut()
+        .remove::<crate::routing::context::PreparedPayload>()
+    {
+        return Ok(PreparedInput {
+            payload: Some(std::sync::Arc::unwrap_or_clone(prepared.payload)),
+            replay: None,
+            observation: prepared.observation,
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        });
+    }
     if *method == Method::GET {
         let payload = if matches!(path, "/search" | "/v1/search") {
             let query = query_value(uri, "q").unwrap_or_else(|| "Jina+AI".into());

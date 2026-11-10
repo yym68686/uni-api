@@ -24,6 +24,7 @@ pub(crate) struct ProviderFailurePolicy {
     pub(crate) force_quota_cooldown: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResolvedRoute {
     pub(crate) providers: Vec<Arc<Provider>>,
     pub(crate) hedging: HedgingConfig,

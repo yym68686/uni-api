@@ -5,15 +5,13 @@ use super::processor::ResponsesProcessor;
 use crate::observability::{stream::StreamStats, usage::FactUsage};
 use crate::protocols::provider_stream::{PrecommitFailure, StreamOutcome, Translation};
 use crate::protocols::sse::{SseDecoder, SseFrame};
+use crate::routing::attempt_policy::ResponseStreamPolicy;
 use crate::transport::{body::upstream_chunks, http::filtered_response_headers};
 use axum::{body::Body, http::Response};
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use std::{io, time::Duration};
 use tokio::{sync::oneshot, time::Instant};
-
-const MAX_PRECOMMIT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PRECOMMIT_EVENTS: u64 = 128;
 
 fn failure(reason: &'static str, status: u16, detail: impl Into<String>) -> PrecommitFailure {
     PrecommitFailure {
@@ -45,6 +43,8 @@ pub(crate) fn protocol_error_code(detail: &str) -> &'static str {
 }
 
 struct Observer {
+    policy: ResponseStreamPolicy,
+    wire: bytes::BytesMut,
     decoder: SseDecoder,
     processor: ResponsesProcessor,
     stats: StreamStats,
@@ -57,12 +57,14 @@ struct Observer {
 }
 
 impl Observer {
-    fn new(started: Instant) -> Self {
+    fn new(started: Instant, policy: ResponseStreamPolicy) -> Self {
         let mut stats = StreamStats::new("generic-responses");
         stats.started_at = started;
         Self {
             decoder: SseDecoder::new(0),
-            processor: ResponsesProcessor::new("real_output".into(), false),
+            processor: ResponsesProcessor::new(policy.commit_policy.clone(), policy.normalize_ids),
+            policy,
+            wire: bytes::BytesMut::new(),
             stats,
             committed: false,
             terminal: false,
@@ -82,6 +84,11 @@ impl Observer {
                 .processor
                 .process(frame, &mut self.stats)
                 .map_err(|detail| failure("protocol_error", 502, detail))?;
+            if self.policy.normalize_ids {
+                if let Some(wire) = &event.wire {
+                    self.wire.extend_from_slice(wire);
+                }
+            }
             if let Some(terminal) = event.terminal.as_ref() {
                 self.terminal = true;
                 self.terminal_kind = Some(match terminal {
@@ -121,7 +128,7 @@ impl Observer {
                     "Responses upstream ended incomplete after output",
                 ));
             }
-            if !self.committed && self.stats.event_count > MAX_PRECOMMIT_EVENTS {
+            if !self.committed && self.stats.event_count > self.policy.max_precommit_items as u64 {
                 return Err(failure(
                     "protocol_error",
                     502,
@@ -218,6 +225,7 @@ pub(crate) async fn prepare(
     started: Instant,
     deadline: Option<Instant>,
     idle: Option<Duration>,
+    policy: ResponseStreamPolicy,
 ) -> Result<Translation, PrecommitFailure> {
     if !response
         .headers()
@@ -242,7 +250,8 @@ pub(crate) async fn prepare(
     // Body adapters and heartbeat insertion can change HTTP transfer framing.
     headers.remove("content-length");
     let mut upstream = Box::pin(upstream_chunks(response, idle));
-    let mut observer = Observer::new(started);
+    let max_precommit_bytes = policy.max_precommit_bytes;
+    let mut observer = Observer::new(started, policy);
     let mut retained = Vec::<Bytes>::new();
     let mut size = 0usize;
     loop {
@@ -256,7 +265,14 @@ pub(crate) async fn prepare(
             Some(Ok(bytes)) => {
                 size = size.saturating_add(bytes.len());
                 let result = observer.feed(&bytes);
-                retained.push(bytes);
+                if observer.policy.normalize_ids {
+                    let wire = observer.wire.split().freeze();
+                    if !wire.is_empty() {
+                        retained.push(wire);
+                    }
+                } else {
+                    retained.push(bytes);
+                }
                 result
             }
             Some(Err(error)) => return Err(failure("transport_error", 502, error.to_string())),
@@ -267,11 +283,12 @@ pub(crate) async fn prepare(
                 return Err(error);
             }
             observer.failure = Some(error);
+            observer.ended = true;
         }
         if observer.committed {
             break;
         }
-        if size > MAX_PRECOMMIT_BYTES {
+        if size > max_precommit_bytes {
             return Err(failure(
                 "protocol_error",
                 502,
@@ -284,7 +301,7 @@ pub(crate) async fn prepare(
     let tail = stream::unfold(
         (upstream, observer),
         |(mut upstream, mut observer)| async move {
-            if observer.terminal {
+            if observer.terminal || observer.failure.is_some() {
                 return None;
             }
             match upstream.next().await {
@@ -298,7 +315,13 @@ pub(crate) async fn prepare(
                     };
                     if let Err(error) = inspected {
                         observer.failure = Some(error);
+                        observer.ended = true;
                     }
+                    let result = if observer.policy.normalize_ids {
+                        result.map(|_| observer.wire.split().freeze())
+                    } else {
+                        result
+                    };
                     Some((result, (upstream, observer)))
                 }
                 None => {
@@ -323,11 +346,15 @@ pub(crate) async fn preflight_translation(
     translation: Translation,
     started: Instant,
     deadline: Option<Instant>,
+    mut policy: ResponseStreamPolicy,
 ) -> Result<Translation, PrecommitFailure> {
     let Translation { response, outcome } = translation;
     let (parts, body) = response.into_parts();
     let mut body = body.into_data_stream();
-    let mut observer = Observer::new(started);
+    // The translator owns IDs and bytes; this layer only controls commitment.
+    policy.normalize_ids = false;
+    let max_precommit_bytes = policy.max_precommit_bytes;
+    let mut observer = Observer::new(started, policy);
     let mut retained = Vec::new();
     let mut size = 0usize;
     loop {
@@ -351,7 +378,7 @@ pub(crate) async fn preflight_translation(
             break;
         }
         inspected?;
-        if size > MAX_PRECOMMIT_BYTES {
+        if size > max_precommit_bytes {
             return Err(failure(
                 "protocol_error",
                 502,

@@ -65,7 +65,10 @@ pub async fn handler(State(state): State<AppState>, mut request: Request) -> Res
     response
 }
 
-async fn handler_inner(state: AppState, request: Request) -> Response<Body> {
+async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> {
+    if crate::api::gateway::supports(request.method(), request.uri().path().trim_end_matches('/')) {
+        state.runtime = state.runtime.for_request().await;
+    }
     let request = match crate::transport::decompression::decode(request).await {
         Ok(request) => request,
         Err(response) => return response,
@@ -150,7 +153,7 @@ async fn handler_inner(state: AppState, request: Request) -> Response<Body> {
             None => None,
         };
         let idempotent_request = idempotency_key.is_some();
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let request_hasher = match idempotency_key.as_deref() {
             Some(key) => match RequestHasher::new(&parts.method, &parts.uri, &parts.headers, key) {
                 Ok(hasher) => Some(hasher),
@@ -264,6 +267,9 @@ async fn handler_inner(state: AppState, request: Request) -> Response<Body> {
                 }
             }
         }
+        parts
+            .extensions
+            .insert(crate::routing::context::ModerationReceipt);
         let native_json_memory_bytes = observation.body_bytes.saturating_mul(
             std::env::var("RUST_RESPONSES_JSON_MEMORY_MULTIPLIER")
                 .ok()
@@ -304,6 +310,15 @@ async fn handler_inner(state: AppState, request: Request) -> Response<Body> {
                     owner.release().await;
                 }
                 return response;
+            }
+            ResponsesPreparation::PreparedFallback(context, payload) => {
+                parts.extensions.insert(context);
+                parts
+                    .extensions
+                    .insert(crate::routing::context::PreparedPayload {
+                        payload: std::sync::Arc::new(payload),
+                        observation: observation.clone(),
+                    });
             }
             ResponsesPreparation::Fallback => {}
         }
@@ -468,8 +483,7 @@ async fn relay_idempotent_axum_response(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"))
     {
-        owner.nonreplayable("streaming_response").await;
-        return response;
+        return crate::runtime::replay::capture_stream(response, owner).await;
     }
     let (parts, body) = response.into_parts();
     let maximum = std::env::var("RUST_GENERIC_UPSTREAM_RESPONSE_MAX_BYTES")
@@ -480,7 +494,9 @@ async fn relay_idempotent_axum_response(
     let body = match to_bytes(body, maximum.saturating_add(1)).await {
         Ok(body) => body,
         Err(error) => {
-            owner.release().await;
+            owner
+                .nonreplayable("response_read_failed_after_execution")
+                .await;
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("Rust compatibility response read failed: {error}"),

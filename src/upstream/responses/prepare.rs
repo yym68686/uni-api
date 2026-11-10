@@ -1,15 +1,10 @@
 use crate::observability::context::request_id;
 use crate::providers::codex::oauth::CodexOAuthManager;
 use crate::routing::access::extract_api_key;
-use crate::routing::filters::request_reasoning_effort;
 use crate::routing::filters::request_type_for_endpoint;
-use crate::routing::planner::diagnostic_key;
-use crate::routing::planner::matching_providers;
 use crate::routing::planner::TARGET_PROVIDER_HEADER;
 use crate::routing::retry::RetryPolicy;
 use crate::runtime::resources::MemoryReservation;
-use crate::runtime::scheduling::parse_rate_limits;
-use crate::runtime::scheduling::tpr_exceeded;
 use crate::runtime::state::GatewayRuntime;
 use crate::storage::database::Persistence;
 use crate::transport::spool::SpoolObservation;
@@ -149,12 +144,6 @@ pub async fn prepare_request(
         return ResponsesPreparation::Fallback;
     }
     let role = api_key.role.as_ref();
-    if let Err(error) = store.ensure_paid_balance(&persistence, &api_key).await {
-        return ResponsesPreparation::Response(json_response(
-            error.status,
-            json!({"error": error.message}),
-        ));
-    }
     let mut payload = match storage.parse_json().await {
         Ok(Value::Object(payload)) => Value::Object(payload),
         Ok(_) => {
@@ -238,7 +227,6 @@ pub async fn prepare_request(
         ));
     }
     let request_type = request_type_for_endpoint(Some(object), endpoint);
-    let reasoning_effort = request_reasoning_effort(object);
     let normalized_endpoint = endpoint.trim_end_matches('/');
     let wants_compact = normalized_endpoint == "/v1/responses/compact";
     let stream_value = object.get("stream").cloned();
@@ -272,8 +260,21 @@ pub async fn prepare_request(
             .expect("checked JSON object")
             .insert("stream".into(), Value::Bool(stream));
     }
-    let route_key = match diagnostic_key(&snapshot, &api_key, &parts.headers, normalized_endpoint) {
-        Ok(key) => key,
+    let context = match store
+        .resolve_route(
+            &persistence,
+            &parts.headers,
+            crate::routing::context::RequestFacts::new(
+                &request_model,
+                normalized_endpoint,
+                observation.body_bytes,
+                Some(&payload),
+            ),
+            true,
+        )
+        .await
+    {
+        Ok(context) => context,
         Err(error) => {
             return ResponsesPreparation::Response(json_response(
                 error.status,
@@ -281,116 +282,20 @@ pub async fn prepare_request(
             ))
         }
     };
-    let providers = match matching_providers(
-        &snapshot,
-        &route_key,
-        &request_model,
-        observation.body_bytes,
-        request_type,
-        reasoning_effort.as_deref(),
-        normalized_endpoint,
-    ) {
-        Ok(providers) if !providers.is_empty() => providers,
-        Ok(_) => {
-            emit_native_rejection(
-                404,
-                NativeRejectionObservation {
-                    request_id: &request_id,
-                    request_model: Some(&request_model),
-                    stream: Some(stream),
-                    role,
-                    request_body_bytes: observation.body_bytes,
-                    snapshot_revision: snapshot.revision.as_ref(),
-                    reason: "no_matching_provider",
-                },
-            );
-            return ResponsesPreparation::Response(json_response(
-                StatusCode::NOT_FOUND,
-                json!({"message": format!("No available providers at the moment: {request_model}")}),
-            ));
-        }
-        Err(()) => return ResponsesPreparation::Fallback,
-    };
-    let providers = store
-        .schedule_providers(&api_key, &request_model, providers)
-        .await;
-    if providers.is_empty() {
-        return ResponsesPreparation::Response(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error":"All matching channels are temporarily disabled"}),
-        ));
-    }
+    let providers = context.route.providers.clone();
     if providers.iter().any(|provider| {
         !matches!(provider.engine.as_ref(), "gpt" | "codex")
             || provider.api_keys.is_empty()
             || (provider.engine.as_ref() == "gpt" && !provider.base_url.contains("v1/responses"))
             || provider_stream_override(provider).is_some_and(|value| value != stream)
     }) {
-        return ResponsesPreparation::Fallback;
-    }
-    let Some(global_rate_rules) = parse_rate_limits(snapshot.preferences.get("rate_limit"), None)
-    else {
-        return ResponsesPreparation::Fallback;
-    };
-    let Some(client_rate_rules) =
-        parse_rate_limits(api_key.preferences.get("rate_limit"), Some(&request_model))
-    else {
-        return ResponsesPreparation::Fallback;
-    };
-    if tpr_exceeded(
-        &client_rate_rules,
-        (observation.body_bytes / 4).max(1) as usize,
-    ) {
-        return ResponsesPreparation::Response(json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({"error":"Tokens per request limit exceeded"}),
-        ));
-    }
-    // Admit only after the request is proven native-safe. A compatibility
-    // fallback must not consume both the Rust and Python rate-limit buckets.
-    if !store.admit_rate("__global__", &global_rate_rules).await {
-        emit_native_rejection(
-            429,
-            NativeRejectionObservation {
-                request_id: &request_id,
-                request_model: Some(&request_model),
-                stream: Some(stream),
-                role,
-                request_body_bytes: observation.body_bytes,
-                snapshot_revision: snapshot.revision.as_ref(),
-                reason: "native_global_rate_limit",
-            },
-        );
-        return ResponsesPreparation::Response(json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({"error": "Too many requests"}),
-        ));
-    }
-    if !store
-        .admit_rate(&format!("client:{}", api_key.token), &client_rate_rules)
-        .await
-    {
-        emit_native_rejection(
-            429,
-            NativeRejectionObservation {
-                request_id: &request_id,
-                request_model: Some(&request_model),
-                stream: Some(stream),
-                role,
-                request_body_bytes: observation.body_bytes,
-                snapshot_revision: snapshot.revision.as_ref(),
-                reason: "native_client_rate_limit",
-            },
-        );
-        return ResponsesPreparation::Response(json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({"error": "Too many requests"}),
-        ));
+        return ResponsesPreparation::PreparedFallback(context, payload);
     }
     let targeted = parts.headers.contains_key(TARGET_PROVIDER_HEADER);
     let retry_policy = RetryPolicy::from_value(api_key.preferences.get("AUTO_RETRY"));
     let max_attempts = retry_policy.max_attempts(&providers, targeted);
     ResponsesPreparation::Ready(ResponsesRoute {
+        context,
         unknown_400: crate::routing::unknown_400::Budget::new(
             crate::routing::unknown_400::configured(&snapshot.preferences),
             !targeted,

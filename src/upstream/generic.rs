@@ -55,6 +55,7 @@ use std::time::Instant;
 use url::Url;
 
 pub(crate) struct AttemptLoop {
+    pub(crate) context: Arc<crate::routing::context::RequestContext>,
     pub(crate) unknown_400: crate::routing::unknown_400::Budget,
     pub(crate) state: AppState,
     pub(crate) started: Instant,
@@ -134,6 +135,14 @@ pub(crate) async fn next_generic_hedge_plan(
         let attempt_index = *cursor;
         *cursor += 1;
         let provider = execution.providers[attempt_index % execution.providers.len()].clone();
+        if !execution
+            .state
+            .runtime
+            .channel_enabled(&execution.api_key, &execution.request_model, &provider.name)
+            .await
+        {
+            continue;
+        }
         if !unknown_400.may_dispatch(provider.name.as_ref()) {
             continue;
         }
@@ -200,7 +209,11 @@ pub(crate) async fn next_generic_hedge_plan(
                 .codex_oauth
                 .resolve(
                     &provider_key_raw,
-                    provider.preferences.get("proxy").and_then(Value::as_str),
+                    crate::routing::attempt_policy::ResolvedAttemptPolicy::proxy(
+                        &execution.context.snapshot,
+                        &provider,
+                    )
+                    .as_deref(),
                 )
                 .await
             {
@@ -485,11 +498,14 @@ pub(crate) async fn run_hedged_attempt_loop(
                     upstream_url,
                 } = success;
                 debug_assert!(stream_outcome.is_none());
+                let final_facts = crate::observability::outcome::FinalFacts::buffered(
+                    collected_outcome.as_ref(),
+                    status.as_u16(),
+                    response.status().as_u16(),
+                    context.downstream_stream,
+                );
                 execution.state.persistence.record_channel(ChannelStat {
-                    terminal_kind: collected_outcome
-                        .as_ref()
-                        .and_then(|v| v["kind"].as_str())
-                        .map(str::to_owned),
+                    terminal_kind: Some(final_facts.terminal.label().into()),
                     failure_reason: None,
                     response_completed: collected_outcome
                         .as_ref()
@@ -525,10 +541,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     .await;
                 execution.state.persistence.record_request(RequestStat {
                     fact_usage,
-                    terminal_kind: collected_outcome
-                        .as_ref()
-                        .and_then(|v| v["kind"].as_str())
-                        .map(str::to_owned),
+                    terminal_kind: Some(final_facts.terminal.label().into()),
                     response_completed: collected_outcome
                         .as_ref()
                         .map(|v| v["kind"] == "completed"),
@@ -557,6 +570,8 @@ pub(crate) async fn run_hedged_attempt_loop(
                         "unknown_400_retry_used": unknown_400.used(),
                         "stream_collection": collected_outcome,
                         "terminal": "hedge_winner",
+                        "snapshot_revision": execution.context.snapshot.revision.as_ref(),
+                        "final_facts": final_facts,
                         "attempt_count": cursor,
                         "winner_attempt_index": context.attempt_index + 1,
                         "hedge_trigger_count": trigger_count,
@@ -706,6 +721,7 @@ pub(crate) async fn run_hedged_attempt_loop(
         last_status = response.status();
     }
     execution.state.persistence.record_request(RequestStat {
+        terminal_kind: Some("unknown".into()),
         is_flagged: true,
         failure_reason: Some("no_successful_channel".into()),
         status: last_status.as_u16(),
@@ -719,6 +735,8 @@ pub(crate) async fn run_hedged_attempt_loop(
         timing_spans: json!({
             "runtime":"rust",
             "terminal":"hedge_exhausted",
+            "snapshot_revision": execution.context.snapshot.revision.as_ref(),
+            "final_facts": crate::observability::outcome::FinalFacts::exhausted(last_status.as_u16()),
             "unknown_400_retry_used": unknown_400.used(),
             "attempt_count": cursor,
             "hedge_trigger_count": trigger_count,
@@ -732,6 +750,7 @@ pub(crate) async fn run_hedged_attempt_loop(
 
 pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let AttemptLoop {
+        context,
         mut unknown_400,
         state,
         started,
@@ -756,6 +775,11 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         completion_price,
         keepalive_updates,
     } = execution;
+    debug_assert_eq!(
+        context.admission,
+        crate::routing::context::AdmissionReceipt::Request
+    );
+    let snapshot_revision = context.snapshot.revision.to_string();
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
@@ -782,6 +806,13 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             providers[attempt_index % providers.len()].clone()
         };
         cursor += 1;
+        if !state
+            .runtime
+            .channel_enabled(&api_key, &request_model, &provider.name)
+            .await
+        {
+            continue;
+        }
         if compaction_request && compaction_visited.contains(provider.name.as_ref()) {
             continue;
         }
@@ -824,7 +855,11 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 .codex_oauth
                 .resolve(
                     &provider_key_raw,
-                    provider.preferences.get("proxy").and_then(Value::as_str),
+                    crate::routing::attempt_policy::ResolvedAttemptPolicy::proxy(
+                        &context.snapshot,
+                        &provider,
+                    )
+                    .as_deref(),
                 )
                 .await
             {
@@ -958,12 +993,16 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     collected_outcome,
                     upstream_url,
                 } = success;
+                let mut response = response;
+                let final_facts = crate::observability::outcome::FinalFacts::buffered(
+                    collected_outcome.as_ref(),
+                    status.as_u16(),
+                    response.status().as_u16(),
+                    downstream_stream,
+                );
                 let request_stat = RequestStat {
                     fact_usage,
-                    terminal_kind: collected_outcome
-                        .as_ref()
-                        .and_then(|v| v["kind"].as_str())
-                        .map(str::to_owned),
+                    terminal_kind: Some(final_facts.terminal.label().into()),
                     response_completed: collected_outcome
                         .as_ref()
                         .map(|v| v["kind"] == "completed"),
@@ -989,6 +1028,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     completion_price,
                     timing_spans: json!({
                         "runtime": "rust",
+                        "snapshot_revision": snapshot_revision,
+                        "final_facts": final_facts,
                         "unknown_400_retry_used": unknown_400.used(),
                         "stream_collection": collected_outcome,
                         "attempt_count": dispatched,
@@ -998,6 +1039,11 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     ..RequestStat::default()
                 };
                 if let Some(stream_outcome) = stream_outcome {
+                    let downstream_status = response.status().as_u16();
+                    let (completion_tx, completion_rx) = tokio::sync::watch::channel(None);
+                    response.extensions_mut().insert(
+                        crate::observability::outcome::CompletionReceipt(completion_rx),
+                    );
                     let outcome_state = state.clone();
                     let outcome_provider = provider.clone();
                     let outcome_original_model = original_model.clone();
@@ -1046,6 +1092,12 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 detail,
                             );
                         }
+                        let final_facts = crate::observability::outcome::FinalFacts::stream(
+                            &outcome,
+                            status.as_u16(),
+                            downstream_status,
+                        );
+                        let _ = completion_tx.send(Some(outcome.success));
                         let mut request_stat = request_stat;
                         request_stat.process_time = started.elapsed().as_secs_f64();
                         request_stat.prompt_tokens = outcome.usage.0;
@@ -1058,10 +1110,13 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.status = outcome.status_code;
                         request_stat.is_flagged = !outcome.success;
                         request_stat.failure_reason = outcome.failure_reason.map(str::to_owned);
-                        request_stat.terminal_kind = outcome.terminal_kind.map(str::to_owned);
-                        request_stat.response_completed = outcome.response_completed;
+                        request_stat.terminal_kind = Some(final_facts.terminal.label().to_owned());
+                        request_stat.response_completed = final_facts.response_completed;
                         request_stat.timing_spans = json!({
                             "runtime": "rust",
+                            "snapshot_revision": snapshot_revision,
+                            "final_facts": final_facts,
+                            "downstream_http_status": downstream_status,
                             "attempt_count": dispatched,
                             "upstream_ms": attempt_started.elapsed().as_millis(),
                             "terminal": if outcome.success { "stream_completed" } else { "stream_failed" },
@@ -1070,7 +1125,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         })
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
-                            terminal_kind: outcome.terminal_kind.map(str::to_owned),
+                            terminal_kind: Some(final_facts.terminal.label().to_owned()),
                             failure_reason: outcome.failure_reason.map(str::to_owned),
                             response_completed: outcome.response_completed,
                             transport_timing: None,
@@ -1189,10 +1244,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     );
                 }
                 state.persistence.record_channel(ChannelStat {
-                    terminal_kind: collected_outcome
-                        .as_ref()
-                        .and_then(|v| v["kind"].as_str())
-                        .map(str::to_owned),
+                    terminal_kind: Some(final_facts.terminal.label().into()),
                     failure_reason: None,
                     response_completed: collected_outcome
                         .as_ref()
@@ -1334,6 +1386,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     }
 
     state.persistence.record_request(RequestStat {
+        terminal_kind: Some("unknown".into()),
         is_flagged: true,
         failure_reason: Some("no_successful_channel".into()),
         status: last_status.as_u16(),
@@ -1350,7 +1403,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         process_time: started.elapsed().as_secs_f64(),
         model: request_model,
         api_key,
-        timing_spans: json!({"runtime":"rust","terminal":"route_exhausted","unknown_400_retry_used":unknown_400.used()}).to_string(),
+        timing_spans: json!({"runtime":"rust","snapshot_revision":snapshot_revision,"final_facts":crate::observability::outcome::FinalFacts::exhausted(last_status.as_u16()),"terminal":"route_exhausted","unknown_400_retry_used":unknown_400.used()}).to_string(),
         ..RequestStat::default()
     });
     last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
@@ -1436,36 +1489,52 @@ pub(crate) async fn send_attempt(
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let compaction = prepared.request_type == Some("compaction");
-    let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
-    let http1_only = provider.engine.eq_ignore_ascii_case("codex");
-    let timeouts = state
+    let snapshot = state
         .runtime
-        .generic_timeouts(
-            incoming_headers,
-            provider,
-            &prepared.request_model,
-            &prepared.original_model,
-            provider.engine.as_ref(),
-            if prepared.upstream_stream
-                && !prepared.downstream_stream
-                && crate::providers::stream_mode::responses_wire(&provider.engine, &prepared.url)
-            {
-                false
-            } else {
-                prepared.upstream_stream
-            },
-            prepared.request_type,
-            endpoint,
-            prepared.method.as_str(),
-        )
-        .await;
+        .snapshot()
+        .await
+        .ok_or_else(|| AttemptFailure {
+            failure_reason: "configuration_unavailable".into(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Runtime configuration is not ready".into(),
+            upstream_url: prepared.url.clone(),
+            response: None,
+        })?;
+    let role = crate::routing::access::extract_api_key(incoming_headers)
+        .and_then(|key| snapshot.api_keys.get(&key))
+        .map(|key| key.role.as_ref())
+        .unwrap_or_default();
+    let facts = crate::routing::context::RequestFacts {
+        model: prepared.request_model.clone(),
+        endpoint: endpoint.into(),
+        body_bytes: 0,
+        request_type: prepared.request_type,
+        reasoning_effort: None,
+        stream: prepared.downstream_stream,
+    };
+    let policy_stream = if prepared.upstream_stream
+        && !prepared.downstream_stream
+        && crate::providers::stream_mode::responses_wire(&provider.engine, &prepared.url)
+    {
+        false
+    } else {
+        prepared.upstream_stream
+    };
+    let policy = crate::routing::attempt_policy::ResolvedAttemptPolicy::resolve(
+        &snapshot,
+        provider,
+        &facts,
+        &prepared.original_model,
+        role,
+        prepared.method.as_str(),
+        policy_stream,
+    );
+    let timeouts = policy.timeouts;
     if let Some(updates) = keepalive_updates {
-        let interval = state
-            .runtime
-            .keepalive_interval(provider, &prepared.request_model, &prepared.original_model)
-            .await;
-        updates.send_replace(interval);
+        updates.send_replace(policy.keepalive_interval);
     }
+    let proxy = policy.proxy.as_deref();
+    let http1_only = policy.http1_only;
     let connect_timeout = positive_duration(timeouts.connect);
     let client = state
         .upstream_client(proxy, http1_only, connect_timeout)
@@ -1716,6 +1785,11 @@ pub(crate) async fn send_attempt(
         } else {
             json_response(status, payload)
         };
+        if prepared.downstream_stream {
+            output
+                .extensions_mut()
+                .insert(crate::observability::outcome::CompletionReceipt::completed());
+        }
         copy_oaix_headers(&attribution_headers, output.headers_mut());
         output
             .headers_mut()
@@ -1777,6 +1851,7 @@ pub(crate) async fn send_attempt(
             started,
             positive_duration(timeouts.first_byte).map(|duration| started + duration),
             positive_duration(timeouts.idle),
+            policy.responses.clone(),
         )
         .await
         .map_err(|failure| AttemptFailure {
@@ -1942,6 +2017,7 @@ pub(crate) async fn send_attempt(
                 translation,
                 started,
                 positive_duration(timeouts.first_byte).map(|duration| started + duration),
+                policy.responses.clone(),
             )
             .await
             .map_err(|failure| AttemptFailure {
@@ -2179,6 +2255,11 @@ pub(crate) async fn send_attempt(
     } else {
         json_response(StatusCode::OK, normalized)
     };
+    if prepared.downstream_stream {
+        output
+            .extensions_mut()
+            .insert(crate::observability::outcome::CompletionReceipt::completed());
+    }
     if collect_responses && prepared.adapter == ResponseAdapter::Passthrough {
         *output.headers_mut() = filtered_response_headers(&attribution_headers);
         output

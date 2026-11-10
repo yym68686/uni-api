@@ -11,6 +11,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_nested_admission_does_not_charge_other_request_buckets() {
+        let runtime = GatewayRuntime::new();
+        let child = ("child".into(), vec![(1, 60)]);
+        let global = ("global".into(), vec![(1, 60)]);
+        assert!(runtime.admit_rate_batch(std::slice::from_ref(&child)).await);
+        assert!(!runtime.admit_rate_batch(&[global.clone(), child]).await);
+        assert!(runtime.admit_rate_batch(&[global]).await);
+    }
+}
+
 pub(crate) type RouteKey = (String, String);
 
 pub(crate) type RouteFailureHistory = HashMap<RouteKey, VecDeque<tokio::time::Instant>>;
@@ -228,10 +243,22 @@ impl GatewayRuntime {
             .remove(&(provider.name.to_string(), original_model.to_owned()));
     }
 
-    pub(crate) async fn admit_rate(&self, bucket: &str, rules: &[(usize, u64)]) -> bool {
+    /// Check all request buckets before charging any of them, including nested keys.
+    pub(crate) async fn admit_rate_batch(&self, requests: &[(String, Vec<(usize, u64)>)]) -> bool {
         let now = tokio::time::Instant::now();
         let mut buckets = self.scheduling.client_windows.lock().await;
-        for (limit, seconds) in rules {
+        let mut limits = std::collections::BTreeMap::new();
+        for (bucket, rules) in requests {
+            for (limit, seconds) in rules {
+                if *seconds > 0 {
+                    limits
+                        .entry((bucket.clone(), *seconds))
+                        .and_modify(|v: &mut usize| *v = (*v).min(*limit))
+                        .or_insert(*limit);
+                }
+            }
+        }
+        for ((bucket, seconds), limit) in &limits {
             if *seconds == 0 {
                 continue;
             }
@@ -247,14 +274,8 @@ impl GatewayRuntime {
                 return false;
             }
         }
-        for (_, seconds) in rules {
-            if *seconds == 0 {
-                continue;
-            }
-            buckets
-                .entry((bucket.to_owned(), *seconds))
-                .or_default()
-                .push_back(now);
+        for ((bucket, seconds), _) in limits {
+            buckets.entry((bucket, seconds)).or_default().push_back(now);
         }
         true
     }

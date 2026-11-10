@@ -4,7 +4,7 @@ use crate::providers::request::ALPHA_SEARCH_ENDPOINT;
 use crate::providers::types::PreparedInput;
 use crate::providers::video::video_task_route_for_path;
 use crate::routing::access::extract_api_key;
-use crate::routing::filters::request_type_for_endpoint;
+use crate::routing::context::{ModerationReceipt, RequestContext, RequestFacts};
 use crate::runtime::context::AppState;
 use crate::runtime::scheduling::ProviderKeySelection;
 use crate::transport::http::json_error;
@@ -83,6 +83,11 @@ pub fn known_path(path: &str) -> bool {
 }
 
 pub async fn handle(state: AppState, request: Request, resource_wait: Duration) -> Response<Body> {
+    let prepared_context = request
+        .extensions()
+        .get::<std::sync::Arc<RequestContext>>()
+        .cloned();
+    let moderation_done = request.extensions().get::<ModerationReceipt>().is_some();
     let started = Instant::now();
     let arrival = request
         .extensions()
@@ -142,6 +147,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         return json_error(StatusCode::BAD_REQUEST, "Request model is required");
     }
     if path != "/v1/moderations"
+        && !moderation_done
         && state
             .runtime
             .moderation_enabled(&headers)
@@ -155,24 +161,24 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         }
     }
     let body_bytes = input.observation.body_bytes;
-    let request_type =
-        request_type_for_endpoint(input.payload.as_ref().and_then(Value::as_object), &path);
-    let mut resolved = match state
-        .runtime
-        .resolve_route(
-            &state.persistence,
-            &headers,
-            &request_model,
-            &path,
-            body_bytes,
-            request_type,
-            true,
-        )
-        .await
-    {
-        Ok(route) => route,
-        Err(error) => return json_error(error.status, &error.message),
+    let context = if let Some(context) = prepared_context {
+        context
+    } else {
+        match state
+            .runtime
+            .resolve_route(
+                &state.persistence,
+                &headers,
+                RequestFacts::new(&request_model, &path, body_bytes, input.payload.as_ref()),
+                true,
+            )
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => return json_error(error.status, &error.message),
+        }
     };
+    let mut resolved = context.route.clone();
     if let Some(route) = video_task_route.as_ref() {
         resolved
             .providers
@@ -184,7 +190,9 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             );
         }
     }
-    let retry_policy = state.runtime.retry_policy(&headers).await;
+    let retry_policy = crate::routing::retry::RetryPolicy::from_value(
+        context.caller.preferences.get("AUTO_RETRY"),
+    );
     let max_attempts = retry_policy.max_attempts(
         &resolved.providers,
         headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
@@ -199,7 +207,8 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         Ok(prepared) => prepared,
         Err((status, detail)) => return json_error(status, &detail),
     };
-    let (prompt_price, completion_price) = state.runtime.prices_for_model(&request_model).await;
+    let (prompt_price, completion_price) =
+        crate::routing::access::model_prices(&context.snapshot.preferences, &context.facts.model);
     let use_guarded_stream = matches!(path.as_str(), "/v1/chat/completions" | "/v1/responses")
         && input
             .payload
@@ -208,6 +217,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let mut execution = AttemptLoop {
+        context,
         unknown_400: crate::routing::unknown_400::Budget::new(
             resolved.unknown_400_retries,
             !headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
@@ -392,12 +402,14 @@ pub(crate) async fn run_moderation_preflight(
         .resolve_route(
             &state.persistence,
             headers,
-            model,
-            "/v1/moderations",
-            serde_json::to_vec(&payload)
-                .map(|body| body.len() as u64)
-                .unwrap_or(0),
-            Some("moderation"),
+            RequestFacts::new(
+                model,
+                "/v1/moderations",
+                serde_json::to_vec(&payload)
+                    .map(|body| body.len() as u64)
+                    .unwrap_or(0),
+                Some(&payload),
+            ),
             false,
         )
         .await
@@ -414,20 +426,20 @@ pub(crate) async fn run_moderation_preflight(
         StatusCode::BAD_GATEWAY,
         "Moderation preflight did not reach an upstream provider",
     );
-    for provider in resolved.providers {
+    for provider in &resolved.route.providers {
         let Some(original_model) = provider.models.get(model).cloned() else {
             continue;
         };
         let provider_key = match state
             .runtime
-            .select_provider_key(&provider, &original_model)
+            .select_provider_key(provider, &original_model)
             .await
         {
             ProviderKeySelection::Selected(key) => key,
             _ => continue,
         };
         let prepared = build_attempt(
-            &provider,
+            provider,
             &provider_key,
             model,
             &original_model,
@@ -441,7 +453,7 @@ pub(crate) async fn run_moderation_preflight(
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?;
         match send_attempt(
             state,
-            &provider,
+            provider,
             prepared,
             headers,
             "/v1/moderations",
