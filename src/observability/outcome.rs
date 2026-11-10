@@ -78,11 +78,15 @@ impl FinalFacts {
 
     pub fn exhausted(status: u16) -> Self {
         Self {
-            terminal: TerminalKind::Unknown,
+            terminal: if status >= 400 {
+                TerminalKind::Rejected
+            } else {
+                TerminalKind::Unknown
+            },
             response_completed: None,
             business_committed: None,
             upstream_http_status: None,
-            downstream_http_status: None,
+            downstream_http_status: Some(status),
             semantic_status: status,
         }
     }

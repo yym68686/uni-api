@@ -49,6 +49,7 @@ pub(crate) fn record_log(log: &Value) {
         "upstream_400_retry_limit",
         "upstream_400_retry_used",
         "skip_reason",
+        "phase",
         "cache_guard_action",
         "cache_prefix_hmac",
         "cache_breakpoint",

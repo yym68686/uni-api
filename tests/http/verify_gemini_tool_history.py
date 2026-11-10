@@ -233,4 +233,7 @@ def verify(binary):
                 server.shutdown(); server.server_close()
 
 
-if __name__ == '__main__': verify(Path(sys.argv[1]).resolve())
+if __name__ == '__main__':
+    verify(Path(sys.argv[1]).resolve())
+    SIG = 's' * 76927  # Appended ordinal makes the incident signature 76,928 bytes.
+    verify(Path(sys.argv[1]).resolve())

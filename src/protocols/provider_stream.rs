@@ -1394,13 +1394,24 @@ impl StreamState {
         if finished {
             for part in self.gemini_tools.take() {
                 let call = &part["functionCall"];
-                let call_id = crate::providers::gemini_tools::call_id(
+                let call_id = match crate::providers::gemini_tools::call_id(
                     call.get("id").and_then(Value::as_str),
                     part.get("thoughtSignature")
                         .or_else(|| part.get("thought_signature"))
                         .and_then(Value::as_str),
                     self.next_tool_index + 1,
-                );
+                ) {
+                    Ok(id) => id,
+                    Err(detail) => {
+                        self.failure = Some(PrecommitFailure {
+                            status_code: 502,
+                            detail: detail.clone(),
+                            failure_reason: Some("protocol_error"),
+                        });
+                        output.push(json!({"error":{"message":detail,"type":"upstream_protocol_error","code":"gemini_tool_stream","status_code":502}}));
+                        return output;
+                    }
+                };
                 let index = self.tool_index(&call_id);
                 output.push(self.chunk(json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{
                     "name":call.get("name").cloned().unwrap_or(Value::Null),

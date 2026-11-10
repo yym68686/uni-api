@@ -560,7 +560,8 @@ fn gemini_thought_signatures_round_trip_for_images_and_tools() {
             }]}}]
         }),
         "gemini-public",
-    );
+    )
+    .unwrap();
     let call_id = chat["choices"][0]["message"]["tool_calls"][0]["id"]
         .as_str()
         .unwrap();
@@ -652,7 +653,8 @@ fn upstream_responses_are_normalized_to_openai_chat() {
             "usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}
         }),
         "gemini-public",
-    );
+    )
+    .unwrap();
     assert_eq!(gemini["choices"][0]["message"]["content"], "hello");
     assert_eq!(gemini["usage"]["total_tokens"], 5);
     let claude = claude_to_chat(

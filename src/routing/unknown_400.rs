@@ -59,6 +59,9 @@ impl Budget {
     pub(crate) fn pending(&self) -> bool {
         self.pending
     }
+    pub(crate) fn sent(&self) -> usize {
+        self.sent
+    }
     /// Global 400 allowance is independent of AUTO_RETRY for other failures.
     /// Cooling/skipped channels do not spend the allowance.
     pub(crate) fn scan_limit(&self, ordinary_limit: usize, providers: usize) -> usize {

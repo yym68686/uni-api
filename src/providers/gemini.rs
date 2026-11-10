@@ -895,7 +895,8 @@ pub(crate) fn apply_gemini_request_controls(
 
 pub(crate) fn decode_gemini_thought_signature(call_id: &str) -> Option<String> {
     let encoded = call_id.strip_prefix("call_")?.split('.').next()?;
-    if encoded.is_empty() || encoded.len() > 90_000 {
+    if encoded.is_empty() || encoded.len() > super::gemini_tools::MAX_LEGACY_SIGNATURE_ENCODED_BYTES
+    {
         return None;
     }
     let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
@@ -903,7 +904,7 @@ pub(crate) fn decode_gemini_thought_signature(call_id: &str) -> Option<String> {
         .decode(encoded.as_bytes())
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes()))
         .ok()?;
-    (decoded.len() <= 64 * 1024)
+    (decoded.len() <= super::gemini_tools::MAX_SIGNATURE_BYTES)
         .then(|| String::from_utf8(decoded).ok())
         .flatten()
 }
@@ -963,9 +964,16 @@ pub(crate) fn cache_gemini_image_thought_signature(encoded: &str, signature: &st
     }
 }
 
-pub(crate) fn gemini_call_id(signature: Option<&str>, fallback_index: usize) -> String {
-    signature
-        .filter(|signature| !signature.is_empty() && signature.len() <= 64 * 1024)
+pub(crate) fn gemini_call_id(
+    signature: Option<&str>,
+    fallback_index: usize,
+) -> Result<String, String> {
+    if signature.is_some_and(|signature| signature.len() > super::gemini_tools::MAX_SIGNATURE_BYTES)
+    {
+        return Err("Gemini thought signature exceeds its bounded capacity".into());
+    }
+    Ok(signature
+        .filter(|signature| !signature.is_empty())
         .map(|signature| {
             format!(
                 "call_{}.{}",
@@ -973,10 +981,10 @@ pub(crate) fn gemini_call_id(signature: Option<&str>, fallback_index: usize) -> 
                 fallback_index
             )
         })
-        .unwrap_or_else(|| format!("call_{fallback_index}"))
+        .unwrap_or_else(|| format!("call_{fallback_index}")))
 }
 
-pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Value {
+pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Result<Value, String> {
     let candidate = value
         .get("candidates")
         .and_then(Value::as_array)
@@ -1018,7 +1026,7 @@ pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Value {
                     .or_else(|| part.get("thought_signature"))
                     .and_then(Value::as_str),
                 tool_calls.len() + 1,
-            );
+            )?;
             tool_calls.push(json!({
                 "id":call_id,
                 "type":"function",
@@ -1046,14 +1054,14 @@ pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Value {
             .expect("chat message")
             .insert("tool_calls".into(), Value::Array(tool_calls));
     }
-    json!({
+    Ok(json!({
         "id":format!("chatcmpl-{}",unix_seconds()),
         "object":"chat.completion",
         "created":unix_seconds(),
         "model":model,
         "choices":[{"index":0,"message":message,"finish_reason":crate::protocols::gemini::chat_finish_reason(value.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("STOP"))}],
         "usage":crate::protocols::provider_stream::gemini_usage_to_chat(&usage),
-    })
+    }))
 }
 
 pub(crate) fn gemini_url(
@@ -1097,7 +1105,7 @@ mod gemini_model_turn_tests {
 
     #[test]
     fn omits_only_empty_tool_text_and_preserves_signed_function_and_parameters() {
-        let id = super::gemini_call_id(Some("opaque-signature"), 0);
+        let id = super::gemini_call_id(Some("opaque-signature"), 0).unwrap();
         for content in [json!(""), json!([{"type":"text","text":""}])] {
             let input = json!({"messages":[
                 {"role":"user","content":"start"},
@@ -1196,7 +1204,7 @@ mod gemini_model_turn_tests {
     #[test]
     fn supports_parallel_responses_calls_and_keeps_signatures() {
         let signature = "test-signature";
-        let id = super::gemini_call_id(Some(signature), 0);
+        let id = super::gemini_call_id(Some(signature), 0).unwrap();
         let input = json!({"input":[
             {"type":"message","role":"user","content":"start"},
             {"type":"function_call","call_id":id,"name":"one","arguments":"{}"},

@@ -65,25 +65,30 @@ pub(crate) fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+// Only fixed, gateway-generated diagnostics qualify for export. Arbitrary
+// preparation errors can contain URLs or caller values and must stay private.
+pub(crate) fn conversion_error_location(message: &str) -> Option<(&str, &str)> {
+    let (code @ ("gemini_tool_history" | "gemini_part"), rest) = message.split_once(": ")? else {
+        return None;
+    };
+    let (field, _) = rest.split_once(": ")?;
+    (!field.is_empty()
+        && field.len() <= 256
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"[]._-".contains(&b)))
+    .then_some((code, field))
+}
+
 pub fn json_error(status: StatusCode, message: &str) -> Response<Body> {
     let mut error = serde_json::json!({"message":message});
-    // These are fixed, gateway-generated conversion diagnostics. Do not invent
-    // field locations or codes for arbitrary upstream rejection messages.
-    if status == StatusCode::BAD_REQUEST {
-        if let Some((code @ ("gemini_tool_history" | "gemini_part"), rest)) =
-            message.split_once(": ")
-        {
-            if let Some((field, _)) = rest.split_once(": ") {
-                if field
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"[]._-".contains(&b))
-                {
-                    error["type"] = serde_json::json!("invalid_request_error");
-                    error["code"] = serde_json::json!(code);
-                    error["param"] = serde_json::json!(field);
-                }
-            }
-        }
+    if let Some((code, field)) = (status == StatusCode::BAD_REQUEST)
+        .then(|| conversion_error_location(message))
+        .flatten()
+    {
+        error["type"] = serde_json::json!("invalid_request_error");
+        error["code"] = serde_json::json!(code);
+        error["param"] = serde_json::json!(field);
     }
     (
         status,

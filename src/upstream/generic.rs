@@ -141,12 +141,21 @@ pub(crate) async fn next_generic_hedge_plan(
             .channel_enabled(&execution.api_key, &execution.request_model, &provider.name)
             .await
         {
+            emit_routing_skip(execution, attempt_index, &provider, "", "channel_disabled");
             continue;
         }
         if !unknown_400.may_dispatch(provider.name.as_ref()) {
+            emit_routing_skip(
+                execution,
+                attempt_index,
+                &provider,
+                "",
+                "retry_budget_route_excluded",
+            );
             continue;
         }
         let Some(original_model) = provider.models.get(&execution.request_model).cloned() else {
+            emit_routing_skip(execution, attempt_index, &provider, "", "model_not_mapped");
             continue;
         };
         let key_selection = if let Some(route) = execution
@@ -251,12 +260,12 @@ pub(crate) async fn next_generic_hedge_plan(
             Err(error) => {
                 *last_status = StatusCode::BAD_REQUEST;
                 *last_detail = error;
-                emit_routing_skip(
-                    execution,
+                RoutingTrace::from_execution(execution).skipped(
                     attempt_index,
                     &provider,
                     &original_model,
                     "attempt_build_failed",
+                    Some(last_detail),
                 );
                 continue;
             }
@@ -360,7 +369,49 @@ pub(crate) fn emit_routing_skip(
     original_model: &str,
     skip_reason: &str,
 ) {
-    crate::observability::telemetry::emit(json!({
+    RoutingTrace::from_execution(execution).skipped(
+        attempt_index,
+        provider,
+        original_model,
+        skip_reason,
+        None,
+    );
+}
+
+struct RoutingTrace<'a> {
+    request: &'a str,
+    trace: &'a str,
+    model: &'a str,
+    path: &'a str,
+    stream: bool,
+}
+
+impl<'a> RoutingTrace<'a> {
+    fn from_execution(execution: &'a AttemptLoop) -> Self {
+        Self {
+            request: &execution.request_id,
+            trace: &execution.trace_id,
+            model: &execution.request_model,
+            path: &execution.path,
+            stream: execution
+                .input
+                .payload
+                .as_ref()
+                .and_then(|v| v.get("stream"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    fn skipped(
+        &self,
+        index: usize,
+        provider: &Provider,
+        original_model: &str,
+        reason: &str,
+        error: Option<&str>,
+    ) {
+        let mut event = json!({
         "kind": "log",
         "fugue_table": "app_events",
         "event": "routing_attempt",
@@ -368,24 +419,29 @@ pub(crate) fn emit_routing_skip(
         "severity": "info",
         "source": "uni-api-ember",
         "message": "uni-api-ember generic routing attempt",
-        "request_id": execution.request_id,
-        "trace_id": execution.trace_id,
-        "path": execution.path,
-        "path_template": execution.path,
-        "route": format!("{} {}", execution.method, execution.path),
-        "method": execution.method.as_str(),
-        "model": execution.request_model,
+        "request_id": self.request,
+        "trace_id": self.trace,
+        "path": self.path,
+        "model": self.model,
         "provider": provider.name.as_ref(),
         "channel": provider.name.as_ref(),
-        "role": execution.api_key_role,
         "actual_model": original_model,
-        "attempt_id": format!("{}-r{}", execution.request_id, attempt_index + 1),
-        "attempt_index": attempt_index + 1,
+        "attempt_id": format!("{}-r{}", self.request, index + 1),
+        "attempt_index": index + 1,
         "attempt_outcome": "skipped",
-        "skip_reason": skip_reason,
-        "streaming": false,
+        "skip_reason": reason,
+        "phase": if reason == "attempt_build_failed" { "request_conversion" } else { "provider_selection" },
+        "streaming": self.stream,
         "rust_generic_data_plane": true,
-    }));
+        });
+        if let Some((message, (code, field))) = error.and_then(|message| {
+            crate::transport::http::conversion_error_location(message)
+                .map(|location| (message, location))
+        }) {
+            event["error"] = json!({"error_code":code,"error_param":field,"error_message":message.chars().take(1024).collect::<String>()});
+        }
+        crate::observability::telemetry::emit(event);
+    }
 }
 
 pub(crate) fn spawn_generic_hedge_attempt(
@@ -429,6 +485,7 @@ pub(crate) async fn run_hedged_attempt_loop(
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
+    let mut last_response_route = None;
 
     if let Some(plan) = next_generic_hedge_plan(
         &execution,
@@ -572,7 +629,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                         "terminal": "hedge_winner",
                         "snapshot_revision": execution.context.snapshot.revision.as_ref(),
                         "final_facts": final_facts,
-                        "attempt_count": cursor,
+                        "attempt_count": unknown_400.sent(),
                         "winner_attempt_index": context.attempt_index + 1,
                         "hedge_trigger_count": trigger_count,
                         "hedge_cancelled_attempt_count": cancelled_count,
@@ -622,8 +679,16 @@ pub(crate) async fn run_hedged_attempt_loop(
                         execution.request_model
                     );
                     last_upstream_response = None;
+                    last_response_route = None;
                 } else {
                     last_detail = failure.detail.clone();
+                    last_response_route = failure.response.as_ref().map(|_| {
+                        (
+                            context.provider.name.to_string(),
+                            context.original_model.clone(),
+                            failure.observed_status(),
+                        )
+                    });
                     last_upstream_response = failure.response.take();
                 }
                 execution.state.persistence.record_channel(ChannelStat {
@@ -717,14 +782,30 @@ pub(crate) async fn run_hedged_attempt_loop(
         }
     }
 
-    if let Some(response) = last_upstream_response.as_ref() {
-        last_status = response.status();
-    }
+    let response = last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail));
+    let mut final_facts =
+        crate::observability::outcome::FinalFacts::exhausted(response.status().as_u16());
+    final_facts.upstream_http_status = last_response_route.as_ref().map(|route| route.2);
     execution.state.persistence.record_request(RequestStat {
-        terminal_kind: Some("unknown".into()),
+        terminal_kind: Some(final_facts.terminal.label().into()),
+        provider: last_response_route
+            .as_ref()
+            .map(|route| route.0.clone())
+            .unwrap_or_default(),
+        upstream_model: last_response_route
+            .as_ref()
+            .map(|route| route.1.clone())
+            .unwrap_or_default(),
+        stream: execution
+            .input
+            .payload
+            .as_ref()
+            .and_then(|v| v.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         is_flagged: true,
         failure_reason: Some("no_successful_channel".into()),
-        status: last_status.as_u16(),
+        status: response.status().as_u16(),
         request_id: execution.request_id,
         trace_id: execution.trace_id,
         endpoint: execution.path,
@@ -736,16 +817,16 @@ pub(crate) async fn run_hedged_attempt_loop(
             "runtime":"rust",
             "terminal":"hedge_exhausted",
             "snapshot_revision": execution.context.snapshot.revision.as_ref(),
-            "final_facts": crate::observability::outcome::FinalFacts::exhausted(last_status.as_u16()),
+            "final_facts": final_facts,
             "unknown_400_retry_used": unknown_400.used(),
-            "attempt_count": cursor,
+            "attempt_count": unknown_400.sent(),
             "hedge_trigger_count": trigger_count,
             "hedge_cancelled_attempt_count": cancelled_count,
         })
         .to_string(),
         ..RequestStat::default()
     });
-    last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
+    response
 }
 
 pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
@@ -783,6 +864,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
+    let mut last_response_route = None;
     let mut upstream_failed = false;
 
     let mut cursor = 0;
@@ -794,6 +876,18 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let mut scan_limit = unknown_400.scan_limit(max_attempts, providers.len());
     let mut cache_fallback = None;
     let mut dispatched = 0usize;
+    let routing_trace = RoutingTrace {
+        request: &request_id,
+        trace: &trace_id,
+        model: &request_model,
+        path: &path,
+        stream: input
+            .payload
+            .as_ref()
+            .and_then(|v| v.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
     while (cursor < scan_limit || cache_fallback.is_some())
         && unknown_400.can_attempt(max_attempts)
         && (!compaction_request || cursor < providers.len())
@@ -811,15 +905,31 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             .channel_enabled(&api_key, &request_model, &provider.name)
             .await
         {
+            routing_trace.skipped(attempt_index, &provider, "", "channel_disabled", None);
             continue;
         }
         if compaction_request && compaction_visited.contains(provider.name.as_ref()) {
+            routing_trace.skipped(
+                attempt_index,
+                &provider,
+                "",
+                "compaction_already_visited",
+                None,
+            );
             continue;
         }
         if !unknown_400.may_dispatch(provider.name.as_ref()) {
+            routing_trace.skipped(
+                attempt_index,
+                &provider,
+                "",
+                "retry_budget_route_excluded",
+                None,
+            );
             continue;
         }
         let Some(original_model) = provider.models.get(&request_model).cloned() else {
+            routing_trace.skipped(attempt_index, &provider, "", "model_not_mapped", None);
             continue;
         };
         let key_selection = if let Some(route) = video_task_route
@@ -838,13 +948,32 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             ProviderKeySelection::NoProviderKey => {
                 last_status = StatusCode::BAD_GATEWAY;
                 last_detail = format!("Provider {} has no API key", provider.name);
+                routing_trace.skipped(
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    "provider_has_no_api_keys",
+                    None,
+                );
                 continue;
             }
-            ProviderKeySelection::ChannelCooling | ProviderKeySelection::AllKeysCooling => {
+            cooling @ (ProviderKeySelection::ChannelCooling
+            | ProviderKeySelection::AllKeysCooling) => {
                 if !upstream_failed {
                     last_status = StatusCode::TOO_MANY_REQUESTS;
                     last_detail = "All matching provider routes are cooling down".into();
                 }
+                routing_trace.skipped(
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    if matches!(cooling, ProviderKeySelection::ChannelCooling) {
+                        "provider_channel_cooldown"
+                    } else {
+                        "provider_keys_cooldown"
+                    },
+                    None,
+                );
                 continue;
             }
         };
@@ -870,6 +999,13 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 Err(error) => {
                     last_status = StatusCode::UNAUTHORIZED;
                     last_detail = error;
+                    routing_trace.skipped(
+                        attempt_index,
+                        &provider,
+                        &original_model,
+                        "codex_oauth_resolution_failed",
+                        None,
+                    );
                     continue;
                 }
             }
@@ -890,6 +1026,13 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             Err(error) => {
                 last_status = StatusCode::BAD_REQUEST;
                 last_detail = error;
+                routing_trace.skipped(
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    "attempt_build_failed",
+                    Some(&last_detail),
+                );
                 continue;
             }
         };
@@ -1309,8 +1452,16 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     last_detail =
                         format!("All configured providers failed for model {request_model}");
                     last_upstream_response = None;
+                    last_response_route = None;
                 } else {
                     last_detail = failure.detail.clone();
+                    last_response_route = failure.response.as_ref().map(|_| {
+                        (
+                            provider.name.to_string(),
+                            original_model.clone(),
+                            failure.observed_status(),
+                        )
+                    });
                     last_upstream_response = failure.response.take();
                 }
                 state.persistence.record_channel(ChannelStat {
@@ -1385,11 +1536,17 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         }
     }
 
+    let response = last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail));
+    let mut final_facts =
+        crate::observability::outcome::FinalFacts::exhausted(response.status().as_u16());
+    final_facts.upstream_http_status = last_response_route.as_ref().map(|route| route.2);
     state.persistence.record_request(RequestStat {
-        terminal_kind: Some("unknown".into()),
+        terminal_kind: Some(final_facts.terminal.label().into()),
+        provider: last_response_route.as_ref().map(|route| route.0.clone()).unwrap_or_default(),
+        upstream_model: last_response_route.as_ref().map(|route| route.1.clone()).unwrap_or_default(),
         is_flagged: true,
         failure_reason: Some("no_successful_channel".into()),
-        status: last_status.as_u16(),
+        status: response.status().as_u16(),
         stream: input
             .payload
             .as_ref()
@@ -1403,10 +1560,10 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         process_time: started.elapsed().as_secs_f64(),
         model: request_model,
         api_key,
-        timing_spans: json!({"runtime":"rust","snapshot_revision":snapshot_revision,"final_facts":crate::observability::outcome::FinalFacts::exhausted(last_status.as_u16()),"terminal":"route_exhausted","unknown_400_retry_used":unknown_400.used()}).to_string(),
+        timing_spans: json!({"runtime":"rust","snapshot_revision":snapshot_revision,"final_facts":final_facts,"terminal":"route_exhausted","unknown_400_retry_used":unknown_400.used(),"attempt_count":dispatched}).to_string(),
         ..RequestStat::default()
     });
-    last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
+    response
 }
 
 pub(crate) struct AttemptSuccess {
@@ -2192,7 +2349,15 @@ pub(crate) async fn send_attempt(
     let normalized = match prepared.adapter {
         ResponseAdapter::Search => normalize_search_response(&prepared.url, &upstream),
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
-        ResponseAdapter::GeminiToChat => gemini_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::GeminiToChat if native_gemini => upstream,
+        ResponseAdapter::GeminiToChat => gemini_to_chat(&upstream, &prepared.original_model)
+            .map_err(|detail| AttemptFailure {
+                failure_reason: "protocol_error".into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?,
         ResponseAdapter::ClaudeToChat => claude_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::CohereToChat => cohere_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::CloudflareToChat => {
@@ -2213,7 +2378,13 @@ pub(crate) async fn send_attempt(
         ),
         ResponseAdapter::Passthrough => upstream,
     };
-    let measured_usage = usage(&normalized);
+    let measured_usage = if native_gemini {
+        usage(
+            &json!({"usage": provider_stream::gemini_usage_to_chat(normalized.get("usageMetadata").unwrap_or(&Value::Null))}),
+        )
+    } else {
+        usage(&normalized)
+    };
     let normalized = if prepared.downstream_protocol == DownstreamProtocol::Gemini {
         preserved_gemini.unwrap_or_else(|| {
             crate::protocols::gemini::response_from_chat(&normalized, &prepared.request_model)

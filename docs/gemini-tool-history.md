@@ -13,6 +13,14 @@ clients must return it unchanged as the tool result's call ID. A native ID witho
 a signature is also enveloped to avoid mistaking native IDs for legacy signature
 encodings. Existing `call_<base64url(signature)>.<ordinal>` IDs remain accepted.
 
+Tool thought signatures are bounded to 1 MiB and native tool IDs to 64 KiB.
+New envelopes, legacy IDs and explicit signature metadata share the same
+signature budget. The encoded envelope bound includes JSON escaping and Base64
+expansion, so every successfully emitted identity can be read back unchanged.
+Oversized upstream identities fail conversion explicitly; signatures are never
+silently omitted or truncated. The existing aggregate streaming Part buffer and
+request/response body budgets still apply independently.
+
 Explicit `thoughtSignature`, `thought_signature` and
 `extra_content.google.thought_signature` on a Chat tool call or Responses
 function_call are accepted. Conflicting or malformed metadata is rejected. The
@@ -43,6 +51,13 @@ invalid function arguments and interruption by another message are rejected
 before sending a malformed Gemini request. Local 400 errors expose
 `code=gemini_tool_history`, `type=invalid_request_error` and a `param` field path;
 they do not echo arguments, results, signatures or caller IDs.
+
+Pre-dispatch conversion failures produce `routing_attempt` trace facts with
+`attempt_outcome=skipped`, `skip_reason=attempt_build_failed`,
+`phase=request_conversion`, the candidate index, and safe error code/field path.
+These are selection decisions, not dispatched attempts, billable requests or
+provider cooldown evidence. Final HTTP facts describe the response actually
+returned, even when a later candidate fails local conversion.
 
 ## Parts and errors
 

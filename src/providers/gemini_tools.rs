@@ -6,16 +6,37 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 const ID_PREFIX: &str = "call_g2_";
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 1024 * 1024;
+const MAX_NATIVE_ID_BYTES: usize = 64 * 1024;
+// JSON can escape each input byte as six bytes. Bound decoding before allocating,
+// while accepting every envelope the encoder can produce from valid inputs.
+const MAX_ENVELOPE_BYTES: usize = 6 * (MAX_SIGNATURE_BYTES + MAX_NATIVE_ID_BYTES) + 16;
+const MAX_ENCODED_ENVELOPE_BYTES: usize = ((MAX_ENVELOPE_BYTES + 2) / 3) * 4;
+pub(crate) const MAX_LEGACY_SIGNATURE_ENCODED_BYTES: usize = ((MAX_SIGNATURE_BYTES + 2) / 3) * 4;
 
-pub(crate) fn call_id(native: Option<&str>, signature: Option<&str>, ordinal: usize) -> String {
-    match (
-        native.filter(|s| !s.is_empty()),
-        signature.filter(|s| !s.is_empty()),
-    ) {
-        (Some(native), signature) => format!(
+fn validate_identity(native: Option<&str>, signature: Option<&str>) -> Result<(), String> {
+    if native.is_some_and(|id| id.is_empty() || id.len() > MAX_NATIVE_ID_BYTES) {
+        return Err("Gemini native tool id exceeds its bounded capacity".into());
+    }
+    if signature.is_some_and(|sig| sig.is_empty() || sig.len() > MAX_SIGNATURE_BYTES) {
+        return Err("Gemini thought signature exceeds its bounded capacity".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn call_id(
+    native: Option<&str>,
+    signature: Option<&str>,
+    ordinal: usize,
+) -> Result<String, String> {
+    let native = native.filter(|s| !s.is_empty());
+    let signature = signature.filter(|s| !s.is_empty());
+    validate_identity(native, signature)?;
+    match (native, signature) {
+        (Some(native), signature) => Ok(format!(
             "{ID_PREFIX}{}.{ordinal}",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&(native, signature)).unwrap())
-        ),
+        )),
         (None, signature) => super::gemini::gemini_call_id(signature, ordinal),
     }
 }
@@ -25,22 +46,18 @@ fn identity(id: &str) -> Result<(Option<String>, Option<String>), String> {
         let (encoded, ordinal) = encoded
             .rsplit_once('.')
             .ok_or("invalid Gemini tool identity")?;
-        if encoded.len() > 180_000 || ordinal.parse::<usize>().is_err() {
+        if encoded.len() > MAX_ENCODED_ENVELOPE_BYTES || ordinal.parse::<usize>().is_err() {
             return Err("invalid Gemini tool identity".into());
         }
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded)
             .map_err(|_| "invalid Gemini tool identity")?;
-        let (native, signature): (String, Option<String>) =
-            serde_json::from_slice(&bytes).map_err(|_| "invalid Gemini tool identity")?;
-        if native.is_empty()
-            || native.len() > 64 * 1024
-            || signature
-                .as_ref()
-                .is_some_and(|signature| signature.is_empty() || signature.len() > 64 * 1024)
-        {
+        if bytes.len() > MAX_ENVELOPE_BYTES {
             return Err("invalid Gemini tool identity".into());
         }
+        let (native, signature): (String, Option<String>) =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid Gemini tool identity")?;
+        validate_identity(Some(&native), signature.as_deref())?;
         return Ok((Some(native), signature));
     }
     // Legacy IDs always contain the numeric ordinal. A normal call_1 is not a signature.
@@ -52,6 +69,7 @@ fn identity(id: &str) -> Result<(Option<String>, Option<String>), String> {
             return Ok((None, Some(signature)));
         }
     }
+    validate_identity(Some(id), None)?;
     Ok((Some(id.to_owned()), None))
 }
 
@@ -81,8 +99,7 @@ pub(crate) fn call_part(tool: &Value, field: &str) -> Result<Value, String> {
     if tool.get("type").and_then(Value::as_str) != Some("function") {
         return Err(error(field, "only function tool calls can be converted"));
     }
-    let (native, mut signature) =
-        identity(id).map_err(|_| error(field, "invalid Gemini tool identity"))?;
+    let (native, mut signature) = identity(id).map_err(|message| error(field, &message))?;
     for value in [
         tool.get("thoughtSignature"),
         tool.get("thought_signature"),
@@ -93,7 +110,7 @@ pub(crate) fn call_part(tool: &Value, field: &str) -> Result<Value, String> {
     {
         let actual = value
             .as_str()
-            .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
+            .filter(|s| !s.is_empty() && s.len() <= MAX_SIGNATURE_BYTES)
             .ok_or_else(|| {
                 error(
                     field,
@@ -252,7 +269,7 @@ mod tests {
             (Some("native-1"), None),
             (None, None),
         ] {
-            let id = call_id(native, sig, 1);
+            let id = call_id(native, sig, 1).unwrap();
             let part = call_part(&tool(&id), "tool_calls[0]").unwrap();
             assert_eq!(part.get("thoughtSignature").and_then(Value::as_str), sig);
             assert_eq!(
@@ -279,7 +296,7 @@ mod tests {
                 "opaque"
             );
         }
-        let mut call = tool(&call_id(Some("native"), Some("opaque"), 1));
+        let mut call = tool(&call_id(Some("native"), Some("opaque"), 1).unwrap());
         call["thoughtSignature"] = json!("different");
         assert!(call_part(&call, "tool_calls[0]")
             .unwrap_err()
@@ -312,6 +329,49 @@ mod tests {
             let message = call_part(&call, "tool_calls[0]").unwrap_err();
             assert!(!message.contains("not-json-secret"));
         }
+    }
+
+    #[test]
+    fn long_signatures_round_trip_in_every_identity_form() {
+        for size in [65536, 65537, 76928, MAX_SIGNATURE_BYTES] {
+            let signature = "s".repeat(size);
+            for native in [None, Some("native-1")] {
+                let id = call_id(native, Some(&signature), 1).unwrap();
+                let part = call_part(&tool(&id), "tool_calls[0]").unwrap();
+                assert_eq!(part["thoughtSignature"], signature);
+            }
+            for name in ["thoughtSignature", "thought_signature"] {
+                let mut call = tool("native-1");
+                call[name] = json!(signature);
+                assert_eq!(
+                    call_part(&call, "tool_calls[0]").unwrap()["thoughtSignature"],
+                    signature
+                );
+            }
+        }
+        // Exercise maximum JSON escaping, not just ASCII signatures.
+        let signature = "\u{0}".repeat(MAX_SIGNATURE_BYTES);
+        let native = "\u{0}".repeat(MAX_NATIVE_ID_BYTES);
+        let id = call_id(Some(&native), Some(&signature), 1).unwrap();
+        let part = call_part(&tool(&id), "tool_calls[0]").unwrap();
+        assert_eq!(part["thoughtSignature"], signature);
+        assert_eq!(part["functionCall"]["id"], native);
+    }
+
+    #[test]
+    fn oversized_signatures_are_rejected_without_silent_loss() {
+        let signature = "s".repeat(MAX_SIGNATURE_BYTES + 1);
+        for native in [None, Some("native-1")] {
+            assert!(call_id(native, Some(&signature), 1).is_err());
+        }
+        let encoded =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&("native-1", &signature)).unwrap());
+        let call = tool(&format!("{ID_PREFIX}{encoded}.1"));
+        assert!(call_part(&call, "tool_calls[0]").is_err());
+        let mut call = tool("native-1");
+        call["thoughtSignature"] = json!(signature);
+        assert!(call_part(&call, "tool_calls[0]").is_err());
+        assert!(call_id(Some(&"n".repeat(MAX_NATIVE_ID_BYTES + 1)), None, 1).is_err());
     }
 
     #[test]
