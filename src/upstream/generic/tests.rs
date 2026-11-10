@@ -60,6 +60,25 @@ const ANIMATED_GIF_BASE64: &str =
     "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQACgAAACwAAAAAAgACAIEAAP8AAAAAAAAAAAAIBgABCAQQEAA7";
 
 #[test]
+fn observed_http_survives_routing_status_remapping() {
+    for (reason, returned, observed) in [
+        ("upstream_http_403", 401, 403),
+        ("upstream_http_502", 413, 502),
+        ("upstream_400_sse", 400, 200),
+        ("protocol_error", 502, 502),
+    ] {
+        let failure = super::AttemptFailure {
+            failure_reason: reason.into(),
+            status: axum::http::StatusCode::from_u16(returned).unwrap(),
+            detail: String::new(),
+            upstream_url: String::new(),
+            response: None,
+        };
+        assert_eq!(failure.observed_status(), observed);
+    }
+}
+
+#[test]
 fn image_inspection_accepts_single_frame_gif() {
     let bytes = BASE64.decode(SINGLE_FRAME_GIF_BASE64).unwrap();
     assert_eq!(

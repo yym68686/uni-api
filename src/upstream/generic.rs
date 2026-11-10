@@ -1615,7 +1615,13 @@ impl AttemptFailure {
         if self.failure_reason == "upstream_400_sse" {
             200
         } else {
-            self.status.as_u16()
+            // The routing policy may remap the returned status. HTTP failures
+            // carry the immutable wire status in this gateway-generated code.
+            self.failure_reason
+                .strip_prefix("upstream_http_")
+                .and_then(|status| status.parse::<u16>().ok())
+                .filter(|status| (100..=599).contains(status))
+                .unwrap_or(self.status.as_u16())
         }
     }
     fn policy(

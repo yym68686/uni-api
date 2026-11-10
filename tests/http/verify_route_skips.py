@@ -21,9 +21,11 @@ class Mock(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers['Content-Length']))
         role = self.path.split('/')[1]
         self.server.hits.append(role)
-        status = 403 if role == 'r16' else 401
+        status = 403 if role == 'r16' or self.server.remapped else 401
         raw = json.dumps({'error': {'message': 'fixture quota' if status == 403 else 'Invalid token.',
                                    'type': 'upstream_error'}}).encode()
+        if role == 'r19' and self.server.remapped:
+            raw = json.dumps({'error': {'message': 'API key expired'}}).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(raw)))
@@ -31,9 +33,10 @@ class Mock(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-def verify(binary, stream, hedging, local_only=False):
+def verify(binary, stream, hedging, local_only=False, remapped=False):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Mock)
     server.facts, server.hits = [], []
+    server.remapped = remapped
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='uni-route-skips-') as directory:
         root, port = Path(directory), free_port()
@@ -90,7 +93,7 @@ def verify(binary, stream, hedging, local_only=False):
                 execution = next(f for f in facts if f.get('stage') == 'request_final_facts')
                 final = execution['trace_detail']['final_facts']
                 assert final['downstream_http_status'] == status, final
-                assert final['upstream_http_status'] == (None if local_only else 401), final
+                assert final['upstream_http_status'] == (None if local_only else 403 if remapped else 401), final
                 assert requests[0]['provider'] == ('' if local_only else 'r19'), requests
                 assert server.hits == ([] if local_only else ['r16', 'r19']), server.hits
                 assert len([f for f in facts if f['kind'] == 'dispatch']) == (0 if local_only else 2)
@@ -105,7 +108,7 @@ def verify(binary, stream, hedging, local_only=False):
                     assert skip['stream'] == stream, skip
                 for secret in ['fixture-client', 'fixture-upstream-secret', 'private fixture result', 'call_g2_invalid.1']:
                     assert secret not in json.dumps(facts), secret
-                print(f'PASS route skips: stream={stream}, hedging={hedging}, local_only={local_only}; HTTP={status}, sends={len(server.hits)}, skips={len(skips)}')
+                print(f'PASS route skips: stream={stream}, hedging={hedging}, local_only={local_only}, remapped={remapped}; HTTP={status}, sends={len(server.hits)}, skips={len(skips)}')
             finally:
                 process.terminate()
                 try: process.wait(timeout=5)
@@ -119,3 +122,4 @@ if __name__ == '__main__':
     for stream, hedging in [(True, False), (False, False), (False, True)]:
         verify(binary, stream, hedging)
         verify(binary, stream, hedging, local_only=True)
+        verify(binary, stream, hedging, remapped=True)
