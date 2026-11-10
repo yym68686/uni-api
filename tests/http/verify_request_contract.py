@@ -44,6 +44,9 @@ def verify():
             for row in completed_facts:
                 assert row['terminal_kind'] == 'completed', row
                 assert row['response_completed'] is True, row
+            final = [row for row in peer.facts if row.get('kind') == 'trace'
+                     and row.get('stage') == 'request_final_facts' and row.get('request_id', '').endswith('-7')]
+            assert len(final) == 1 and final[0]['trace_detail']['final_facts']['terminal'] == 'completed', final
             with gateway(prefix+'-'+engine+'-policy', mixed=mixed, engine=engine,
                          provider_preferences={'responses_stream_commit_policy': 'completed_usage'}) as (call, _):
                 row = call('tool-start-fail')
@@ -88,6 +91,17 @@ def verify():
             row = call('ok')
             assert {k.lower(): v for k, v in row['hits'][0]['headers'].items()}['x-config-marker'] == 'after', row
         # Runtime disable remains dynamic even though configuration is pinned.
+        with gateway(prefix+'-reenable', mixed=mixed) as (call, peer):
+            state = control(peer, 'GET', '/v1/channel-controls')
+            control(peer, 'POST', '/v1/channel-controls', {'revision': state['revision'],
+                'action': 'set', 'disabled': ['fallback'] + (['unused'] if mixed else []), 'order': [], 'api_key_id': '', 'model': ''})
+            def reenable(role, case):
+                if role == 'first':
+                    state = control(peer, 'GET', '/v1/channel-controls')
+                    control(peer, 'POST', '/v1/channel-controls', {'revision': state['revision'], 'action': 'reset'})
+            peer.on_request = reenable
+            row = call('done-only')
+            assert roles(row) == ['first', 'fallback'] and row['wire_completed'], row
         with gateway(prefix+'-disable', mixed=mixed) as (call, peer):
             def disable(role, case):
                 if role == 'first':

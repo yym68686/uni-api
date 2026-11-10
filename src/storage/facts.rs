@@ -387,6 +387,21 @@ pub fn request_event(s: &crate::storage::database::RequestStat) -> Value {
     json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"terminal_kind":s.terminal_kind,"failure_reason":s.failure_reason,"response_completed":s.response_completed,"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
 }
 
+// Preserve the shared execution facts even when the local SQL backend is off.
+// Decode into the typed contract rather than exporting arbitrary timing fields.
+pub(crate) fn execution_event(s: &crate::storage::database::RequestStat) -> Option<Value> {
+    let timing: Value = serde_json::from_str(&s.timing_spans).ok()?;
+    let facts: crate::observability::outcome::FinalFacts =
+        serde_json::from_value(timing.get("final_facts")?.clone()).ok()?;
+    let revision = timing
+        .get("snapshot_revision")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit()));
+    Some(
+        json!({"schema":1,"kind":"trace","event_id":new_event_id("execution"),"instance_id":instance_id(),"at_ms":now_ms(),"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",hex_sha(&s.api_key)),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"stream":s.stream,"status":s.status,"stage":"request_final_facts","trace_detail":{"final_facts":facts,"snapshot_revision":revision}}),
+    )
+}
+
 pub fn attempt_event(s: &crate::storage::database::ChannelStat) -> Value {
     let at = now_ms();
     let attempt_id = if s.attempt_id.is_empty() {
@@ -454,6 +469,22 @@ mod tests {
     use super::*;
     use crate::storage::database::ChannelStat;
     use crate::storage::database::RequestStat;
+
+    #[test]
+    fn execution_facts_export_only_typed_contract_and_snapshot_hash() {
+        let stat = RequestStat {
+            timing_spans: json!({"snapshot_revision":"a".repeat(64),"secret":"do-not-export","final_facts":{"terminal":"semantic_failure","response_completed":false,"business_committed":true,"upstream_http_status":200,"downstream_http_status":200,"semantic_status":503,"secret":"do-not-export"}}).to_string(),
+            ..Default::default()
+        };
+        let event = execution_event(&stat).unwrap();
+        assert_eq!(event["stage"], "request_final_facts");
+        assert_eq!(event["trace_detail"]["final_facts"]["semantic_status"], 503);
+        assert_eq!(
+            event["trace_detail"]["final_facts"]["upstream_http_status"],
+            200
+        );
+        assert!(!event.to_string().contains("do-not-export"));
+    }
 
     #[test]
     fn repeated_caller_ids_do_not_collide_and_replays_keep_the_created_fact() {

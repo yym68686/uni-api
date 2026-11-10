@@ -103,6 +103,14 @@ impl Default for Controls {
 }
 
 impl Controls {
+    pub(crate) fn routing_intent(&self) -> Self {
+        let mut intent = self.routing_rules();
+        for rule in intent.rules.values_mut() {
+            rule.disabled.clear();
+        }
+        intent
+    }
+
     // Scheduling only needs routing rules, never full provider intent or audit
     // payloads. Keep request-path work independent of settings history size.
     pub(crate) fn routing_rules(&self) -> Self {

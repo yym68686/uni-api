@@ -207,7 +207,7 @@ impl GatewayRuntime {
         let base = self.current.read().await.clone();
         let controls = self.channel_controls.read().await;
         runtime.request_snapshot = Some(base.map(|snapshot| controls.overlay(snapshot)));
-        runtime.request_rules = Some(Arc::new(controls.routing_rules()));
+        runtime.request_rules = Some(Arc::new(controls.routing_intent()));
         runtime
     }
 

@@ -129,7 +129,14 @@ impl GatewayRuntime {
         let providers = self
             .schedule_providers(&api_key, &facts.model, providers)
             .await;
-        if providers.is_empty() {
+        let all_disabled = {
+            let controls = self.channel_controls.read().await;
+            let key = crate::routing::catalog::key_id(&api_key.token);
+            providers
+                .iter()
+                .all(|provider| controls.disabled(&key, &facts.model, &provider.name))
+        };
+        if providers.is_empty() || all_disabled {
             return Err(reject(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "All matching channels are temporarily disabled",

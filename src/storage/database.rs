@@ -162,6 +162,9 @@ impl Persistence {
     pub fn record_request(&self, stat: RequestStat) {
         if let Some(writer) = &self.fact_writer {
             writer.enqueue(crate::storage::facts::request_event(&stat));
+            if let Some(event) = crate::storage::facts::execution_event(&stat) {
+                writer.enqueue(event);
+            }
         }
         let Some(writer) = &self.writer else {
             return;

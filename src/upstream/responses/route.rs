@@ -852,7 +852,7 @@ impl ResponsesRoute {
         let final_facts = crate::observability::outcome::FinalFacts::native(
             outcome,
             status,
-            self.stream && self.endpoint == "/v1/responses",
+            self.endpoint == "/v1/responses",
         );
         if self.final_emitted {
             return;
@@ -1010,7 +1010,7 @@ impl ResponsesRoute {
         let final_facts = crate::observability::outcome::FinalFacts::native(
             outcome,
             outcome_status(outcome, 502),
-            self.stream && self.endpoint == "/v1/responses",
+            self.endpoint == "/v1/responses",
         );
         self.persistence.record_channel(ChannelStat {
             failure_reason: metric_failure_reason(

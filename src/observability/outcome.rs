@@ -1,8 +1,8 @@
 //! Common final facts; transport status is never inferred from semantic status.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TerminalKind {
     Completed,
@@ -45,7 +45,7 @@ impl TerminalKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FinalFacts {
     pub terminal: TerminalKind,
     pub response_completed: Option<bool>,
@@ -60,16 +60,12 @@ impl FinalFacts {
         value: Option<&Value>,
         status: u16,
         downstream_status: u16,
-        stream: bool,
+        _stream: bool,
     ) -> Self {
         let terminal = value
             .and_then(|v| v["kind"].as_str())
             .map(TerminalKind::parse)
-            .unwrap_or(if stream {
-                TerminalKind::Unknown
-            } else {
-                TerminalKind::Completed
-            });
+            .unwrap_or(TerminalKind::Unknown);
         Self {
             terminal,
             response_completed: value.map(|_| terminal == TerminalKind::Completed),
@@ -91,11 +87,11 @@ impl FinalFacts {
         }
     }
 
-    pub fn native(value: &Value, semantic_status: u16, responses_stream: bool) -> Self {
+    pub fn native(value: &Value, semantic_status: u16, responses_protocol: bool) -> Self {
         let terminal = TerminalKind::parse(value["kind"].as_str().unwrap_or("unknown"));
         Self {
             terminal,
-            response_completed: responses_stream.then_some(terminal == TerminalKind::Completed),
+            response_completed: responses_protocol.then_some(terminal == TerminalKind::Completed),
             business_committed: value["committed"].as_bool(),
             upstream_http_status: value["upstream_status_code"]
                 .as_u64()
@@ -152,5 +148,24 @@ mod tests {
         assert_eq!(facts.upstream_http_status, Some(200));
         assert_eq!(facts.downstream_http_status, None);
         assert_eq!(facts.response_completed, Some(false));
+    }
+
+    #[test]
+    fn opaque_json_completion_remains_unknown_without_a_protocol_receipt() {
+        let facts = FinalFacts::buffered(None, 200, 200, false);
+        assert_eq!(facts.terminal, TerminalKind::Unknown);
+        assert_eq!(facts.response_completed, None);
+    }
+
+    #[test]
+    fn validated_buffered_responses_terminal_is_recorded_as_complete() {
+        let facts = FinalFacts::buffered(
+            Some(&serde_json::json!({"kind":"completed"})),
+            200,
+            200,
+            false,
+        );
+        assert_eq!(facts.terminal, TerminalKind::Completed);
+        assert_eq!(facts.response_completed, Some(true));
     }
 }
