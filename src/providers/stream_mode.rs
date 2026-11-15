@@ -40,7 +40,7 @@ pub(crate) fn responses_wire(engine: &str, url: &str) -> bool {
     engine.eq_ignore_ascii_case("codex")
         || (matches!(
             engine.to_ascii_lowercase().as_str(),
-            "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
+            "gpt" | "openrouter" | "requesty" | "azure" | "azure-databricks" | "cloudflare"
         ) && url.to_ascii_lowercase().contains("/responses"))
 }
 
@@ -66,6 +66,17 @@ mod tests {
             json!({"default":"follow_client","models":{"m":"stream_only"}}),
         ] {
             assert!(validate(&value).is_ok());
+        }
+    }
+
+    #[test]
+    fn responses_wire_covers_openai_compatible_gateways() {
+        for engine in ["gpt", "openrouter", "requesty"] {
+            assert!(responses_wire(engine, "https://example.test/v1/responses"));
+            assert!(!responses_wire(
+                engine,
+                "https://example.test/v1/chat/completions"
+            ));
         }
     }
 }
