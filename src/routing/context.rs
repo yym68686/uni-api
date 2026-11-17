@@ -45,6 +45,7 @@ pub(crate) struct ModerationReceipt;
 pub(crate) struct PreparedPayload {
     pub payload: Arc<Value>,
     pub observation: crate::transport::spool::SpoolObservation,
+    pub reservation: Arc<crate::runtime::resources::MemoryReservation>,
 }
 
 pub(crate) struct RequestContext {

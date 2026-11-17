@@ -8,9 +8,9 @@ use crate::protocols::responses::processor::inspect_terminal_frame;
 use crate::protocols::responses::processor::selective_rewrite_candidate;
 use crate::protocols::responses::processor::terminal_candidate;
 use crate::protocols::responses::processor::ResponsesProcessor;
+use crate::protocols::sse::max_event_bytes;
 use crate::protocols::sse::SseDecoder;
 use crate::protocols::sse::SseFrame;
-use crate::protocols::sse::UNLIMITED_SSE_EVENT_BYTES;
 
 pub(crate) mod prepare;
 pub(crate) mod route;
@@ -105,7 +105,7 @@ fn default_commit_policy() -> String {
 }
 
 fn default_max_event_bytes() -> usize {
-    UNLIMITED_SSE_EVENT_BYTES
+    max_event_bytes()
 }
 
 fn default_max_precommit_items() -> usize {
@@ -2545,14 +2545,7 @@ async fn complete_failure(
 
 fn downstream_write_timeout() -> Duration {
     static TIMEOUT: OnceLock<Duration> = OnceLock::new();
-    *TIMEOUT.get_or_init(|| {
-        let seconds = std::env::var("RUST_DOWNSTREAM_WRITE_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(30.0);
-        Duration::from_secs_f64(seconds)
-    })
+    *TIMEOUT.get_or_init(crate::transport::body::downstream_write_timeout)
 }
 
 struct GuardedBodyStream {
@@ -2916,7 +2909,7 @@ mod tests {
 
     #[test]
     fn decoder_zero_limit_accepts_frames_beyond_the_legacy_bound() {
-        let mut decoder = SseDecoder::new(UNLIMITED_SSE_EVENT_BYTES);
+        let mut decoder = SseDecoder::new(0);
         let payload = vec![b'x'; 8 * 1024 * 1024 + 1];
         assert!(decoder.feed(b"data: ").unwrap().is_empty());
         assert!(decoder.feed(&payload).unwrap().is_empty());
@@ -2929,10 +2922,7 @@ mod tests {
     fn decoder_explicit_limit_remains_enforced() {
         let mut decoder = SseDecoder::new(8);
         let error = decoder.feed(b"data: too-large\n\n").unwrap_err();
-        assert_eq!(
-            error,
-            "Responses upstream SSE event exceeds the configured limit"
-        );
+        assert!(error.contains("exceeds the configured limit"));
     }
 
     #[test]

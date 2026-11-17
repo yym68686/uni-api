@@ -16,6 +16,31 @@ mod admission_tests {
     use super::*;
 
     #[tokio::test]
+    async fn oversized_429_wait_falls_back_without_panicking_or_disabling_all_keys() {
+        let runtime = GatewayRuntime::new();
+        let provider = crate::config::snapshot::runtime_provider(
+            serde_json::from_value(serde_json::json!({"name":"retry-range", "base_url":"http://127.0.0.1/never-called", "models":{}, "api":["a","b"]})).unwrap(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for detail in [
+            "Too many requests, please try again in 999999999999999999999999999999999999999999 seconds",
+            "Too many requests, please try again in 999999999999999999999999999999999999999999 minutes",
+        ] {
+            assert_eq!(retry_after_seconds(detail), None);
+            runtime.cool_failed_route(FailedRoute { provider: &provider, key:"a", original_model:"m", has_alternative:true, status:429, detail, provider_model_unavailable:false, force_quota_cooldown:false }).await;
+            let deadlines = runtime.scheduling.key_cooldowns.lock().await;
+            let until = deadlines.get(&(provider.name.to_string(), "a".into())).unwrap();
+            assert!(until.saturating_duration_since(tokio::time::Instant::now()) <= Duration::from_secs(1800));
+            assert!(!deadlines.contains_key(&(provider.name.to_string(), "b".into())));
+        }
+        assert_eq!(retry_after_seconds("try again in 1500 ms"), Some(2.0));
+        assert_eq!(retry_after_seconds("try again in 2 minutes"), Some(120.0));
+        for invalid in [f64::MAX, f64::INFINITY, f64::NAN, -1.0] {
+            assert!(cooldown_deadline(invalid).is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn rejected_nested_admission_does_not_charge_other_request_buckets() {
         let runtime = GatewayRuntime::new();
         let child = ("child".into(), vec![(1, 60)]);
@@ -233,10 +258,10 @@ impl GatewayRuntime {
             .map(|s| s.preferences.clone())
             .unwrap_or_default();
         let channel_seconds = cooldown_seconds(&provider.preferences, &globals, "cooldown_period");
-        if has_alternative && channel_seconds > 0.0 {
+        if let Some(deadline) = cooldown_deadline(channel_seconds).filter(|_| has_alternative) {
             self.scheduling.channel_cooldowns.lock().await.insert(
                 (provider.name.to_string(), original_model.to_owned()),
-                tokio::time::Instant::now() + Duration::from_secs_f64(channel_seconds),
+                deadline,
             );
         }
         if provider_model_unavailable || provider.api_keys.len() <= 1 {
@@ -276,11 +301,12 @@ impl GatewayRuntime {
         } else {
             cooldown_seconds(&provider.preferences, &globals, "api_key_cooldown_period")
         };
-        if key_seconds > 0.0 {
-            self.scheduling.key_cooldowns.lock().await.insert(
-                (provider.name.to_string(), key.to_owned()),
-                tokio::time::Instant::now() + Duration::from_secs_f64(key_seconds),
-            );
+        if let Some(deadline) = cooldown_deadline(key_seconds) {
+            self.scheduling
+                .key_cooldowns
+                .lock()
+                .await
+                .insert((provider.name.to_string(), key.to_owned()), deadline);
         }
     }
 
@@ -383,13 +409,24 @@ pub(crate) fn provider_model_circuit_open_period() -> Duration {
 }
 
 pub(crate) fn environment_duration(name: &str, default_seconds: f64) -> Duration {
-    Duration::from_secs_f64(
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(default_seconds),
-    )
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(checked_cooldown_duration)
+        .unwrap_or_else(|| Duration::from_secs_f64(default_seconds))
+}
+
+fn checked_cooldown_duration(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let duration = Duration::try_from_secs_f64(seconds).ok()?;
+    tokio::time::Instant::now().checked_add(duration)?;
+    Some(duration)
+}
+
+fn cooldown_deadline(seconds: f64) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(checked_cooldown_duration(seconds)?)
 }
 
 pub(crate) fn retry_after_seconds(detail: &str) -> Option<f64> {
@@ -403,15 +440,14 @@ pub(crate) fn retry_after_seconds(detail: &str) -> Option<f64> {
     }
     let number = tail[..number_end].parse::<f64>().ok()?;
     let unit = tail[number_end..].trim_start();
-    Some(
-        if unit.starts_with("ms") || unit.starts_with("millisecond") {
-            (number / 1000.0).ceil()
-        } else if unit.starts_with('m') {
-            (number * 60.0).ceil()
-        } else {
-            number.ceil()
-        },
-    )
+    let seconds = if unit.starts_with("ms") || unit.starts_with("millisecond") {
+        (number / 1000.0).ceil()
+    } else if unit.starts_with('m') {
+        (number * 60.0).ceil()
+    } else {
+        number.ceil()
+    };
+    checked_cooldown_duration(seconds).map(|_| seconds)
 }
 
 pub(crate) fn tpr_exceeded(rules: &[(usize, u64)], estimated_tokens: usize) -> bool {
@@ -496,7 +532,9 @@ pub(crate) fn cooldown_seconds(
         _ => 0.0,
     };
     let value = preference_f64(provider, key)
+        .filter(|value| *value == 0.0 || checked_cooldown_duration(*value).is_some())
         .or_else(|| preference_f64(global, key))
+        .filter(|value| *value == 0.0 || checked_cooldown_duration(*value).is_some())
         .unwrap_or(fallback);
     if fallback > 0.0 && value <= 0.0 {
         fallback

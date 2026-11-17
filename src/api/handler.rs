@@ -69,10 +69,6 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
     if crate::api::gateway::supports(request.method(), request.uri().path().trim_end_matches('/')) {
         state.runtime = state.runtime.for_request().await;
     }
-    let request = match crate::transport::decompression::decode(request).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
     let raw_path = request.uri().path();
     let path = raw_path.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path }.to_owned();
@@ -124,6 +120,11 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
             }
         }
     };
+    let request =
+        match crate::transport::decompression::decode(request, &state.resource_governor).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
     if use_spooled_dispatch {
         let idempotency_values = request
             .headers()
@@ -253,7 +254,14 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
             .await
             .unwrap_or(false)
         {
-            if let Ok(payload) = storage.parse_json().await {
+            let parsed = storage.parse_json_governed(&state.resource_governor).await;
+            if let Err(crate::transport::spool::JsonReadFailure::Capacity(failure)) = parsed {
+                if let Some(owner) = owner {
+                    owner.release().await;
+                }
+                return resource_capacity_response(failure);
+            }
+            if let Ok((payload, _reservation)) = parsed {
                 if let Some(text) = crate::api::gateway::moderation_text(&payload) {
                     if let Err(response) =
                         crate::api::gateway::run_moderation_preflight(&state, &parts.headers, &text)
@@ -270,26 +278,6 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
         parts
             .extensions
             .insert(crate::routing::context::ModerationReceipt);
-        let native_json_memory_bytes = observation.body_bytes.saturating_mul(
-            std::env::var("RUST_RESPONSES_JSON_MEMORY_MULTIPLIER")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(3),
-        );
-        let native_memory_reservation = match state
-            .resource_governor
-            .reserve_memory_capacity(native_json_memory_bytes)
-            .await
-        {
-            Ok((_, reservation)) => reservation,
-            Err(failure) => {
-                if let Some(owner) = owner {
-                    owner.release().await;
-                }
-                return resource_capacity_response(failure);
-            }
-        };
         match prepare_request(
             &state.runtime,
             state.codex_oauth.clone(),
@@ -297,7 +285,7 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
             &parts,
             &storage,
             &observation,
-            native_memory_reservation,
+            &state.resource_governor,
             &path,
         )
         .await
@@ -311,13 +299,14 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
                 }
                 return response;
             }
-            ResponsesPreparation::PreparedFallback(context, payload) => {
+            ResponsesPreparation::PreparedFallback(context, payload, reservation) => {
                 parts.extensions.insert(context);
                 parts
                     .extensions
                     .insert(crate::routing::context::PreparedPayload {
                         payload: std::sync::Arc::new(payload),
                         observation: observation.clone(),
+                        reservation: std::sync::Arc::new(reservation),
                     });
             }
             ResponsesPreparation::Fallback => {}
@@ -602,7 +591,7 @@ fn insert_spool_observation_headers(headers: &mut HeaderMap, observation: &Spool
     }
 }
 
-fn resource_capacity_response(failure: CapacityFailure) -> Response<Body> {
+pub(crate) fn resource_capacity_response(failure: CapacityFailure) -> Response<Body> {
     let mut response = json_error(
         failure.resource.exhausted_status(),
         &format!(

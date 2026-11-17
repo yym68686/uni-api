@@ -484,6 +484,7 @@ fn gemini_and_claude_payloads_preserve_system_and_tools() {
 fn responses_compat_compiles_to_gemini_and_restores_responses_shape() {
     let provider = test_provider("gemini", "https://generativelanguage.googleapis.com/v1beta");
     let input = PreparedInput {
+        _memory_reservations: Vec::new(),
         payload: Some(json!({
             "model":"public-model",
             "instructions":"be concise",
@@ -916,6 +917,7 @@ fn alpha_search_strips_responses_fields_and_skips_provider_overrides() {
     );
     provider.preferences = std::sync::Arc::new(preferences);
     let input = PreparedInput {
+        _memory_reservations: Vec::new(),
         payload: Some(json!({
             "id": "search-session-a",
             "model": "gpt-public",
@@ -984,6 +986,7 @@ fn non_alpha_routes_still_apply_provider_overrides() {
     );
     provider.preferences = std::sync::Arc::new(preferences);
     let input = PreparedInput {
+        _memory_reservations: Vec::new(),
         payload: Some(json!({"model": "gpt-public", "input": "hello"})),
         replay: None,
         observation: SpoolObservation::default(),

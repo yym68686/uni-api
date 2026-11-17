@@ -20,7 +20,6 @@ pub enum ResourceKind {
     Memory,
     FileDescriptor,
     EphemeralPort,
-    Connection,
     LocalDisk,
     LocalInode,
 }
@@ -31,7 +30,6 @@ impl ResourceKind {
             Self::Memory => "memory_headroom",
             Self::FileDescriptor => "file_descriptor_headroom",
             Self::EphemeralPort => "ephemeral_port_headroom",
-            Self::Connection => "connection_headroom",
             Self::LocalDisk => "local_disk_headroom",
             Self::LocalInode => "local_inode_headroom",
         }
@@ -74,6 +72,7 @@ struct Inner {
     disk_reserve_bps: u64,
     inode_reserve_bps: u64,
     reserved_memory_bytes: AtomicU64,
+    materialized_memory_bytes: AtomicU64,
     shared_memory_ledger: Option<Arc<SharedMemoryReservationLedger>>,
 }
 
@@ -81,7 +80,9 @@ struct SharedMemoryReservationLedger {
     file: Mutex<File>,
 }
 
-const SHARED_MEMORY_FIELDS: usize = 6;
+// The first six slots retain the category totals; the last slot records claims
+// already represented by memory.current. Only pending claims are added to RSS.
+const SHARED_MEMORY_FIELDS: usize = 7;
 
 const SHARED_MEMORY_LEDGER_BYTES: u64 = (SHARED_MEMORY_FIELDS * 8) as u64;
 
@@ -174,11 +175,26 @@ impl SharedMemoryReservationLedger {
         self.with_locked_file(|file| Ok(Self::read_locked(file)?[0]))
     }
 
+    fn pending(&self) -> io::Result<u64> {
+        self.with_locked_file(|file| {
+            let values = Self::read_locked(file)?;
+            Ok(values[0].saturating_sub(values[6]))
+        })
+    }
+
+    fn materialize(&self, bytes: u64) -> io::Result<()> {
+        self.with_locked_file(|file| {
+            let mut values = Self::read_locked(file)?;
+            values[6] = values[6].saturating_add(bytes);
+            Self::write_locked(file, values)
+        })
+    }
+
     fn try_reserve(
         &self,
         category: SharedMemoryCategory,
         bytes: u64,
-        maximum_total: u64,
+        budget: impl FnOnce() -> (u64, bool),
     ) -> io::Result<bool> {
         self.with_locked_file(|file| {
             let mut values = Self::read_locked(file)?;
@@ -186,7 +202,16 @@ impl SharedMemoryReservationLedger {
             let Some(after) = before.checked_add(bytes) else {
                 return Ok(false);
             };
-            if after > maximum_total {
+            // Sample residency under the same lock used to materialize claims.
+            // Otherwise a claim could move into memory.current between an old
+            // RSS sample and this ledger read and disappear from both charges.
+            let (maximum_total, pending_only) = budget();
+            let charge = if pending_only {
+                after.saturating_sub(values[6])
+            } else {
+                after
+            };
+            if charge > maximum_total {
                 return Ok(false);
             }
             values[0] = after;
@@ -197,7 +222,12 @@ impl SharedMemoryReservationLedger {
         })
     }
 
-    fn release(&self, category: SharedMemoryCategory, bytes: u64) -> io::Result<()> {
+    fn release(
+        &self,
+        category: SharedMemoryCategory,
+        bytes: u64,
+        materialized_bytes: u64,
+    ) -> io::Result<()> {
         self.with_locked_file(|file| {
             let mut values = Self::read_locked(file)?;
             let category_index = category as usize;
@@ -214,6 +244,7 @@ impl SharedMemoryReservationLedger {
                         "shared memory reservation category underflow",
                     )
                 })?;
+            values[6] = values[6].saturating_sub(materialized_bytes);
             Self::write_locked(file, values)
         })
     }
@@ -236,7 +267,7 @@ impl ResourceGovernor {
     pub fn new() -> Self {
         let shared_memory_path = PathBuf::from(
             std::env::var("UNI_API_SHARED_MEMORY_RESERVATION_PATH")
-                .unwrap_or_else(|_| "/tmp/uni-api-shared-memory-reservation-v1".to_string()),
+                .unwrap_or_else(|_| "/tmp/uni-api-shared-memory-reservation-v2".to_string()),
         );
         let shared_memory_ledger = SharedMemoryReservationLedger::open(&shared_memory_path, true)
             .unwrap_or_else(|error| {
@@ -257,10 +288,10 @@ impl ResourceGovernor {
                     "RUST_RESOURCE_SAMPLE_INTERVAL_MS",
                     250,
                 )),
-                wait_timeout: Duration::from_secs_f64(env_f64(
+                wait_timeout: crate::runtime::scheduling::environment_duration(
                     "RUST_RESOURCE_WAIT_TIMEOUT_SECONDS",
                     120.0,
-                )),
+                ),
                 memory_soft_limit_bytes: env_optional_u64("MEMORY_SOFT_LIMIT_BYTES"),
                 memory_guard_bytes: env_u64_allow_zero("MEMORY_GUARD_BYTES", 512 * 1024 * 1024),
                 memory_guard_bps: env_ratio_basis_points("MEMORY_GUARD_RATIO", 0.25),
@@ -273,6 +304,7 @@ impl ResourceGovernor {
                 disk_reserve_bps: env_basis_points("RUST_REQUEST_SPOOL_DISK_RESERVE_BPS", 1000),
                 inode_reserve_bps: env_basis_points("RUST_REQUEST_SPOOL_INODE_RESERVE_BPS", 500),
                 reserved_memory_bytes: AtomicU64::new(0),
+                materialized_memory_bytes: AtomicU64::new(0),
                 shared_memory_ledger: Some(Arc::new(shared_memory_ledger)),
             }),
         }
@@ -299,6 +331,7 @@ impl ResourceGovernor {
                 disk_reserve_bps: 0,
                 inode_reserve_bps: 0,
                 reserved_memory_bytes: AtomicU64::new(0),
+                materialized_memory_bytes: AtomicU64::new(0),
                 shared_memory_ledger: None,
             }),
         }
@@ -373,18 +406,33 @@ impl ResourceGovernor {
         let started = Instant::now();
         loop {
             let reserved = self.inner.reserved_memory_bytes.load(Ordering::Acquire);
-            let maximum_total = cgroup_memory()
+            let memory = cgroup_memory();
+            let maximum_total = memory
                 .map(|(current, limit)| {
                     memory_soft_limit(&self.inner, limit).saturating_sub(current)
                 })
                 .unwrap_or(self.inner.memory_fallback_budget_bytes);
+            let local_charge = if memory.is_some() {
+                reserved
+                    .saturating_sub(self.inner.materialized_memory_bytes.load(Ordering::Acquire))
+            } else {
+                reserved
+            };
             let shared_reserved = self
                 .inner
                 .shared_memory_ledger
                 .as_ref()
-                .and_then(|ledger| ledger.total().ok())
-                .unwrap_or(reserved);
-            let available = shared_reserved.saturating_add(additional_bytes) <= maximum_total;
+                .and_then(|ledger| {
+                    if memory.is_some() {
+                        ledger.pending().ok()
+                    } else {
+                        ledger.total().ok()
+                    }
+                })
+                .unwrap_or(local_charge);
+            let available = shared_reserved
+                .checked_add(additional_bytes)
+                .is_some_and(|total| total <= maximum_total);
             let local_claimed = available
                 && self
                     .inner
@@ -403,7 +451,17 @@ impl ResourceGovernor {
                     .as_ref()
                     .is_none_or(|ledger| {
                         ledger
-                            .try_reserve(category, additional_bytes, maximum_total)
+                            .try_reserve(category, additional_bytes, || {
+                                cgroup_memory()
+                                    .map(|(current, limit)| {
+                                        (
+                                            memory_soft_limit(&self.inner, limit)
+                                                .saturating_sub(current),
+                                            true,
+                                        )
+                                    })
+                                    .unwrap_or((self.inner.memory_fallback_budget_bytes, false))
+                            })
                             .unwrap_or(false)
                     });
             if shared_claimed {
@@ -415,6 +473,7 @@ impl ResourceGovernor {
                         inner: self.inner.clone(),
                         bytes: additional_bytes,
                         category,
+                        materialized_bytes: 0,
                     },
                 ));
             }
@@ -439,6 +498,14 @@ impl ResourceGovernor {
         additional_bytes: u64,
     ) -> Result<LocalCapacity, ResourceKind> {
         let stats = statvfs(path).map_err(|_| ResourceKind::LocalDisk)?;
+        self.local_capacity_from_stats(stats, additional_bytes)
+    }
+
+    fn local_capacity_from_stats(
+        &self,
+        stats: FileSystemStats,
+        additional_bytes: u64,
+    ) -> Result<LocalCapacity, ResourceKind> {
         let writable_bytes = fraction(
             stats.free_bytes,
             10_000u64.saturating_sub(self.inner.disk_reserve_bps),
@@ -446,8 +513,7 @@ impl ResourceGovernor {
         if writable_bytes < additional_bytes {
             return Err(ResourceKind::LocalDisk);
         }
-        let reserve_inodes = fraction(stats.total_inodes, self.inner.inode_reserve_bps);
-        let writable_inodes = stats.free_inodes.saturating_sub(reserve_inodes);
+        let writable_inodes = fraction(stats.free_inodes, 10_000 - self.inner.inode_reserve_bps);
         if writable_inodes == 0 {
             return Err(ResourceKind::LocalInode);
         }
@@ -485,6 +551,7 @@ impl ResourceGovernor {
             ephemeral_port_usage().unwrap_or((0, 0));
         json!({
             "reserved_memory_bytes":reserved,
+            "pending_memory_bytes":pending_memory(&self.inner),
             "cgroup_memory_current_bytes":memory_current,
             "cgroup_memory_limit_bytes":memory_limit,
             "open_file_descriptors":open_fds,
@@ -501,29 +568,68 @@ pub struct MemoryReservation {
     inner: Arc<Inner>,
     bytes: u64,
     category: SharedMemoryCategory,
+    materialized_bytes: u64,
+}
+
+impl MemoryReservation {
+    /// Call only after allocation, while retaining this guard with the data.
+    /// On systems without cgroup accounting the full claim remains charged.
+    pub fn materialize(&mut self) {
+        self.materialize_bytes(self.bytes);
+    }
+
+    pub fn materialize_bytes(&mut self, allocated_bytes: u64) {
+        let target = allocated_bytes.min(self.bytes);
+        if target <= self.materialized_bytes {
+            return;
+        }
+        let additional = target - self.materialized_bytes;
+        if let Some(ledger) = &self.inner.shared_memory_ledger {
+            if let Err(error) = ledger.materialize(additional) {
+                eprintln!("shared memory materialization failed: {error}");
+                return;
+            }
+        }
+        self.inner
+            .materialized_memory_bytes
+            .fetch_add(additional, Ordering::AcqRel);
+        self.materialized_bytes = target;
+    }
 }
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
         if let Some(ledger) = &self.inner.shared_memory_ledger {
-            if let Err(error) = ledger.release(self.category, self.bytes) {
+            if let Err(error) = ledger.release(self.category, self.bytes, self.materialized_bytes) {
                 eprintln!("shared memory reservation ledger release failed: {error}");
             }
         }
+        self.inner
+            .materialized_memory_bytes
+            .fetch_sub(self.materialized_bytes, Ordering::AcqRel);
         self.inner
             .reserved_memory_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
+fn pending_memory(config: &Inner) -> u64 {
+    config
+        .shared_memory_ledger
+        .as_ref()
+        .and_then(|ledger| ledger.pending().ok())
+        .unwrap_or_else(|| {
+            config
+                .reserved_memory_bytes
+                .load(Ordering::Acquire)
+                .saturating_sub(config.materialized_memory_bytes.load(Ordering::Acquire))
+        })
+}
+
 fn sample_global_rejection(config: &Inner) -> Option<ResourceKind> {
+    let pending = pending_memory(config);
     if let Some((current, limit)) = cgroup_memory() {
-        let reserved = config
-            .shared_memory_ledger
-            .as_ref()
-            .and_then(|ledger| ledger.total().ok())
-            .unwrap_or_else(|| config.reserved_memory_bytes.load(Ordering::Acquire));
-        if current.saturating_add(reserved) >= memory_soft_limit(config, limit) {
+        if current.saturating_add(pending) >= memory_soft_limit(config, limit) {
             return Some(ResourceKind::Memory);
         }
     } else {
@@ -540,11 +646,8 @@ fn sample_global_rejection(config: &Inner) -> Option<ResourceKind> {
         if open.saturating_add(fraction(limit, config.descriptor_reserve_bps)) >= limit {
             return Some(ResourceKind::FileDescriptor);
         }
-        if let Some(connections) = tcp_connection_usage() {
-            if connections.saturating_add(fraction(limit, config.descriptor_reserve_bps)) >= limit {
-                return Some(ResourceKind::Connection);
-            }
-        }
+        // /proc/net/tcp includes TIME_WAIT and other processes' sockets. It is
+        // useful telemetry, but cannot be compared with this process's FD limit.
     }
     if let Some((used, total)) = ephemeral_port_usage() {
         if used.saturating_add(fraction(total, config.port_reserve_bps)) >= total {
@@ -555,7 +658,8 @@ fn sample_global_rejection(config: &Inner) -> Option<ResourceKind> {
 }
 
 fn fraction(total: u64, basis_points: u64) -> u64 {
-    total.saturating_mul(basis_points).saturating_add(9_999) / 10_000
+    ((u128::from(total) * u128::from(basis_points)).div_ceil(10_000)).min(u128::from(u64::MAX))
+        as u64
 }
 
 fn memory_soft_limit(config: &Inner, limit: u64) -> u64 {
@@ -684,7 +788,6 @@ fn ephemeral_port_usage() -> Option<(u64, u64)> {
 #[derive(Clone, Copy)]
 struct FileSystemStats {
     free_bytes: u64,
-    total_inodes: u64,
     free_inodes: u64,
 }
 
@@ -705,10 +808,6 @@ fn statvfs(path: &Path) -> io::Result<FileSystemStats> {
     };
     Ok(FileSystemStats {
         free_bytes: stat_value(stats.f_bavail, 0).saturating_mul(fragment_size),
-        total_inodes: match stat_value(stats.f_files, 0) {
-            0 => u64::MAX,
-            value => value,
-        },
         free_inodes: match stat_value(stats.f_files, 0) {
             0 => u64::MAX,
             _ => stat_value(stats.f_favail, 0),
@@ -767,14 +866,6 @@ fn env_ratio_basis_points(name: &str, default: f64) -> u64 {
     (ratio * 10_000.0).round() as u64
 }
 
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(default)
-}
-
 fn env_basis_points(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -786,6 +877,59 @@ fn env_basis_points(name: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_inodes_are_usable_below_old_total_reserve() {
+        let mut governor = ResourceGovernor::unconstrained_for_test();
+        Arc::get_mut(&mut governor.inner).unwrap().inode_reserve_bps = 500;
+        for free in [1, 499, 501] {
+            let capacity = governor
+                .local_capacity_from_stats(
+                    FileSystemStats {
+                        free_bytes: 1_000_000,
+                        free_inodes: free,
+                    },
+                    1,
+                )
+                .unwrap();
+            assert!(capacity.writable_inodes > 0 && capacity.writable_inodes <= free);
+        }
+        assert_eq!(
+            governor
+                .local_capacity_from_stats(
+                    FileSystemStats {
+                        free_bytes: 1_000_000,
+                        free_inodes: 0
+                    },
+                    1
+                )
+                .unwrap_err(),
+            ResourceKind::LocalInode
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_reservations_are_not_added_to_resident_memory_again() {
+        let governor = ResourceGovernor::unconstrained_for_test();
+        let (_, mut reservation) = governor.reserve_memory_capacity(300).await.unwrap();
+        assert_eq!(pending_memory(&governor.inner), 300);
+        reservation.materialize_bytes(100);
+        assert_eq!(pending_memory(&governor.inner), 200);
+        reservation.materialize();
+        reservation.materialize(); // idempotent; no ledger double conversion
+        assert_eq!(pending_memory(&governor.inner), 0);
+        // Fallback accounting still retains the full live allocation.
+        assert_eq!(
+            governor.observability_snapshot()["reserved_memory_bytes"],
+            300
+        );
+        drop(reservation);
+        assert_eq!(pending_memory(&governor.inner), 0);
+        assert_eq!(
+            governor.observability_snapshot()["reserved_memory_bytes"],
+            0
+        );
+    }
 
     #[test]
     fn fraction_rounds_up_without_overflowing() {
@@ -827,6 +971,7 @@ mod tests {
             disk_reserve_bps: 0,
             inode_reserve_bps: 0,
             reserved_memory_bytes: AtomicU64::new(0),
+            materialized_memory_bytes: AtomicU64::new(0),
             shared_memory_ledger: None,
         };
         assert_eq!(
@@ -890,21 +1035,33 @@ mod tests {
         let first = SharedMemoryReservationLedger::open(&path, true).unwrap();
         let second = SharedMemoryReservationLedger::open(&path, false).unwrap();
         assert!(first
-            .try_reserve(SharedMemoryCategory::ParsedBody, 400, 1_000)
+            .try_reserve(SharedMemoryCategory::ParsedBody, 400, || (1_000, false))
             .unwrap());
         assert_eq!(second.total().unwrap(), 400);
+        first.materialize(400).unwrap();
+        assert_eq!(second.pending().unwrap(), 0);
+        // Resident usage has risen by 400; another 600 fits in the remaining
+        // headroom. The old lifetime-total calculation rejected this claim.
+        assert!(second
+            .try_reserve(SharedMemoryCategory::Other, 600, || (600, true))
+            .unwrap());
+        second.release(SharedMemoryCategory::Other, 600, 0).unwrap();
         assert!(!second
-            .try_reserve(SharedMemoryCategory::TransportBuffer, 601, 1_000)
+            .try_reserve(SharedMemoryCategory::TransportBuffer, 601, || (
+                1_000, false
+            ))
             .unwrap());
         assert!(second
-            .try_reserve(SharedMemoryCategory::TransportBuffer, 600, 1_000)
+            .try_reserve(SharedMemoryCategory::TransportBuffer, 600, || (
+                1_000, false
+            ))
             .unwrap());
         assert_eq!(first.total().unwrap(), 1_000);
         second
-            .release(SharedMemoryCategory::TransportBuffer, 600)
+            .release(SharedMemoryCategory::TransportBuffer, 600, 0)
             .unwrap();
         first
-            .release(SharedMemoryCategory::ParsedBody, 400)
+            .release(SharedMemoryCategory::ParsedBody, 400, 400)
             .unwrap();
         assert_eq!(first.total().unwrap(), 0);
         let _ = fs::remove_file(path);

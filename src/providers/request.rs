@@ -58,6 +58,7 @@ pub(crate) fn preview_channel_request(
         .parse()
         .map_err(|_| "invalid preview endpoint".to_owned())?;
     let input = PreparedInput {
+        _memory_reservations: Vec::new(),
         payload: Some(payload),
         replay: None,
         observation: SpoolObservation::default(),

@@ -219,13 +219,21 @@ impl RequestSpoolWriter {
     }
 
     pub async fn finish(mut self) -> Result<RequestSpool, SpoolFailure> {
-        let mut writer = self.writer.take().expect("request spool writer missing");
-        writer.file.flush().await.map_err(|error| {
-            SpoolFailure::io(
-                format!("flush local request spool: {error}"),
-                self.observation.clone(),
-            )
-        })?;
+        // Keep ownership in self until flush succeeds. Error and cancellation
+        // must run the same cleanup as an interrupted upload.
+        self.writer
+            .as_mut()
+            .expect("request spool writer missing")
+            .file
+            .flush()
+            .await
+            .map_err(|error| {
+                SpoolFailure::io(
+                    format!("flush local request spool: {error}"),
+                    self.observation.clone(),
+                )
+            })?;
+        let writer = self.writer.take().expect("request spool writer missing");
         drop(writer.file);
         self.observation.final_tier = "local_disk";
         Ok(RequestSpool {
@@ -285,16 +293,49 @@ impl StoredBody {
         }))
     }
 
-    pub async fn parse_json(&self) -> Result<serde_json::Value, String> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&path)
-                .map_err(|error| format!("open local request spool for JSON parse: {error}"))?;
-            serde_json::from_reader(std::io::BufReader::new(file))
-                .map_err(|error| format!("invalid JSON request body: {error}"))
+    pub async fn parse_json_governed(
+        &self,
+        governor: &ResourceGovernor,
+    ) -> Result<
+        (
+            serde_json::Value,
+            crate::runtime::resources::MemoryReservation,
+        ),
+        JsonReadFailure,
+    > {
+        let storage = self.clone();
+        let estimate = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&storage.path)?;
+            let wire_bytes = file.metadata()?.len();
+            let configured_floor = std::env::var("RUST_RESPONSES_JSON_MEMORY_MULTIPLIER")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            crate::transport::json_memory::estimate(std::io::BufReader::new(file))
+                .map(|structural| structural.max(wire_bytes.saturating_mul(configured_floor)))
         })
         .await
-        .map_err(|error| format!("request JSON parser task failed: {error}"))?
+        .map_err(|error| JsonReadFailure::Invalid(error.to_string()))?
+        .map_err(|error| JsonReadFailure::Invalid(error.to_string()))?;
+        let (_, mut reservation) = governor
+            .reserve_memory_capacity(estimate)
+            .await
+            .map_err(JsonReadFailure::Capacity)?;
+        let storage = self.clone();
+        // A blocking parser outlives cancellation of its caller. Move both the
+        // file owner and its reservation into that task, not its awaiter.
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&storage.path)
+                .map_err(|error| JsonReadFailure::Invalid(error.to_string()))?;
+            let payload =
+                serde_json::from_reader(std::io::BufReader::new(file)).map_err(|error| {
+                    JsonReadFailure::Invalid(format!("invalid JSON request body: {error}"))
+                })?;
+            reservation.materialize();
+            Ok((payload, reservation))
+        })
+        .await
+        .map_err(|error| JsonReadFailure::Invalid(error.to_string()))?
     }
 
     pub fn clone_for_replay(&self) -> Self {
@@ -402,6 +443,20 @@ impl StoredBody {
     }
 }
 
+pub enum JsonReadFailure {
+    Capacity(CapacityFailure),
+    Invalid(String),
+}
+
+impl JsonReadFailure {
+    pub fn response(self, invalid_status: StatusCode) -> axum::http::Response<Body> {
+        match self {
+            Self::Capacity(failure) => crate::api::handler::resource_capacity_response(failure),
+            Self::Invalid(message) => crate::transport::http::json_error(invalid_status, &message),
+        }
+    }
+}
+
 struct LocalWriter {
     file: File,
     path: PathBuf,
@@ -448,6 +503,57 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::{HeaderMap, HeaderValue, Method, Uri};
+
+    #[tokio::test]
+    async fn failed_flush_removes_its_spool_file() {
+        let manager = SpoolManager::new(ResourceGovernor::unconstrained_for_test()).unwrap();
+        let mut writer = manager.begin(None, None, Duration::ZERO).await.unwrap();
+        let local = writer.writer.as_mut().unwrap();
+        let path = local.path.clone();
+        local.file = File::from_std(std::fs::File::open(&path).unwrap());
+        // Tokio reports this real read-only-file write failure on flush.
+        local.file.write_all(b"pending write").await.unwrap();
+        let failure = writer
+            .finish()
+            .await
+            .err()
+            .expect("read-only file cannot flush writes");
+        assert_eq!(failure.status, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn json_parse_retains_and_releases_the_memory_claim() {
+        let governor = ResourceGovernor::unconstrained_for_test();
+        let manager = SpoolManager::new(governor.clone()).unwrap();
+        for body in [
+            b"{\"values\":[0,1,2]}".as_slice(),
+            b"{\"invalid\":".as_slice(),
+        ] {
+            let mut writer = manager.begin(None, None, Duration::ZERO).await.unwrap();
+            writer.append(Bytes::copy_from_slice(body)).await.unwrap();
+            let stored = writer.finish().await.unwrap().storage;
+            let result = stored.parse_json_governed(&governor).await;
+            if body.ends_with(b"}") {
+                let (value, reservation) = result.ok().unwrap();
+                assert_eq!(value["values"][2], 2);
+                assert!(
+                    governor.observability_snapshot()["reserved_memory_bytes"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert_eq!(governor.observability_snapshot()["pending_memory_bytes"], 0);
+                drop((value, reservation));
+            } else {
+                assert!(matches!(result, Err(JsonReadFailure::Invalid(_))));
+            }
+            assert_eq!(
+                governor.observability_snapshot()["reserved_memory_bytes"],
+                0
+            );
+        }
+    }
 
     fn request_hasher() -> RequestHasher {
         let mut headers = HeaderMap::new();

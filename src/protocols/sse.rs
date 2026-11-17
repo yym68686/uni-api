@@ -1,7 +1,17 @@
 use bytes::{Bytes, BytesMut};
 use memchr::memchr2;
 
-pub(crate) const UNLIMITED_SSE_EVENT_BYTES: usize = 0;
+// Match the default bounded non-stream response body. Zero from older plans
+// selects the default instead of disabling protection.
+pub(crate) const DEFAULT_MAX_SSE_EVENT_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn max_event_bytes() -> usize {
+    std::env::var("RUST_RESPONSES_MAX_EVENT_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_SSE_EVENT_BYTES)
+}
 
 #[derive(Debug)]
 pub(crate) struct SseFrame {
@@ -45,41 +55,57 @@ impl SseDecoder {
         Self {
             buffer: BytesMut::new(),
             scan_from: 0,
-            max_event_bytes,
+            max_event_bytes: if max_event_bytes == 0 {
+                self::max_event_bytes()
+            } else {
+                max_event_bytes
+            },
         }
     }
 
     pub(crate) fn exceeds_event_limit(&self, observed_bytes: usize) -> bool {
-        self.max_event_bytes != UNLIMITED_SSE_EVENT_BYTES && observed_bytes > self.max_event_bytes
+        observed_bytes > self.max_event_bytes
     }
 
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, String> {
-        self.buffer.extend_from_slice(chunk);
+    pub(crate) fn feed(&mut self, mut chunk: &[u8]) -> Result<Vec<SseFrame>, String> {
         let mut frames = Vec::new();
-        while let Some((end, delimiter_len)) =
-            find_event_delimiter_from(&self.buffer, self.scan_from)
-        {
-            if self.exceeds_event_limit(end) {
-                return Err("Responses upstream SSE event exceeds the configured limit".into());
+        loop {
+            // Do not copy an arbitrarily large transport chunk before checking the
+            // bound. Leave room for the longest delimiter, including split CRLFs.
+            let room = self
+                .max_event_bytes
+                .saturating_add(4)
+                .saturating_sub(self.buffer.len());
+            let consumed = room.min(chunk.len());
+            self.buffer.extend_from_slice(&chunk[..consumed]);
+            chunk = &chunk[consumed..];
+            while let Some((end, delimiter_len)) =
+                find_event_delimiter_from(&self.buffer, self.scan_from)
+            {
+                if self.exceeds_event_limit(end) {
+                    return Err("Responses upstream SSE event exceeds the configured limit".into());
+                }
+                let wire = self.buffer.split_to(end + delimiter_len).freeze();
+                self.scan_from = 0;
+                if wire[..end].iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                frames.push(SseFrame {
+                    wire,
+                    raw_len: end,
+                    terminated: true,
+                });
             }
-            let wire = self.buffer.split_to(end + delimiter_len).freeze();
-            self.scan_from = 0;
-            if wire[..end].iter().all(|byte| byte.is_ascii_whitespace()) {
-                continue;
+            self.scan_from = self.buffer.len().saturating_sub(3);
+            if self.buffer.len() > self.max_event_bytes.saturating_add(3) {
+                return Err(
+                    "Responses upstream SSE pending frame exceeds the configured limit".into(),
+                );
             }
-            frames.push(SseFrame {
-                wire,
-                raw_len: end,
-                terminated: true,
-            });
+            if chunk.is_empty() {
+                return Ok(frames);
+            }
         }
-        self.scan_from = self.buffer.len().saturating_sub(3);
-        if self.max_event_bytes != UNLIMITED_SSE_EVENT_BYTES
-            && self.buffer.len() > self.max_event_bytes.saturating_add(64 * 1024)
-        {
-            return Err("Responses upstream SSE pending frame exceeds the configured limit".into());
-        }
-        Ok(frames)
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<SseFrame>, String> {
@@ -154,4 +180,41 @@ pub(crate) fn parse_sse_frame(frame: &SseFrame) -> Result<ParsedSseFrame, String
         data: (!data_lines.is_empty()).then(|| data_lines.join("\n")),
         comment_only: saw_comment && !saw_field,
     })
+}
+
+#[cfg(test)]
+mod bounded_decoder_tests {
+    use super::*;
+
+    #[test]
+    fn pending_and_complete_frames_are_checked_before_large_copies() {
+        for suffix in [b"".as_slice(), b"\n\n".as_slice()] {
+            let mut decoder = SseDecoder::new(1024);
+            let mut chunk = vec![b'x'; 1024 * 1024];
+            chunk.extend_from_slice(suffix);
+            assert!(decoder.feed(&chunk).is_err());
+            assert!(decoder.buffer.len() <= 1028);
+        }
+        let mut decoder = SseDecoder::new(1024);
+        for _ in 0..4 {
+            assert!(decoder.feed(&[b'x'; 256]).unwrap().is_empty());
+        }
+        assert!(decoder.feed(&[b'x'; 4]).is_err());
+    }
+
+    #[test]
+    fn large_chunks_of_small_events_and_split_delimiters_remain_valid() {
+        let mut decoder = SseDecoder::new(8);
+        assert_eq!(
+            decoder.feed(&b"data: x\n\n".repeat(100)).unwrap().len(),
+            100
+        );
+        assert!(decoder.feed(b"12345678\r\n\r").unwrap().is_empty());
+        assert_eq!(decoder.feed(b"\n").unwrap()[0].raw(), b"12345678");
+    }
+
+    #[test]
+    fn legacy_zero_selects_a_finite_default() {
+        assert!(SseDecoder::new(0).max_event_bytes > 0);
+    }
 }

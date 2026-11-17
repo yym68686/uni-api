@@ -24,13 +24,7 @@ pub(crate) async fn read_spooled_body(
         .begin(request_hasher, content_length, initial_wait)
         .await
         .map_err(RequestBodySpoolError::Spool)?;
-    let idle_timeout = Duration::from_secs_f64(
-        std::env::var("REQUEST_BODY_IDLE_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(15.0),
-    );
+    let idle_timeout = request_body_idle_timeout();
     loop {
         let next = tokio::time::timeout(idle_timeout, stream.next())
             .await
@@ -44,6 +38,25 @@ pub(crate) async fn read_spooled_body(
             .await
             .map_err(RequestBodySpoolError::Spool)?;
     }
+}
+
+pub(crate) fn request_body_idle_timeout() -> Duration {
+    crate::routing::timeouts::positive_duration(
+        std::env::var("REQUEST_BODY_IDLE_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0),
+    )
+    .unwrap_or(Duration::from_secs(15))
+}
+
+pub(crate) fn downstream_write_timeout() -> Duration {
+    crate::routing::timeouts::positive_duration(
+        std::env::var("RUST_DOWNSTREAM_WRITE_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+    )
+    .unwrap_or(Duration::from_secs(30))
 }
 
 pub(crate) const DEFAULT_UPSTREAM_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;

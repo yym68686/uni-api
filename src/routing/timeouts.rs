@@ -11,6 +11,7 @@ pub(crate) fn positive_duration(seconds: Option<f64>) -> Option<Duration> {
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
         .map(|duration| duration.max(Duration::from_nanos(1)))
+        .filter(|duration| std::time::Instant::now().checked_add(*duration).is_some())
 }
 
 pub(crate) fn earliest_timeout(values: &[Option<f64>]) -> Option<Duration> {

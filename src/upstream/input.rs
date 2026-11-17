@@ -177,16 +177,17 @@ pub(crate) async fn normalize_image_url(
             ));
         }
     };
-    Ok(format!(
-        "data:{media_type};base64,{}",
-        BASE64.encode(&bytes)
-    ))
+    let normalized = format!("data:{media_type};base64,{}", BASE64.encode(&bytes));
+    for reservation in reservations.iter_mut() {
+        reservation.materialize();
+    }
+    Ok(normalized)
 }
 
 pub(crate) async fn validate_image_data_url(
     state: &AppState,
     value: &str,
-    reservations: &mut Vec<MemoryReservation>,
+    _reservations: &mut [MemoryReservation],
 ) -> Result<(), (StatusCode, String)> {
     let (header, encoded) = value
         .split_once(',')
@@ -222,9 +223,9 @@ pub(crate) async fn validate_image_data_url(
             "Image input exceeds the configured size limit".into(),
         ));
     }
-    let (_, reservation) = state
+    let (_, mut reservation) = state
         .resource_governor
-        .reserve_memory_capacity(predicted as u64)
+        .reserve_memory_capacity(predicted.saturating_add(encoded.len()).saturating_add(4) as u64)
         .await
         .map_err(|_| {
             (
@@ -232,11 +233,11 @@ pub(crate) async fn validate_image_data_url(
                 "Insufficient memory capacity for image input".into(),
             )
         })?;
-    reservations.push(reservation);
     let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
     let decoded = BASE64
         .decode(padded.as_bytes())
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image base64".into()))?;
+    reservation.materialize();
     let detected = match inspect_image_media_type(&decoded) {
         ImageMediaTypeInspection::Supported(media_type) => media_type,
         ImageMediaTypeInspection::AnimatedGif => {
@@ -380,6 +381,7 @@ pub(crate) async fn prepare_input(
         .remove::<crate::routing::context::PreparedPayload>()
     {
         return Ok(PreparedInput {
+            _memory_reservations: vec![prepared.reservation],
             payload: Some(std::sync::Arc::unwrap_or_clone(prepared.payload)),
             replay: None,
             observation: prepared.observation,
@@ -400,6 +402,7 @@ pub(crate) async fn prepare_input(
             Some(json!({"model": model}))
         };
         return Ok(PreparedInput {
+            _memory_reservations: Vec::new(),
             payload,
             replay: None,
             observation: SpoolObservation::default(),
@@ -443,11 +446,11 @@ pub(crate) async fn prepare_input(
         RequestBodySpoolError::Spool(failure) => json_error(failure.status, &failure.message),
     })?;
     if normalized_content_type.starts_with("application/json") {
-        let payload = spool
+        let (payload, reservation) = spool
             .storage
-            .parse_json()
+            .parse_json_governed(&state.resource_governor)
             .await
-            .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?;
+            .map_err(|error| error.response(StatusCode::BAD_REQUEST))?;
         if !payload.is_object() {
             return Err(json_error(
                 StatusCode::BAD_REQUEST,
@@ -455,6 +458,7 @@ pub(crate) async fn prepare_input(
             ));
         }
         return Ok(PreparedInput {
+            _memory_reservations: vec![std::sync::Arc::new(reservation)],
             payload: Some(payload),
             replay: None,
             observation: spool.observation,
@@ -479,6 +483,7 @@ pub(crate) async fn prepare_input(
         None => String::new(),
     };
     Ok(PreparedInput {
+        _memory_reservations: Vec::new(),
         payload: Some(json!({"model": model})),
         replay: Some((spool.storage, spool.observation.clone())),
         observation: spool.observation,

@@ -415,6 +415,7 @@ pub(crate) async fn run_moderation_preflight(
         .await
         .map_err(|error| json_error(error.status, &error.message))?;
     let input = PreparedInput {
+        _memory_reservations: Vec::new(),
         payload: Some(payload),
         replay: None,
         observation: SpoolObservation::default(),

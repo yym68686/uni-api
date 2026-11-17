@@ -4,7 +4,7 @@ use crate::routing::access::extract_api_key;
 use crate::routing::filters::request_type_for_endpoint;
 use crate::routing::planner::TARGET_PROVIDER_HEADER;
 use crate::routing::retry::RetryPolicy;
-use crate::runtime::resources::MemoryReservation;
+use crate::runtime::resources::ResourceGovernor;
 use crate::runtime::state::GatewayRuntime;
 use crate::storage::database::Persistence;
 use crate::transport::spool::SpoolObservation;
@@ -94,7 +94,7 @@ pub async fn prepare_request(
     parts: &Parts,
     storage: &StoredBody,
     observation: &SpoolObservation,
-    memory_reservation: MemoryReservation,
+    governor: &ResourceGovernor,
     endpoint: &str,
 ) -> ResponsesPreparation {
     let Some(snapshot) = store.snapshot().await else {
@@ -144,8 +144,8 @@ pub async fn prepare_request(
         return ResponsesPreparation::Fallback;
     }
     let role = api_key.role.as_ref();
-    let mut payload = match storage.parse_json().await {
-        Ok(Value::Object(payload)) => Value::Object(payload),
+    let (mut payload, memory_reservation) = match storage.parse_json_governed(governor).await {
+        Ok((Value::Object(payload), reservation)) => (Value::Object(payload), reservation),
         Ok(_) => {
             emit_native_rejection(
                 422,
@@ -165,6 +165,14 @@ pub async fn prepare_request(
             ));
         }
         Err(error) => {
+            if let crate::transport::spool::JsonReadFailure::Capacity(failure) = error {
+                return ResponsesPreparation::Response(
+                    crate::api::handler::resource_capacity_response(failure),
+                );
+            }
+            let crate::transport::spool::JsonReadFailure::Invalid(error) = error else {
+                unreachable!()
+            };
             emit_native_rejection(
                 422,
                 NativeRejectionObservation {
@@ -289,7 +297,7 @@ pub async fn prepare_request(
             || (provider.engine.as_ref() == "gpt" && !provider.base_url.contains("v1/responses"))
             || provider_stream_override(provider).is_some_and(|value| value != stream)
     }) {
-        return ResponsesPreparation::PreparedFallback(context, payload);
+        return ResponsesPreparation::PreparedFallback(context, payload, memory_reservation);
     }
     let targeted = parts.headers.contains_key(TARGET_PROVIDER_HEADER);
     let retry_policy = RetryPolicy::from_value(api_key.preferences.get("AUTO_RETRY"));

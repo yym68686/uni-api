@@ -431,6 +431,24 @@ curl -X GET 'https://xxx.xxx/v1/search?q=Jina%2BAI' \
 - STDOUT_REQUEST_SUMMARY_LOG_SAMPLE_RATE: Optional sample rate for human-readable stdout request summary logs, default is `1.0`. Use a lower value or disable the logs during high-concurrency tests.
 - REQUEST_MAX_BODY_BYTES: Rust request-body maximum in bytes, default `134217728` (128 MiB). Ordinary bodies are checked by declared length and actual streamed bytes, including uploads without `Content-Length`. Exactly the limit is accepted; larger bodies return HTTP 413. This also caps both compressed and decoded zstd bodies. `ZSTD_REQUEST_MAX_BODY_BYTES` optionally supplies a smaller shared zstd limit; `ZSTD_REQUEST_MAX_COMPRESSED_BODY_BYTES` and `ZSTD_REQUEST_MAX_DECOMPRESSED_BODY_BYTES` override the two zstd limits independently, capped by `REQUEST_MAX_BODY_BYTES`. These environment settings can be changed independently of the image and take effect on process restart. Effective Rust limits are exposed as `request_body_limits` at `/v1/observability/runtime`. Resource headroom, endpoint-specific limits (such as admin configuration updates), and provider limits still apply.
 - MESSAGES_REQUEST_SPOOL_THRESHOLD_BYTES, MESSAGES_REQUEST_SPOOL_MAX_VARIANTS, MESSAGES_REQUEST_TRANSPORT_CHUNK_BYTES, MESSAGES_REQUEST_SPOOL_DIRECTORY: Control `/v1/messages` upstream request replay. Bodies at or above the default 1 MiB threshold are serialized by Rust directly to a request-scoped file, cached for at most four provider-specific variants, and reopened in 256 KiB chunks for every retry without changing provider order or retry count.
+- REQUEST_BODY_IDLE_TIMEOUT_SECONDS: Upload idle deadline, default `15` seconds, applied to both identity and zstd bodies. Zstd buffering and decoder allocations pass through resource admission; decoded output grows under a memory claim rather than preallocating the maximum request size.
+- RUST_RESPONSES_MAX_EVENT_BYTES: Maximum individual native Responses SSE frame, default `67108864` (64 MiB, matching the default buffered upstream response limit). This includes incomplete events and is checked before copying a large transport chunk. Zero or invalid values select the finite default. Large transport chunks containing many smaller events remain valid.
+- RUST_DOWNSTREAM_WRITE_TIMEOUT_SECONDS: Maximum wait for a full downstream stream queue, default `30` seconds. Applies to native Responses and protocol conversion, including final/error events. An enabled total request timeout also bounds conversion and downstream queue waits; explicit zero still disables the total deadline.
+
+Rust JSON parsing uses a bounded-memory structural scan to budget array elements,
+object entries, strings and parser scratch before constructing the JSON DOM.
+Both native and generic routes retain the claim with the parsed input. Only
+pending allocations are added to cgroup memory usage; completed allocations stay
+in kernel accounting. Without cgroup sampling, live claims remain charged to the
+fallback memory budget. Runtime observations expose `pending_memory_bytes` as
+well as the total live `reserved_memory_bytes`.
+An explicitly configured `RUST_RESPONSES_JSON_MEMORY_MULTIPLIER` remains an
+additional minimum estimate; it cannot lower the structural budget.
+
+Request spool inode headroom is derived from **free** inodes using
+`RUST_REQUEST_SPOOL_INODE_RESERVE_BPS` (default `500`), rather than reserving a
+percentage of the filesystem's total inode count. TCP connection table counts
+are telemetry, not a substitute for this process's open file descriptor count.
 
 ### Weighted resource admission
 

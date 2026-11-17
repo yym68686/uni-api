@@ -341,15 +341,19 @@ fn spawn_translation(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (outcome_tx, outcome_rx) = oneshot::channel();
     tokio::spawn(async move {
+        let total_deadline = positive_duration(total_timeout_seconds)
+            .and_then(|duration| tokio::time::Instant::now().checked_add(duration));
         if emit_precommit_comment {
-            let _ = tx.send(Ok(Bytes::from_static(b":\n\n"))).await;
+            let _ = send_downstream(&tx, Bytes::from_static(b":\n\n"), total_deadline).await;
         }
         let options = TranslationOptions {
             include_usage,
             timing,
             timeouts: StreamTimeouts {
                 idle: positive_duration(idle_timeout_seconds),
-                total: positive_duration(total_timeout_seconds),
+                total: total_deadline.map(|deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                }),
             },
         };
         let result = tokio::select! {
@@ -369,7 +373,7 @@ fn spawn_translation(
             options,
         ) => result,
         };
-        let outcome = match result {
+        let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 let payload = match output_protocol {
@@ -383,19 +387,23 @@ fn spawn_translation(
                         }
                     }),
                 };
-                let _ = send_wire(&tx, &payload, output_protocol).await;
+                if !error.starts_with("downstream") {
+                    // Reporting an error must not create a second unbounded
+                    // wait after the total deadline has already expired.
+                    let _ = send_wire_until(&tx, &payload, output_protocol, total_deadline).await;
+                }
                 StreamOutcome {
                     usage: (0, 0, 0),
                     fact_usage: Default::default(),
                     success: false,
                     observational_only: false,
-                    status_code: 502,
-                    failure_reason: Some(stream_failure_reason(&error)),
-                    terminal_kind: Some(if stream_failure_reason(&error) == "transport_error" {
-                        "transport_error"
+                    status_code: if error.starts_with("downstream") {
+                        499
                     } else {
-                        "protocol_error"
-                    }),
+                        502
+                    },
+                    failure_reason: Some(stream_failure_reason(&error)),
+                    terminal_kind: Some(stream_failure_reason(&error)),
                     response_completed: (protocol == Protocol::Responses
                         || output_protocol == OutputProtocol::Responses)
                         .then_some(false),
@@ -407,7 +415,15 @@ fn spawn_translation(
             }
         };
         if output_protocol == OutputProtocol::Chat && outcome.success {
-            let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+            if let Err(error) =
+                send_downstream(&tx, Bytes::from_static(b"data: [DONE]\n\n"), total_deadline).await
+            {
+                outcome.success = false;
+                outcome.status_code = 499;
+                outcome.failure_reason = Some(stream_failure_reason(&error));
+                outcome.terminal_kind = outcome.failure_reason;
+                outcome.detail = error;
+            }
         }
         let _ = outcome_tx.send(outcome);
     });
@@ -428,6 +444,33 @@ fn spawn_translation(
 }
 
 async fn run_translation(
+    stream: UpstreamStream,
+    protocol: Protocol,
+    output_protocol: OutputProtocol,
+    model: &str,
+    content_type: &str,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    options: TranslationOptions,
+) -> Result<StreamOutcome, String> {
+    let total = options.timeouts.total;
+    let translation = run_translation_inner(
+        stream,
+        protocol,
+        output_protocol,
+        model,
+        content_type,
+        tx,
+        options,
+    );
+    match total {
+        Some(total) => tokio::time::timeout(total, translation)
+            .await
+            .map_err(|_| "upstream stream total timeout exceeded".to_owned())?,
+        None => translation.await,
+    }
+}
+
+async fn run_translation_inner(
     mut stream: UpstreamStream,
     protocol: Protocol,
     output_protocol: OutputProtocol,
@@ -985,7 +1028,9 @@ pub(crate) fn semantic_output_value(protocol: Protocol, value: &Value) -> bool {
 // These prefixes are produced by this translation loop, not upstream error
 // payloads (semantic failures have their own explicit outcome).
 fn stream_failure_reason(detail: &str) -> &'static str {
-    if detail == "downstream disconnected" {
+    if detail.starts_with("downstream write timeout") {
+        "downstream_write_timeout"
+    } else if detail == "downstream disconnected" {
         "downstream_disconnected"
     } else if detail.starts_with("upstream transport error:")
         || detail.starts_with("upstream stream idle or total timeout")
@@ -1072,6 +1117,15 @@ async fn send_wire(
     value: &Value,
     output_protocol: OutputProtocol,
 ) -> Result<(), String> {
+    send_wire_until(tx, value, output_protocol, None).await
+}
+
+async fn send_wire_until(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    value: &Value,
+    output_protocol: OutputProtocol,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), String> {
     let mut wire = Vec::new();
     if output_protocol == OutputProtocol::Responses {
         if let Some(event_type) = value.get("type").and_then(Value::as_str) {
@@ -1083,8 +1137,21 @@ async fn send_wire(
     wire.extend_from_slice(b"data: ");
     serde_json::to_writer(&mut wire, value).map_err(|error| error.to_string())?;
     wire.extend_from_slice(b"\n\n");
-    tx.send(Ok(Bytes::from(wire)))
+    send_downstream(tx, Bytes::from(wire), deadline).await
+}
+
+async fn send_downstream(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    bytes: Bytes,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), String> {
+    let timeout = crate::transport::body::downstream_write_timeout();
+    let timeout = deadline.map_or(timeout, |deadline| {
+        timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    });
+    tokio::time::timeout(timeout, tx.send(Ok(bytes)))
         .await
+        .map_err(|_| "downstream write timeout exceeded".to_owned())?
         .map_err(|_| "downstream disconnected".to_owned())
 }
 
@@ -2517,6 +2584,56 @@ impl JsonObjectFramer {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn full_output_queue_cannot_outlive_total_timeout() {
+        let chunk = Bytes::from_static(b"data: {\"id\":\"audit\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n");
+        let upstream =
+            stream::iter((0..64).map(move |_| Ok::<_, reqwest::Error>(chunk.clone()))).boxed();
+        let translation = spawn_translation(
+            reqwest::StatusCode::OK,
+            "text/event-stream".into(),
+            upstream,
+            Protocol::Chat,
+            OutputProtocol::Chat,
+            "test".into(),
+            false,
+            Some(1.0),
+            Some(0.01),
+            true,
+            StreamTiming::new(tokio::time::Instant::now()),
+        );
+        // Retain the HTTP body without polling it. This also tests that error
+        // reporting after timeout cannot block delivery of the final outcome.
+        let outcome = tokio::time::timeout(Duration::from_secs(1), translation.outcome)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!outcome.success);
+        assert!(
+            outcome.detail.contains("total timeout"),
+            "{}",
+            outcome.detail
+        );
+        drop(translation.response);
+    }
+
+    #[tokio::test]
+    async fn final_write_respects_an_expired_deadline() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"occupied"))).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_downstream(
+                &tx,
+                Bytes::from_static(b"data: [DONE]\n\n"),
+                Some(tokio::time::Instant::now()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), "downstream write timeout exceeded");
+    }
 
     async fn mock_sse_response(body: &'static str) -> reqwest::Response {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,7 +1,7 @@
 use crate::config::snapshot::ApiKey;
 use crate::config::snapshot::Provider;
 use crate::config::snapshot::Snapshot;
-use crate::protocols::sse::UNLIMITED_SSE_EVENT_BYTES;
+use crate::protocols::sse::max_event_bytes;
 use crate::providers::codex::oauth::CodexOAuthManager;
 use crate::routing::access::model_prices;
 use crate::routing::attempt_policy::ResolvedAttemptPolicy;
@@ -54,7 +54,11 @@ pub(crate) struct RoutingAttemptEvent<'a> {
 
 pub enum ResponsesPreparation {
     Ready(ResponsesRoute),
-    PreparedFallback(Arc<crate::routing::context::RequestContext>, Value),
+    PreparedFallback(
+        Arc<crate::routing::context::RequestContext>,
+        Value,
+        MemoryReservation,
+    ),
     Fallback,
     Response(Response<Body>),
 }
@@ -503,7 +507,7 @@ impl ResponsesRoute {
                 provider_name: Some(provider.name.to_string()),
                 provider_key: Some(provider_key_raw),
                 original_model: Some(original_model),
-                max_event_bytes: UNLIMITED_SSE_EVENT_BYTES,
+                max_event_bytes: max_event_bytes(),
                 max_precommit_items: policy.responses.max_precommit_items,
                 max_precommit_bytes: policy.responses.max_precommit_bytes,
             }));

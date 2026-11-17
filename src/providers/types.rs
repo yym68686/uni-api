@@ -64,6 +64,8 @@ pub(crate) enum AttemptBody {
 }
 
 pub(crate) struct PreparedInput {
+    pub(crate) _memory_reservations:
+        Vec<std::sync::Arc<crate::runtime::resources::MemoryReservation>>,
     pub(crate) payload: Option<Value>,
     pub(crate) replay: Option<(StoredBody, SpoolObservation)>,
     pub(crate) observation: SpoolObservation,
