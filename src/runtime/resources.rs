@@ -439,8 +439,10 @@ impl ResourceGovernor {
         additional_bytes: u64,
     ) -> Result<LocalCapacity, ResourceKind> {
         let stats = statvfs(path).map_err(|_| ResourceKind::LocalDisk)?;
-        let reserve_bytes = fraction(stats.total_bytes, self.inner.disk_reserve_bps);
-        let writable_bytes = stats.free_bytes.saturating_sub(reserve_bytes);
+        let writable_bytes = fraction(
+            stats.free_bytes,
+            10_000u64.saturating_sub(self.inner.disk_reserve_bps),
+        );
         if writable_bytes < additional_bytes {
             return Err(ResourceKind::LocalDisk);
         }
@@ -681,7 +683,6 @@ fn ephemeral_port_usage() -> Option<(u64, u64)> {
 
 #[derive(Clone, Copy)]
 struct FileSystemStats {
-    total_bytes: u64,
     free_bytes: u64,
     total_inodes: u64,
     free_inodes: u64,
@@ -703,7 +704,6 @@ fn statvfs(path: &Path) -> io::Result<FileSystemStats> {
         value => value,
     };
     Ok(FileSystemStats {
-        total_bytes: stat_value(stats.f_blocks, u64::MAX).saturating_mul(fragment_size),
         free_bytes: stat_value(stats.f_bavail, 0).saturating_mul(fragment_size),
         total_inodes: match stat_value(stats.f_files, 0) {
             0 => u64::MAX,
