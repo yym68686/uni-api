@@ -29,7 +29,7 @@ class Upstream(BaseHTTPRequestHandler):
             self.server.active += 1
         try:
             if mode == "slow":
-                time.sleep(0.18)
+                time.sleep(0.9)
             repaired = any(item.get("type") == "message" and item.get("role") == "assistant"
                            for item in body.get("input", []) if isinstance(item, dict))
             status, error = 503, {"error": {"message": "fixture upstream unavailable"}}
@@ -75,7 +75,12 @@ def verify(binary, hedging):
                              + [provider(f"small-{i}", "small") for i in range(3)],
                 "api_keys": api_keys,
                 "preferences": {"hedging": {"enabled": hedging, "max_inflight_attempts": 2},
-                                "timeout_policy": {"default": {"first_byte": 0.06, "total": 2}}},
+                                # This suite counts physical sends. A 60 ms
+                                # deadline can expire before a loopback mock
+                                # is scheduled on a busy builder. Keep the slow
+                                # fixture at 3x the deadline without conflating
+                                # scheduler jitter with the retry budget.
+                                "timeout_policy": {"default": {"first_byte": 0.3, "total": 2}}},
             }
             config_path = root / "api.json"
             original = json.dumps(config).encode()
