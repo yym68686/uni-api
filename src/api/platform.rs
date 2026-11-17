@@ -970,7 +970,7 @@ fn unix_seconds() -> i64 {
 }
 
 fn app_version() -> &'static str {
-    "1.7.275"
+    env!("CARGO_PKG_VERSION")
 }
 
 #[cfg(test)]
@@ -978,8 +978,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_version_is_embedded() {
-        assert!(app_version().starts_with("1.7."));
+    fn public_versions_match_native_build() {
+        assert_eq!(app_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            openapi_document()["info"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[test]
