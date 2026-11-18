@@ -6,7 +6,11 @@ use reqwest::Client;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,7 +79,7 @@ impl FactWriter {
                     DROPPED.fetch_add(batch.len() as u64, Ordering::Relaxed);
                     continue;
                 };
-                let spool = persist_batch(&config, &key, &body).await;
+                let spool = persist_batch(&config, &body).await;
                 QUEUED.fetch_sub(batch.len() as u64, Ordering::Relaxed);
                 if let Err(error) = upload_body_with_retry(&config, &key, &body).await {
                     if !spool {
@@ -241,36 +245,74 @@ fn ingest_url(restore: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-async fn persist_batch(c: &UploadConfig, key: &str, body: &str) -> bool {
+async fn persist_batch(c: &UploadConfig, body: &str) -> bool {
     if body.len() > 4 * 1024 * 1024 {
         return false;
     }
-    if !reserve_spool(c, body.len() as u64).await {
-        return false;
+    let spool = c.spool.clone();
+    let body = body.to_owned();
+    match tokio::task::spawn_blocking(move || persist_spool_batch(&spool, &body)).await {
+        Ok(Ok(persisted)) => persisted,
+        Ok(Err(error)) => {
+            eprintln!("facts_ingest_spool_write_failed kind={:?}", error.kind());
+            false
+        }
+        Err(_) => {
+            eprintln!("facts_ingest_spool_write_failed kind=worker_unavailable");
+            false
+        }
     }
+}
+
+fn persist_spool_batch(spool: &Path, body: &str) -> io::Result<bool> {
+    // Hold a directory-local writer lock from the capacity scan to the final
+    // rename. Uploads and acknowledged deletions can proceed independently.
+    #[cfg(unix)]
+    let _writer_lock = {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(spool.join(".writer.lock"))?;
+        while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let _writer_lock = {
+        static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        WRITER_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    };
+
     let digest = hex_sha(body);
-    let target = c.spool.join(format!("{}.jsonl", digest));
-    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
-        return true;
+    let target = spool.join(format!("{digest}.jsonl"));
+    if target.try_exists()? {
+        return Ok(true);
     }
-    let pending = c.spool.join(format!("{}.pending", digest));
-    if tokio::fs::write(&pending, body.as_bytes()).await.is_err() {
-        eprintln!("facts_ingest_spool_write_failed digest={digest}");
-        return false;
+    let entries = fs::read_dir(spool)?.map(|entry| entry.map(|entry| entry.path()));
+    if !reserve_spool(entries, body.len() as u64)? {
+        return Ok(false);
     }
-    if let Ok(file) = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(&pending)
-        .await
-    {
-        let _ = file.sync_all().await;
+    // Use a separate scratch filename from the previous version, which can
+    // still run during a rolling update and does not acquire the lock.
+    let pending = spool.join(format!(".{digest}.pending"));
+    let result = (|| {
+        let mut file = fs::File::create(&pending)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&pending, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&pending);
     }
-    if tokio::fs::rename(&pending, &target).await.is_err() {
-        eprintln!("facts_ingest_spool_commit_failed digest={digest}");
-        return false;
-    }
-    let _ = key;
-    true
+    result.map(|()| true)
 }
 
 async fn retry_spool(c: UploadConfig) {
@@ -316,24 +358,27 @@ async fn spool_pending(c: &UploadConfig) -> u64 {
     count
 }
 
-async fn reserve_spool(c: &UploadConfig, incoming: u64) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(&c.spool).await else {
-        return false;
-    };
+fn reserve_spool(
+    entries: impl Iterator<Item = io::Result<PathBuf>>,
+    incoming: u64,
+) -> io::Result<bool> {
     let mut files = Vec::new();
     let mut size = 0u64;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry?;
         if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(meta) = entry.metadata().await else {
-            return false;
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Another upload task may have acknowledged and deleted it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         };
         size = size.saturating_add(meta.len());
         files.push((meta.modified().unwrap_or(UNIX_EPOCH), path, meta.len()));
         if files.len() >= 4096 {
-            return false;
+            return Ok(false);
         }
     }
     files.sort_by_key(|row| row.0);
@@ -341,18 +386,26 @@ async fn reserve_spool(c: &UploadConfig, incoming: u64) -> bool {
         if size.saturating_add(incoming) <= SPOOL_LIMIT {
             break;
         }
-        let Ok(body) = tokio::fs::read_to_string(&path).await else {
-            return false;
+        let body = match fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                size = size.saturating_sub(bytes);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
-        let records = body.lines().filter(|line| !line.trim().is_empty()).count() as u64;
-        if tokio::fs::remove_file(&path).await.is_err() {
-            return false;
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                let records = body.lines().filter(|line| !line.trim().is_empty()).count() as u64;
+                DROPPED.fetch_add(records, Ordering::Relaxed);
+                eprintln!("facts_ingest_spool_evicted bytes={bytes}");
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         size = size.saturating_sub(bytes);
-        DROPPED.fetch_add(records, Ordering::Relaxed);
-        eprintln!("facts_ingest_spool_evicted bytes={bytes}");
     }
-    size.saturating_add(incoming) <= SPOOL_LIMIT
+    Ok(size.saturating_add(incoming) <= SPOOL_LIMIT)
 }
 
 async fn upload_body_with_retry(c: &UploadConfig, key: &str, body: &str) -> Result<(), String> {
@@ -754,9 +807,75 @@ async fn spool_capacity_evicts_oldest_file_before_reserving_new_bytes() {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(reserve_spool(&c, 4 * 1024 * 1024).await);
+    assert!(persist_batch(&c, "{\"event_id\":\"new-batch\"}\n").await);
     assert!(!root.join("old.jsonl").exists());
     assert!(root.join("middle.jsonl").exists());
     assert!(root.join("new.jsonl").exists());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reserve_spool_tolerates_acknowledged_deletion_during_scan_and_eviction() {
+    let root = std::env::temp_dir().join(new_event_id("spool-disappeared-test"));
+    fs::create_dir(&root).unwrap();
+    let deleted_before_stat = root.join("before-stat.jsonl");
+    let deleted_after_stat = root.join("after-stat.jsonl");
+    fs::File::create(&deleted_after_stat)
+        .unwrap()
+        .set_len(SPOOL_LIMIT)
+        .unwrap();
+
+    // The filesystem has returned both directory entries. The uploader has
+    // deleted one already, and deletes the other after its size is observed.
+    let entries = [Ok(deleted_before_stat), Ok(deleted_after_stat.clone())]
+        .into_iter()
+        .chain(std::iter::once_with(|| {
+            fs::remove_file(&deleted_after_stat).unwrap();
+            Ok(root.join("ignored.pending"))
+        }));
+    assert!(reserve_spool(entries, 1024).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reserve_spool_propagates_unexpected_io_errors() {
+    let entries = std::iter::once(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+    assert_eq!(
+        reserve_spool(entries, 1024).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn concurrent_batch_writers_leave_complete_retryable_files() {
+    let root = std::env::temp_dir().join(new_event_id("spool-concurrent-test"));
+    fs::create_dir(&root).unwrap();
+    let c = UploadConfig {
+        client: Client::new(),
+        endpoint: "http://127.0.0.1/unused".into(),
+        token: "fixture".into(),
+        instance: "fixture".into(),
+        epoch: "epoch".into(),
+        spool: root.clone(),
+    };
+    let a = "{\"event_id\":\"a\"}\n";
+    let b = "{\"event_id\":\"b\"}\n";
+    let (first, duplicate, other) = tokio::join!(
+        persist_batch(&c, a),
+        persist_batch(&c, a),
+        persist_batch(&c, b)
+    );
+    assert!(first && duplicate && other);
+    for body in [a, b] {
+        assert_eq!(
+            fs::read_to_string(root.join(format!("{}.jsonl", hex_sha(body)))).unwrap(),
+            body
+        );
+    }
+    assert!(fs::read_dir(&root).unwrap().all(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .is_none_or(|ext| ext != "pending")));
+    fs::remove_dir_all(root).unwrap();
 }
