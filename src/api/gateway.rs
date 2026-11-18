@@ -164,14 +164,21 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let context = if let Some(context) = prepared_context {
         context
     } else {
+        let mut facts =
+            RequestFacts::new(&request_model, &path, body_bytes, input.payload.as_ref());
+        if gemini_route.is_some()
+            && headers.contains_key(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER)
+        {
+            facts.reasoning_effort = input
+                .payload
+                .as_ref()
+                .and_then(|v| v.pointer("/generationConfig/thinkingConfig/thinkingLevel"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
         match state
             .runtime
-            .resolve_route(
-                &state.persistence,
-                &headers,
-                RequestFacts::new(&request_model, &path, body_bytes, input.payload.as_ref()),
-                true,
-            )
+            .resolve_route(&state.persistence, &headers, facts, true)
             .await
         {
             Ok(route) => route,

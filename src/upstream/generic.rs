@@ -856,6 +856,10 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         completion_price,
         keepalive_updates,
     } = execution;
+    // A diagnostic sibling endpoint is not the channel's serving endpoint.
+    // Keep usage/attempt facts, but do not train routing health on its result.
+    let fingerprint_probe =
+        headers.contains_key(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER);
     debug_assert_eq!(
         context.admission,
         crate::routing::context::AdmissionReceipt::Request
@@ -1041,10 +1045,14 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 prepared.headers.insert("chatgpt-account-id", value);
             }
         }
-        let cache_candidate = state
-            .runtime
-            .explicit_cache
-            .candidate(&api_key, &provider, &prepared, &path);
+        let cache_candidate = if fingerprint_probe {
+            None
+        } else {
+            state
+                .runtime
+                .explicit_cache
+                .candidate(&api_key, &provider, &prepared, &path)
+        };
         if let Some(mut detail) = cache_candidate
             .as_ref()
             .and_then(|c| state.runtime.explicit_cache.avoidance(c))
@@ -1288,7 +1296,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             stream: downstream_stream,
                         });
                         let recorded_status = if outcome.success {
-                            if !outcome.observational_only {
+                            if !outcome.observational_only && !fingerprint_probe {
                                 outcome_state
                                     .runtime
                                     .reset_route_failure(&outcome_provider, &outcome_original_model)
@@ -1309,7 +1317,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 auto_retry,
                                 wire_model.as_deref(),
                             );
-                            if !policy.request_scoped || policy.force_quota_cooldown {
+                            if !fingerprint_probe
+                                && (!policy.request_scoped || policy.force_quota_cooldown)
+                            {
                                 outcome_state
                                     .runtime
                                     .cool_failed_route(FailedRoute {
@@ -1416,10 +1426,12 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     endpoint: path.clone(),
                     stream: downstream_stream,
                 });
-                state
-                    .runtime
-                    .reset_route_failure(&provider, &original_model)
-                    .await;
+                if !fingerprint_probe {
+                    state
+                        .runtime
+                        .reset_route_failure(&provider, &original_model)
+                        .await;
+                }
                 state.persistence.record_request(request_stat);
                 emit_attempt(
                     &request_id,
@@ -1484,7 +1496,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     endpoint: path.clone(),
                     stream: downstream_stream,
                 });
-                if !failure.failure_reason.starts_with("compaction_")
+                if !fingerprint_probe
+                    && !failure.failure_reason.starts_with("compaction_")
                     && (!policy.request_scoped || policy.force_quota_cooldown)
                 {
                     state

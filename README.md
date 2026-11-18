@@ -1292,6 +1292,16 @@ provider. Check `GET /v1/observability/runtime` for
 `capabilities.targeted_responses: true` before using the header with an older
 release; older gateways may ignore unknown headers.
 
+For a native fingerprint, check that `capabilities.targeted_fingerprint_protocols`
+contains the required protocol, then send the same target header plus
+`X-Uni-API-Fingerprint-Protocol: gemini` on
+`POST /v1beta/models/{model}:streamGenerateContent?alt=sse`, or `chat` on
+`POST /v1/chat/completions`. Standard relays use the corresponding same-origin
+endpoint under the same deployment prefix, even if their serving URL ends in
+`/v1/responses`. This changes only the diagnostic request; no provider or model
+mapping is saved. Incompatible targets and conflicting body overrides fail
+without switching protocols. Ordinary targeted Responses requests are unchanged.
+
 ### Temporary channel controls (no database)
 
 The first configured key and administrator keys can read or update

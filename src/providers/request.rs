@@ -633,6 +633,17 @@ pub(crate) fn build_attempt(
             }
         }
     }
+    if incoming_headers.contains_key(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER) {
+        // Reject overrides/conversion that would score a different request. The
+        // channel's configured model alias is the only intentional body change.
+        let mut expected = input.payload.clone().ok_or("Missing fingerprint payload")?;
+        if !native_gemini {
+            set_model(&mut expected, original_model)?;
+        }
+        if payload != expected || (!native_gemini && adapter != ResponseAdapter::Passthrough) {
+            return Err("Channel parameters conflict with the fingerprint protocol".into());
+        }
+    }
     if wire_path == "/v1/messages"
         || matches!(
             adapter,
@@ -703,6 +714,21 @@ pub(crate) fn build_attempt(
             upstream_stream,
             None,
         )?
+    };
+    // Native Gemini accepts the provider key in a header; keep it out of the
+    // probe URL (and never forward the console's x-goog-api-key).
+    let url = if native_gemini
+        && engine == "gemini"
+        && incoming_headers.contains_key(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER)
+    {
+        let mut url = Url::parse(&url).map_err(|_| "Invalid Gemini fingerprint URL")?;
+        url.set_query(Some("alt=sse"));
+        headers.entry("x-goog-api-key").or_insert(
+            HeaderValue::from_str(provider_key).map_err(|_| "Invalid Gemini provider key")?,
+        );
+        url.to_string()
+    } else {
+        url
     };
     if is_alpha_search && engine == "codex" {
         apply_alpha_search_headers(&mut headers, incoming_headers, &payload)?;
@@ -935,6 +961,20 @@ pub(crate) fn provider_headers(
         .flatten()
         .filter_map(Value::as_str);
     for name in passthrough {
+        if incoming.contains_key(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER)
+            && (name.to_ascii_lowercase().starts_with("x-uni-api-")
+                || [
+                    "authorization",
+                    "x-api-key",
+                    "x-goog-api-key",
+                    "cookie",
+                    "proxy-authorization",
+                ]
+                .iter()
+                .any(|h| name.eq_ignore_ascii_case(h)))
+        {
+            continue;
+        }
         if let (Ok(header_name), Some(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
             incoming.get(name).cloned(),

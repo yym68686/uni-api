@@ -142,6 +142,15 @@ impl GatewayRuntime {
                 "All matching channels are temporarily disabled",
             ));
         }
+        let providers = if let Some(protocol) = headers.get(FINGERPRINT_PROTOCOL_HEADER) {
+            // diagnostic_key has already authorized and pinned this single provider.
+            providers
+                .into_iter()
+                .map(|p| fingerprint_provider(p, &facts.model, protocol))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            providers
+        };
         let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) {
             HedgingConfig::default()
         } else {
@@ -291,6 +300,73 @@ pub(crate) fn nested_keys_for_model(
 pub(crate) const TARGET_PROVIDER_HEADER: &str = "x-uni-api-provider";
 
 pub(crate) const PROBE_UNCONFIGURED_MODEL_HEADER: &str = "x-uni-api-probe-unconfigured-model";
+pub(crate) const FINGERPRINT_PROTOCOL_HEADER: &str = "x-uni-api-fingerprint-protocol";
+
+// Select a sibling wire endpoint only for this probe. Never reinterpret a cloud
+// credential, custom deployment URL or OAuth account bundle as a relay API key.
+fn fingerprint_provider(
+    mut provider: Arc<Provider>,
+    model: &str,
+    protocol: &axum::http::HeaderValue,
+) -> Result<Arc<Provider>, RouteResolutionError> {
+    let unsupported = || RouteResolutionError {
+        status: StatusCode::BAD_REQUEST,
+        message: "Target provider has no compatible native fingerprint endpoint".into(),
+    };
+    let gemini = protocol == "gemini";
+    let engine = provider.engine.trim().to_ascii_lowercase();
+    if gemini {
+        let alias = provider.models.get(model).ok_or_else(unsupported)?;
+        if alias.split('/').any(|segment| {
+            matches!(segment, "" | "." | "..")
+                || !segment
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        }) {
+            return Err(unsupported());
+        }
+        if matches!(engine.as_str(), "gemini" | "vertex" | "vertex-gemini") {
+            return Ok(provider);
+        }
+    }
+    if !(matches!(engine.as_str(), "codex" | "gpt") || (!gemini && engine == "openrouter"))
+        || (engine == "codex" && provider.api_keys.iter().any(|k| k.contains(',')))
+    {
+        return Err(unsupported());
+    }
+    let mut url = url::Url::parse(&provider.base_url).map_err(|_| unsupported())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(unsupported());
+    }
+    let path = url.path().trim_end_matches('/');
+    let prefix = if path.is_empty() {
+        ""
+    } else {
+        ["/v1/responses", "/v1/chat/completions", "/v1"]
+            .iter()
+            .find_map(|suffix| path.strip_suffix(suffix))
+            .ok_or_else(unsupported)?
+    };
+    if prefix.contains("/models/") || prefix.ends_with("/models") {
+        return Err(unsupported());
+    }
+    url.set_path(&format!(
+        "{prefix}/{}",
+        if gemini { "v1beta" } else { "v1" }
+    ));
+    let probe = Arc::make_mut(&mut provider);
+    probe.base_url = url.to_string().into();
+    if engine != "openrouter" {
+        probe.engine = if gemini { "gemini" } else { "gpt" }.into();
+    }
+    Ok(provider)
+}
 
 pub(crate) fn diagnostic_key(
     snapshot: &Snapshot,
@@ -299,10 +375,12 @@ pub(crate) fn diagnostic_key(
     endpoint: &str,
 ) -> Result<ApiKey, RouteResolutionError> {
     let Some(value) = headers.get(TARGET_PROVIDER_HEADER) else {
-        if headers.contains_key(PROBE_UNCONFIGURED_MODEL_HEADER) {
+        if headers.contains_key(PROBE_UNCONFIGURED_MODEL_HEADER)
+            || headers.contains_key(FINGERPRINT_PROTOCOL_HEADER)
+        {
             return Err(RouteResolutionError {
                 status: StatusCode::BAD_REQUEST,
-                message: "Unconfigured model probes require a target provider".into(),
+                message: "Diagnostic probes require a target provider".into(),
             });
         }
         return Ok(key.clone());
@@ -313,10 +391,20 @@ pub(crate) fn diagnostic_key(
             message: "Targeted requests require a platform administrator key".into(),
         });
     }
-    if endpoint.trim_end_matches('/') != "/v1/responses" {
+    let valid_endpoint = match headers.get(FINGERPRINT_PROTOCOL_HEADER) {
+        None => endpoint.trim_end_matches('/') == "/v1/responses",
+        Some(p) if p == "chat" => endpoint == "/v1/chat/completions",
+        Some(p) if p == "gemini" => {
+            endpoint.starts_with("/v1beta/models/")
+                && crate::protocols::gemini::route(endpoint)
+                    .is_some_and(|(_, a)| a == "streamGenerateContent")
+        }
+        _ => false,
+    };
+    if !valid_endpoint {
         return Err(RouteResolutionError {
             status: StatusCode::BAD_REQUEST,
-            message: "Targeted requests require /v1/responses".into(),
+            message: "Endpoint does not match the requested diagnostic protocol".into(),
         });
     }
     let name = value
