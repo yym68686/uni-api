@@ -167,6 +167,7 @@ struct ActiveAttempt {
     mode: StreamMode,
     early_output: Vec<Bytes>,
     buffered: Vec<Bytes>,
+    reasoning_tail: BytesMut,
     stats: StreamStats,
     terminal: Option<Terminal>,
     precommit_deadline: Option<tokio::time::Instant>,
@@ -789,7 +790,7 @@ pub async fn serve_session(
                     "commit_reason": active.commit_reason,
                     "business_committed": active.business_committed,
                     "precommit_events": active.stats.event_count,
-                    "precommit_bytes": active.buffered.iter().map(|item| item.len() as u64).sum::<u64>(),
+                    "precommit_bytes": active.buffered_bytes(),
                 });
                 if let Err(error) = control_commit(&state, &session_id, &observation).await {
                     release_owner(&mut idempotency_owner).await;
@@ -1004,6 +1005,7 @@ async fn preflight_attempt_with_trigger(
         stream,
         early_output: Vec::new(),
         buffered: Vec::new(),
+        reasoning_tail: BytesMut::new(),
         stats,
         terminal: None,
         precommit_deadline: (!hedge_triggered).then_some(first_deadline).flatten(),
@@ -1042,14 +1044,12 @@ async fn preflight_attempt_with_trigger(
         let chunk = match read_result {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(error))) => {
-                return Ok(PreflightResult::Retry(json!({
-                    "kind": "transport_error",
-                    "status_code": 502,
-                    "upstream_status_code": status.as_u16(),
-                    "detail": format!("upstream stream read failed: {error}"),
-                    "transport_timing": active.stats.transport_timing(),
-                    "committed": false,
-                })))
+                return Ok(PreflightResult::Retry(preflight_failure(
+                    &active,
+                    "transport_error",
+                    502,
+                    &format!("upstream stream read failed: {error}"),
+                )))
             }
             Ok(None) => {
                 let frames = active.decoder.finish()?;
@@ -1058,14 +1058,12 @@ async fn preflight_attempt_with_trigger(
                         return Ok(result);
                     }
                 }
-                return Ok(PreflightResult::Retry(json!({
-                    "kind": "protocol_error",
-                    "status_code": 502,
-                    "upstream_status_code": status.as_u16(),
-                    "detail": "Responses upstream closed before substantive output",
-                    "transport_timing": active.stats.transport_timing(),
-                    "committed": false,
-                })));
+                return Ok(PreflightResult::Retry(preflight_failure(
+                    &active,
+                    "protocol_error",
+                    502,
+                    "Responses upstream closed before substantive output",
+                )));
             }
             Err(error) => {
                 if trigger.is_some()
@@ -1081,14 +1079,12 @@ async fn preflight_attempt_with_trigger(
                     }
                     continue;
                 }
-                return Ok(PreflightResult::Retry(json!({
-                    "kind": "transport_error",
-                    "status_code": 504,
-                    "upstream_status_code": status.as_u16(),
-                    "detail": error,
-                    "transport_timing": active.stats.transport_timing(),
-                    "committed": false,
-                })));
+                return Ok(PreflightResult::Retry(preflight_failure(
+                    &active,
+                    "transport_error",
+                    504,
+                    &error,
+                )));
             }
         };
         idle_deadline = deadline(
@@ -1165,7 +1161,7 @@ fn process_preflight_frames_inner(
         if let Some(wire) = processed.wire.filter(|_| !suppress_repeated_keepalive) {
             if !active.business_committed
                 && !commits_response
-                && precommit_buffer_exceeded(active, wire.len())
+                && active.buffer_would_overflow(wire.len(), processed.reasoning_progress)
             {
                 return Ok(Some(PreflightResult::Retry(json!({
                     "kind": "protocol_error",
@@ -1178,7 +1174,10 @@ fn process_preflight_frames_inner(
             if early_keepalive {
                 active.early_output.push(wire);
             } else {
-                active.buffered.push(wire);
+                active.buffer_wire(
+                    wire,
+                    processed.reasoning_progress && !active.business_committed,
+                );
             }
         }
         if early_keepalive {
@@ -1230,6 +1229,7 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
         mode: active.mode,
         early_output: Vec::new(),
         buffered: Vec::new(),
+        reasoning_tail: BytesMut::new(),
         stats: StreamStats::new(&active.plan.attempt_id),
         terminal: None,
         precommit_deadline: active.precommit_deadline,
@@ -2135,6 +2135,7 @@ async fn flush_initial_output(
 ) -> Result<(), ()> {
     let mut wires = std::mem::take(&mut active.early_output);
     if active.business_committed {
+        active.finish_reasoning_run();
         wires.extend(std::mem::take(&mut active.buffered));
     }
     for wire in wires {
@@ -2144,15 +2145,34 @@ async fn flush_initial_output(
     Ok(())
 }
 
-fn precommit_buffer_exceeded(active: &ActiveAttempt, wire_bytes: usize) -> bool {
-    active.buffered.len() >= active.plan.max_precommit_items
-        || active
-            .buffered
-            .iter()
-            .map(Bytes::len)
-            .sum::<usize>()
-            .saturating_add(wire_bytes)
-            > active.plan.max_precommit_bytes
+impl ActiveAttempt {
+    fn buffered_bytes(&self) -> usize {
+        self.buffered.iter().map(Bytes::len).sum::<usize>() + self.reasoning_tail.len()
+    }
+
+    fn buffer_would_overflow(&self, bytes: usize, reasoning: bool) -> bool {
+        let other_slots =
+            self.buffered.len() + usize::from(!reasoning && !self.reasoning_tail.is_empty());
+        other_slots >= self.plan.max_precommit_items
+            || self.buffered_bytes().saturating_add(bytes) > self.plan.max_precommit_bytes
+    }
+
+    fn finish_reasoning_run(&mut self) {
+        if !self.reasoning_tail.is_empty() {
+            self.buffered.push(self.reasoning_tail.split().freeze());
+        }
+    }
+
+    fn buffer_wire(&mut self, wire: Bytes, reasoning: bool) {
+        // One bounded byte buffer for consecutive reasoning frames, independent
+        // of how finely an upstream tokenizes its summary.
+        if reasoning {
+            self.reasoning_tail.extend_from_slice(&wire);
+        } else {
+            self.finish_reasoning_run();
+            self.buffered.push(wire);
+        }
+    }
 }
 
 fn semantic_failure_outcome(
@@ -2196,10 +2216,19 @@ fn semantic_retry_outcome(active: &ActiveAttempt, terminal: Terminal) -> Value {
 }
 
 fn failure_retry_outcome(active: &ActiveAttempt, kind: &str, detail: &str) -> Value {
+    preflight_failure(
+        active,
+        kind,
+        if kind == "transport_error" { 504 } else { 502 },
+        detail,
+    )
+}
+
+fn preflight_failure(active: &ActiveAttempt, kind: &str, status: u16, detail: &str) -> Value {
     let mut outcome = active.stats.report();
     outcome["attempt_id"] = Value::String(active.plan.attempt_id.clone());
     outcome["kind"] = Value::String(kind.into());
-    outcome["status_code"] = Value::from(if kind == "transport_error" { 504 } else { 502 });
+    outcome["status_code"] = Value::from(status);
     outcome["upstream_status_code"] = Value::from(active.status.as_u16());
     outcome["detail"] = Value::String(detail.chars().take(4096).collect());
     outcome["committed"] = Value::Bool(false);
@@ -2218,7 +2247,7 @@ fn commit_observation(active: &ActiveAttempt, reason: &str) -> Value {
         "commit_reason": reason,
         "business_committed": active.business_committed,
         "precommit_events": active.stats.event_count,
-        "precommit_bytes": active.buffered.iter().map(|item| item.len() as u64).sum::<u64>(),
+        "precommit_bytes": active.buffered_bytes(),
     })
 }
 
@@ -2339,7 +2368,7 @@ async fn process_active_frames(
             }
             if let Some(wire) = processed.wire {
                 if processed.hold {
-                    if precommit_buffer_exceeded(active, wire.len()) {
+                    if active.buffer_would_overflow(wire.len(), false) {
                         return ActiveFrameResult::Retry(failure_retry_outcome(
                             active,
                             "protocol_error",
@@ -2427,14 +2456,16 @@ async fn process_active_frames(
                     return ActiveFrameResult::Done(false);
                 }
             } else {
-                if !processed.commits && precommit_buffer_exceeded(active, wire.len()) {
+                if !processed.commits
+                    && active.buffer_would_overflow(wire.len(), processed.reasoning_progress)
+                {
                     return ActiveFrameResult::Retry(failure_retry_outcome(
                         active,
                         "protocol_error",
                         "Responses upstream precommit buffer limit exceeded",
                     ));
                 }
-                active.buffered.push(wire);
+                active.buffer_wire(wire, processed.reasoning_progress);
             }
         }
 
@@ -2823,6 +2854,7 @@ mod tests {
             stream: Box::pin(futures_util::stream::empty()),
             early_output: Vec::new(),
             buffered: Vec::new(),
+            reasoning_tail: BytesMut::new(),
             stats: StreamStats::default(),
             terminal: None,
             precommit_deadline: None,
@@ -2831,6 +2863,23 @@ mod tests {
             precommit_keepalive_sent: false,
             business_committed: false,
         }
+    }
+
+    #[test]
+    fn consecutive_reasoning_shares_an_item_but_not_a_byte_allowance() {
+        let mut active = test_active("gpt");
+        active.plan.max_precommit_items = 2;
+        active.plan.max_precommit_bytes = 6;
+        active.buffer_wire(Bytes::from_static(b"id"), false);
+        for _ in 0..2 {
+            assert!(!active.buffer_would_overflow(2, true));
+            active.buffer_wire(Bytes::from_static(b"xx"), true);
+        }
+        assert!(active.buffer_would_overflow(1, true));
+        assert!(active.buffer_would_overflow(0, false));
+        active.finish_reasoning_run();
+        assert_eq!(active.buffered.len(), 2);
+        assert_eq!(active.buffered.concat(), b"idxxxx");
     }
 
     #[tokio::test]

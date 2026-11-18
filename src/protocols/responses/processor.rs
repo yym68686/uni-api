@@ -3,6 +3,7 @@ use crate::protocols::responses::events::encode_event;
 use crate::protocols::responses::events::extract_usage;
 use crate::protocols::responses::events::has_real_output;
 use crate::protocols::responses::events::is_canonical_keepalive;
+use crate::protocols::responses::events::is_reasoning_progress;
 use crate::protocols::responses::events::semantic_failure;
 use crate::protocols::responses::events::validate_terminal;
 use crate::protocols::responses::events::Terminal;
@@ -20,6 +21,7 @@ pub(crate) struct ProcessedEvent {
     pub(crate) wire: Option<Bytes>,
     pub(crate) event_type: Option<String>,
     pub(crate) commits: bool,
+    pub(crate) reasoning_progress: bool,
     pub(crate) canonical_keepalive: bool,
     pub(crate) terminal: Option<Terminal>,
 }
@@ -65,6 +67,7 @@ impl ResponsesProcessor {
                     wire: None,
                     event_type: None,
                     commits: false,
+                    reasoning_progress: false,
                     canonical_keepalive: false,
                     terminal: None,
                 });
@@ -74,6 +77,7 @@ impl ResponsesProcessor {
                 wire: Some(frame.canonical_wire()),
                 event_type: None,
                 commits: false,
+                reasoning_progress: false,
                 canonical_keepalive: true,
                 terminal: None,
             });
@@ -84,6 +88,7 @@ impl ResponsesProcessor {
                 wire: None,
                 event_type: None,
                 commits: false,
+                reasoning_progress: false,
                 canonical_keepalive: false,
                 terminal: None,
             });
@@ -158,6 +163,7 @@ impl ResponsesProcessor {
         {
             return Err("Responses upstream ended without substantive output".into());
         }
+        let reasoning_progress = is_reasoning_progress(&event_type, &payload);
         let commits = if self.compaction.is_some() {
             matches!(terminal, Some(Terminal::Completed))
         } else {
@@ -165,7 +171,8 @@ impl ResponsesProcessor {
                 || (!matches!(
                     event_type.as_str(),
                     "response.created" | "response.in_progress" | "response.queued" | "keepalive"
-                ) && self.commit_policy != "completed_usage"
+                ) && !reasoning_progress
+                    && self.commit_policy != "completed_usage"
                     && has_real_output(&event_type, &payload))
         };
         Ok(ProcessedEvent {
@@ -173,6 +180,7 @@ impl ResponsesProcessor {
             wire: Some(wire),
             event_type: Some(event_type),
             commits,
+            reasoning_progress,
             canonical_keepalive,
             terminal,
         })

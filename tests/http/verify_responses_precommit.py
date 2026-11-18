@@ -15,9 +15,11 @@ import time
 
 RETRY = {"failed", "coalesced", "eof", "whitespace-failed", "empty-completed",
          "whitespace-completed", "empty-incomplete", "malformed", "wrong-type",
-         "wrong-content-type", "done-only", "multiline-failed", "timeout", "overflow", "flat-error"}
-NO_RETRY = {"text-failed", "tool-failed", "custom-tool-failed", "reasoning-failed", "partial-incomplete", "flat-error-after-output"}
-SUCCESS = {"tool-only", "terminal-only", "whitespace-success", "opaque-reasoning", "refusal"}
+         "wrong-content-type", "done-only", "multiline-failed", "timeout", "overflow", "flat-error",
+         "reasoning-failed", "reasoning-eof", "reasoning-read-error", "reasoning-timeout"}
+NO_RETRY = {"text-failed", "tool-failed", "custom-tool-failed", "partial-incomplete", "flat-error-after-output",
+            "reasoning-then-text-failed", "reasoning-then-tool-failed"}
+SUCCESS = {"tool-only", "terminal-only", "whitespace-success", "opaque-reasoning", "refusal", "long-reasoning-success"}
 CASES = sorted(RETRY | NO_RETRY | SUCCESS | {"semantic-400", "flat-400", "exhausted"})
 VARIANTS = [("gpt", False, 0, False), ("codex", False, 0, True),
             ("gpt", True, 0, False), ("gpt", True, 3, False), ("codex", True, 3, False)]
@@ -53,6 +55,20 @@ def fixture(case, role):
     if case == "multiline-failed":
         return [created, failure.replace(b', "response":', b',\r\ndata: "response":').replace(b"\n\n", b"\r\n\r\n")]
     if case in ("eof", "timeout"): return [created]
+    if case in ("reasoning-eof", "reasoning-read-error", "reasoning-timeout", "long-reasoning-success",
+                "reasoning-then-text-failed", "reasoning-then-tool-failed"):
+        secret = "fixture-private-reasoning"
+        prefix = (event("response.output_item.added", item=reasoning) +
+                  event("response.reasoning_summary_text.delta", delta=secret) * 256 +
+                  event("response.reasoning_summary_text.done", text=secret) +
+                  event("response.output_item.done", item=reasoning))
+        if case == "long-reasoning-success":
+            return [created, prefix, event("response.output_text.delta", delta="OK"), complete([reasoning, text])]
+        if case == "reasoning-then-text-failed":
+            return [created, prefix, event("response.output_text.delta", delta="OK"), failure]
+        if case == "reasoning-then-tool-failed":
+            return [created, prefix, event("response.output_item.added", item=tool), failure]
+        return [created, prefix]
     if case == "whitespace-failed": return [created + event("response.output_text.delta", delta=" \n\t"), failure]
     if case == "empty-completed": return [created, complete([])]
     if case == "whitespace-completed":
@@ -105,6 +121,8 @@ class Upstream(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json" if case == "wrong-content-type" and role == "first" else "text/event-stream")
         self.send_header("X-Oaix-Fixture", role)
+        if case == "reasoning-read-error" and role == "first":
+            self.send_header("Content-Length", str(sum(map(len, chunks)) + 512))
         self.end_headers()
         try:
             for index, chunk in enumerate(chunks):
@@ -115,7 +133,7 @@ class Upstream(BaseHTTPRequestHandler):
                         self.wfile.write(chunk[offset:offset + 7]); self.wfile.flush()
                 else:
                     self.wfile.write(chunk); self.wfile.flush()
-            if case == "timeout" and role == "first": time.sleep(.5)
+            if case in ("timeout", "reasoning-timeout") and role == "first": time.sleep(.5)
         except (BrokenPipeError, ConnectionResetError): pass
 
 
@@ -175,6 +193,10 @@ def verify(binary, engine, mixed, budget, hedging, converted=False):
                         assert completed == expected_success, (label, case, response.status, wire)
                         if retried:
                             assert f"resp_first_{case}".encode() not in wire, (label, case, "failed metadata leaked", wire)
+                            assert b"fixture-private-reasoning" not in wire and b"opaque-fixture" not in wire, (label, case)
+                        if case == "long-reasoning-success":
+                            assert wire.count(b"fixture-private-reasoning") == 257, (label, case)
+                            assert wire.index(b"fixture-private-reasoning") < wire.index(b"response.output_text.delta")
                         if mixed and case in SUCCESS and not converted:
                             # Gateway comments may be added, while upstream event bytes stay exact.
                             expected = b"".join(fixture(case, "first"))
@@ -189,6 +211,10 @@ def verify(binary, engine, mixed, budget, hedging, converted=False):
                     for case in ("whitespace-failed", "whitespace-completed", "empty-completed", "failed"):
                         fact = next(f for f in server.facts if f.get("kind") == "attempt" and f.get("request_id") == case and f.get("provider") == "first")
                         assert fact.get("first_output_ms") is None and fact.get("first_text_ms") is None, (label, case, fact)
+                    if not mixed and not converted:
+                        for case in ("reasoning-eof", "reasoning-read-error"):
+                            first = next(f for f in server.facts if f.get("kind") == "attempt" and f.get("request_id") == case and f.get("provider") == "first")
+                            assert first.get("first_output_ms") is not None and first.get("first_text_ms") is None, (label, case, first)
                     if not converted:
                         fact = next(f for f in server.facts if f.get("kind") == "request" and f.get("request_id") == "partial-incomplete")
                         assert fact["outcome"] == "failed" and fact["failure_reason"] == "responses_max_output_tokens", (label, fact)

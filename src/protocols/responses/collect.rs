@@ -26,6 +26,7 @@ struct Collector {
     processor: ResponsesProcessor,
     stats: StreamStats,
     compaction: bool,
+    committed: bool,
 }
 
 impl Collector {
@@ -35,8 +36,8 @@ impl Collector {
             detail: detail.clone(),
             outcome: json!({
                 "kind":kind, "status_code":status, "upstream_status_code":200, "detail":detail,
-                "retry_allowed":self.compaction || self.stats.first_output_ms.is_none(), "usage":self.stats.usage,
-                "committed":!self.compaction && self.stats.first_output_ms.is_some(),
+                "retry_allowed":!self.committed, "usage":self.stats.usage,
+                "committed":self.committed,
                 "failure_reason":self.compaction.then(|| super::compaction::failure_reason(&detail)),
                 "upstream_stream":true, "downstream_stream":false,
                 "first_output_ms":self.stats.first_output_ms, "first_text_ms":self.stats.first_text_ms,
@@ -55,6 +56,7 @@ impl Collector {
             .process(frame, &mut self.stats)
             .map_err(|e| self.error(502, "protocol_error", e))?;
         let Some(terminal) = event.terminal else {
+            self.committed |= event.commits;
             return Ok(None);
         };
         if let Terminal::SemanticFailure {
@@ -68,7 +70,6 @@ impl Collector {
             // The routing classifier must not guess error fields from detail.
             failure.outcome["payload"] = payload;
             failure.outcome["event_type"] = event_type.into();
-            failure.outcome["committed"] = self.stats.first_output_ms.is_some().into();
             return Err(failure);
         }
         let mut event: Value = serde_json::from_str(data.as_deref().unwrap_or_default())
@@ -122,6 +123,7 @@ pub(crate) async fn collect(
         processor: ResponsesProcessor::new("real_output".into(), normalize_ids),
         stats: StreamStats::new("nonstream-collection"),
         compaction,
+        committed: false,
     };
     if compaction {
         collector.processor.require_compaction();

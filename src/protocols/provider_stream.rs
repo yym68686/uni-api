@@ -841,7 +841,9 @@ fn responses_event_has_output(
 }
 
 fn responses_event_precommit_decision(event_type: &str, payload: &Value) -> PrecommitDecision {
-    if responses_event_has_real_output(event_type, payload) {
+    if crate::protocols::responses::events::is_reasoning_progress(event_type, payload) {
+        PrecommitDecision::Retain
+    } else if responses_event_has_real_output(event_type, payload) {
         PrecommitDecision::Commit
     } else if responses_event_has_nonempty_output(event_type, payload) {
         PrecommitDecision::Retain
@@ -2684,7 +2686,6 @@ mod tests {
     fn responses_precommit_commits_only_real_output_or_completed() {
         for event in [
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
-            "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}",
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}",
             "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"hello\"}",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}}",
@@ -2701,6 +2702,13 @@ mod tests {
             )
             .unwrap(),
             PrecommitDecision::Ignore
+        );
+        assert_eq!(
+            classify_responses_precommit_event(
+                b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}"
+            )
+            .unwrap(),
+            PrecommitDecision::Retain
         );
         assert_eq!(
             classify_responses_precommit_event(

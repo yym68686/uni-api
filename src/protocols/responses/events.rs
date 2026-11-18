@@ -186,6 +186,22 @@ pub(crate) fn is_canonical_keepalive(payload: &Value) -> bool {
         && object.get("sequence_number").and_then(Value::as_i64) == Some(0)
 }
 
+/// Reasoning is observable model output, but remains private to an attempt
+/// until the gateway has an answer, an action, or a valid terminal to deliver.
+pub(crate) fn is_reasoning_progress(event_type: &str, payload: &Value) -> bool {
+    event_type.starts_with("response.reasoning")
+        || match event_type {
+            "response.output_item.added" | "response.output_item.done" => {
+                payload.pointer("/item/type").and_then(Value::as_str) == Some("reasoning")
+            }
+            "response.content_part.added" | "response.content_part.done" => matches!(
+                payload.pointer("/part/type").and_then(Value::as_str),
+                Some("reasoning_text" | "summary_text")
+            ),
+            _ => false,
+        }
+}
+
 pub(crate) fn has_real_output(event_type: &str, payload: &Value) -> bool {
     if event_type.starts_with("response.") && event_type.ends_with(".delta") {
         return payload

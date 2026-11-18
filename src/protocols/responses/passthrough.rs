@@ -8,7 +8,7 @@ use crate::protocols::sse::{SseDecoder, SseFrame};
 use crate::routing::attempt_policy::ResponseStreamPolicy;
 use crate::transport::{body::upstream_chunks, http::filtered_response_headers};
 use axum::{body::Body, http::Response};
-use bytes::Bytes;
+use bytes::BytesMut;
 use futures_util::{stream, StreamExt};
 use std::{io, time::Duration};
 use tokio::{sync::oneshot, time::Instant};
@@ -49,6 +49,9 @@ struct Observer {
     processor: ResponsesProcessor,
     stats: StreamStats,
     committed: bool,
+    precommit_groups: usize,
+    precommit_frame_bytes: usize,
+    last_was_reasoning: bool,
     terminal: bool,
     terminal_kind: Option<&'static str>,
     ended: bool,
@@ -67,6 +70,9 @@ impl Observer {
             wire: bytes::BytesMut::new(),
             stats,
             committed: false,
+            precommit_groups: 0,
+            precommit_frame_bytes: 0,
+            last_was_reasoning: false,
             terminal: false,
             terminal_kind: None,
             ended: false,
@@ -80,6 +86,7 @@ impl Observer {
             if self.terminal || self.failure.is_some() {
                 break;
             }
+            let frame_bytes = frame.wire.len();
             let event = self
                 .processor
                 .process(frame, &mut self.stats)
@@ -128,12 +135,30 @@ impl Observer {
                     "Responses upstream ended incomplete after output",
                 ));
             }
-            if !self.committed && self.stats.event_count > self.policy.max_precommit_items as u64 {
-                return Err(failure(
-                    "protocol_error",
-                    502,
-                    "Responses precommit event limit exceeded",
-                ));
+            if !self.committed {
+                // A committing event later in this transport chunk must not
+                // exempt the reasoning prefix from the existing byte budget.
+                self.precommit_frame_bytes = self.precommit_frame_bytes.saturating_add(
+                    frame_bytes.max(event.wire.as_ref().map_or(0, |wire| wire.len())),
+                );
+                if self.precommit_frame_bytes > self.policy.max_precommit_bytes {
+                    return Err(failure(
+                        "protocol_error",
+                        502,
+                        "Responses precommit byte limit exceeded",
+                    ));
+                }
+                if !event.reasoning_progress || !self.last_was_reasoning {
+                    self.precommit_groups += 1;
+                }
+                self.last_was_reasoning = event.reasoning_progress;
+                if self.precommit_groups > self.policy.max_precommit_items {
+                    return Err(failure(
+                        "protocol_error",
+                        502,
+                        "Responses precommit event limit exceeded",
+                    ));
+                }
             }
         }
         Ok(())
@@ -252,7 +277,7 @@ pub(crate) async fn prepare(
     let mut upstream = Box::pin(upstream_chunks(response, idle));
     let max_precommit_bytes = policy.max_precommit_bytes;
     let mut observer = Observer::new(started, policy);
-    let mut retained = Vec::<Bytes>::new();
+    let mut retained = BytesMut::new();
     let mut size = 0usize;
     loop {
         let next = match deadline {
@@ -268,10 +293,10 @@ pub(crate) async fn prepare(
                 if observer.policy.normalize_ids {
                     let wire = observer.wire.split().freeze();
                     if !wire.is_empty() {
-                        retained.push(wire);
+                        retained.extend_from_slice(&wire);
                     }
                 } else {
-                    retained.push(bytes);
+                    retained.extend_from_slice(&bytes);
                 }
                 result
             }
@@ -333,7 +358,7 @@ pub(crate) async fn prepare(
             }
         },
     );
-    let body = stream::iter(retained.into_iter().map(Ok::<_, io::Error>)).chain(tail);
+    let body = stream::iter([Ok::<_, io::Error>(retained.freeze())]).chain(tail);
     let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -355,7 +380,7 @@ pub(crate) async fn preflight_translation(
     policy.normalize_ids = false;
     let max_precommit_bytes = policy.max_precommit_bytes;
     let mut observer = Observer::new(started, policy);
-    let mut retained = Vec::new();
+    let mut retained = BytesMut::new();
     let mut size = 0usize;
     loop {
         let next = match deadline {
@@ -368,7 +393,7 @@ pub(crate) async fn preflight_translation(
             Some(Ok(bytes)) => {
                 size = size.saturating_add(bytes.len());
                 let inspected = observer.feed(&bytes);
-                retained.push(bytes);
+                retained.extend_from_slice(&bytes);
                 inspected
             }
             Some(Err(error)) => Err(failure("transport_error", 502, error.to_string())),
@@ -386,7 +411,7 @@ pub(crate) async fn preflight_translation(
             ));
         }
     }
-    let stream = stream::iter(retained.into_iter().map(Ok::<_, axum::Error>)).chain(body);
+    let stream = stream::iter([Ok::<_, axum::Error>(retained.freeze())]).chain(body);
     Ok(Translation {
         response: Response::from_parts(parts, Body::from_stream(stream)),
         outcome,

@@ -24,6 +24,13 @@ execution retains protocol conversion and other endpoint transports.
   Responses commit/normalization limits from the fixed snapshot. Codex OAuth
   refresh uses the same proxy selection. `providers::responses` constructs the
   shared Responses body and headers; Chat conversion keeps its own defaults.
+* Reasoning progress in a Responses stream is measured but does not lock the
+  channel. Keep its events private to the current attempt until answer text,
+  a refusal, tool output or another deliverable result commits the stream.
+  On a retryable failure, discard the attempt's prefix and use the existing
+  retry budget. On success, forward the winning prefix in order. A validated
+  reasoning-only terminal remains deliverable. Buffer and timeout limits
+  still apply; long runs of reasoning deltas share the bounded byte budget.
 * `FinalFacts` distinguishes protocol terminal, semantic status, upstream HTTP
   status, downstream HTTP status and business commit. Missing evidence remains
   unknown. Responses completion requires a validated successful terminal event.

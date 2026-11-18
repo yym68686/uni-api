@@ -45,11 +45,13 @@ class Upstream(BaseHTTPRequestHandler):
             content_type = 'application/json'; status = 400
         else:
             raw = b': heartbeat\r\n\r\n' + event('response.created', response={'id':'resp_fixture','status':'in_progress'})
-            if model != 'early-fail':
+            if model == 'reasoning-eof' and name != 'fallback':
+                raw += event('response.reasoning_summary_text.delta', delta='private reasoning')
+            elif model != 'early-fail':
                 raw += event('response.output_text.delta', delta='test 中文')
             if model in ('failed', 'early-fail') and name != 'fallback':
                 raw += event('response.failed', response={'status':'failed','error':{'code':'server_error','message':'fixture failed'}})
-            elif model == 'truncated':
+            elif model == 'truncated' or (model == 'reasoning-eof' and name != 'fallback'):
                 pass
             elif model == 'malformed':
                 raw += b'data: {bad json}\n\n'
@@ -84,7 +86,7 @@ class Upstream(BaseHTTPRequestHandler):
 def verify(binary):
     upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream); upstream.hits = []
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
-    models = ['normal','follow','failed','early-fail','truncated','malformed','done-only','incomplete','oversize','idle','total']
+    models = ['normal','follow','failed','early-fail','reasoning-eof','truncated','malformed','done-only','incomplete','oversize','idle','total']
     with tempfile.TemporaryDirectory(prefix='uni-stream-only-') as directory:
         root = Path(directory); port = free_port()
         mode = {'default':'stream_only', 'models':{'follow':'follow_client'}}
@@ -149,7 +151,7 @@ def verify(binary):
                     for path,model in [('/v1/responses','follow'),('/v1/responses/compact','normal')]:
                         before=len(upstream.hits);status,_,raw=call('POST',path,{'model':model,'input':'test'},key)
                         assert status==200 and upstream.hits[before][2] is False,(status,raw)
-                for model,count,status in [('early-fail',2,200),('failed',1,500),('truncated',1,502)]:
+                for model,count,status in [('early-fail',2,200),('reasoning-eof',2,200),('failed',1,500),('truncated',1,502)]:
                     before=len(upstream.hits)
                     code,_,raw=call('POST','/v1/responses',{'model':model,'input':'test'},'retry-fixture')
                     assert code==status and len(upstream.hits)-before==count,(model,code,upstream.hits[before:],raw)
