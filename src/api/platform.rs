@@ -127,6 +127,17 @@ pub async fn handle(
             StatusCode::OK,
             json!({"status":"ok","version": app_version()}),
         )),
+        (&Method::GET, "/readyz") => Some(if state.runtime.is_ready().await {
+            json_response(StatusCode::OK, json!({"status":"ready"}))
+        } else {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }),
+        (&Method::GET, "/v1/configuration/export") => {
+            Some(crate::config::managed::export_response(state, headers).await)
+        }
         (&Method::GET, "/v1/observability/runtime") => {
             let (api_keys, providers, models) = state.runtime.runtime_counts().await;
             let details = state.runtime_observability().await;
@@ -139,6 +150,7 @@ pub async fn handle(
                     "capabilities": {"responses_stream_collection":true,"gemini_native":true,"gemini_cross_protocol":true,"targeted_responses": true,"targeted_fingerprint_protocols":["gemini","chat"],"targeted_unconfigured_models":true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
                     "request_body_limits": crate::transport::decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.runtime.is_ready().await,
+                    "managed_config_revision": state.managed_config.as_ref().and_then(|m| m.applied_revision()),
                     "database_disabled": state.persistence.disabled(),
                     "persistence": if state.persistence.disabled() { "disabled" } else { "rust" },
                     "api_key_count": api_keys,
@@ -161,8 +173,21 @@ pub async fn handle(
             Some(response)
         }
         (&Method::GET, "/v1/channel-controls") => {
+            let _managed_read = match &state.managed_config {
+                Some(managed) => Some(managed.read_guard().await),
+                None => None,
+            };
             Some(match state.runtime.controls_view(headers).await {
-                Ok(value) => json_response(StatusCode::OK, value),
+                Ok(mut value) => {
+                    if let Some(revision) = state
+                        .managed_config
+                        .as_ref()
+                        .and_then(|m| m.applied_revision())
+                    {
+                        value["managed_config_revision"] = json!(revision);
+                    }
+                    json_response(StatusCode::OK, value)
+                }
                 Err(status) => json_error(
                     StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
                     "Channel controls unavailable",
@@ -473,6 +498,19 @@ pub fn supports_mutation(method: &Method, path: &str) -> bool {
 }
 
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
+    if let Some(managed) = &state.managed_config {
+        let path = request.uri().path().trim_end_matches('/');
+        if !matches!(
+            path,
+            "/v1/channel-settings/validate" | "/v1/channel-settings/discover"
+        ) {
+            return managed.mutate(state, request).await;
+        }
+    }
+    handle_local_mutation(state, request).await
+}
+
+pub(crate) async fn handle_local_mutation(state: &AppState, request: Request) -> Response<Body> {
     let path = request.uri().path().trim_end_matches('/').to_owned();
     let headers = request.headers().clone();
     if path == "/v1/channel-settings"
@@ -794,7 +832,10 @@ async fn api_config_response(state: &AppState, headers: &HeaderMap) -> Response<
     }
 }
 
-async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response<Body>> {
+pub(crate) async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), Response<Body>> {
     let auth = state
         .runtime
         .authorize(headers)
@@ -900,7 +941,7 @@ fn openapi_document() -> Value {
     json!({"openapi":"3.1.0","info":{"title":"uni-api","version":app_version()},"paths":paths})
 }
 
-fn json_response(status: StatusCode, value: Value) -> Response<Body> {
+pub(crate) fn json_response(status: StatusCode, value: Value) -> Response<Body> {
     (
         status,
         [("content-type", "application/json")],

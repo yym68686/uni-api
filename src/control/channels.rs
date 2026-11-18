@@ -143,6 +143,40 @@ impl Controls {
     pub(crate) fn export(&self, base: &Snapshot) -> Value {
         json!({"revision":self.revision(base),"channel_settings":self.settings,"digest":crate::control::settings::digest(&self.settings),"temporary_definitions":self.settings_definitions(base)})
     }
+    pub(crate) fn retained(&self) -> RetainedSnapshot {
+        RetainedSnapshot {
+            version: 2,
+            rules: self.rules.values().cloned().collect(),
+            channel_settings: self.settings.clone(),
+            temporary_channels: self
+                .temporary
+                .values()
+                .map(|p| RetainedChannel {
+                    provider: p.name.to_string(),
+                    api_key_id: p
+                        .preferences
+                        .get("__temporary_key_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    base_url: p.base_url.to_string(),
+                    api_key: p
+                        .api_keys
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "__full_definition__".into()),
+                    models: p
+                        .models
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    definition: self.temporary_documents.get(p.name.as_ref()).cloned(),
+                })
+                .collect(),
+        }
+    }
     pub(crate) fn management_read_copy(&self) -> Self {
         Self {
             instance: self.instance.clone(),
@@ -786,7 +820,7 @@ pub(crate) struct RetainedSnapshot {
     #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]
-    pub temporary_channels: Vec<RetainedChannel>,
+    pub(crate) temporary_channels: Vec<RetainedChannel>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub channel_settings: BTreeMap<String, crate::control::settings::ProviderSettings>,
 }
@@ -810,6 +844,15 @@ impl GatewayRuntime {
                 "Platform administrator key required".into(),
             )
         })?;
+        self.restore_controls_authorized(input).await
+    }
+
+    // Managed configuration has its own transport authentication and does not
+    // add the bootstrap credential to the model-serving key directory.
+    pub(crate) async fn restore_controls_authorized(
+        &self,
+        input: RestoreMutation,
+    ) -> Result<Value, (StatusCode, String)> {
         let base = self.base_snapshot().await.ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             "Configuration unavailable".into(),

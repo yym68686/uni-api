@@ -85,6 +85,15 @@ pub struct RuntimeConfigPublisher {
 impl RuntimeConfigPublisher {
     pub fn discover(database_disabled: bool) -> Result<Self, String> {
         let source = RuntimeConfigSource::discover()?;
+        Self::with_source(source, database_disabled)
+    }
+
+    pub(crate) fn local_for_bootstrap(database_disabled: bool) -> Result<Self, String> {
+        let path = std::env::var("UNI_API_CONFIG_PATH").unwrap_or_else(|_| "api.yaml".into());
+        Self::with_source(RuntimeConfigSource::File(path.into()), database_disabled)
+    }
+
+    fn with_source(source: RuntimeConfigSource, database_disabled: bool) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .http1_only()
             .build()
@@ -101,15 +110,19 @@ impl RuntimeConfigPublisher {
     }
 
     pub async fn publish(&self) -> Result<(), String> {
+        let snapshot = self.compile_source().await?;
+        atomic_write(self.snapshot_path.as_ref(), &snapshot).await
+    }
+
+    pub(crate) async fn compile_source(&self) -> Result<Vec<u8>, String> {
         let raw = self.source.read(&self.client).await?;
-        let snapshot = compile_snapshot_with_discovery(
+        compile_snapshot_with_discovery(
             &raw,
             self.database_disabled,
             &self.client,
             &self.discovery_cache,
         )
-        .await?;
-        atomic_write(self.snapshot_path.as_ref(), &snapshot).await
+        .await
     }
 
     pub async fn apply_patch(&self, patch: &Value) -> Result<(), String> {
@@ -123,20 +136,7 @@ impl RuntimeConfigPublisher {
             .map_err(|error| format!("decode configuration for update: {error}"))?;
         let mut config = serde_json::to_value(yaml)
             .map_err(|error| format!("convert configuration for update: {error}"))?;
-        let root = config
-            .as_object_mut()
-            .ok_or_else(|| "uni-api configuration must be a mapping".to_owned())?;
-        let patch = patch
-            .as_object()
-            .ok_or_else(|| "configuration patch must be an object".to_owned())?;
-        for (key, value) in patch {
-            if matches!(
-                key.as_str(),
-                "providers" | "api_keys" | "preferences" | "video"
-            ) {
-                root.insert(key.clone(), value.clone());
-            }
-        }
+        patch_document(&mut config, patch)?;
         compile_snapshot_bytes(
             serde_yaml::to_string(&config)
                 .map_err(|error| format!("validate configuration update: {error}"))?
@@ -161,27 +161,7 @@ impl RuntimeConfigPublisher {
             .map_err(|error| format!("decode configuration for credits update: {error}"))?;
         let mut config = serde_json::to_value(yaml)
             .map_err(|error| format!("convert configuration for credits update: {error}"))?;
-        let keys = config
-            .get_mut("api_keys")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| "configuration contains no API keys".to_owned())?;
-        let item = keys
-            .iter_mut()
-            .find(|item| item.get("api").and_then(Value::as_str) == Some(paid_key))
-            .ok_or_else(|| "Paid API key not found".to_owned())?;
-        let preferences = item
-            .as_object_mut()
-            .expect("API key configuration object")
-            .entry("preferences")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| "API key preferences must be an object".to_owned())?;
-        let current = preferences
-            .get("credits")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let updated = current + amount;
-        preferences.insert("credits".into(), json!(updated));
+        let updated = credit_document(&mut config, paid_key, amount)?;
         write_config_file(path, &config).await?;
         self.publish().await?;
         Ok(updated)
@@ -235,6 +215,58 @@ impl RuntimeConfigPublisher {
             }
         });
     }
+}
+
+pub(crate) fn patch_document(config: &mut Value, patch: &Value) -> Result<(), String> {
+    let root = config
+        .as_object_mut()
+        .ok_or("uni-api configuration must be a mapping")?;
+    for (key, value) in patch
+        .as_object()
+        .ok_or("configuration patch must be an object")?
+    {
+        if matches!(
+            key.as_str(),
+            "providers" | "api_keys" | "preferences" | "video"
+        ) {
+            root.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn credit_document(
+    config: &mut Value,
+    paid_key: &str,
+    amount: f64,
+) -> Result<f64, String> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err("amount must be positive".into());
+    }
+    let keys = config
+        .get_mut("api_keys")
+        .and_then(Value::as_array_mut)
+        .ok_or("configuration contains no API keys")?;
+    let item = keys
+        .iter_mut()
+        .find(|item| item.get("api").and_then(Value::as_str) == Some(paid_key))
+        .and_then(Value::as_object_mut)
+        .ok_or("Paid API key not found")?;
+    let preferences = item
+        .entry("preferences")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("API key preferences must be an object")?;
+    let updated = preferences
+        .get("credits")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        + amount;
+    if !updated.is_finite() {
+        return Err("credits out of range".into());
+    }
+    preferences.insert("credits".into(), json!(updated));
+    Ok(updated)
 }
 
 pub(crate) async fn write_config_file(path: &Path, config: &Value) -> Result<(), String> {

@@ -11,6 +11,15 @@ pub fn compile_snapshot_bytes(raw: &[u8], database_disabled: bool) -> Result<Vec
     let mut config = serde_json::to_value(yaml)
         .map_err(|error| format!("convert uni-api configuration: {error}"))?;
     expand_environment(&mut config);
+    compile_config_document(config, database_disabled)
+}
+
+// Remote configuration is already a materialized document. Never interpolate
+// arbitrary process environment variables in a control-plane payload.
+pub(crate) fn compile_config_document(
+    config: Value,
+    database_disabled: bool,
+) -> Result<Vec<u8>, String> {
     let root = config
         .as_object()
         .ok_or_else(|| "uni-api configuration must be a mapping".to_owned())?;

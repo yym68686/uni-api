@@ -7,15 +7,29 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let public_port = env_u16("PORT", 8000)?;
     let database_disabled = env_bool("DISABLE_DATABASE", false);
-    let publisher = RuntimeConfigPublisher::discover(database_disabled)?;
-    publisher.publish().await?;
-    publisher.start_watcher();
+    let managed = crate::config::managed::ManagedConfig::from_env()?;
+    let publisher = if managed.is_some() {
+        RuntimeConfigPublisher::local_for_bootstrap(database_disabled)?
+    } else {
+        let publisher = RuntimeConfigPublisher::discover(database_disabled)?;
+        publisher.publish().await?;
+        publisher.start_watcher();
+        publisher
+    };
     let persistence = crate::storage::database::Persistence::initialize(database_disabled).await?;
-    let state = AppState::new(String::new(), String::new(), false, persistence, publisher)?;
-    let _ = state.runtime.refresh().await;
-    state.runtime.start_watcher();
-
-    state.runtime.restore_controls_on_start().await?;
+    let mut state = AppState::new(String::new(), String::new(), false, persistence, publisher)?;
+    state.managed_config = managed;
+    if let Some(managed) = state.managed_config.clone() {
+        tokio::select! {
+            _ = managed.wait_for_first_configuration(&state) => {},
+            _ = shutdown_signal() => return Ok(()),
+        }
+        managed.start_watcher(state.clone());
+    } else {
+        let _ = state.runtime.refresh().await;
+        state.runtime.start_watcher();
+        state.runtime.restore_controls_on_start().await?;
+    }
 
     let app = Router::new()
         .fallback(any(crate::api::handler::handler))

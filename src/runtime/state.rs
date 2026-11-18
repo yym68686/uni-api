@@ -89,21 +89,7 @@ impl GatewayRuntime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(format!("read native Responses snapshot: {error}")),
         };
-        let raw: RawSnapshot = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("decode native Responses snapshot: {error}"))?;
-        crate::routing::unknown_400::validate(
-            raw.preferences.get(crate::routing::unknown_400::KEY),
-        )?;
-        if raw.schema_version != SNAPSHOT_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported native Responses snapshot schema {}",
-                raw.schema_version
-            ));
-        }
-        if raw.revision.len() != 64 {
-            return Err("native Responses snapshot revision is invalid".into());
-        }
-        *self.snapshot_stamp.lock().await = Some(stamp);
+        let raw = Self::decode_snapshot(&bytes)?;
         if self
             .current
             .read()
@@ -111,9 +97,37 @@ impl GatewayRuntime {
             .as_ref()
             .is_some_and(|snapshot| snapshot.revision.as_ref() == raw.revision)
         {
+            *self.snapshot_stamp.lock().await = Some(stamp);
             return Ok(false);
         }
+        let snapshot = self.build_snapshot(raw).await;
+        *self.current.write().await = Some(snapshot.clone());
+        *self.snapshot_stamp.lock().await = Some(stamp);
+        eprintln!(
+            "{}",
+            json!({
+                "event_type": "rust_responses_config_snapshot_loaded",
+                "revision": snapshot.revision.as_ref(),
+                "api_key_count": snapshot.api_keys.len(),
+                "provider_count": snapshot.providers.len(),
+            })
+        );
+        Ok(true)
+    }
 
+    pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<RawSnapshot, String> {
+        let raw: RawSnapshot = serde_json::from_slice(bytes)
+            .map_err(|error| format!("decode native Responses snapshot: {error}"))?;
+        crate::routing::unknown_400::validate(
+            raw.preferences.get(crate::routing::unknown_400::KEY),
+        )?;
+        if raw.schema_version != SNAPSHOT_SCHEMA_VERSION || raw.revision.len() != 64 {
+            return Err("invalid native Responses snapshot schema or revision".into());
+        }
+        Ok(raw)
+    }
+
+    pub(crate) async fn build_snapshot(&self, raw: RawSnapshot) -> Arc<Snapshot> {
         let mut cursors = self.scheduling.provider_cursors.lock().await;
         let mut providers = Vec::with_capacity(raw.providers.len());
         let mut providers_by_name = HashMap::with_capacity(raw.providers.len());
@@ -165,7 +179,7 @@ impl GatewayRuntime {
                 ))
             })
             .collect::<HashMap<_, _>>();
-        let snapshot = Arc::new(Snapshot {
+        Arc::new(Snapshot {
             revision: raw.revision.into(),
             preferences: Arc::new(raw.preferences),
             api_keys: Arc::new(api_keys),
@@ -173,18 +187,19 @@ impl GatewayRuntime {
             providers: Arc::new(providers),
             providers_by_name: Arc::new(providers_by_name),
             api_config: Arc::new(raw.api_config),
-        });
-        *self.current.write().await = Some(snapshot.clone());
-        eprintln!(
-            "{}",
-            json!({
-                "event_type": "rust_responses_config_snapshot_loaded",
-                "revision": snapshot.revision.as_ref(),
-                "api_key_count": snapshot.api_keys.len(),
-                "provider_count": snapshot.providers.len(),
-            })
-        );
-        Ok(true)
+        })
+    }
+
+    // Every reader of the pair takes controls first. Existing requests keep
+    // their pinned plan when a new bundle replaces both halves.
+    pub(crate) async fn install_bundle(
+        &self,
+        base: Arc<Snapshot>,
+        controls: crate::control::channels::Controls,
+    ) {
+        let mut active_controls = self.channel_controls.write().await;
+        *active_controls = controls;
+        *self.current.write().await = Some(base);
     }
 
     pub(crate) async fn base_snapshot(&self) -> Option<Arc<Snapshot>> {
@@ -195,8 +210,9 @@ impl GatewayRuntime {
         if let Some(snapshot) = &self.request_snapshot {
             return snapshot.clone();
         }
+        let controls = self.channel_controls.read().await;
         let base = self.current.read().await.clone()?;
-        Some(self.channel_controls.read().await.overlay(base))
+        Some(controls.overlay(base))
     }
 
     pub(crate) async fn for_request(&self) -> Self {
@@ -204,8 +220,8 @@ impl GatewayRuntime {
             return self.clone();
         }
         let mut runtime = self.clone();
-        let base = self.current.read().await.clone();
         let controls = self.channel_controls.read().await;
+        let base = self.current.read().await.clone();
         runtime.request_snapshot = Some(base.map(|snapshot| controls.overlay(snapshot)));
         runtime.request_rules = Some(Arc::new(controls.routing_intent()));
         runtime
