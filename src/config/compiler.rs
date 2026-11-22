@@ -27,6 +27,14 @@ pub(crate) fn compile_config_document(
         root.get("preferences")
             .and_then(|p| p.get(crate::routing::unknown_400::KEY)),
     )?;
+    for provider in root
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        compile_model_protocols(provider)?;
+    }
 
     let mut providers = root
         .get("providers")
@@ -162,6 +170,20 @@ pub(crate) fn compile_video_provider(value: &Value) -> Option<Value> {
     )
 }
 
+pub(crate) fn compile_model_protocols(value: &Value) -> Result<Value, String> {
+    let base = value["base_url"].as_str().unwrap_or_default();
+    let engine = value["engine"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| infer_engine(base));
+    crate::config::model_protocol::compile(
+        value.get(crate::config::model_protocol::FIELD),
+        base,
+        &engine,
+        value.get("api"),
+    )
+}
+
 pub(crate) fn compile_provider(value: &Value) -> Option<Value> {
     let item = value.as_object()?;
     let name = scalar_string(item.get("provider")?).trim().to_owned();
@@ -182,6 +204,7 @@ pub(crate) fn compile_provider(value: &Value) -> Option<Value> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    crate::config::model_protocol::attach(&mut preferences, compile_model_protocols(value).ok()?);
     if !preferences.contains_key("max_request_body_bytes") {
         if let Some(limit) = item.get("max_request_body_bytes") {
             preferences.insert("max_request_body_bytes".into(), limit.clone());

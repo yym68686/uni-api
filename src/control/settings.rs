@@ -616,6 +616,7 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
             }
         }
     }
+    crate::config::compiler::compile_model_protocols(&materialized)?;
     let compiled =
         crate::config::compiler::compile_provider(&materialized).ok_or(field_error("/model"))?;
     let parsed = serde_json::from_value(compiled).map_err(|_| field_error("/"))?;
@@ -821,9 +822,13 @@ impl GatewayRuntime {
             "Configuration unavailable".into(),
         ))?;
         let effective = state.overlay(base);
-        Ok(
-            json!({"providers":effective.providers.iter().map(|p|json!({"provider":p.name.as_ref(),"base_url":p.base_url.as_ref(),"api":p.api_keys.as_ref(),"temporary":state.temporary.contains_key(p.name.as_ref()),"identity_changed":p.name.starts_with("sub2api-copy-")||state.settings.get(p.name.as_ref()).is_some_and(identity_changed)})).collect::<Vec<_>>()}),
-        )
+        Ok(json!({"providers":effective.providers.iter().map(|p| {
+                let mut row = json!({"provider":p.name.as_ref(),"base_url":p.base_url.as_ref(),"api":p.api_keys.as_ref(),"temporary":state.temporary.contains_key(p.name.as_ref()),"identity_changed":p.name.starts_with("sub2api-copy-")||state.settings.get(p.name.as_ref()).is_some_and(identity_changed)});
+                if let Some(models) = crate::config::model_protocol::export(p) {
+                    row["model_endpoints"] = models;
+                }
+                row
+            }).collect::<Vec<_>>()}))
     }
     pub(crate) async fn settings_discover(&self, input: Mutation) -> Result<Value, Failure> {
         if input.changes.len() != 1 {

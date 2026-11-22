@@ -21,8 +21,13 @@ fn catalog(
         .into_iter()
         .filter(|(p, _)| !p.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case("all")))
         .filter_map(|(p, model)| {
+            let p = crate::config::model_protocol::effective(p, &model);
             let upstream = p.models.get(&model)?;
-            Some(json!({"provider":p.name.as_ref(),"model":model,"upstream_model":upstream,"engine":p.engine.as_ref(),"engine_mode":p.engine_mode.as_ref()}))
+            let mut row = json!({"provider":p.name.as_ref(),"model":model,"upstream_model":upstream,"engine":p.engine.as_ref(),"engine_mode":p.engine_mode.as_ref()});
+            if let Some(protocol) = crate::config::model_protocol::selected(&p, &model) {
+                row["upstream_protocol"] = json!(protocol);
+            }
+            Some(row)
         })
         .collect();
     rows.sort_by_key(|row| {

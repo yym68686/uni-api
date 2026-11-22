@@ -633,7 +633,10 @@ pub(crate) fn build_attempt(
             }
         }
     }
-    if incoming_headers.contains_key(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER) {
+    if incoming_headers
+        .get(crate::routing::planner::FINGERPRINT_PROTOCOL_HEADER)
+        .is_some_and(|p| crate::routing::planner::discovery_protocol(p).is_none())
+    {
         // Reject overrides/conversion that would score a different request. The
         // channel's configured model alias is the only intentional body change.
         let mut expected = input.payload.clone().ok_or("Missing fingerprint payload")?;

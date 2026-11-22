@@ -31,6 +31,7 @@ impl GatewayRuntime {
         let models = crate::routing::catalog::ordered_entries(&snapshot, key)
             .into_iter()
             .filter(|(provider, model)| {
+                let provider = &crate::config::model_protocol::effective(provider.clone(), model);
                 crate::control::channels::temporary_allowed(provider, key)
                     && provider_accepts_endpoint(provider, "/v1/responses")
                     && !provider.excluded_endpoints.iter().any(|endpoint| {
@@ -57,39 +58,47 @@ impl GatewayRuntime {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let snapshot = self.snapshot().await.ok_or(503u16)?;
         let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
-        let allowed = |p: &Arc<Provider>| {
+        let allowed = |p: &Arc<Provider>, model: &str| {
+            let p = &crate::config::model_protocol::effective(p.clone(), model);
             crate::control::channels::temporary_allowed(p, api_key)
                 && provider_accepts_endpoint(p, endpoint)
         };
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {
             if rule == "all" {
-                for provider in snapshot.providers.iter().filter(|p| allowed(p)) {
-                    models.extend(provider.models.keys().cloned());
+                for provider in snapshot.providers.iter() {
+                    models.extend(
+                        provider
+                            .models
+                            .keys()
+                            .filter(|m| allowed(provider, m))
+                            .cloned(),
+                    );
                 }
                 continue;
             }
             if rule.starts_with('<') && rule.ends_with('>') {
                 let model = rule[1..rule.len() - 1].to_owned();
-                if snapshot
-                    .providers
-                    .iter()
-                    .filter(|p| allowed(p))
-                    .any(|provider| provider.models.contains_key(&model))
-                {
+                if snapshot.providers.iter().any(|provider| {
+                    provider.models.contains_key(&model) && allowed(provider, &model)
+                }) {
                     models.insert(model);
                 }
                 continue;
             }
             if let Some((provider_name, model_rule)) = rule.split_once('/') {
-                if let Some(provider) = snapshot
-                    .providers_by_name
-                    .get(provider_name)
-                    .filter(|p| allowed(p))
-                {
+                if let Some(provider) = snapshot.providers_by_name.get(provider_name) {
                     if model_rule == "*" {
-                        models.extend(provider.models.keys().cloned());
-                    } else if provider.models.contains_key(model_rule) {
+                        models.extend(
+                            provider
+                                .models
+                                .keys()
+                                .filter(|m| allowed(provider, m))
+                                .cloned(),
+                        );
+                    } else if provider.models.contains_key(model_rule)
+                        && allowed(provider, model_rule)
+                    {
                         models.insert(model_rule.to_owned());
                     }
                 }
@@ -98,8 +107,7 @@ impl GatewayRuntime {
             if snapshot
                 .providers
                 .iter()
-                .filter(|p| allowed(p))
-                .any(|provider| provider.models.contains_key(rule))
+                .any(|provider| provider.models.contains_key(rule) && allowed(provider, rule))
             {
                 models.insert(rule.clone());
             }
@@ -164,6 +172,7 @@ impl GatewayRuntime {
         let now = tokio::time::Instant::now();
         let controls = self.channel_controls.read().await.routing_rules();
         let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
+            let provider = crate::config::model_protocol::effective(provider, &model);
             if !provider_accepts_endpoint(&provider, endpoint) || (provider.engine.eq_ignore_ascii_case("typesafe") && stream) || provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
             }
@@ -174,7 +183,11 @@ impl GatewayRuntime {
             } else if provider.api_keys.is_empty() && provider.client_email.is_none() {
                 (false, "no_provider_key")
             } else if route_cooling { (false, "channel_cooldown") } else { (true, "eligible") };
-            Some(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"engine_mode":provider.engine_mode.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}))
+            let mut row = json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"engine_mode":provider.engine_mode.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason});
+            if let Some(protocol) = crate::config::model_protocol::selected(&provider, &model) {
+                row["upstream_protocol"] = json!(protocol);
+            }
+            Some(row)
         }).collect();
         rows.sort_by_key(|row| {
             controls

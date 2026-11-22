@@ -147,7 +147,7 @@ pub async fn handle(
                     "runtime": "rust",
                     "native_version": env!("CARGO_PKG_VERSION"),
                     "source_commit": std::env::var("SOURCE_COMMIT").unwrap_or_else(|_| "unknown".into()),
-                    "capabilities": {"responses_stream_collection":true,"gemini_native":true,"gemini_cross_protocol":true,"targeted_responses": true,"targeted_fingerprint_protocols":["gemini","chat"],"targeted_unconfigured_models":true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
+                    "capabilities": {"responses_stream_collection":true,"gemini_native":true,"gemini_cross_protocol":true,"targeted_responses": true,"targeted_fingerprint_protocols":["gemini","chat"],"targeted_upstream_protocols":true,"targeted_unconfigured_models":true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
                     "request_body_limits": crate::transport::decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.runtime.is_ready().await,
                     "managed_config_revision": state.managed_config.as_ref().and_then(|m| m.applied_revision()),

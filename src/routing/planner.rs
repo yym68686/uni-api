@@ -142,7 +142,10 @@ impl GatewayRuntime {
                 "All matching channels are temporarily disabled",
             ));
         }
-        let providers = if let Some(protocol) = headers.get(FINGERPRINT_PROTOCOL_HEADER) {
+        let providers = if let Some(protocol) = headers
+            .get(FINGERPRINT_PROTOCOL_HEADER)
+            .filter(|p| discovery_protocol(p).is_none())
+        {
             // diagnostic_key has already authorized and pinned this single provider.
             providers
                 .into_iter()
@@ -302,6 +305,11 @@ pub(crate) const TARGET_PROVIDER_HEADER: &str = "x-uni-api-provider";
 pub(crate) const PROBE_UNCONFIGURED_MODEL_HEADER: &str = "x-uni-api-probe-unconfigured-model";
 pub(crate) const FINGERPRINT_PROTOCOL_HEADER: &str = "x-uni-api-fingerprint-protocol";
 
+pub(crate) fn discovery_protocol(value: &axum::http::HeaderValue) -> Option<&str> {
+    let proto = value.to_str().ok()?.strip_prefix("endpoint-")?;
+    crate::config::model_protocol::endpoint(proto).map(|_| proto)
+}
+
 // Select a sibling wire endpoint only for this probe. Never reinterpret a cloud
 // credential, custom deployment URL or OAuth account bundle as a relay API key.
 fn fingerprint_provider(
@@ -399,6 +407,13 @@ pub(crate) fn diagnostic_key(
                 && crate::protocols::gemini::route(endpoint)
                     .is_some_and(|(_, a)| a == "streamGenerateContent")
         }
+        Some(p) if discovery_protocol(p).is_some() => match discovery_protocol(p) {
+            Some("gemini") => crate::protocols::gemini::route(endpoint)
+                .is_some_and(|(_, action)| action == "streamGenerateContent"),
+            Some(protocol) => crate::config::model_protocol::endpoint(protocol)
+                .is_some_and(|(_, path)| path == endpoint),
+            None => false,
+        },
         _ => false,
     };
     if !valid_endpoint {
@@ -432,6 +447,14 @@ pub(crate) fn diagnostic_key(
     let mut preferences = (*key.preferences).clone();
     preferences.remove("__route_graph");
     preferences.insert("__diagnostic_provider".into(), json!(name));
+    if let Some(protocol) = headers
+        .get(FINGERPRINT_PROTOCOL_HEADER)
+        .and_then(discovery_protocol)
+    {
+        preferences.insert("__diagnostic_upstream_protocol".into(), json!(protocol));
+    } else {
+        preferences.remove("__diagnostic_upstream_protocol");
+    }
     if let Some(value) = headers.get(PROBE_UNCONFIGURED_MODEL_HEADER) {
         if value != "true" {
             return Err(RouteResolutionError {
@@ -546,6 +569,23 @@ pub(crate) fn matching_providers(
     // Sorting to deduplicate silently changes fixed_priority into name order.
     let mut seen = BTreeSet::new();
     matches.retain(|provider| seen.insert(provider.name.clone()));
+    let mut matches: Vec<_> = matches
+        .into_iter()
+        .filter_map(|provider| {
+            if let Some(protocol) = api_key
+                .preferences
+                .get("__diagnostic_upstream_protocol")
+                .and_then(Value::as_str)
+            {
+                crate::config::model_protocol::diagnostic(provider, request_model, protocol)
+            } else {
+                Some(crate::config::model_protocol::effective(
+                    provider,
+                    request_model,
+                ))
+            }
+        })
+        .collect();
     matches.retain(|provider| {
         crate::control::channels::temporary_allowed(provider, api_key)
             && provider_accepts_endpoint(provider, endpoint)
