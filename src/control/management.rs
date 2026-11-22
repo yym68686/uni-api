@@ -12,6 +12,7 @@ fn catalog(
     controls: &Controls,
     caller: &ApiKey,
     key: Option<&str>,
+    options_by_provider: &std::collections::HashMap<&str, Value>,
 ) -> Vec<Value> {
     // Same all-endpoint/all-stream directory and stable routing order as
     // /v1/model-channels. Transient cooldown/eligibility is not part of a
@@ -27,6 +28,7 @@ fn catalog(
             if let Some(protocol) = crate::config::model_protocol::selected(&p, &model) {
                 row["upstream_protocol"] = json!(protocol);
             }
+            row["upstream_protocol_options"] = options_by_provider[p.name.as_ref()].clone();
             Some(row)
         })
         .collect();
@@ -129,12 +131,28 @@ impl GatewayRuntime {
         drop(controls);
         let controls = captured;
         let keys = crate::routing::catalog::keys(&effective, caller);
+        let options_by_provider = effective
+            .providers
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_ref(),
+                    json!(crate::config::model_protocol::options(p)),
+                )
+            })
+            .collect();
         let mut routes = Map::new();
         for key in &keys {
             let id = key["key_id"].as_str().expect("catalog key identity");
             routes.insert(
                 id.to_owned(),
-                json!(catalog(&effective, &controls, caller, Some(id))),
+                json!(catalog(
+                    &effective,
+                    &controls,
+                    caller,
+                    Some(id),
+                    &options_by_provider
+                )),
             );
         }
         // Provider credentials and exported intent have the exact same admin
@@ -147,7 +165,7 @@ impl GatewayRuntime {
         })).collect();
         Ok(
             json!({"format":"management-snapshot-v1","revision":revision,"config_revision":base.revision.as_ref(),
-            "controls":controls.view(&base),"keys":keys,"catalog":catalog(&effective,&controls,caller,None),
+            "controls":controls.view(&base),"keys":keys,"catalog":catalog(&effective,&controls,caller,None,&options_by_provider),
             "routes":routes,"providers":providers,"export":controls.export(&base)}),
         )
     }
@@ -276,8 +294,15 @@ mod tests {
     }
 
     fn management_fields(rows: Vec<Value>) -> Vec<Value> {
-        rows.into_iter().map(|v| json!({"provider":v["provider"],"model":v["model"],
-            "upstream_model":v["upstream_model"],"engine":v["engine"],"engine_mode":v["engine_mode"]})).collect()
+        rows.into_iter()
+            .map(|mut v| {
+                let obj = v.as_object_mut().unwrap();
+                for field in ["endpoint", "stream", "eligible", "reason"] {
+                    obj.remove(field);
+                }
+                v
+            })
+            .collect()
     }
 
     #[tokio::test]

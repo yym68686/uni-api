@@ -5,6 +5,7 @@ use url::Url;
 
 pub(crate) const FIELD: &str = "model_upstream_protocols";
 const INTERNAL: &str = "__model_upstream_protocols";
+const PROTOCOLS: [&str; 4] = ["responses", "chat", "messages", "gemini"];
 
 pub(crate) fn endpoint(protocol: &str) -> Option<(&'static str, &'static str)> {
     Some(match protocol {
@@ -20,9 +21,6 @@ pub(crate) fn endpoint(protocol: &str) -> Option<(&'static str, &'static str)> {
 /// deployment prefix. Keep custom URLs usable through the inherited setting.
 fn target(base: &str, engine: &str, protocol: &str) -> Option<(&'static str, String)> {
     let (next_engine, suffix) = endpoint(protocol)?;
-    if !matches!(engine, "codex" | "gpt" | "claude" | "gemini" | "openrouter") {
-        return None;
-    }
     let mut url = Url::parse(base.trim()).ok()?;
     if !matches!(url.scheme(), "https" | "http")
         || !url.has_host()
@@ -34,6 +32,24 @@ fn target(base: &str, engine: &str, protocol: &str) -> Option<(&'static str, Str
         return None;
     }
     let path = url.path().trim_end_matches('/');
+    // A saved OpenRouter channel may have been imported with the System One
+    // suffix. Its gateway inference must stay unchanged for other models, but
+    // OpenRouter's documented OpenAI endpoints are safe same-origin choices.
+    if url.scheme() == "https"
+        && url.host_str() == Some("openrouter.ai")
+        && url.port().is_none()
+        && path == "/api/v1/systemone"
+        && matches!(engine, "typesafe" | "openrouter" | "gpt")
+    {
+        if !matches!(protocol, "chat" | "responses") {
+            return None;
+        }
+        url.set_path(&format!("/api{suffix}"));
+        return Some((next_engine, url.into()));
+    }
+    if !matches!(engine, "codex" | "gpt" | "claude" | "gemini" | "openrouter") {
+        return None;
+    }
     let prefix = if path.is_empty() {
         ""
     } else {
@@ -53,6 +69,19 @@ fn target(base: &str, engine: &str, protocol: &str) -> Option<(&'static str, Str
     }
     url.set_path(&format!("{prefix}{suffix}"));
     Some((next_engine, url.into()))
+}
+
+pub(crate) fn options(provider: &Provider) -> Vec<&'static str> {
+    if provider.api_keys.is_empty()
+        || (provider.engine.as_ref() == "codex"
+            && provider.api_keys.iter().any(|k| k.contains(',')))
+    {
+        return vec![];
+    }
+    PROTOCOLS
+        .into_iter()
+        .filter(|protocol| target(&provider.base_url, &provider.engine, protocol).is_some())
+        .collect()
 }
 
 pub(crate) fn compile(
@@ -231,5 +260,44 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    #[test]
+    fn openrouter_legacy_systemone_can_select_its_documented_endpoints() {
+        let document = json!({
+            "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1/systemone",
+            "api": "fixture", "model": ["jev-latest", "gemini-4-carbon"],
+            "model_upstream_protocols": {"gemini-4-carbon": "chat"}
+        });
+        let provider = runtime_provider(
+            serde_json::from_value(compile_provider(&document).unwrap()).unwrap(),
+            Arc::default(),
+        );
+        assert_eq!(options(&provider), vec!["responses", "chat"]);
+        assert_eq!(
+            effective(provider.clone(), "gemini-4-carbon")
+                .base_url
+                .as_ref(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            effective(provider.clone(), "jev-latest").engine.as_ref(),
+            "typesafe"
+        );
+        assert_eq!(
+            diagnostic(provider.clone(), "gemini-4-carbon", "responses")
+                .unwrap()
+                .base_url
+                .as_ref(),
+            "https://openrouter.ai/api/v1/responses"
+        );
+        assert!(diagnostic(provider, "gemini-4-carbon", "gemini").is_none());
+        assert!(target("https://api.typesafe.ai/v1/systemone", "typesafe", "chat").is_none());
+        assert!(target(
+            "https://openrouter.ai.example/api/v1/systemone",
+            "typesafe",
+            "chat"
+        )
+        .is_none());
     }
 }

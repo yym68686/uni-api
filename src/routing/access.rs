@@ -171,7 +171,9 @@ impl GatewayRuntime {
         let cooldowns = self.scheduling.channel_cooldowns.lock().await.clone();
         let now = tokio::time::Instant::now();
         let controls = self.channel_controls.read().await.routing_rules();
+        let mut options_by_provider = std::collections::HashMap::new();
         let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
+            let protocol_options = (endpoint == "all").then(|| options_by_provider.entry(provider.name.clone()).or_insert_with(|| json!(crate::config::model_protocol::options(&provider))).clone());
             let provider = crate::config::model_protocol::effective(provider, &model);
             if !provider_accepts_endpoint(&provider, endpoint) || (provider.engine.eq_ignore_ascii_case("typesafe") && stream) || provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
@@ -186,6 +188,9 @@ impl GatewayRuntime {
             let mut row = json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"engine_mode":provider.engine_mode.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason});
             if let Some(protocol) = crate::config::model_protocol::selected(&provider, &model) {
                 row["upstream_protocol"] = json!(protocol);
+            }
+            if let Some(options) = protocol_options {
+                row["upstream_protocol_options"] = options;
             }
             Some(row)
         }).collect();
