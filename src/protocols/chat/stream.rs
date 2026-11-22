@@ -303,10 +303,11 @@ fn real_output(event: &[u8]) -> Result<bool, PrecommitFailure> {
             .filter(|status| (400..=599).contains(status))
             .unwrap_or(502) as u16;
         return Err(PrecommitFailure {
-            failure_reason: Some(if status == 400 {
-                "upstream_400"
-            } else {
-                "upstream_response_failed"
+            failure_reason: Some(match (status, error.get("code").and_then(Value::as_str)) {
+                (400, Some("gemini_prompt_blocked")) => "gemini_prompt_blocked",
+                (400, _) => "upstream_400",
+                (502, Some("gemini_invalid_response")) => "protocol_error",
+                _ => "upstream_response_failed",
             }),
             status_code: status,
             detail: error.to_string(),

@@ -499,10 +499,77 @@ pub(crate) fn usage_from_chat(u: &Value) -> Value {
 pub(crate) fn chat_finish_reason(reason: &str) -> &'static str {
     match reason {
         "MAX_TOKENS" => "length",
-        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => {
-            "content_filter"
-        }
+        "SAFETY"
+        | "RECITATION"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION" => "content_filter",
         _ => "stop",
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ChatResponseError {
+    pub status: u16,
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+impl ChatResponseError {
+    pub(crate) fn invalid(detail: impl Into<String>) -> Self {
+        Self {
+            status: 502,
+            reason: "protocol_error",
+            detail: detail.into(),
+        }
+    }
+}
+
+pub(crate) fn chat_prompt_block(value: &Value) -> Option<ChatResponseError> {
+    let reason = value.pointer("/promptFeedback/blockReason")?.as_str()?;
+    if reason.is_empty() || reason == "BLOCK_REASON_UNSPECIFIED" {
+        return None;
+    }
+    // Preserve the reason enum, not the upstream's free-form feedback.
+    let reason = if reason.len() <= 64
+        && reason
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        reason
+    } else {
+        "UNKNOWN"
+    };
+    Some(ChatResponseError {
+        status: 400,
+        reason: "gemini_prompt_blocked",
+        detail: format!("Gemini blocked the prompt (blockReason: {reason})"),
+    })
+}
+
+pub(crate) fn finish_chat_response(
+    reason: &str,
+    has_tool_calls: bool,
+    has_output: bool,
+) -> Result<&'static str, ChatResponseError> {
+    match reason {
+        "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "TOO_MANY_TOOL_CALLS" => {
+            return Err(ChatResponseError::invalid(format!(
+                "Gemini tool call failed ({reason})"
+            )));
+        }
+        _ => {}
+    }
+    let finish = chat_finish_reason(reason);
+    match finish {
+        "stop" if has_tool_calls => Ok("tool_calls"),
+        "stop" if !has_output => Err(ChatResponseError::invalid(
+            "Gemini returned no usable response content or tool calls",
+        )),
+        _ => Ok(finish),
     }
 }
 

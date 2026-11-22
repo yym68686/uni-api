@@ -2370,10 +2370,10 @@ pub(crate) async fn send_attempt(
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::GeminiToChat if native_gemini => upstream,
         ResponseAdapter::GeminiToChat => gemini_to_chat(&upstream, &prepared.original_model)
-            .map_err(|detail| AttemptFailure {
-                failure_reason: "protocol_error".into(),
-                status: StatusCode::BAD_GATEWAY,
-                detail,
+            .map_err(|error| AttemptFailure {
+                failure_reason: error.reason.into(),
+                status: StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                detail: error.detail,
                 upstream_url: prepared.url.clone(),
                 response: None,
             })?,

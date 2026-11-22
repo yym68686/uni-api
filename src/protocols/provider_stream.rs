@@ -1165,6 +1165,7 @@ struct StreamState {
     next_tool_index: usize,
     tools: HashMap<String, usize>,
     gemini_tools: crate::providers::gemini_tools::StreamTools,
+    gemini_has_output: bool,
     response_tool_output_indexes: HashMap<u64, usize>,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -1194,6 +1195,7 @@ impl StreamState {
             next_tool_index: 0,
             tools: HashMap::new(),
             gemini_tools: Default::default(),
+            gemini_has_output: false,
             response_tool_output_indexes: HashMap::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -1407,6 +1409,19 @@ impl StreamState {
     }
 
     fn gemini(&mut self, value: &Value) -> Vec<Value> {
+        use crate::protocols::gemini::{
+            chat_prompt_block, finish_chat_response, ChatResponseError,
+        };
+
+        let native = self.output_protocol == OutputProtocol::Gemini;
+        if self.failure.is_some() {
+            return Vec::new();
+        }
+        if !native {
+            if let Some(error) = chat_prompt_block(value) {
+                return self.gemini_failure(error);
+            }
+        }
         let mut output = Vec::new();
         for part in value
             .pointer("/candidates/0/content/parts")
@@ -1415,6 +1430,7 @@ impl StreamState {
             .flatten()
         {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
+                self.gemini_has_output |= !text.trim().is_empty();
                 let field = if part.get("thought").and_then(Value::as_bool) == Some(true) {
                     "reasoning_content"
                 } else {
@@ -1422,21 +1438,17 @@ impl StreamState {
                 };
                 output.push(self.chunk(json!({field:text}), None, None));
             }
-            if self.output_protocol != OutputProtocol::Gemini && part.get("functionCall").is_some()
-            {
+            if !native && part.get("functionCall").is_some() {
                 if let Err(detail) = self.gemini_tools.push(part) {
-                    self.terminal = true;
-                    self.failure = Some(PrecommitFailure {
-                        status_code: 502,
-                        detail: detail.clone(),
-                        failure_reason: Some("protocol_error"),
-                    });
-                    return vec![
-                        json!({"error":{"message":detail,"type":"upstream_protocol_error","code":"gemini_tool_stream","status_code":502}}),
-                    ];
+                    return self.gemini_failure(ChatResponseError::invalid(detail));
                 }
             }
-            if let Some(data) = part.pointer("/inlineData/data").and_then(Value::as_str) {
+            if let Some(data) = part
+                .pointer("/inlineData/data")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                self.gemini_has_output = true;
                 if let Some(signature) = part
                     .get("thoughtSignature")
                     .or_else(|| part.get("thought_signature"))
@@ -1455,14 +1467,36 @@ impl StreamState {
                 ));
             }
         }
-        let finished = value
+        let reason = value
             .pointer("/candidates/0/finishReason")
-            .and_then(Value::as_str)
-            .is_some()
-            || value.pointer("/promptFeedback/blockReason").is_some();
-        if finished {
-            for part in self.gemini_tools.take() {
+            .and_then(Value::as_str);
+        let finished =
+            reason.is_some() || (native && value.pointer("/promptFeedback/blockReason").is_some());
+        let finish = if finished {
+            let parts = self.gemini_tools.take();
+            let finish = if native {
+                crate::protocols::gemini::chat_finish_reason(reason.unwrap_or("SAFETY"))
+            } else {
+                match finish_chat_response(
+                    reason.unwrap_or("STOP"),
+                    !parts.is_empty() || !self.tools.is_empty(),
+                    self.gemini_has_output,
+                ) {
+                    Ok(finish) => finish,
+                    Err(error) => return self.gemini_failure(error),
+                }
+            };
+            for part in parts {
                 let call = &part["functionCall"];
+                let Some(name) = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    return self.gemini_failure(ChatResponseError::invalid(
+                        "Gemini returned a function call without a name",
+                    ));
+                };
                 let call_id = match crate::providers::gemini_tools::call_id(
                     call.get("id").and_then(Value::as_str),
                     part.get("thoughtSignature")
@@ -1471,23 +1505,21 @@ impl StreamState {
                     self.next_tool_index + 1,
                 ) {
                     Ok(id) => id,
-                    Err(detail) => {
-                        self.failure = Some(PrecommitFailure {
-                            status_code: 502,
-                            detail: detail.clone(),
-                            failure_reason: Some("protocol_error"),
-                        });
-                        output.push(json!({"error":{"message":detail,"type":"upstream_protocol_error","code":"gemini_tool_stream","status_code":502}}));
-                        return output;
-                    }
+                    Err(detail) => return self.gemini_failure(ChatResponseError::invalid(detail)),
                 };
                 let index = self.tool_index(&call_id);
                 output.push(self.chunk(json!({"tool_calls":[{"index":index,"id":call_id,"type":"function","function":{
-                    "name":call.get("name").cloned().unwrap_or(Value::Null),
+                    "name":name,
                     "arguments":serde_json::to_string(call.get("args").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into())}}]}), None, None));
             }
-        }
-        if let Some(usage) = value.get("usageMetadata") {
+            Some(finish)
+        } else {
+            None
+        };
+        if let Some(usage) = value
+            .get("usageMetadata")
+            .filter(|usage| native || usage.as_object().is_some_and(|fields| !fields.is_empty()))
+        {
             self.prompt_tokens = number(usage.get("promptTokenCount"));
             self.completion_tokens =
                 number(usage.get("candidatesTokenCount")) + number(usage.get("thoughtsTokenCount"));
@@ -1499,22 +1531,27 @@ impl StreamState {
             // Gemini may report its final usage after the candidate finish frame.
             output.push(json!({"choices":[],"usage":self.chat_usage}));
         }
-        if finished {
-            let finish = crate::protocols::gemini::chat_finish_reason(
-                value
-                    .pointer("/candidates/0/finishReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("SAFETY"),
-            );
-            output.extend(
-                self.finish_chunks(if finish == "stop" && !self.tools.is_empty() {
-                    "tool_calls"
-                } else {
-                    finish
-                }),
-            );
+        if let Some(finish) = finish {
+            output.extend(self.finish_chunks_with_usage(finish, native));
         }
         output
+    }
+
+    fn gemini_failure(&mut self, error: crate::protocols::gemini::ChatResponseError) -> Vec<Value> {
+        self.terminal = true;
+        let (kind, code) = if error.reason == "gemini_prompt_blocked" {
+            ("invalid_request_error", "gemini_prompt_blocked")
+        } else {
+            ("upstream_protocol_error", "gemini_invalid_response")
+        };
+        self.failure = Some(PrecommitFailure {
+            status_code: error.status,
+            detail: error.detail.clone(),
+            failure_reason: Some(error.reason),
+        });
+        vec![
+            json!({"error":{"message":error.detail,"type":kind,"code":code,"status_code":error.status}}),
+        ]
     }
 
     fn claude(&mut self, value: &Value) -> Vec<Value> {

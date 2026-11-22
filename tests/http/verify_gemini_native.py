@@ -14,6 +14,27 @@ from verify_dispatch_timing import free_port
 USAGE = {"promptTokenCount":100,"cachedContentTokenCount":60,"candidatesTokenCount":12,"thoughtsTokenCount":8,"totalTokenCount":120}
 CHAT_USAGE = {"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":60},"completion_tokens_details":{"reasoning_tokens":8}}
 
+def candidate(reason, parts=()):
+    return {'candidates': [{'content': {'role': 'model', 'parts': list(parts)}, 'finishReason': reason}]}
+
+TOOL_PART = {'functionCall': {'id': 'native-lookup', 'name': 'lookup', 'args': {'term': 'fixture'}},
+             'thoughtSignature': 'opaque-fixture-signature'}
+GEMINI_CHAT_CASES = {
+    'empty-object': ({}, 502, None),
+    'empty-candidates': ({'candidates': [], 'usageMetadata': USAGE}, 502, None),
+    'empty-stop': (candidate('STOP', [{'text': '  '}]), 502, None),
+    'blocked-prompt': ({'promptFeedback': {'blockReason': 'SAFETY', 'blockReasonMessage': 'do not echo'}}, 400, None),
+    'invalid-tool-finish': (candidate('MALFORMED_FUNCTION_CALL'), 502, None),
+    'nameless-tool': (candidate('STOP', [{'functionCall': {'args': {}}}]), 502, None),
+    'tool-stop': ({**candidate('STOP', [TOOL_PART]), 'usageMetadata': USAGE}, 200, 'tool_calls'),
+    'tool-with-text': ({**candidate('STOP', [{'text': 'checking'}, TOOL_PART]), 'usageMetadata': USAGE}, 200, 'tool_calls'),
+    'empty-filtered-candidate': (candidate('SAFETY'), 200, 'content_filter'),
+    'empty-truncated-candidate': (candidate('MAX_TOKENS'), 200, 'length'),
+    'tool-truncated': (candidate('MAX_TOKENS', [TOOL_PART]), 200, 'length'),
+    'text-without-usage': (candidate('STOP', [{'text': 'hello without usage'}]), 200, 'stop'),
+    'image-without-text': (candidate('STOP', [{'inlineData': {'mimeType': 'image/png', 'data': 'iVBORw0KGgo='}}]), 200, 'stop'),
+}
+
 class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
     def do_POST(self):
@@ -41,6 +62,17 @@ class Upstream(BaseHTTPRequestHandler):
             if mode == 'truncated':
                 value['candidates'][0]['finishReason'] = 'MAX_TOKENS'
             if mode == 'json-error': value = {'error': {'code':503,'message':'semantic failure'}}
+            if mode in GEMINI_CHAT_CASES:
+                value = GEMINI_CHAT_CASES[mode][0]
+                events = [value]
+                if mode == 'tool-stop':
+                    # Metadata, function call, and terminal may arrive in separate SSE frames.
+                    events = [{'usageMetadata': {'promptTokenCount': 100}},
+                              {'candidates': [{'content': {'parts': [TOOL_PART]}}]},
+                              candidate('STOP'), {'usageMetadata': USAGE}]
+                if '/models/gemini-failover:' in self.path and self.path.startswith('/fallback/'):
+                    value = {**candidate('STOP', [{'text': 'fallback completed'}]), 'usageMetadata': USAGE}
+                    events = [value]
         elif self.path.endswith('/responses'):
             assert 'input' in body and 'messages' not in body, body
             value = {'id':'resp_fixture','object':'response','status':'completed','output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'hello'}]}],'usage':{'input_tokens':100,'output_tokens':20,'total_tokens':120,'input_tokens_details':{'cached_tokens':60},'output_tokens_details':{'reasoning_tokens':8}}}
@@ -75,11 +107,16 @@ def verify(binary):
         providers.append({'provider':'vertex','engine':'vertex','base_url':base,'api':['ab.fixture'],'model':[{'vertex':'vertex'}]})
         for name,engine,path in [('gemini','gemini','/v1beta'),('responses','gpt','/v1/responses'),('codex','codex','/v1/responses'),('claude','claude','/v1/messages'),('chat','gpt','/v1/chat/completions')]:
             providers.append({'provider':name,'engine':engine,'base_url':base+path,'api':'fixture-provider','model':[{name:name}]+([{'tool':'tool'},{'broken':'broken'},{'error':'error'}] if name=='chat' else [])})
+        for name in ['primary', 'fallback']:
+            providers.append({'provider': 'chat-gemini-'+name, 'engine': 'gemini', 'base_url': base+'/'+name+'/v1beta',
+                              'api': 'fixture-provider', 'model': ['gemini-failover'],
+                              'preferences': {'cooldown_period': 0}})
         for name in ['limited', 'fallback', 'also-limited']:
             providers.append({'provider': 'platform-'+name, 'engine': 'gemini', 'base_url': base+'/v1beta',
                               'api': 'fixture-provider', 'model': [{'platform-'+name: 'platform'}],
                               'preferences': {'cooldown_period': 0}})
         keys = [{'api':'fixture-client','model':['all'],'preferences':{'AUTO_RETRY':False}},
+                {'api':'gemini-failover','model':['chat-gemini-primary/*','chat-gemini-fallback/*']},
                 {'api':'platform-retry','model':['platform-limited/*','platform-fallback/*']},
                 {'api':'platform-no-retry','model':['platform-limited/*','platform-fallback/*'], 'preferences':{'AUTO_RETRY':False}},
                 {'api':'platform-exhausted','model':['platform-limited/*','platform-also-limited/*']}]
@@ -107,6 +144,57 @@ def verify(binary):
                     except OSError: pass
                     time.sleep(.05)
                 body={'contents':[{'role':'user','parts':[{'text':'hello'}]}]}
+                for stream in (False, True):
+                    for mode, (_, expected_status, finish) in GEMINI_CHAT_CASES.items():
+                        payload = {'model': 'gemini', 'messages': [{'role': 'user', 'content': mode}], 'stream': stream}
+                        if mode in ('tool-stop', 'tool-with-text'):
+                            payload['tools'] = [{'type': 'function', 'function': {'name': 'lookup'}}]
+                            payload['tool_choice'] = 'required'
+                            payload['messages'] += [
+                                {'role': 'assistant', 'tool_calls': [
+                                    {'id': 'prior-call', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}]},
+                                {'role': 'tool', 'tool_call_id': 'prior-call', 'content': 'prior tool result'},
+                                {'role': 'user', 'content': 'Look up the next item'},
+                            ]
+                        if stream:
+                            payload['stream_options'] = {'include_usage': True}
+                        status, _, raw = call('/v1/chat/completions', payload, 'bearer')
+                        assert status == expected_status, (mode, stream, status, raw)
+                        if status != 200:
+                            assert json.loads(raw).get('error') and b'"choices"' not in raw, (mode, stream, raw)
+                            if mode == 'blocked-prompt':
+                                assert b'SAFETY' in raw and b'do not echo' not in raw, raw
+                            continue
+                        frames = ([json.loads(line[5:]) for line in raw.decode().splitlines()
+                                   if line.startswith('data:') and line[5:].strip() != '[DONE]']
+                                  if stream else [json.loads(raw)])
+                        choices = [choice for frame in frames for choice in frame.get('choices', [])]
+                        assert [c['finish_reason'] for c in choices if c.get('finish_reason')] == [finish], (mode, choices)
+                        usage = [f['usage'] for f in frames if f.get('usage') is not None]
+                        if mode in ('tool-stop', 'tool-with-text'):
+                            calls = [call for c in choices for call in c.get('delta' if stream else 'message', {}).get('tool_calls', [])]
+                            assert len(calls) == 1 and calls[0]['function']['name'] == 'lookup', calls
+                            assert json.loads(calls[0]['function']['arguments']) == {'term': 'fixture'}, calls
+                            assert usage[-1]['total_tokens'] == 120, usage
+                        else:
+                            assert not usage, (mode, stream, usage)
+                        if mode == 'image-without-text':
+                            assert b'data:image/png;base64,iVBORw0KGgo=' in raw, raw
+                for stream in (False, True):
+                    for mode, expected, paths in [('empty-stop', 200, ['primary', 'fallback']),
+                                                  ('blocked-prompt', 400, ['primary'])]:
+                        upstream.hits.clear()
+                        payload = {'model': 'gemini-failover', 'messages': [{'role': 'user', 'content': mode}], 'stream': stream}
+                        status, _, raw = call('/v1/chat/completions', payload, 'none',
+                                              extra={'Authorization': 'Bearer gemini-failover'})
+                        assert status == expected, (mode, stream, status, raw)
+                        assert [path.split('/')[1] for path, _, _ in upstream.hits] == paths, upstream.hits
+                        if mode == 'empty-stop':
+                            assert b'fallback completed' in raw, raw
+                    path = '/v1beta/models/gemini:' + ('streamGenerateContent?alt=sse' if stream else 'generateContent')
+                    status, _, raw = call(path, {'contents': [{'parts': [{'text': 'blocked-prompt'}]}]})
+                    assert status == 200 and b'"blockReason":"SAFETY"' in raw, (stream, status, raw)
+                print(f'Gemini Chat response outcome matrix passed: {2 * (len(GEMINI_CHAT_CASES) + 3)} cases')
                 for model in ['gemini','responses','codex','claude','chat']:
                     for version in ['v1beta','v1']:
                         for action,suffix in [('generateContent',''),('streamGenerateContent','?alt=sse'),('streamGenerateContent','')]:

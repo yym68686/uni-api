@@ -984,29 +984,51 @@ pub(crate) fn gemini_call_id(
         .unwrap_or_else(|| format!("call_{fallback_index}")))
 }
 
-pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Result<Value, String> {
+pub(crate) fn gemini_to_chat(
+    value: &Value,
+    model: &str,
+) -> Result<Value, crate::protocols::gemini::ChatResponseError> {
+    use crate::protocols::gemini::{chat_prompt_block, finish_chat_response, ChatResponseError};
+
+    if let Some(error) = chat_prompt_block(value) {
+        return Err(error);
+    }
     let candidate = value
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first());
+        .pointer("/candidates/0")
+        .filter(|candidate| candidate.is_object())
+        .ok_or_else(|| ChatResponseError::invalid("Gemini response has no candidates"))?;
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     for part in candidate
-        .and_then(|candidate| candidate.pointer("/content/parts"))
+        .pointer("/content/parts")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        if let (Some(data), Some(signature)) = (
-            part.pointer("/inlineData/data")
-                .or_else(|| part.pointer("/inline_data/data"))
-                .and_then(Value::as_str),
-            part.get("thoughtSignature")
+        if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data")) {
+            let data = inline
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let signature = part
+                .get("thoughtSignature")
                 .or_else(|| part.get("thought_signature"))
-                .and_then(Value::as_str),
-        ) {
-            cache_gemini_image_thought_signature(data, signature);
+                .and_then(Value::as_str);
+            if let Some(data) = data {
+                if let Some(signature) = signature {
+                    cache_gemini_image_thought_signature(data, signature);
+                }
+                let mime = inline
+                    .get("mimeType")
+                    .or_else(|| inline.get("mime_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                if mime.starts_with("image/") {
+                    use std::fmt::Write;
+                    let _ = write!(text, "\n![image](data:{mime};base64,{data})");
+                }
+            }
         }
         if let Some(value) = part.get("text").and_then(Value::as_str) {
             if part
@@ -1020,27 +1042,39 @@ pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Result<Value, String
             }
         }
         if let Some(call) = part.get("functionCall") {
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    ChatResponseError::invalid("Gemini returned a function call without a name")
+                })?;
             let call_id = super::gemini_tools::call_id(
                 call.get("id").and_then(Value::as_str),
                 part.get("thoughtSignature")
                     .or_else(|| part.get("thought_signature"))
                     .and_then(Value::as_str),
                 tool_calls.len() + 1,
-            )?;
+            )
+            .map_err(ChatResponseError::invalid)?;
             tool_calls.push(json!({
                 "id":call_id,
                 "type":"function",
                 "function":{
-                    "name":call.get("name").cloned().unwrap_or(Value::Null),
+                    "name":name,
                     "arguments":serde_json::to_string(call.get("args").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into()),
                 }
             }));
         }
     }
-    let usage = value
-        .get("usageMetadata")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let finish_reason = finish_chat_response(
+        candidate
+            .get("finishReason")
+            .and_then(Value::as_str)
+            .unwrap_or("STOP"),
+        !tool_calls.is_empty(),
+        !text.trim().is_empty() || !reasoning.trim().is_empty(),
+    )?;
     let mut message = json!({"role":"assistant","content":text});
     if !reasoning.is_empty() {
         message
@@ -1054,14 +1088,20 @@ pub(crate) fn gemini_to_chat(value: &Value, model: &str) -> Result<Value, String
             .expect("chat message")
             .insert("tool_calls".into(), Value::Array(tool_calls));
     }
-    Ok(json!({
+    let mut response = json!({
         "id":format!("chatcmpl-{}",unix_seconds()),
         "object":"chat.completion",
         "created":unix_seconds(),
         "model":model,
-        "choices":[{"index":0,"message":message,"finish_reason":crate::protocols::gemini::chat_finish_reason(value.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("STOP"))}],
-        "usage":crate::protocols::provider_stream::gemini_usage_to_chat(&usage),
-    }))
+        "choices":[{"index":0,"message":message,"finish_reason":finish_reason}],
+    });
+    if let Some(usage) = value
+        .get("usageMetadata")
+        .filter(|usage| usage.as_object().is_some_and(|fields| !fields.is_empty()))
+    {
+        response["usage"] = crate::protocols::provider_stream::gemini_usage_to_chat(usage);
+    }
+    Ok(response)
 }
 
 pub(crate) fn gemini_url(
