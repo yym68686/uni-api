@@ -5,7 +5,7 @@ use url::Url;
 
 pub(crate) const FIELD: &str = "model_upstream_protocols";
 const INTERNAL: &str = "__model_upstream_protocols";
-const PROTOCOLS: [&str; 4] = ["responses", "chat", "messages", "gemini"];
+const PROTOCOLS: [&str; 5] = ["responses", "chat", "messages", "gemini", "systemone"];
 
 pub(crate) fn endpoint(protocol: &str) -> Option<(&'static str, &'static str)> {
     Some(match protocol {
@@ -13,8 +13,23 @@ pub(crate) fn endpoint(protocol: &str) -> Option<(&'static str, &'static str)> {
         "chat" => ("gpt", "/v1/chat/completions"),
         "messages" => ("claude", "/v1/messages"),
         "gemini" => ("gemini", "/v1beta"),
+        "systemone" => ("typesafe", "/v1/systemone"),
         _ => return None,
     })
+}
+
+fn openrouter_api(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("openrouter.ai")
+        && url.port().is_none()
+        && matches!(
+            url.path().trim_end_matches('/'),
+            "/api/v1/systemone"
+                | "/api/v1"
+                | "/api/v1/chat/completions"
+                | "/api/v1/responses"
+                | "/api/v1/messages"
+        )
 }
 
 /// Protocol switches can change only a known suffix, never the origin or
@@ -32,20 +47,32 @@ fn target(base: &str, engine: &str, protocol: &str) -> Option<(&'static str, Str
         return None;
     }
     let path = url.path().trim_end_matches('/');
-    // A saved OpenRouter channel may have been imported with the System One
-    // suffix. Its gateway inference must stay unchanged for other models, but
-    // OpenRouter's documented OpenAI endpoints are safe same-origin choices.
-    if url.scheme() == "https"
-        && url.host_str() == Some("openrouter.ai")
-        && url.port().is_none()
-        && path == "/api/v1/systemone"
-        && matches!(engine, "typesafe" | "openrouter" | "gpt")
+    let openrouter = openrouter_api(&url);
+    let legacy_openrouter = openrouter && path == "/api/v1/systemone";
+    if openrouter
+        && (matches!(engine, "codex" | "gpt" | "claude" | "gemini" | "openrouter")
+            || legacy_openrouter && engine == "typesafe")
+        && (legacy_openrouter || protocol == "systemone")
     {
-        if !matches!(protocol, "chat" | "responses") {
+        // This OpenRouter API prefix serves System One, Messages and the two
+        // OpenAI text formats. Its native Gemini sibling returned 404.
+        // Do not invalidate pre-existing overrides on non-legacy base paths.
+        if protocol == "gemini" {
             return None;
         }
         url.set_path(&format!("/api{suffix}"));
         return Some((next_engine, url.into()));
+    }
+    if protocol == "systemone" {
+        // A native TypeSafe channel can select its own wire endpoint, but must
+        // not reinterpret its origin or credentials as another API family.
+        if engine != "typesafe" {
+            return None;
+        }
+        return Some((
+            next_engine,
+            crate::providers::endpoints::typesafe_endpoint_url(url.as_str()).ok()?,
+        ));
     }
     if !matches!(engine, "codex" | "gpt" | "claude" | "gemini" | "openrouter") {
         return None;
@@ -78,8 +105,10 @@ pub(crate) fn options(provider: &Provider) -> Vec<&'static str> {
     {
         return vec![];
     }
+    let openrouter = Url::parse(&provider.base_url).is_ok_and(|url| openrouter_api(&url));
     PROTOCOLS
         .into_iter()
+        .filter(|protocol| *protocol != "gemini" || !openrouter)
         .filter(|protocol| target(&provider.base_url, &provider.engine, protocol).is_some())
         .collect()
 }
@@ -183,6 +212,10 @@ pub(crate) fn diagnostic(
     if protocol == "gemini" && !gemini_model(provider.models.get(model)?) {
         return None;
     }
+    if protocol == "gemini" && Url::parse(&provider.base_url).is_ok_and(|url| openrouter_api(&url))
+    {
+        return None;
+    }
     let (engine, url) = target(&provider.base_url, &provider.engine, protocol)?;
     let current = Arc::make_mut(&mut provider);
     current.engine = engine.into();
@@ -263,22 +296,25 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_legacy_systemone_can_select_its_documented_endpoints() {
+    fn openrouter_legacy_systemone_can_select_the_observed_protocols() {
         let document = json!({
             "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1/systemone",
             "api": "fixture", "model": ["jev-latest", "gemini-4-carbon"],
-            "model_upstream_protocols": {"gemini-4-carbon": "chat"}
+            "model_upstream_protocols": {"gemini-4-carbon": "messages", "jev-latest": "systemone"}
         });
         let provider = runtime_provider(
             serde_json::from_value(compile_provider(&document).unwrap()).unwrap(),
             Arc::default(),
         );
-        assert_eq!(options(&provider), vec!["responses", "chat"]);
+        assert_eq!(
+            options(&provider),
+            vec!["responses", "chat", "messages", "systemone"]
+        );
         assert_eq!(
             effective(provider.clone(), "gemini-4-carbon")
                 .base_url
                 .as_ref(),
-            "https://openrouter.ai/api/v1/chat/completions"
+            "https://openrouter.ai/api/v1/messages"
         );
         assert_eq!(
             effective(provider.clone(), "jev-latest").engine.as_ref(),
@@ -292,7 +328,27 @@ mod tests {
             "https://openrouter.ai/api/v1/responses"
         );
         assert!(diagnostic(provider, "gemini-4-carbon", "gemini").is_none());
+        assert_eq!(
+            target(
+                "https://openrouter.ai/api/v1/chat/completions",
+                "gpt",
+                "systemone"
+            ),
+            Some(("typesafe", "https://openrouter.ai/api/v1/systemone".into()))
+        );
         assert!(target("https://api.typesafe.ai/v1/systemone", "typesafe", "chat").is_none());
+        assert_eq!(
+            target(
+                "https://api.typesafe.ai/tenant/v1/systemone",
+                "typesafe",
+                "systemone"
+            ),
+            Some((
+                "typesafe",
+                "https://api.typesafe.ai/tenant/v1/systemone".into()
+            ))
+        );
+        assert!(target("https://example.test/v1", "gpt", "systemone").is_none());
         assert!(target(
             "https://openrouter.ai.example/api/v1/systemone",
             "typesafe",
