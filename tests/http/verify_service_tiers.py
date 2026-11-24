@@ -181,6 +181,11 @@ def main():
                 # Renewing detection evidence must not undo an explicit routing preference.
                 setting("verified", {path: result["checked_at"]}, "renew-fast-evidence")
                 assert request("fast", "verified-only")[0] == 503
+                setting(global_scope, {"/preferences/service_tier_routing": False}, "disable-global-filter")
+                assert request("fast", "verified-only")[0] == 503
+                assert request("ultrafast", "verified-only")[0] == 200
+                assert request(key="verified-only")[0] == 200
+                setting(global_scope, {"/preferences/service_tier_routing": True}, "restore-global-filter")
                 setting("verified", {disabled_path: False}, "reenable-fast")
                 assert request("fast", "verified-only")[0] == 200
                 assert request("ultrafast", "verified-only")[0] == 200

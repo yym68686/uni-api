@@ -126,12 +126,13 @@ impl GatewayRuntime {
                 message: format!("No available providers at the moment: {}", facts.model),
             });
         }
-        let providers = if crate::routing::service_tier::enabled(&snapshot)
-            && !headers.contains_key(TARGET_PROVIDER_HEADER)
+        let providers = if let Some(tier) = facts
+            .service_tier
+            .filter(|_| !headers.contains_key(TARGET_PROVIDER_HEADER))
         {
-            if let Some(tier) = facts.service_tier {
+            let eligible: Vec<_> = if crate::routing::service_tier::enabled(&snapshot) {
                 let now = crate::runtime::clock::unix_seconds();
-                let eligible: Vec<_> = providers
+                providers
                     .into_iter()
                     .filter_map(|p| {
                         crate::routing::service_tier::restrict(
@@ -142,17 +143,20 @@ impl GatewayRuntime {
                             now,
                         )
                     })
-                    .collect();
-                if eligible.is_empty() {
-                    return Err(reject(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        crate::routing::service_tier::UNAVAILABLE,
-                    ));
-                }
-                eligible
+                    .collect()
             } else {
                 providers
+                    .into_iter()
+                    .filter(|p| !crate::routing::service_tier::disabled(p, tier))
+                    .collect()
+            };
+            if eligible.is_empty() {
+                return Err(reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    crate::routing::service_tier::UNAVAILABLE,
+                ));
             }
+            eligible
         } else {
             providers
         };
