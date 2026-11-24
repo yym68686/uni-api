@@ -161,6 +161,7 @@ impl GatewayRuntime {
         let providers: Vec<Value> = effective.providers.iter().map(|p| json!({
             "provider":p.name.as_ref(),"base_url":p.base_url.as_ref(),"api":p.api_keys.as_ref(),
             "service_tier_scope":crate::routing::service_tier::inventory_scope(&effective,p),
+            "service_tier_routing":crate::routing::service_tier::routing_state(&effective,p,crate::runtime::clock::unix_seconds()),
             "temporary":controls.temporary.contains_key(p.name.as_ref()),
             "identity_changed":p.name.starts_with("sub2api-copy-") || controls.settings.get(p.name.as_ref()).is_some_and(crate::control::settings::identity_changed)
         })).collect();

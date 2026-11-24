@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub(crate) const ENDPOINT: &str = "/v1/responses";
 pub(crate) const SWITCH: &str = "service_tier_routing";
 pub(crate) const EVIDENCE: &str = "service_tier_evidence";
+pub(crate) const DISABLED: &str = "service_tier_disabled";
 pub(crate) const ROUTED: &str = "__verified_service_tier";
 pub(crate) const TTL: i64 = 7 * 24 * 60 * 60;
 pub(crate) const UNAVAILABLE: &str =
@@ -185,6 +186,23 @@ pub(crate) fn valid_evidence(value: &Value) -> bool {
     })
 }
 
+pub(crate) fn valid_disabled(value: &Value) -> bool {
+    value.as_object().is_some_and(|tiers| {
+        tiers.iter().all(|(tier, disabled)| {
+            matches!(tier.as_str(), "fast" | "ultrafast") && disabled.is_boolean()
+        })
+    })
+}
+
+pub(crate) fn disabled(provider: &Provider, tier: Tier) -> bool {
+    provider
+        .preferences
+        .get(DISABLED)
+        .and_then(|v| v.get(tier.wire()))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 pub(crate) fn fresh(time: i64, now: i64) -> bool {
     time > 0 && time <= now && now.saturating_sub(time) < TTL
 }
@@ -196,8 +214,25 @@ pub(crate) fn restrict(
     tier: Tier,
     now: i64,
 ) -> Option<Arc<Provider>> {
+    if disabled(&provider, tier) {
+        return None;
+    }
+    let keys = qualified_keys(snapshot, &provider, model, tier, now)?;
+    let selected = Arc::make_mut(&mut provider);
+    selected.api_keys = Arc::new(keys);
+    Arc::make_mut(&mut selected.preferences).insert(ROUTED.into(), json!(tier.wire()));
+    Some(provider)
+}
+
+fn qualified_keys(
+    snapshot: &Snapshot,
+    provider: &Provider,
+    model: &str,
+    tier: Tier,
+    now: i64,
+) -> Option<Vec<String>> {
     let evidence = provider.preferences.get(EVIDENCE)?;
-    let url = endpoint(&provider, model)?;
+    let url = endpoint(provider, model)?;
     let keys: Vec<_> = provider
         .api_keys
         .iter()
@@ -205,20 +240,89 @@ pub(crate) fn restrict(
             !key.is_empty()
                 && !key.contains(',')
                 && evidence
-                    .get(binding(snapshot, &provider, model, &url, key))
+                    .get(binding(snapshot, provider, model, &url, key))
                     .and_then(|v| v.get(tier.wire()))
                     .and_then(Value::as_i64)
                     .is_some_and(|time| fresh(time, now))
         })
         .cloned()
         .collect();
-    if keys.is_empty() {
+    (!keys.is_empty()).then_some(keys)
+}
+
+// Return only route state, not bindings or raw credentials. This describes
+// this provider's configuration, independent of the global routing switch.
+pub(crate) fn routing_state(snapshot: &Snapshot, provider: &Arc<Provider>, now: i64) -> Value {
+    let mut result = serde_json::Map::new();
+    let evidence = provider.preferences.get(EVIDENCE);
+    for tier in [Tier::Fast, Tier::Ultrafast] {
+        let has_evidence = evidence.is_some_and(|e| {
+            e.as_object().is_some_and(|o| {
+                o.values().any(|v| {
+                    v.get(tier.wire())
+                        .and_then(Value::as_i64)
+                        .is_some_and(|at| fresh(at, now))
+                })
+            })
+        }) && provider.models.keys().any(|model| {
+            qualified_keys(
+                snapshot,
+                &crate::config::model_protocol::effective(provider.clone(), model),
+                model,
+                tier,
+                now,
+            )
+            .is_some()
+        });
+        let state = match (disabled(provider, tier), has_evidence) {
+            (true, true) => "disabled_verified",
+            (true, false) => "disabled",
+            (false, true) => "enabled",
+            (false, false) => "unconfigured",
+        };
+        result.insert(tier.wire().into(), json!(state));
+    }
+    Value::Object(result)
+}
+
+// Portable receipts are issued only for plain Responses channels. Transfer
+// still requires the same authenticated destination, wire model, protocol,
+// proxy and streaming behavior. Provider names and public aliases are not
+// wire inputs; routing evidence itself remains bound to those names.
+pub(crate) fn compatibility(
+    snapshot: &Snapshot,
+    provider: &Provider,
+    model: &str,
+    url: &str,
+    key: &str,
+) -> Option<String> {
+    if [
+        "headers",
+        "post_body_parameter_overrides",
+        "passthrough_request_headers",
+    ]
+    .iter()
+    .any(|field| provider.preferences.get(*field).is_some())
+    {
         return None;
     }
-    let selected = Arc::make_mut(&mut provider);
-    selected.api_keys = Arc::new(keys);
-    Arc::make_mut(&mut selected.preferences).insert(ROUTED.into(), json!(tier.wire()));
-    Some(provider)
+    let upstream = provider.models.get(model)?;
+    let stream = crate::providers::stream_mode::stream_only(provider, model, upstream)
+        || crate::providers::responses::provider_stream_override(provider)
+            .unwrap_or(provider.engine.as_ref() == "codex");
+    let wire = json!([
+        "responses-portable-v1",
+        url,
+        provider.engine.as_ref(),
+        upstream,
+        ResolvedAttemptPolicy::proxy(snapshot, provider),
+        stream
+    ]);
+    let mut hash = Sha256::new();
+    hash.update(wire.to_string().as_bytes());
+    hash.update([0]);
+    hash.update(key.as_bytes());
+    Some(format!("{:x}", hash.finalize()))
 }
 
 pub(crate) fn rejection(error: &super::types::RouteResolutionError) -> Option<Value> {

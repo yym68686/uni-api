@@ -25,7 +25,9 @@ class Upstream(BaseHTTPRequestHandler):
                     "model": body["model"], "output": [{"id": "msg", "type": "message", "role": "assistant",
                     "status": "completed", "content": [{"type": "output_text", "text": "OK"}]}],
                     "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                    "service_tier": {"fast": "priority", "ultrafast": "default"}.get(tier, tier)}
+                    "service_tier": {"fast": "priority", "ultrafast": (
+                        "ultrafast" if self.path.startswith("/verified/") else "default"
+                    )}.get(tier, tier)}
         kind = "application/json"
         raw = json.dumps(response).encode()
         if body.get("stream"):
@@ -53,25 +55,28 @@ def main():
     with tempfile.TemporaryDirectory(prefix="service-tier-test-") as directory:
         port, root = free_port(), Path(directory)
         providers = [
-            {"provider": name, "engine": "gpt", "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
+            {"provider": name, **({} if name == "portable" else {"engine": "gpt"}),
+             "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
              "api": ["first-" + name, "second-" + name], "model": [{"wire": "public"}],
              "preferences": {"api_key_schedule_algorithm": "fixed_priority", **(
                  {"upstream_stream_mode": "stream_only"} if name in ("early", "full") else {}
              )}}
-            for name in ("peer", "verified", "early", "full")
+            for name in ("peer", "verified", "early", "full", "portable")
         ]
         config = {"providers": providers, "api_keys": [
             {"api": "admin", "role": "admin", "model": ["all"]},
             {"api": "caller", "role": "user", "model": ["peer/*", "verified/*"],
              "preferences": {"SCHEDULING_ALGORITHM": "fixed_priority"}},
             {"api": "peer-only", "role": "user", "model": ["peer/*"]},
+            {"api": "verified-only", "role": "user", "model": ["verified/*"]},
         ]}
         (root / "config.json").write_text(json.dumps(config))
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "TMPDIR", "LANG", "DYLD_LIBRARY_PATH")}
         env.update(PORT=str(port), DISABLE_DATABASE="true", UNI_API_CONFIG_PATH=str(root / "config.json"),
                    RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root / "snapshot.json"),
                    UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "ledger"),
-                   RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"), NO_PROXY="127.0.0.1,localhost")
+                   RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"), NO_PROXY="127.0.0.1,localhost",
+                   RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0", RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0")
 
         def call(method, path, body=None, key="admin"):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
@@ -104,6 +109,8 @@ def main():
             proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
             try:
                 for _ in range(100):
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"Gateway exited unexpectedly: {proc.returncode}")
                     try:
                         if call("GET", "/readyz")[0] == 200:
                             break
@@ -115,6 +122,19 @@ def main():
                 assert call("POST", probe_path, req, "caller")[0] == 403
                 code, pre = call("POST", probe_path, dict(req, verify_only=True))
                 assert code == 200 and pre["status"] == "ready" and not upstream.hits, pre
+                code, portable = call("POST", probe_path, dict(req, provider="portable", verify_only=True))
+                assert code == 200 and portable["status"] == "ready" and portable["compatibility"]
+                candidate = {"base_url": providers[-1]["base_url"], "api_key": "first-portable",
+                             "models": {"new-alias": "wire"}}
+                preview = dict(req, provider="candidate", verify_only=True, candidate=candidate)
+                assert call("POST", probe_path, dict(preview, verify_only=False))[0] == 400
+                code, options = call("POST", probe_path, preview)
+                assert code == 200, options
+                option = options["models"]["new-alias"]
+                assert option["binding"] != portable["binding"]
+                assert option["compatibility"] == portable["compatibility"]
+                code, options = call("POST", probe_path, dict(preview, candidate=dict(candidate, api_key="rotated")))
+                assert code == 200 and options["models"]["new-alias"]["compatibility"] != option["compatibility"]
                 assert call("POST", probe_path, dict(req, expected_scope="0" * 64))[0] == 409
                 assert not upstream.hits
                 code, result = call("POST", probe_path, dict(req, expected_scope=pre["scope"]))
@@ -123,7 +143,7 @@ def main():
                 assert len(upstream.hits) == 1 and upstream.hits[-1] == (
                     "/verified/v1/responses", "Bearer first-verified",
                     {"model": "wire", "input": "Reply OK.", "service_tier": "fast", "store": False, "stream": False})
-                code, slow = call("POST", probe_path, dict(req, tier="ultrafast"))
+                code, slow = call("POST", probe_path, dict(req, provider="peer", tier="ultrafast"))
                 assert code == 200 and slow["status"] == "not_honored" and slow["observed"] == "default", slow
                 for provider, status in (("early", "inconclusive"), ("full", "supported")):
                     code, streamed = call("POST", probe_path, dict(req, provider=provider))
@@ -148,6 +168,22 @@ def main():
                 assert request("fast", "peer-only")[0] == 503
                 assert request("ultrafast")[0] == 503
                 assert len(upstream.hits) == before + 2
+                code, ultra = call("POST", probe_path, dict(req, tier="ultrafast"))
+                assert code == 200 and ultra["status"] == "supported", ultra
+                ultra_path = "/preferences/service_tier_evidence/" + ultra["binding"] + "/ultrafast"
+                disabled_path = "/preferences/service_tier_disabled/fast"
+                setting("verified", {ultra_path: ultra["checked_at"], disabled_path: True}, "enable-ultra-disable-fast")
+                assert request("fast", "verified-only")[0] == 503
+                assert request("ultrafast", "verified-only")[0] == 200
+                assert upstream.hits[-1][0] == "/verified/v1/responses"
+                assert request(key="verified-only")[0] == 200
+                assert upstream.hits[-1][0] == "/verified/v1/responses"
+                # Renewing detection evidence must not undo an explicit routing preference.
+                setting("verified", {path: result["checked_at"]}, "renew-fast-evidence")
+                assert request("fast", "verified-only")[0] == 503
+                setting("verified", {disabled_path: False}, "reenable-fast")
+                assert request("fast", "verified-only")[0] == 200
+                assert request("ultrafast", "verified-only")[0] == 200
                 code, response = request("default")
                 assert code == 200 and upstream.hits[-1][0] == "/peer/v1/responses", response
                 setting("verified", {}, "withdraw", [path])

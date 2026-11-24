@@ -9,6 +9,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Duration;
 
 pub(crate) const PATH: &str = "/v1/channel-settings/service-tier-probe";
@@ -24,13 +26,75 @@ struct Input {
     verify_only: bool,
     #[serde(default)]
     expected_scope: String,
+    candidate: Option<Candidate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Candidate {
+    base_url: String,
+    api_key: String,
+    models: BTreeMap<String, String>,
+}
+
+fn valid_model(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 256 && !v.chars().any(char::is_control)
+}
+
+fn preview_candidate(
+    snapshot: &crate::config::snapshot::Snapshot,
+    provider: &str,
+    c: Candidate,
+) -> Option<Value> {
+    if !crate::control::settings::valid_created_name(provider)
+        || snapshot.providers_by_name.contains_key(provider)
+        || c.base_url.is_empty()
+        || c.base_url.len() > 8192
+        || c.base_url.chars().any(char::is_control)
+        || c.api_key.is_empty()
+        || c.api_key.len() > 8192
+        || c.api_key.contains([',', '\r', '\n'])
+        || c.models.is_empty()
+        || c.models.len() > 128
+        || !c
+            .models
+            .iter()
+            .all(|(public, upstream)| valid_model(public) && valid_model(upstream))
+    {
+        return None;
+    }
+    let models: Vec<_> = c
+        .models
+        .iter()
+        .map(|(public, upstream)| json!({upstream:public}))
+        .collect();
+    let raw = json!({"provider":provider,"base_url":c.base_url,"api":[c.api_key],"model":models});
+    let compiled = crate::config::compiler::compile_provider(&raw)?;
+    let provider = crate::config::snapshot::runtime_provider(
+        serde_json::from_value(compiled).ok()?,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let key = provider.api_keys.first()?;
+    let mut out = serde_json::Map::new();
+    for model in provider.models.keys() {
+        if let Some(url) = tiers::endpoint(&provider, model) {
+            out.insert(
+                model.clone(),
+                json!({
+                    "binding": tiers::binding(snapshot,&provider,model,&url,key),
+                    "compatibility": tiers::compatibility(snapshot,&provider,model,&url,key),
+                }),
+            );
+        }
+    }
+    Some(json!({"models":out}))
 }
 
 pub(crate) async fn handle(state: &AppState, request: Request) -> Response<Body> {
     if let Err(response) = require_admin(state, request.headers()).await {
         return response;
     }
-    let Ok(raw) = to_bytes(request.into_body(), 4096).await else {
+    let Ok(raw) = to_bytes(request.into_body(), 100 * 1024).await else {
         return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Probe request too large");
     };
     let Ok(input) = serde_json::from_slice::<Input>(&raw) else {
@@ -38,7 +102,7 @@ pub(crate) async fn handle(state: &AppState, request: Request) -> Response<Body>
     };
     if [&input.provider, &input.model]
         .iter()
-        .any(|v| v.is_empty() || v.len() > 256 || v.chars().any(char::is_control))
+        .any(|v| !valid_model(v))
     {
         return json_error(StatusCode::BAD_REQUEST, "Invalid service tier probe target");
     }
@@ -48,6 +112,18 @@ pub(crate) async fn handle(state: &AppState, request: Request) -> Response<Body>
             "Runtime configuration is not ready",
         );
     };
+    if let Some(candidate) = input.candidate {
+        if !input.verify_only || !input.expected_scope.is_empty() {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "A candidate can only be verified locally",
+            );
+        }
+        return match preview_candidate(&snapshot, &input.provider, candidate) {
+            Some(value) => json_response(StatusCode::OK, value),
+            None => json_error(StatusCode::CONFLICT, "Candidate could not be verified"),
+        };
+    }
     let Some(provider) = snapshot.providers_by_name.get(&input.provider) else {
         return json_error(StatusCode::NOT_FOUND, "Provider not found");
     };
@@ -81,10 +157,11 @@ pub(crate) async fn handle(state: &AppState, request: Request) -> Response<Body>
         return unsupported_target();
     };
     let binding = tiers::binding(&snapshot, &provider, &input.model, &url, key);
+    let compatibility = tiers::compatibility(&snapshot, &provider, &input.model, &url, key);
     if input.verify_only {
         return json_response(
             StatusCode::OK,
-            json!({"status":"ready","binding":binding,"scope":scope}),
+            json!({"status":"ready","binding":binding,"scope":scope,"compatibility":compatibility,"upstream_model":upstream_model}),
         );
     }
     let stream =
@@ -144,6 +221,7 @@ pub(crate) async fn handle(state: &AppState, request: Request) -> Response<Body>
         StatusCode::OK,
         json!({
             "status":result.0, "observed":result.1, "binding":binding, "checked_at":checked_at, "scope":scope,
+            "compatibility":compatibility, "upstream_model":upstream_model,
         }),
     )
 }

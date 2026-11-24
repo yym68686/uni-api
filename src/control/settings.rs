@@ -400,6 +400,13 @@ fn validate_paths(c: &Change) -> Result<(), Failure> {
         return Err(bad("Channel settings patch is too large"));
     }
     for p in c.set.keys().chain(c.remove.iter()) {
+        if matches!(
+            p.as_str(),
+            "/preferences/service_tier_disabled/fast"
+                | "/preferences/service_tier_disabled/ultrafast"
+        ) {
+            continue;
+        }
         if let Some(path) = p.strip_prefix("/preferences/service_tier_evidence/") {
             if path.split_once('/').is_some_and(|(binding, tier)| {
                 crate::routing::service_tier::is_digest(binding)
@@ -483,6 +490,11 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
             .is_some_and(|v| !crate::routing::service_tier::valid_evidence(v))
         {
             return Err(field_error("/preferences/service_tier_evidence"));
+        }
+        if p.get(crate::routing::service_tier::DISABLED)
+            .is_some_and(|v| !crate::routing::service_tier::valid_disabled(v))
+        {
+            return Err(field_error("/preferences/service_tier_disabled"));
         }
         for (k, v) in p {
             if k.starts_with("__") {
@@ -841,6 +853,7 @@ impl GatewayRuntime {
                     row["model_endpoints"] = models;
                 }
                 row["service_tier_scope"] = json!(crate::routing::service_tier::inventory_scope(&effective, p));
+                row["service_tier_routing"] = crate::routing::service_tier::routing_state(&effective, p, crate::runtime::clock::unix_seconds());
                 row
             }).collect::<Vec<_>>()}))
     }
