@@ -307,7 +307,11 @@ pub(crate) fn request_to_chat(value: &Value, model: &str, stream: bool) -> Resul
         // Tool results must precede the user's next text turn.
         messages.extend(results);
         if !blocks.is_empty() || !calls.is_empty() {
-            let mut message = json!({"role":role,"content":blocks});
+            let mut message = json!({"role":role});
+            // A tool-only turn has no text part to carry across protocols.
+            if !blocks.is_empty() {
+                message["content"] = json!(blocks);
+            }
             if !calls.is_empty() {
                 message["tool_calls"] = json!(calls);
             }
@@ -332,6 +336,7 @@ pub(crate) fn request_to_chat(value: &Value, model: &str, stream: bool) -> Resul
                 "candidateCount" | "candidate_count" => "n",
                 "seed" => "seed",
                 "thinkingConfig" | "thinking_config" => {
+                    let v = v.as_object().ok_or("thinkingConfig must be an object")?;
                     if v.get("thinkingBudget")
                         .or_else(|| v.get("thinking_budget"))
                         .is_some()
@@ -342,11 +347,16 @@ pub(crate) fn request_to_chat(value: &Value, model: &str, stream: bool) -> Resul
                     }
                     if let Some(effort) = v.get("thinkingLevel").or_else(|| v.get("thinking_level"))
                     {
-                        out["reasoning_effort"] = effort.clone();
+                        match effort.as_str().map(str::to_ascii_lowercase).as_deref() {
+                            Some("thinking_level_unspecified") => {}
+                            Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh")) => {
+                                out["reasoning_effort"] = json!(level);
+                            }
+                            // Preserve extensions and invalid values for existing upstream validation.
+                            _ => out["reasoning_effort"] = effort.clone(),
+                        }
                     } else {
-                        return Err(
-                            "Exact thinking budgets require a native Gemini provider".into()
-                        );
+                        return Err("thinkingConfig without thinkingLevel requires a native Gemini provider".into());
                     }
                     continue;
                 }
@@ -771,6 +781,55 @@ mod tests {
             request[field] = value;
             assert!(request_to_chat(&request, "model", false).is_err());
         }
+    }
+
+    #[test]
+    fn normalizes_gemini_thinking_levels_for_cross_protocol_requests() {
+        for (input_level, expected_effort) in [
+            ("MINIMAL", "minimal"),
+            ("LOW", "low"),
+            ("MEDIUM", "medium"),
+            ("HIGH", "high"),
+            ("high", "high"),
+            ("XHIGH", "xhigh"),
+        ] {
+            let request = request_to_chat(
+                &json!({
+                    "contents":[{"parts":[{"text":"hi"}]}],
+                    "generationConfig":{"thinkingConfig":{"thinkingLevel":input_level}}
+                }),
+                "model",
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                request["reasoning_effort"], expected_effort,
+                "{input_level}"
+            );
+        }
+
+        let request = request_to_chat(
+            &json!({
+                "contents":[{"parts":[{"text":"hi"}]}],
+                "generation_config":{"thinking_config":{"thinking_level":"THINKING_LEVEL_UNSPECIFIED"}}
+            }),
+            "model",
+            false,
+        )
+        .unwrap();
+        assert!(request.get("reasoning_effort").is_none());
+        // Preserve invalid values for existing downstream validation instead
+        // of silently inventing a different reasoning policy.
+        let request = request_to_chat(
+            &json!({
+                "contents":[{"parts":[{"text":"hi"}]}],
+                "generationConfig":{"thinkingConfig":{"thinkingLevel":"future-level"}}
+            }),
+            "model",
+            true,
+        )
+        .unwrap();
+        assert_eq!(request["reasoning_effort"], "future-level");
     }
 
     #[test]

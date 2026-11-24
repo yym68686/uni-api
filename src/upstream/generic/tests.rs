@@ -481,6 +481,99 @@ fn gemini_and_claude_payloads_preserve_system_and_tools() {
 }
 
 #[test]
+fn gemini_to_responses_sends_normalized_thinking_and_only_real_tool_items() {
+    let provider = test_provider("codex", "https://openrouter.ai/api/v1/responses");
+    let input = PreparedInput {
+        _memory_reservations: Vec::new(),
+        payload: Some(json!({
+            "contents":[
+                {"role":"user","parts":[{"text":"look up the result"}]},
+                {"role":"model","parts":[{"functionCall":{"id":"a","name":"lookup","args":{"q":"a"}}}]},
+                {"role":"user","parts":[{"functionResponse":{"id":"a","name":"lookup","response":{"result":2}}}]}
+            ],
+            "generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}
+        })),
+        replay: None,
+        observation: SpoolObservation::default(),
+        default_model: String::new(),
+        content_type: "application/json".into(),
+    };
+    let uri: Uri = "/v1/models/gemini-4-carbon:streamGenerateContent?alt=sse"
+        .parse()
+        .unwrap();
+    let prepared = build_attempt(
+        &provider,
+        "key",
+        "gemini-4-carbon",
+        "google/gemini-4-carbon",
+        &Method::POST,
+        &uri,
+        uri.path(),
+        &HeaderMap::new(),
+        &input,
+        "request-gemini-responses",
+    )
+    .unwrap();
+    assert_eq!(prepared.url, "https://openrouter.ai/api/v1/responses");
+    assert_eq!(prepared.adapter, ResponseAdapter::ResponsesToChat);
+    let AttemptBody::Json(body) = prepared.body else {
+        panic!("Responses request must be JSON");
+    };
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["model"], "google/gemini-4-carbon");
+    assert_eq!(body["reasoning"], json!({"effort":"high"}));
+    assert_eq!(body["stream"], true);
+    assert_eq!(
+        body["input"],
+        json!([
+            {"role":"user","content":[{"type":"input_text","text":"look up the result"}]},
+            {"type":"function_call","call_id":"a","name":"lookup","arguments":"{\"q\":\"a\"}"},
+            {"type":"function_call_output","call_id":"a","output":"{\"result\":2}"}
+        ])
+    );
+}
+
+#[test]
+fn native_gemini_preserves_the_original_thinking_level() {
+    let provider = test_provider("gemini", "https://generativelanguage.googleapis.com/v1beta");
+    let input = PreparedInput {
+        _memory_reservations: Vec::new(),
+        payload: Some(json!({
+            "contents":[{"parts":[{"text":"hello"}]}],
+            "generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}
+        })),
+        replay: None,
+        observation: SpoolObservation::default(),
+        default_model: String::new(),
+        content_type: "application/json".into(),
+    };
+    let uri: Uri = "/v1/models/gemini-3-flash:streamGenerateContent?alt=sse"
+        .parse()
+        .unwrap();
+    let prepared = build_attempt(
+        &provider,
+        "key",
+        "gemini-3-flash",
+        "gemini-3-flash",
+        &Method::POST,
+        &uri,
+        "/v1/models/gemini-3-flash:streamGenerateContent",
+        &HeaderMap::new(),
+        &input,
+        "request-native-gemini",
+    )
+    .unwrap();
+    let AttemptBody::Json(body) = prepared.body else {
+        panic!("native Gemini request must be JSON");
+    };
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+}
+
+#[test]
 fn responses_compat_compiles_to_gemini_and_restores_responses_shape() {
     let provider = test_provider("gemini", "https://generativelanguage.googleapis.com/v1beta");
     let input = PreparedInput {

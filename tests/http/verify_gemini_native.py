@@ -207,6 +207,32 @@ def verify(binary):
                             assert usage['promptTokenCount']==100 and usage['candidatesTokenCount']+usage.get('thoughtsTokenCount',0)==20,(model,usage)
                             assert usage['cachedContentTokenCount']==60,(model,usage)
                             if model=='gemini': assert frames[-1]['extraNativeField']=={'untouched':True}
+                thinking_history = {
+                    'contents': [
+                        {'role': 'user', 'parts': [{'text': 'Look up a result'}]},
+                        {'role': 'model', 'parts': [TOOL_PART]},
+                        {'role': 'user', 'parts': [{'functionResponse': {
+                            'id': 'native-lookup', 'name': 'lookup', 'response': {'value': 42}}}]},
+                    ],
+                    'generationConfig': {'thinkingConfig': {'thinkingLevel': 'HIGH'}},
+                }
+                for model in ['gemini', 'codex', 'chat']:
+                    upstream.hits.clear()
+                    path = f'/v1/models/{model}:streamGenerateContent?alt=sse'
+                    status, _, raw = call(path, thinking_history)
+                    assert status == 200 and not any(f.get('error') for f in decode(raw)), (status, raw)
+                    assert len(upstream.hits) == 1, upstream.hits
+                    wire = upstream.hits[0][1]
+                    if model == 'gemini':
+                        assert wire == thinking_history, wire
+                    elif model == 'codex':
+                        assert wire['reasoning'] == {'effort': 'high'}, wire
+                        assert [i.get('type', i.get('role')) for i in wire['input']] == [
+                            'user', 'function_call', 'function_call_output'], wire
+                    else:
+                        assert wire['reasoning_effort'] == 'high', wire
+                        assistant = wire['messages'][1]
+                        assert 'content' not in assistant and assistant['tool_calls'][0]['id'] == 'native-lookup', wire
                 for auth in ['query','bearer']:
                     assert call('/v1beta/models/chat:generateContent',body,auth)[0]==200
                 assert call('/v1beta/models/chat:generateContent',body,'none')[0] in [401,403]
