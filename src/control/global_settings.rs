@@ -14,6 +14,7 @@ pub(crate) const KEYS: &[&str] = &[
     "api_key_quota_cooldown_period",
     "hedging",
     "unknown_upstream_400_retries",
+    crate::routing::service_tier::SWITCH,
 ];
 
 pub(crate) fn document(preferences: &Map<String, Value>) -> Value {
@@ -23,6 +24,8 @@ pub(crate) fn schema() -> Value {
     json!({"version":1,"global_settings":true,"unknown_upstream_400_retries":true,"all_upstream_400_retries":true,"fields":KEYS.iter().map(|k| {
         if *k == crate::routing::unknown_400::KEY {
             json!({"path":format!("/preferences/{k}"),"group":"重试保护","type":"integer","minimum":0,"maximum":3,"note":note(k)})
+        } else if *k == crate::routing::service_tier::SWITCH {
+            json!({"path":format!("/preferences/{k}"),"group":"路由","type":"boolean"})
         } else {
             json!({"path":format!("/preferences/{k}"),"group":if *k=="hedging"{"并行请求"}else{"超时与冷却"},"type":if k.ends_with("cooldown_period"){"number"}else{"json"}})
         }
@@ -40,6 +43,7 @@ pub(crate) fn default_value(key: &str) -> Option<Value> {
             json!({"enabled":false,"max_inflight_attempts":1,"winner_policy":"first_valid_success"})
         }
         "unknown_upstream_400_retries" => json!(0),
+        crate::routing::service_tier::SWITCH => json!(false),
         _ => return None,
     })
 }
@@ -55,6 +59,9 @@ pub(crate) fn validate(raw: &Value) -> Result<(), String> {
         }
         if !KEYS.contains(&k.as_str()) {
             return Err(format!("Unsupported global preference: {k}"));
+        }
+        if k == crate::routing::service_tier::SWITCH && !v.is_boolean() {
+            return Err(format!("Invalid global preference: {k}"));
         }
         if k.ends_with("cooldown_period") && !numeric(v) {
             return Err(format!("Invalid global preference: {k}"));

@@ -126,6 +126,36 @@ impl GatewayRuntime {
                 message: format!("No available providers at the moment: {}", facts.model),
             });
         }
+        let providers = if crate::routing::service_tier::enabled(&snapshot)
+            && !headers.contains_key(TARGET_PROVIDER_HEADER)
+        {
+            if let Some(tier) = facts.service_tier {
+                let now = crate::runtime::clock::unix_seconds();
+                let eligible: Vec<_> = providers
+                    .into_iter()
+                    .filter_map(|p| {
+                        crate::routing::service_tier::restrict(
+                            &snapshot,
+                            &facts.model,
+                            p,
+                            tier,
+                            now,
+                        )
+                    })
+                    .collect();
+                if eligible.is_empty() {
+                    return Err(reject(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routing::service_tier::UNAVAILABLE,
+                    ));
+                }
+                eligible
+            } else {
+                providers
+            }
+        } else {
+            providers
+        };
         let providers = self
             .schedule_providers(&api_key, &facts.model, providers)
             .await;

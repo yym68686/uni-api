@@ -1,0 +1,172 @@
+"""Service tier evidence and routing; every upstream is loopback."""
+import http.client
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from verify_dispatch_timing import free_port
+
+
+class Upstream(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        tier = body.get("service_tier")
+        self.server.hits.append((self.path, self.headers["Authorization"], body))
+        response = {"id": "resp_test", "status": "completed", "object": "response",
+                    "model": body["model"], "output": [{"id": "msg", "type": "message", "role": "assistant",
+                    "status": "completed", "content": [{"type": "output_text", "text": "OK"}]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    "service_tier": {"fast": "priority", "ultrafast": "default"}.get(tier, tier)}
+        kind = "application/json"
+        raw = json.dumps(response).encode()
+        if body.get("stream"):
+            kind = "text/event-stream"
+            events = [{"type": "response.created", "response": dict(response, status="in_progress", service_tier=tier)}]
+            if self.path.startswith("/full/"):
+                events.append({"type": "response.output_text.delta", "delta": "OK", "item_id": "msg",
+                               "output_index": 0, "content_index": 0})
+                events.append({"type": "response.completed", "response": response})
+            raw = "".join("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n" for e in events).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+def main():
+    binary = Path(sys.argv[1]).resolve()
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    upstream.hits = []
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    probe_path = "/v1/channel-settings/service-tier-probe"
+    global_scope = "__uni_console_global_preferences__"
+    with tempfile.TemporaryDirectory(prefix="service-tier-test-") as directory:
+        port, root = free_port(), Path(directory)
+        providers = [
+            {"provider": name, "engine": "gpt", "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
+             "api": ["first-" + name, "second-" + name], "model": [{"wire": "public"}],
+             "preferences": {"api_key_schedule_algorithm": "fixed_priority", **(
+                 {"upstream_stream_mode": "stream_only"} if name in ("early", "full") else {}
+             )}}
+            for name in ("peer", "verified", "early", "full")
+        ]
+        config = {"providers": providers, "api_keys": [
+            {"api": "admin", "role": "admin", "model": ["all"]},
+            {"api": "caller", "role": "user", "model": ["peer/*", "verified/*"],
+             "preferences": {"SCHEDULING_ALGORITHM": "fixed_priority"}},
+            {"api": "peer-only", "role": "user", "model": ["peer/*"]},
+        ]}
+        (root / "config.json").write_text(json.dumps(config))
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "TMPDIR", "LANG", "DYLD_LIBRARY_PATH")}
+        env.update(PORT=str(port), DISABLE_DATABASE="true", UNI_API_CONFIG_PATH=str(root / "config.json"),
+                   RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root / "snapshot.json"),
+                   UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root / "ledger"),
+                   RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"), NO_PROXY="127.0.0.1,localhost")
+
+        def call(method, path, body=None, key="admin"):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
+            try:
+                conn.request(method, path, json.dumps(body) if body is not None else None,
+                             {"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                raw = response.read().decode()
+                try:
+                    return response.status, json.loads(raw)
+                except ValueError:
+                    return response.status, raw
+            finally:
+                conn.close()
+
+        def setting(provider, changes, operation, remove=None):
+            code, view = call("GET", "/v1/channel-settings?provider=" + provider)
+            assert code == 200, (code, view)
+            code, applied = call("PATCH", "/v1/channel-settings", {
+                "revision": view["revision"], "operation_id": operation,
+                "changes": [{"provider": provider, "set": changes, "remove": remove or []}],
+            })
+            assert code == 200, (code, applied)
+
+        def request(tier=None, key="caller"):
+            return call("POST", "/v1/responses", {"model": "public", "input": "test",
+                                                 **({"service_tier": tier} if tier else {})}, key)
+
+        with (root / "process.log").open("w+") as log:
+            proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
+            try:
+                for _ in range(100):
+                    try:
+                        if call("GET", "/readyz")[0] == 200:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(.05)
+                assert call("GET", "/v1/observability/runtime")[1]["service_tier_probe_version"] == 1
+                req = {"provider": "verified", "model": "public", "tier": "fast"}
+                assert call("POST", probe_path, req, "caller")[0] == 403
+                code, pre = call("POST", probe_path, dict(req, verify_only=True))
+                assert code == 200 and pre["status"] == "ready" and not upstream.hits, pre
+                assert call("POST", probe_path, dict(req, expected_scope="0" * 64))[0] == 409
+                assert not upstream.hits
+                code, result = call("POST", probe_path, dict(req, expected_scope=pre["scope"]))
+                assert code == 200 and result["status"] == "supported" and result["observed"] == "priority", result
+                assert result["binding"] == pre["binding"]
+                assert len(upstream.hits) == 1 and upstream.hits[-1] == (
+                    "/verified/v1/responses", "Bearer first-verified",
+                    {"model": "wire", "input": "Reply OK.", "service_tier": "fast", "store": False, "stream": False})
+                code, slow = call("POST", probe_path, dict(req, tier="ultrafast"))
+                assert code == 200 and slow["status"] == "not_honored" and slow["observed"] == "default", slow
+                for provider, status in (("early", "inconclusive"), ("full", "supported")):
+                    code, streamed = call("POST", probe_path, dict(req, provider=provider))
+                    assert code == 200 and streamed["status"] == status, (provider, streamed)
+                assert len(upstream.hits) == 4
+                code, response = request("ultrafast")
+                assert code == 200 and upstream.hits[-1][0] == "/peer/v1/responses", response
+                setting(global_scope, {"/preferences/service_tier_routing": True}, "enable")
+                before = len(upstream.hits)
+                code, denied = request("fast")
+                assert code == 503 and denied["error"]["code"] == "service_tier_unavailable", denied
+                assert len(upstream.hits) == before
+                path = "/preferences/service_tier_evidence/" + result["binding"] + "/fast"
+                setting("verified", {path: result["checked_at"] - 7 * 86400}, "expired")
+                assert request("fast")[0] == 503 and len(upstream.hits) == before
+                setting("verified", {path: result["checked_at"]}, "publish")
+                for tier in ("fast", "priority"):
+                    code, served = request(tier)
+                    assert code == 200 and served["service_tier"] == "priority", served
+                    assert upstream.hits[-1][:2] == ("/verified/v1/responses", "Bearer first-verified")
+                    assert upstream.hits[-1][2]["service_tier"] == "fast"
+                assert request("fast", "peer-only")[0] == 503
+                assert request("ultrafast")[0] == 503
+                assert len(upstream.hits) == before + 2
+                code, response = request("default")
+                assert code == 200 and upstream.hits[-1][0] == "/peer/v1/responses", response
+                setting("verified", {}, "withdraw", [path])
+                assert request("fast")[0] == 503
+                assert request()[0] == 200 and upstream.hits[-1][0] == "/peer/v1/responses"
+            except Exception:
+                print((root / "process.log").read_text()[-8000:])
+                raise
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                upstream.shutdown()
+                upstream.server_close()
+    print("PASS service tier preflight, exact credential, terminal receipts, expiry, ACL and rollback")
+
+
+if __name__ == "__main__":
+    main()

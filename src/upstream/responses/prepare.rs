@@ -286,7 +286,8 @@ pub async fn prepare_request(
         Err(error) => {
             return ResponsesPreparation::Response(json_response(
                 error.status,
-                json!({"error":error.message}),
+                crate::routing::service_tier::rejection(&error)
+                    .unwrap_or_else(|| json!({"error":error.message})),
             ))
         }
     };

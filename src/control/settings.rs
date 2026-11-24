@@ -400,6 +400,14 @@ fn validate_paths(c: &Change) -> Result<(), Failure> {
         return Err(bad("Channel settings patch is too large"));
     }
     for p in c.set.keys().chain(c.remove.iter()) {
+        if let Some(path) = p.strip_prefix("/preferences/service_tier_evidence/") {
+            if path.split_once('/').is_some_and(|(binding, tier)| {
+                crate::routing::service_tier::is_digest(binding)
+                    && matches!(tier, "fast" | "ultrafast")
+            }) {
+                continue;
+            }
+        }
         if !roots
             .iter()
             .any(|r| p == r || (p.starts_with(&(r.clone() + "/")) && r != "/api" && r != "/model"))
@@ -470,6 +478,11 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
         }
         if let Some(mode) = p.get("upstream_stream_mode") {
             crate::providers::stream_mode::validate(mode)?;
+        }
+        if p.get(crate::routing::service_tier::EVIDENCE)
+            .is_some_and(|v| !crate::routing::service_tier::valid_evidence(v))
+        {
+            return Err(field_error("/preferences/service_tier_evidence"));
         }
         for (k, v) in p {
             if k.starts_with("__") {
@@ -827,6 +840,7 @@ impl GatewayRuntime {
                 if let Some(models) = crate::config::model_protocol::export(p) {
                     row["model_endpoints"] = models;
                 }
+                row["service_tier_scope"] = json!(crate::routing::service_tier::inventory_scope(&effective, p));
                 row
             }).collect::<Vec<_>>()}))
     }

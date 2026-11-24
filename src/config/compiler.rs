@@ -27,6 +27,13 @@ pub(crate) fn compile_config_document(
         root.get("preferences")
             .and_then(|p| p.get(crate::routing::unknown_400::KEY)),
     )?;
+    if root
+        .get("preferences")
+        .and_then(|p| p.get(crate::routing::service_tier::SWITCH))
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return Err("Invalid global preference: service_tier_routing".into());
+    }
     for provider in root
         .get("providers")
         .and_then(Value::as_array)

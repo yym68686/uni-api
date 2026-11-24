@@ -12,6 +12,7 @@ pub(crate) struct RequestFacts {
     pub request_type: Option<&'static str>,
     pub reasoning_effort: Option<String>,
     pub stream: bool,
+    pub service_tier: Option<crate::routing::service_tier::Tier>,
 }
 
 impl RequestFacts {
@@ -23,6 +24,7 @@ impl RequestFacts {
             body_bytes,
             request_type: crate::routing::filters::request_type_for_endpoint(object, endpoint),
             reasoning_effort: object.and_then(crate::routing::filters::request_reasoning_effort),
+            service_tier: crate::routing::service_tier::Tier::requested(endpoint, payload),
             stream: payload
                 .and_then(|p| p.get("stream"))
                 .and_then(Value::as_bool)

@@ -1681,6 +1681,7 @@ pub(crate) async fn send_attempt(
         .map(|key| key.role.as_ref())
         .unwrap_or_default();
     let facts = crate::routing::context::RequestFacts {
+        service_tier: None,
         model: prepared.request_model.clone(),
         endpoint: endpoint.into(),
         body_bytes: 0,

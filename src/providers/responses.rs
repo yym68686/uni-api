@@ -31,6 +31,15 @@ pub(crate) fn compile_payload(
             .or_insert(Value::String(String::new()));
     }
     apply_overrides(root, provider, request_model);
+    if !wants_compact {
+        if let Some(tier) = provider
+            .preferences
+            .get(crate::routing::service_tier::ROUTED)
+        {
+            root.insert("service_tier".into(), tier.clone());
+            root.insert("model".into(), Value::String(original_model.to_owned()));
+        }
+    }
     if engine == "codex" {
         strip_codex_fields(root);
         if wants_compact {

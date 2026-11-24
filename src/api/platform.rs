@@ -148,6 +148,7 @@ pub async fn handle(
                     "native_version": env!("CARGO_PKG_VERSION"),
                     "source_commit": std::env::var("SOURCE_COMMIT").unwrap_or_else(|_| "unknown".into()),
                     "capabilities": {"responses_stream_collection":true,"gemini_native":true,"gemini_cross_protocol":true,"targeted_responses": true,"targeted_fingerprint_protocols":["gemini","chat"],"targeted_upstream_protocols":true,"targeted_unconfigured_models":true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
+                    "service_tier_probe_version": 1,
                     "request_body_limits": crate::transport::decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.runtime.is_ready().await,
                     "managed_config_revision": state.managed_config.as_ref().and_then(|m| m.applied_revision()),
@@ -479,13 +480,14 @@ async fn channel_metrics_timeseries_response(
 }
 
 pub fn supports_mutation(method: &Method, path: &str) -> bool {
-    ((*method == Method::PATCH || *method == Method::POST)
-        && matches!(
-            path,
-            "/v1/channel-settings"
-                | "/v1/channel-settings/validate"
-                | "/v1/channel-settings/discover"
-        ))
+    (*method == Method::POST && path == crate::api::service_tier::PATH)
+        || ((*method == Method::PATCH || *method == Method::POST)
+            && matches!(
+                path,
+                "/v1/channel-settings"
+                    | "/v1/channel-settings/validate"
+                    | "/v1/channel-settings/discover"
+            ))
         || *method == Method::POST
             && matches!(
                 path,
@@ -498,6 +500,9 @@ pub fn supports_mutation(method: &Method, path: &str) -> bool {
 }
 
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
+    if request.uri().path().trim_end_matches('/') == crate::api::service_tier::PATH {
+        return crate::api::service_tier::handle(state, request).await;
+    }
     if let Some(managed) = &state.managed_config {
         let path = request.uri().path().trim_end_matches('/');
         if !matches!(
