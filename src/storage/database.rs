@@ -23,6 +23,9 @@ enum Backend {
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestStat {
+    /// Allowlisted request classification, not a claim about the billed/served tier.
+    pub request_type: Option<&'static str>,
+    pub requested_service_tier: Option<&'static str>,
     /// Observed native Responses termination; absent for legacy/other protocols.
     pub terminal_kind: Option<String>,
     pub failure_reason: Option<String>,

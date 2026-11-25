@@ -597,6 +597,8 @@ pub(crate) async fn run_hedged_attempt_loop(
                     .reset_route_failure(&context.provider, &context.original_model)
                     .await;
                 execution.state.persistence.record_request(RequestStat {
+                    request_type: execution.context.facts.log_request_type(),
+                    requested_service_tier: execution.context.facts.log_service_tier(),
                     fact_usage,
                     terminal_kind: Some(final_facts.terminal.label().into()),
                     response_completed: collected_outcome
@@ -787,6 +789,8 @@ pub(crate) async fn run_hedged_attempt_loop(
         crate::observability::outcome::FinalFacts::exhausted(response.status().as_u16());
     final_facts.upstream_http_status = last_response_route.as_ref().map(|route| route.2);
     execution.state.persistence.record_request(RequestStat {
+        request_type: execution.context.facts.log_request_type(),
+        requested_service_tier: execution.context.facts.log_service_tier(),
         terminal_kind: Some(final_facts.terminal.label().into()),
         provider: last_response_route
             .as_ref()
@@ -1152,6 +1156,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     downstream_stream,
                 );
                 let request_stat = RequestStat {
+                    request_type: context.facts.log_request_type(),
+                    requested_service_tier: context.facts.log_service_tier(),
                     fact_usage,
                     terminal_kind: Some(final_facts.terminal.label().into()),
                     response_completed: collected_outcome
@@ -1554,6 +1560,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         crate::observability::outcome::FinalFacts::exhausted(response.status().as_u16());
     final_facts.upstream_http_status = last_response_route.as_ref().map(|route| route.2);
     state.persistence.record_request(RequestStat {
+        request_type: context.facts.log_request_type(),
+        requested_service_tier: context.facts.log_service_tier(),
         terminal_kind: Some(final_facts.terminal.label().into()),
         provider: last_response_route.as_ref().map(|route| route.0.clone()).unwrap_or_default(),
         upstream_model: last_response_route.as_ref().map(|route| route.1.clone()).unwrap_or_default(),
@@ -1682,6 +1690,7 @@ pub(crate) async fn send_attempt(
         .unwrap_or_default();
     let facts = crate::routing::context::RequestFacts {
         service_tier: None,
+        requested_service_tier: None,
         model: prepared.request_model.clone(),
         endpoint: endpoint.into(),
         body_bytes: 0,

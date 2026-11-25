@@ -951,6 +951,8 @@ impl ResponsesRoute {
         let (prompt_price, completion_price) =
             model_prices(&self.snapshot.preferences, &self.request_model);
         self.persistence.record_request(RequestStat {
+            request_type: self.context.facts.log_request_type(),
+            requested_service_tier: self.context.facts.log_service_tier(),
             terminal_kind: Some(final_facts.terminal.label().to_owned()),
             failure_reason: metric_failure_reason(kind, outcome),
             response_completed: final_facts.response_completed,

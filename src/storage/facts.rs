@@ -437,7 +437,28 @@ pub fn global() -> Option<FactWriter> {
 pub fn request_event(s: &crate::storage::database::RequestStat) -> Value {
     let key = hex_sha(&s.api_key);
     let at = now_ms();
-    json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"terminal_kind":s.terminal_kind,"failure_reason":s.failure_reason,"response_completed":s.response_completed,"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h})
+    let mut event = json!({"schema":1,"kind":"request","event_id":new_event_id("request"),"instance_id":instance_id(),"at_ms":at,"request_id":s.request_id,"trace_id":s.trace_id,"key_id":format!("key-{}",key),"endpoint":s.endpoint,"provider":s.provider,"model":s.model,"upstream_model":s.upstream_model,"stream":s.stream,"status":s.status,"outcome":if s.is_flagged{"failed"}else{"success"},"terminal_kind":s.terminal_kind,"failure_reason":s.failure_reason,"response_completed":s.response_completed,"duration_ms":s.process_time*1000.0,"first_output_ms":s.first_output_ms,"response_created_ms":s.response_created_ms,"first_text_ms":s.first_text_ms,"input_tokens":s.fact_usage.input,"output_tokens":s.fact_usage.output,"cache_read_tokens":s.fact_usage.cache_read,"cache_write_tokens":s.fact_usage.cache_write,"cache_write_1h_tokens":s.fact_usage.cache_write_1h});
+    // Reuse the existing JSON metadata envelope: older analytics replicas can
+    // store this without a schema migration. Never copy raw payload values.
+    let mut detail = serde_json::Map::new();
+    if let Some(kind) = s
+        .request_type
+        .filter(|v| matches!(*v, "standard" | "compaction"))
+    {
+        detail.insert("request_type".into(), json!(kind));
+    }
+    if let Some(tier) = s.requested_service_tier.filter(|v| {
+        matches!(
+            *v,
+            "default" | "fast" | "ultrafast" | "flex" | "scale" | "auto"
+        )
+    }) {
+        detail.insert("requested_service_tier".into(), json!(tier));
+    }
+    if !detail.is_empty() {
+        event["trace_detail"] = Value::Object(detail);
+    }
+    event
 }
 
 // Preserve the shared execution facts even when the local SQL backend is off.
@@ -522,6 +543,71 @@ mod tests {
     use super::*;
     use crate::storage::database::ChannelStat;
     use crate::storage::database::RequestStat;
+
+    #[test]
+    fn request_classification_exports_only_allowlisted_request_metadata() {
+        use crate::routing::context::RequestFacts;
+        for (endpoint, payload, kind, tier) in [
+            (
+                "/v1/responses",
+                json!({"input":"private text","service_tier":"priority"}),
+                "standard",
+                "fast",
+            ),
+            (
+                "/v1/responses",
+                json!({"input":[{"type":"compaction_trigger"}],"service_tier":"ultrafast"}),
+                "compaction",
+                "ultrafast",
+            ),
+            (
+                "/v1/responses/compact",
+                json!({"input":"private text"}),
+                "compaction",
+                "default",
+            ),
+            (
+                "/v1/responses",
+                json!({"input":"private text"}),
+                "standard",
+                "default",
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"service_tier":"priority"}),
+                "standard",
+                "fast",
+            ),
+            ("/v1/messages", json!({"speed":"fast"}), "standard", "fast"),
+            (
+                "/v1/responses",
+                json!({"service_tier":"flex"}),
+                "standard",
+                "flex",
+            ),
+        ] {
+            let facts = RequestFacts::new("fixture", endpoint, 0, Some(&payload));
+            let event = request_event(&RequestStat {
+                request_type: facts.log_request_type(),
+                requested_service_tier: facts.log_service_tier(),
+                ..Default::default()
+            });
+            assert_eq!(
+                event["trace_detail"],
+                json!({"request_type":kind,"requested_service_tier":tier})
+            );
+            assert!(!event.to_string().contains("private text"));
+        }
+        let legacy = request_event(&RequestStat::default());
+        assert!(legacy.get("trace_detail").is_none());
+        let invalid = RequestFacts::new(
+            "fixture",
+            "/v1/responses",
+            0,
+            Some(&json!({"service_tier":"private text"})),
+        );
+        assert_eq!(invalid.log_service_tier(), None);
+    }
 
     #[test]
     fn execution_facts_export_only_typed_contract_and_snapshot_hash() {
