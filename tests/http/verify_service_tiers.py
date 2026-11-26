@@ -39,6 +39,11 @@ class Upstream(BaseHTTPRequestHandler):
                     "service_tier": {"fast": "priority", "ultrafast": (
                         "ultrafast" if self.path.startswith("/verified/") else "default"
                     )}.get(tier, tier)}
+        items = body.get("input")
+        if self.path.endswith("/compact") or (isinstance(items, list) and any(
+            item.get("type") == "compaction_trigger" for item in items
+        )):
+            response["output"] = [{"type": "compaction", "encrypted_content": "fixture"}]
         if name == "compat":
             response = {"id": "chatcmpl_1", "object": "chat.completion", "model": body["model"],
                         "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"},
@@ -131,8 +136,8 @@ def main():
             })
             assert code == 200, (code, applied)
 
-        def request(tier=None, key="caller", **options):
-            return call("POST", "/v1/responses", {"model": "public", "input": "test",
+        def request(tier=None, key="caller", endpoint="/v1/responses", **options):
+            return call("POST", endpoint, {"model": "public", "input": "test",
                                                  **({"service_tier": tier} if tier else {}), **options}, key)
 
         def check_route(tier, expected, key="caller", status=200, **options):
@@ -281,6 +286,29 @@ def main():
                 assert_catalog(["ultrafast"])
                 check_route("fast", [("peer", None)])
                 assert request()[0] == 200 and upstream.hits[-1][0] == "/peer/v1/responses"
+                policy = "/preferences/compaction_ultrafast_only"
+                setting("verified", {policy: True}, "ultrafast-compaction-only")
+                assert_catalog(["ultrafast"])
+                check_route(None, [("verified", None)], "verified-only")
+                check_route("fast", [("verified", None)], "verified-only")
+                check_route("ultrafast", [("verified", "ultrafast")], "verified-only")
+                for endpoint in ("/v1/responses", "/v1/responses/compact"):
+                    fixture = dict(endpoint=endpoint, input=[
+                        {"type": "message", "role": "user", "content": "test"},
+                        *([{"type": "compaction_trigger"}] if endpoint == "/v1/responses" else []),
+                    ])
+                    for tier in (None, "fast", "priority", "default"):
+                        check_route(tier, [], "verified-only", status=404, **fixture)
+                    check_route("ultrafast", [("verified", "ultrafast")], "verified-only", **fixture)
+                fixture["endpoint"] = "/v1/responses"
+                fixture["input"].append({"type": "compaction_trigger"})
+                upstream.faults["verified", "ultrafast"] = rejection
+                check_route("ultrafast", [("verified", "ultrafast"), ("peer", None)], **fixture)
+                check_route("ultrafast", [("verified", "ultrafast")], "verified-only", status=400, **fixture)
+                upstream.faults.clear()
+                setting("verified", {}, "remove-ultrafast-evidence", [ultra_path])
+                check_route("ultrafast", [], "verified-only", status=503, **fixture)
+                setting("verified", {ultra_path: ultra["checked_at"]}, "restore-ultrafast-evidence", [policy])
                 # An unavailable accelerated route must not take up a send
                 # on the next request, even when AUTO_RETRY disables replays.
                 setting("verified", {"/preferences/cooldown_period": 30}, "cool-after-failure")

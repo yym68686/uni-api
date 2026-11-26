@@ -35,6 +35,10 @@ pub(crate) struct ResolvedRoute {
 
 impl ResolvedRoute {
     pub(crate) fn scan_limit(&self, original: usize) -> usize {
+        if self.preferred_count != 0 && self.preferred_count == self.providers.len() {
+            // A route may have tier-specific candidates but no standard fallback.
+            return self.preferred_count;
+        }
         if self.preferred_count != 0
             || self
                 .providers

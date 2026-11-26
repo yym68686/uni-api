@@ -348,6 +348,11 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
         ("exclude_endpoints", "请求规则", "json"),
         ("only_request_types", "请求规则", "json"),
         ("exclude_request_types", "请求规则", "json"),
+        (
+            "preferences/compaction_ultrafast_only",
+            "请求规则",
+            "boolean",
+        ),
         ("exclude_request_rules", "请求规则", "json"),
         ("preferences/max_request_body_bytes", "请求规则", "json"),
         ("preferences/headers", "请求改写", "json"),
@@ -478,10 +483,13 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
     }
     if let Some(p) = raw.get("preferences") {
         let p = p.as_object().ok_or(field_error("/preferences"))?;
-        if p.get("explicit_cache_guard")
-            .is_some_and(|v| !v.is_boolean())
-        {
-            return Err(field_error("/preferences/explicit_cache_guard"));
+        for key in [
+            "explicit_cache_guard",
+            crate::routing::filters::ULTRAFAST_COMPACTION_ONLY,
+        ] {
+            if p.get(key).is_some_and(|v| !v.is_boolean()) {
+                return Err(field_error(&format!("/preferences/{key}")));
+            }
         }
         if let Some(mode) = p.get("upstream_stream_mode") {
             crate::providers::stream_mode::validate(mode)?;
@@ -1193,6 +1201,19 @@ impl GatewayRuntime {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            let mut body=input.sample.get("body").cloned().unwrap_or(json!({"model":request_model,"input":"Preview","messages":[{"role":"user","content":"Preview"}]}));
+            let facts =
+                crate::routing::context::RequestFacts::new(request_model, endpoint, 0, Some(&body));
+            let request_type = facts
+                .request_type
+                .or_else(|| input.sample.get("request_type").and_then(Value::as_str));
+            let excluded_type =
+                !crate::routing::filters::provider_accepts_request_type(&compiled, request_type)
+                    || !crate::routing::filters::provider_accepts_compaction_tier(
+                        &compiled,
+                        request_type,
+                        facts.requested_service_tier,
+                    );
             let preview_snapshot = candidate.overlay(base.clone());
             let timeout = crate::routing::timeouts::resolve_timeouts(
                 &preview_snapshot,
@@ -1201,12 +1222,11 @@ impl GatewayRuntime {
                 upstream,
                 &compiled.engine,
                 stream,
-                input.sample.get("request_type").and_then(Value::as_str),
+                request_type,
                 "",
                 endpoint,
                 "POST",
             );
-            let mut body=input.sample.get("body").cloned().unwrap_or(json!({"model":request_model,"input":"Preview","messages":[{"role":"user","content":"Preview"}]}));
             if let Some(o) = body.as_object_mut() {
                 o.insert("model".into(), json!(request_model));
                 if endpoint != "/v1/systemone" {
@@ -1237,7 +1257,7 @@ impl GatewayRuntime {
             }
             // Payload may contain configured secrets. Only the field names leave
             // the gateway preview; unredacted headers/body never enter logs.
-            previews.push(json!({"provider":c.provider,"created":!original_change.copy_to_key.is_empty() || !original_change.create_to_key.is_empty(),"before":redact_at(&current,""),"after":redact_at(&merged,""),"sample":{"model":request_model,"upstream_model":upstream,"endpoint":endpoint,"timeouts":timeout,"excluded_endpoint":compiled.excluded_endpoints.iter().any(|e|e==endpoint),"excluded_request_type":!crate::routing::filters::provider_accepts_request_type(&compiled,input.sample.get("request_type").and_then(Value::as_str)),"engine":compiled.engine.as_ref(),"base_url":compiled.base_url.as_ref(),"wire_request":wire,"excluded_rule":!crate::routing::filters::provider_accepts_request_rules(&compiled,endpoint,request_model,input.sample.get("reasoning_effort").and_then(Value::as_str),input.sample.get("request_type").and_then(Value::as_str)),"body":redact_at(&json!({"preferences":{"post_body_parameter_overrides":body}}),"")["preferences"]["post_body_parameter_overrides"]}}));
+            previews.push(json!({"provider":c.provider,"created":!original_change.copy_to_key.is_empty() || !original_change.create_to_key.is_empty(),"before":redact_at(&current,""),"after":redact_at(&merged,""),"sample":{"model":request_model,"upstream_model":upstream,"endpoint":endpoint,"timeouts":timeout,"excluded_endpoint":compiled.excluded_endpoints.iter().any(|e|e==endpoint),"excluded_request_type":excluded_type,"engine":compiled.engine.as_ref(),"base_url":compiled.base_url.as_ref(),"wire_request":wire,"excluded_rule":!crate::routing::filters::provider_accepts_request_rules(&compiled,endpoint,request_model,input.sample.get("reasoning_effort").and_then(Value::as_str),request_type),"body":redact_at(&json!({"preferences":{"post_body_parameter_overrides":body}}),"")["preferences"]["post_body_parameter_overrides"]}}));
         }
         let effective = candidate.overlay(base.clone());
         for p in &mut previews {

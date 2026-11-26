@@ -120,6 +120,16 @@ impl GatewayRuntime {
                 "Nested runtime provider is not available",
             )
         })?;
+        let providers: Vec<_> = providers
+            .into_iter()
+            .filter(|provider| {
+                crate::routing::filters::provider_accepts_compaction_tier(
+                    provider,
+                    facts.request_type,
+                    facts.requested_service_tier,
+                )
+            })
+            .collect();
         if providers.is_empty() {
             return Err(RouteResolutionError {
                 status: StatusCode::NOT_FOUND,
@@ -192,10 +202,23 @@ impl GatewayRuntime {
                 }
             }
         }
+        if prefer_verified {
+            // A tier-restricted compaction channel may participate in the
+            // verified tier phase, but must never receive a standard retry.
+            providers.retain(|p| {
+                !crate::routing::filters::ultrafast_compaction_only(p, facts.request_type)
+            });
+        }
         let preferred_count = preferred.len();
         if preferred_count != 0 {
             preferred.append(&mut providers);
             providers = preferred;
+        }
+        if providers.is_empty() {
+            return Err(reject(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No verified Ultrafast compaction route is available",
+            ));
         }
         // A speculative ordinary attempt must not outrun a verified one.
         let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) || preferred_count != 0 {

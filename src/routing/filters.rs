@@ -1,6 +1,25 @@
 use crate::config::snapshot::Provider;
 use serde_json::{Map, Value};
 
+pub(crate) const ULTRAFAST_COMPACTION_ONLY: &str = "compaction_ultrafast_only";
+
+pub(crate) fn ultrafast_compaction_only(provider: &Provider, request_type: Option<&str>) -> bool {
+    request_type == Some("compaction")
+        && provider
+            .preferences
+            .get(ULTRAFAST_COMPACTION_ONLY)
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+pub(crate) fn provider_accepts_compaction_tier(
+    provider: &Provider,
+    request_type: Option<&str>,
+    service_tier: Option<&str>,
+) -> bool {
+    !ultrafast_compaction_only(provider, request_type) || service_tier == Some("ultrafast")
+}
+
 pub(crate) fn provider_accepts_endpoint(provider: &Provider, endpoint: &str) -> bool {
     let endpoint = endpoint.trim_end_matches('/');
     if endpoint == "all" {
