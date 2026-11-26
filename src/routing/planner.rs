@@ -382,6 +382,28 @@ fn fingerprint_provider(
             return Ok(provider);
         }
     }
+    if protocol == "chat" && engine == "gemini" {
+        // A relay imported with its native /v1beta endpoint may also serve
+        // Chat Completions. Use the same sibling resolver as endpoint-chat,
+        // while retaining the fingerprint-only body and routing guards.
+        let url = url::Url::parse(&provider.base_url).map_err(|_| unsupported())?;
+        let path = url.path().trim_end_matches('/');
+        if !(path.ends_with("/v1beta") || path.ends_with("/v1beta/models"))
+            || url.domain().is_some_and(|domain| {
+                let domain = domain.trim_end_matches('.');
+                domain == "googleapis.com" || domain.ends_with(".googleapis.com")
+            })
+            || provider.project_id.is_some()
+            || provider.private_key.is_some()
+            || provider.client_email.is_some()
+            || provider.api_keys.is_empty()
+            || provider.api_keys.iter().any(|key| key.contains(','))
+        {
+            return Err(unsupported());
+        }
+        return crate::config::model_protocol::diagnostic(provider, model, "chat")
+            .ok_or_else(unsupported);
+    }
     if !(matches!(engine.as_str(), "codex" | "gpt") || (!gemini && engine == "openrouter"))
         || (engine == "codex" && provider.api_keys.iter().any(|k| k.contains(',')))
     {

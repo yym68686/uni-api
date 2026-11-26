@@ -48,6 +48,14 @@ def verify(binary, endpoint):
             dict(good,provider='overridden',preferences={'post_body_parameter_overrides':{'reasoning_effort':'high'}}),
             dict(good,provider='excluded',exclude_request_rules=[{'match':{'reasoning_effort':'low'}}]),
         ])
+        relay={**good,'provider':'relay','engine':'gemini','base_url':f'http://127.0.0.1:{server.server_port}/relay/v1beta',
+               'model':[{'gemini-4-neon-upstream':'gemini-4-neon'}]}
+        config['providers'].extend([
+            relay,
+            dict(relay,provider='relay-custom',base_url=relay['base_url']+'/deployment'),
+            dict(relay,provider='relay-composite',api='account,secret'),
+            dict(relay,provider='relay-overridden',preferences={'post_body_parameter_overrides':{'reasoning_effort':'high'}}),
+        ])
         config['providers'][1]['preferences']['passthrough_request_headers'] = ['x-uni-api-provider','x-uni-api-fingerprint-protocol','x-api-key']
         (root/'api.json').write_text(json.dumps(config))
         env=dict(os.environ,PORT=str(port),DISABLE_DATABASE='true',UNI_API_CONFIG_PATH=str(root/'api.json'),RUST_RESPONSES_CONFIG_SNAPSHOT_PATH=str(root/'snapshot.json'),UNI_API_SHARED_MEMORY_RESERVATION_PATH=str(root/'ledger'),RUST_REQUEST_SPOOL_DIRECTORY=str(root/'spool'),NO_PROXY='127.0.0.1,localhost',RUST_REQUEST_SPOOL_DISK_RESERVE_BPS='0',RUST_REQUEST_SPOOL_INODE_RESERVE_BPS='0')
@@ -119,6 +127,24 @@ def verify(binary, endpoint):
                         headers=sent[0][2]
                         assert headers.get('x-goog-api-key' if protocol=='gemini' else 'authorization')==('upstream-test' if protocol=='gemini' else 'Bearer upstream-test'),headers
                         assert 'admin-test' not in headers.values() and not any(k.startswith('x-uni-api-') for k in headers),headers
+                # Same contract as a catalog-driven Neon fingerprint on a /v1beta relay.
+                neon=dict(cbody,model='gemini-4-neon',max_tokens=8192)
+                before=len(server.requests)
+                for key,target,expected in [('ordinary-test','relay',403),('admin-test','relay-custom',400),
+                                            ('admin-test','relay-composite',400),('admin-test','relay-overridden',400)]:
+                    status,raw=request('POST',chat,key,target,'chat',neon)
+                    assert status==expected,(target,status,raw)
+                assert len(server.requests)==before,server.requests[before:]
+                status,raw=request('POST',chat,target='relay',protocol='chat',payload=neon)
+                assert status==200 and b'native sample' in raw and b'[DONE]' in raw,(status,raw)
+                [(path,body,headers)]=server.requests[before:]
+                assert path=='/relay/v1/chat/completions' and body==dict(neon,model='gemini-4-neon-upstream'),(path,body)
+                assert headers['authorization']=='Bearer upstream-test' and 'admin-test' not in headers.values(),headers
+                assert not any(k.startswith('x-uni-api-') for k in headers),headers
+                neon_native='/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse'
+                status,raw=request('POST',neon_native,target='relay',protocol='gemini',payload=gbody,native_auth=True)
+                assert status==200 and b'native sample' in raw,(status,raw)
+                assert server.requests[-1][:2]==('/relay/v1beta/models/gemini-4-neon-upstream:streamGenerateContent?alt=sse',gbody)
                 # Diagnostic wire selection must not mutate the serving provider.
                 assert request('POST','/v1/responses',target='good')[0]==200
                 assert server.hits[-1]==(f'/good{endpoint}','gpt-6-astra'),server.hits
