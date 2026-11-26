@@ -15,6 +15,14 @@ pub(crate) fn compile_payload(
     engine: &str,
     wants_compact: bool,
 ) -> Result<(), String> {
+    let gemini_effort = if !wants_compact {
+        super::gemini_effort::route(provider, original_model)
+            .map(|(preset, _)| super::gemini_effort::selected(preset, original_model, payload))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let root = payload
         .as_object_mut()
         .ok_or_else(|| "native Responses payload is not an object".to_owned())?;
@@ -31,6 +39,9 @@ pub(crate) fn compile_payload(
             .or_insert(Value::String(String::new()));
     }
     apply_overrides(root, provider, request_model);
+    if let Some(effort) = gemini_effort {
+        super::gemini_effort::Wire::Responses.apply(root, effort);
+    }
     if !wants_compact {
         crate::routing::service_tier::strip_for_standard(root, provider);
         if let Some(tier) = provider

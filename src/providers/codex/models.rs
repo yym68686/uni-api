@@ -209,7 +209,13 @@ fn generic_card(name: &str, priority: u64) -> Value {
     })
 }
 
-fn catalog(models: &BTreeMap<String, BTreeSet<Tier>>) -> Value {
+#[derive(Default)]
+pub(crate) struct Capabilities {
+    pub(crate) tiers: BTreeSet<Tier>,
+    pub(crate) gemini_effort: Option<crate::providers::gemini_effort::Preset>,
+}
+
+fn catalog(models: &BTreeMap<String, Capabilities>) -> Value {
     let mut remaining: BTreeSet<&str> = models.keys().map(String::as_str).collect();
     let templates = templates();
     let mut cards = Vec::with_capacity(remaining.len());
@@ -246,7 +252,12 @@ fn catalog(models: &BTreeMap<String, BTreeSet<Tier>>) -> Value {
         cards.push(card);
     }
     for card in &mut cards {
-        let tiers = &models[card["slug"].as_str().expect("model card slug")];
+        let capabilities = &models[card["slug"].as_str().expect("model card slug")];
+        if let Some(effort) = capabilities.gemini_effort {
+            card["default_reasoning_level"] = json!(effort.default_level());
+            card["supported_reasoning_levels"] = effort.options();
+        }
+        let tiers = &capabilities.tiers;
         if !tiers.is_empty() {
             card["service_tiers"] = json!(tiers
                 .iter()
@@ -269,7 +280,7 @@ fn catalog(models: &BTreeMap<String, BTreeSet<Tier>>) -> Value {
 }
 
 pub(crate) fn response(
-    models: &BTreeMap<String, BTreeSet<Tier>>,
+    models: &BTreeMap<String, Capabilities>,
     headers: &HeaderMap,
 ) -> Response<Body> {
     let body = serde_json::to_vec(&catalog(models)).expect("serializable model catalog");
@@ -315,7 +326,7 @@ mod tests {
             &models
                 .iter()
                 .cloned()
-                .map(|name| (name, BTreeSet::new()))
+                .map(|name| (name, Capabilities::default()))
                 .collect(),
         )
     }
@@ -564,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn etag_tracks_the_authorized_body_and_never_uses_upstream_etag() {
-        let mut models = BTreeMap::from([("gpt-6-sol".to_owned(), BTreeSet::new())]);
+        let mut models = BTreeMap::from([("gemini-4-neon".to_owned(), Capabilities::default())]);
         let response = response(&models, &HeaderMap::new());
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "private, no-cache");
@@ -586,7 +597,8 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        models.get_mut("gpt-6-sol").unwrap().insert(Tier::Fast);
+        models.get_mut("gemini-4-neon").unwrap().gemini_effort =
+            Some(crate::providers::gemini_effort::Preset::Extended);
         assert_eq!(super::response(&models, &headers).status(), StatusCode::OK);
     }
 }

@@ -1,6 +1,6 @@
 # Key-scoped Codex model catalog
 
-GET /v1/models?client_version=... returns Codex-compatible model cards for the
+GET /v1/codex/models and GET /v1/models?client_version=... return Codex-compatible model cards for the
 authenticated API key's configured conversational routes. The query parameter's
 presence selects this format; its value is ignored. An empty value, old version,
 current version, or arbitrary future version returns exactly the same body and
@@ -22,11 +22,17 @@ For existing GPT/Codex entries, full embedded metadata is retained, including
 hidden helper cards. gpt-6-astra.context_window remains 600000, with its existing
 max_context_window of 872000.
 
-Other configured models, including gpt-6-sol, Claude, Gemini, Grok and future
-conversational model names, clone the existing gpt-5.6-sol compatibility card.
-Only slug, display name, description and ordering priority change. The cloned
-capabilities/context are compatibility defaults, not independently discovered
-provider specifications. New model names require only configuration updates.
+Unrecognized GPT/Codex aliases use the gpt-5.6-sol compatibility card.
+Other conversational names use generic cards with provider-neutral instructions
+and compatibility context settings.
+
+Gemini 4 Neon and Hydrogen offer low, medium, high and xhigh (default high).
+Gemini 4 Carbon and Argon offer low, medium and high (default medium).
+These fields are derived from the caller's effective upstream models and
+protocols. Multiple routes for an alias advertise only levels supported by
+all of them. The Responses and Chat adapters use the same capability
+definitions to serialize requested levels instead of translating them to
+legacy Gemini thinking budgets.
 
 Ordinary GET /v1/models retains its existing OpenAI/TypeSafe response and
 continues to include modality-specific models where authorized.

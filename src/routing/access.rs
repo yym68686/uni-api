@@ -1,5 +1,6 @@
 use crate::config::snapshot::ApiKey;
 use crate::config::snapshot::Provider;
+use crate::providers::codex::models::Capabilities;
 use crate::routing::filters::provider_accepts_endpoint;
 use crate::routing::service_tier::{self, Tier};
 use crate::routing::types::AuthContext;
@@ -22,7 +23,7 @@ impl GatewayRuntime {
     pub(crate) async fn codex_models_for_headers(
         &self,
         headers: &HeaderMap,
-    ) -> Result<BTreeMap<String, BTreeSet<Tier>>, u16> {
+    ) -> Result<BTreeMap<String, Capabilities>, u16> {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let base = self.base_snapshot().await.ok_or(503u16)?;
         let controls = self.channel_controls.read().await;
@@ -30,7 +31,7 @@ impl GatewayRuntime {
         let key = snapshot.api_keys.get(&token).ok_or(403u16)?;
         let key_id = crate::routing::catalog::key_id(&token);
         let now = crate::runtime::clock::unix_seconds();
-        let mut models = BTreeMap::<_, BTreeSet<_>>::new();
+        let mut models = BTreeMap::<_, Capabilities>::new();
         for (provider, model) in crate::routing::catalog::ordered_entries(&snapshot, key) {
             let provider = crate::config::model_protocol::effective(provider, &model);
             if !crate::control::channels::temporary_allowed(&provider, key)
@@ -48,7 +49,24 @@ impl GatewayRuntime {
             {
                 continue;
             }
-            let tiers = models.entry(model.clone()).or_default();
+            let effort = provider.models.get(&model).and_then(|upstream| {
+                crate::providers::gemini_effort::route(&provider, upstream)
+                    .map(|(preset, _)| preset)
+            });
+            let capabilities = models
+                .entry(model.clone())
+                .and_modify(|card| {
+                    // Every configured fallback must be able to honor the advertised effort.
+                    card.gemini_effort = card
+                        .gemini_effort
+                        .zip(effort)
+                        .map(|(previous, current)| previous.intersect(current));
+                })
+                .or_insert_with(|| Capabilities {
+                    gemini_effort: effort,
+                    ..Default::default()
+                });
+            let tiers = &mut capabilities.tiers;
             // The global switch selects a routing policy; it does not change
             // what the configured channels have been verified to support.
             for tier in Tier::ALL {

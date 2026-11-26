@@ -18,7 +18,7 @@ pub(crate) fn endpoint(protocol: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
-fn openrouter_api(url: &Url) -> bool {
+pub(crate) fn openrouter_api(url: &Url) -> bool {
     url.scheme() == "https"
         && url.host_str() == Some("openrouter.ai")
         && url.port().is_none()

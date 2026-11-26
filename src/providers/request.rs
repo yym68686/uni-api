@@ -227,6 +227,25 @@ pub(crate) fn build_attempt(
     }
 
     let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
+    let gemini_effort = if matches!(path, "/v1/responses" | "/v1/chat/completions") {
+        if let Some((preset, wire)) = super::gemini_effort::route(provider, original_model) {
+            super::gemini_effort::selected(preset, original_model, &payload)?
+                .map(|effort| (wire, effort))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if matches!(
+        gemini_effort,
+        Some((super::gemini_effort::Wire::OpenRouterMessages, _))
+    ) {
+        if let Some(root) = payload.as_object_mut() {
+            // Avoid Anthropic's generic Chat effort-to-budget conversion.
+            super::gemini_effort::remove_openai_effort(root);
+        }
+    }
     if path == "/v1/responses" {
         if let Some(root) = payload.as_object_mut() {
             crate::routing::service_tier::strip_for_standard(root, provider);
@@ -629,6 +648,9 @@ pub(crate) fn build_attempt(
         } else {
             if !shared_responses_wire {
                 apply_overrides(root, provider, request_model);
+                if let Some((wire, effort)) = gemini_effort {
+                    wire.apply(root, effort);
+                }
             }
             if path == "/v1/responses/compact" {
                 root.remove("store");

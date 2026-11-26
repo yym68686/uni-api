@@ -120,7 +120,7 @@ impl GatewayRuntime {
                 "Nested runtime provider is not available",
             )
         })?;
-        let providers: Vec<_> = providers
+        let mut providers: Vec<_> = providers
             .into_iter()
             .filter(|provider| {
                 crate::routing::filters::provider_accepts_compaction_tier(
@@ -135,6 +135,30 @@ impl GatewayRuntime {
                 status: StatusCode::NOT_FOUND,
                 message: format!("No available providers at the moment: {}", facts.model),
             });
+        }
+        if matches!(
+            facts.endpoint.as_str(),
+            "/v1/responses" | "/v1/chat/completions"
+        ) {
+            if let Some(effort) = facts
+                .reasoning_effort
+                .as_deref()
+                .filter(|v| !v.eq_ignore_ascii_case("none"))
+            {
+                providers.retain(|provider| {
+                    let preset = provider.models.get(&facts.model).and_then(|model| {
+                        crate::providers::gemini_effort::route(provider, model)
+                            .map(|(preset, _)| preset)
+                    });
+                    preset.is_none_or(|preset| preset.level(effort).is_some())
+                });
+                if providers.is_empty() {
+                    return Err(reject(
+                        StatusCode::BAD_REQUEST,
+                        &format!("{} does not support reasoning effort {effort}", facts.model),
+                    ));
+                }
+            }
         }
         let tier = facts
             .service_tier

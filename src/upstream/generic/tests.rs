@@ -574,6 +574,163 @@ fn native_gemini_preserves_the_original_thinking_level() {
 }
 
 #[test]
+fn gemini_4_responses_map_named_levels_on_each_configured_wire() {
+    let cases = [
+        (
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-4-neon",
+            "xhigh",
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "XHIGH",
+        ),
+        (
+            "gemini",
+            "https://relay.example/v1beta",
+            "gemini-4-hydrogen",
+            "xhigh",
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "XHIGH",
+        ),
+        (
+            "gemini",
+            "https://relay.example/v1beta",
+            "gemini-4-carbon",
+            "low",
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "LOW",
+        ),
+        (
+            "gemini",
+            "https://relay.example/v1beta",
+            "gemini-4-argon",
+            "medium",
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "MEDIUM",
+        ),
+        (
+            "claude",
+            "https://openrouter.ai/api/v1/messages",
+            "google/gemini-4-neon",
+            "xhigh",
+            "/output_config/effort",
+            "xhigh",
+        ),
+        (
+            "codex",
+            "https://openrouter.ai/api/v1/responses",
+            "google/gemini-4-hydrogen",
+            "xhigh",
+            "/reasoning/effort",
+            "xhigh",
+        ),
+        (
+            "codex",
+            "https://relay.example/v1/responses",
+            "gemini-4-argon-a",
+            "high",
+            "/reasoning/effort",
+            "high",
+        ),
+        (
+            "gpt",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "google/gemini-4-argon",
+            "medium",
+            "/reasoning/effort",
+            "medium",
+        ),
+        (
+            "gpt",
+            "https://relay.example/v1/chat/completions",
+            "gemini-4-argon",
+            "high",
+            "/reasoning_effort",
+            "high",
+        ),
+    ];
+    let uri: Uri = "/v1/responses".parse().unwrap();
+    for (engine, base, model, effort, pointer, expected) in cases {
+        let mut provider = test_provider(engine, base);
+        provider.preferences = std::sync::Arc::new(
+            json!({"post_body_parameter_overrides": match engine {
+                "gemini" => json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"LOW","thinkingBudget":99,"includeThoughts":true}}}),
+                "claude" => json!({"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"low"}}),
+                _ => json!({"reasoning":{"effort":"low"}})
+            }}).as_object().unwrap().clone()
+        );
+        let input = PreparedInput {
+            _memory_reservations: Vec::new(),
+            payload: Some(
+                json!({"model":"public-alias","input":"test","reasoning":{"effort":effort}}),
+            ),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        };
+        let prepared = build_attempt(
+            &provider,
+            "fixture",
+            "public-alias",
+            model,
+            &Method::POST,
+            &uri,
+            "/v1/responses",
+            &HeaderMap::new(),
+            &input,
+            "request-gemini-4",
+        )
+        .unwrap();
+        let AttemptBody::Json(body) = prepared.body else {
+            panic!("expected JSON")
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body.pointer(pointer),
+            Some(&json!(expected)),
+            "{engine} {model}"
+        );
+        if engine == "gemini" {
+            assert_eq!(
+                body.pointer("/generationConfig/thinkingConfig/includeThoughts"),
+                Some(&json!(true))
+            );
+            assert!(body
+                .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+                .is_none());
+        }
+        if engine == "claude" {
+            assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+            assert_eq!(body["max_tokens"], 4096);
+        }
+        if model.ends_with("argon") || model.ends_with("carbon") {
+            let input = PreparedInput {
+                payload: Some(
+                    json!({"model":"public-alias","input":"test","reasoning":{"effort":"xhigh"}}),
+                ),
+                ..input
+            };
+            let result = build_attempt(
+                &provider,
+                "fixture",
+                "public-alias",
+                model,
+                &Method::POST,
+                &uri,
+                "/v1/responses",
+                &HeaderMap::new(),
+                &input,
+                "request-unsupported-effort",
+            );
+            assert!(
+                matches!(result, Err(error) if error.contains("does not support reasoning effort xhigh"))
+            );
+        }
+    }
+}
+
+#[test]
 fn responses_compat_compiles_to_gemini_and_restores_responses_shape() {
     let provider = test_provider("gemini", "https://generativelanguage.googleapis.com/v1beta");
     let input = PreparedInput {

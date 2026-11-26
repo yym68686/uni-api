@@ -23,7 +23,25 @@ class Upstream(BaseHTTPRequestHandler):
         self.send_response(500)
         self.end_headers()
 
-    do_POST = do_GET
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.hits.append((self.path, payload))
+        if "/v1beta/models/" not in self.path or self.path.startswith("/unavailable/"):
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"fixture upstream unavailable","code":503}}')
+            return
+        value = {"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "OK"}]}, "finishReason": "STOP",
+        }], "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}}
+        stream = ":streamGenerateContent" in self.path
+        body = (("data: " + json.dumps(value) + "\n\n") if stream else json.dumps(value)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def verify(binary):
@@ -34,10 +52,18 @@ def verify(binary):
         (Path(__file__).resolve().parents[2] / "assets/codex/codex_models_pro_0_153_2.json").read_text()
     )["models"]
     known = {model["slug"]: model for model in templates}
+    levels = ["low", "medium", "high"]
+    gemini_efforts = {
+        "gemini-4-neon": ("high", levels + ["xhigh"]),
+        "gemini-4-hydrogen": ("high", levels + ["xhigh"]),
+        "gemini-4-carbon": ("medium", levels),
+        "gemini-4-argon": ("medium", levels),
+        "mixed-gemini": ("medium", levels),
+    }
     expected = {
         "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "codex-auto-review",
         "claude-opus-5", "gemini-3.8-flash", "grok-4.6", "deepseek-v4-pro", "deepseek-v4-flash", "custom-chat",
-    }
+    } | gemini_efforts.keys()
     excluded = {
         "gpt-image-2", "gpt-image-2.5", "gemini-embedding-001", "text-embedding-004",
         "gemini-3.1-flash-image", "gemini-2.5-flash-tts", "sora-2", "seedance-2-0",
@@ -53,7 +79,16 @@ def verify(binary):
 
         config = {
             "providers": [
-                provider("primary", sorted(expected | excluded) + [{"gpt-image-2.5": "masked-media"}]),
+                provider("primary", sorted((expected - gemini_efforts.keys()) | excluded)
+                         + [{"gpt-image-2.5": "masked-media"}]),
+                provider("native-gemini",
+                         sorted(gemini_efforts.keys() - {"mixed-gemini"})
+                         + [{"gemini-4-neon": "mixed-gemini"}],
+                         base_url=base + "/v1beta", engine="gemini"),
+                provider("responses-gemini", [{"google/gemini-4-argon": "mixed-gemini"}],
+                         engine="codex"),
+                provider("unavailable-gemini", ["gemini-4-neon"],
+                         base_url=base + "/unavailable/v1beta", engine="gemini"),
                 provider("fallback", ["gpt-6-sol"]),
                 provider("private", ["private-model"]),
                 provider("blocked", ["blocked-model"], exclude_endpoints=["/v1/responses"]),
@@ -61,7 +96,12 @@ def verify(binary):
             ],
             "api_keys": [
                 {"api": "admin-fixture", "model": ["all"]},
-                {"api": "business-fixture", "model": ["primary/*", "fallback/*", "blocked/*", "systemone/*"]},
+                {"api": "business-fixture", "model": ["primary/*", "fallback/*", "blocked/*", "systemone/*",
+                                                      "native-gemini/*", "responses-gemini/*"]},
+                {"api": "gemini-only-fixture", "model": ["native-gemini/mixed-gemini"]},
+                {"api": "gemini-fallback-fixture", "model": ["unavailable-gemini/gemini-4-neon",
+                                                           "native-gemini/gemini-4-neon"],
+                 "preferences": {"SCHEDULING_ALGORITHM": "fixed_priority"}},
                 {"api": "restricted-fixture", "model": ["primary/gpt-6-sol"]},
                 {"api": "nested-fixture", "model": ["restricted-fixture/*"]},
                 {"api": "media-fixture", "model": ["primary/gpt-image-2.5", "primary/gemini-embedding-001"]},
@@ -151,10 +191,16 @@ def verify(binary):
                         assert card["base_instructions"] == known["gpt-5.6-sol"]["base_instructions"]
                         assert card["supported_reasoning_levels"] == known["gpt-5.6-sol"]["supported_reasoning_levels"]
                     else:
-                        assert len(json.dumps(card, separators=(",", ":")).encode()) < 900
+                        assert len(json.dumps(card, separators=(",", ":")).encode()) < (1250 if slug in gemini_efforts else 900)
                         assert "AGENTS.md" in card["base_instructions"]
                         assert "GPT-5" not in card["base_instructions"]
-                        assert card["supported_reasoning_levels"] == []
+                        if slug in gemini_efforts:
+                            default, supported = gemini_efforts[slug]
+                            assert card["default_reasoning_level"] == default, slug
+                            assert [level["effort"] for level in card["supported_reasoning_levels"]] == supported, slug
+                            assert all(level["description"] for level in card["supported_reasoning_levels"]), slug
+                        else:
+                            assert card["supported_reasoning_levels"] == []
                         assert card["experimental_supported_tools"] == []
                         assert card["context_window"] == 272000
                         assert card["max_context_window"] == 872000
@@ -175,6 +221,17 @@ def verify(binary):
                 status, _, raw = call("/v1/codex/models", headers={"If-None-Match": baseline_etag})
                 assert status == 304 and not raw
                 assert slugs("restricted-fixture") == {"gpt-6-sol"}
+                status, _, raw = call("/v1/codex/models", "gemini-only-fixture")
+                assert status == 200
+                [only_card] = json.loads(raw)["models"]
+                assert only_card["slug"] == "mixed-gemini"
+                assert only_card["default_reasoning_level"] == "high"
+                assert [level["effort"] for level in only_card["supported_reasoning_levels"]] == levels + ["xhigh"]
+                for model in ["gemini-4-carbon", "gemini-4-argon"]:
+                    status, _, raw = call("/v1/responses", body={
+                        "model": model, "input": "test", "reasoning": {"effort": "xhigh"},
+                    })
+                    assert status == 400 and b"does not support reasoning effort xhigh" in raw, (status, raw)
                 assert slugs("nested-fixture") == {"gpt-6-sol"}
                 assert slugs("media-fixture") == set()
                 assert slugs("other-fixture") == {"private-model"}
@@ -218,10 +275,29 @@ def verify(binary):
                 assert slugs() == expected | {"new-temporary-model"}
                 assert "new-temporary-model" not in slugs("admin-fixture")
                 assert not upstream.hits, upstream.hits
+                for model, (_, supported) in gemini_efforts.items():
+                    if model == "mixed-gemini":
+                        continue
+                    for effort in supported:
+                        status, _, raw = call("/v1/responses", body={
+                            "model": model, "input": "test", "reasoning": {"effort": effort},
+                        })
+                        assert status == 200, (model, effort, status, raw)
+                        path, wire = upstream.hits.pop()
+                        assert "/models/" + model + ":" in path, path
+                        assert wire["generationConfig"]["thinkingConfig"] == {"thinkingLevel": effort.upper()}, wire
+                status, _, raw = call("/v1/responses", "gemini-fallback-fixture", body={
+                    "model": "gemini-4-neon", "input": "test", "reasoning": {"effort": "xhigh"},
+                })
+                assert status == 200, (status, raw)
+                assert len(upstream.hits) == 2 and upstream.hits[0][0].startswith("/unavailable/"), upstream.hits
+                assert all(wire["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "XHIGH"}
+                           for _, wire in upstream.hits), upstream.hits
                 assert config_path.read_bytes() == original
                 print("PASS Codex catalog: per-key/nested grants, aliases, modality exclusions, "
                       "all client versions identical, 600k Astra, template metadata, ETag, "
-                      "local disable/fallback/temporary scope, ordinary catalog unchanged, no upstream calls")
+                      "local disable/fallback/temporary scope, ordinary catalog unchanged, "
+                      "no discovery calls, Gemini 4 levels and exact fallback wire")
             except Exception:
                 log.flush()
                 print((root / "gateway.log").read_text()[-6000:])
