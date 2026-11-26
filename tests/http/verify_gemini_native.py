@@ -107,6 +107,8 @@ def verify(binary):
         providers.append({'provider':'vertex','engine':'vertex','base_url':base,'api':['ab.fixture'],'model':[{'vertex':'vertex'}]})
         for name,engine,path in [('gemini','gemini','/v1beta'),('responses','gpt','/v1/responses'),('codex','codex','/v1/responses'),('claude','claude','/v1/messages'),('chat','gpt','/v1/chat/completions')]:
             providers.append({'provider':name,'engine':engine,'base_url':base+path,'api':'fixture-provider','model':[{name:name}]+([{'tool':'tool'},{'broken':'broken'},{'error':'error'}] if name=='chat' else [])})
+        providers.append({'provider':'openrouter','engine':'openrouter','base_url':base+'/v1/chat/completions',
+                          'api':'fixture-provider','model':['openrouter']})
         for name in ['primary', 'fallback']:
             providers.append({'provider': 'chat-gemini-'+name, 'engine': 'gemini', 'base_url': base+'/'+name+'/v1beta',
                               'api': 'fixture-provider', 'model': ['gemini-failover'],
@@ -254,6 +256,49 @@ def verify(binary):
                     response=decode(raw)[-1]['response'] if streaming else json.loads(raw)
                     assert response['usage']['input_tokens']==100 and response['usage']['output_tokens']==20,response
                     assert response['usage']['input_tokens_details']['cached_tokens']==60,response
+                companion_output = {
+                    'type': 'function_call_output', 'id': 'fco_fixture', 'name': 'codex_apps_open_page',
+                    'namespace': 'agent', 'output': 'companion event',
+                    'internal_chat_message_metadata_passthrough': {'turn_id': 'fixture'},
+                }
+                paired_history = [
+                    {'role': 'user', 'content': 'Look up a result'},
+                    {'type': 'function_call', 'name': 'lookup', 'call_id': 'call_fixture',
+                     'arguments': '{}'},
+                    {'type': 'function_call_output', 'call_id': 'call_fixture', 'output': 'paired result'},
+                    {'role': 'user', 'content': 'Continue'},
+                ]
+                with_sideband = paired_history[:-1] + [
+                    companion_output,
+                    dict(companion_output, id='fco_fixture_2', name='codex_apps_selected_page_part_1_of_1'),
+                ] + paired_history[-1:]
+                for model in ['gemini', 'openrouter', 'responses']:
+                    wires = []
+                    for history in [paired_history, with_sideband]:
+                        upstream.hits.clear()
+                        status, _, raw = call('/v1/responses', {
+                            'model': model, 'input': history, 'stream': True,
+                        }, 'bearer')
+                        assert status == 200 and decode(raw)[-1]['type'] == 'response.completed', (model, status, raw)
+                        assert len(upstream.hits) == 1, upstream.hits
+                        wires.append(upstream.hits[0][1])
+                    assert 'paired result' in json.dumps(wires[1]), (model, wires[1])
+                    if model == 'responses':
+                        assert 'companion event' in json.dumps(wires[1]), wires[1]
+                    else:
+                        assert wires[0] == wires[1], (model, wires)
+                for bad_result in [
+                    {'type': 'function_call_output', 'output': 'ordinary malformed result'},
+                    dict(companion_output, call_id='unmatched_fixture'),
+                    dict(companion_output, namespace='ordinary'),
+                ]:
+                    upstream.hits.clear()
+                    status, _, raw = call('/v1/responses', {
+                        'model': 'gemini', 'input': paired_history[:-1] + [bad_result] + paired_history[-1:],
+                    }, 'bearer')
+                    assert status == 400 and json.loads(raw)['error']['code'] == 'gemini_tool_history', (status, raw)
+                    assert not upstream.hits, upstream.hits
+                print('Responses companion history compatibility passed for Gemini, OpenRouter and native Responses')
                 for streaming in [False, True]:
                     status,_,raw=call('/v1/responses',{'model':'gemini','input':'truncated','stream':streaming},'bearer')
                     response=decode(raw)[-1]['response'] if streaming else json.loads(raw)

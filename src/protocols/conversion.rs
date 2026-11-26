@@ -23,6 +23,19 @@ pub(crate) fn responses_to_gemini_chat_request(
     responses_to_chat_request_inner(input, original_model, true)
 }
 
+// Codex records companion-app sideband notifications in Responses history as
+// named agent outputs without a call_id. They have no corresponding model
+// tool call, so they cannot be represented as Chat tool messages. Match that
+// shape narrowly; do not hide missing IDs in ordinary tool history.
+fn codex_companion_notification(item: &Value) -> bool {
+    item.get("call_id").is_none()
+        && item["namespace"] == "agent"
+        && item["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("codex_apps_"))
+        && item["internal_chat_message_metadata_passthrough"].is_object()
+}
+
 fn responses_to_chat_request_inner(
     input: &Value,
     original_model: &str,
@@ -45,6 +58,9 @@ fn responses_to_chat_request_inner(
             let mut previous_call = false;
             for item in items {
                 let item_type = item.get("type").and_then(Value::as_str);
+                if item_type == Some("function_call_output") && codex_companion_notification(item) {
+                    continue;
+                }
                 match item_type {
                     Some("function_call") => {
                         let mut call = json!({
