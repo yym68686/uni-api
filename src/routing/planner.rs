@@ -126,37 +126,24 @@ impl GatewayRuntime {
                 message: format!("No available providers at the moment: {}", facts.model),
             });
         }
-        let providers = if let Some(tier) = facts
+        let tier = facts
             .service_tier
-            .filter(|_| !headers.contains_key(TARGET_PROVIDER_HEADER))
-        {
-            let eligible: Vec<_> = if crate::routing::service_tier::enabled(&snapshot) {
-                let now = crate::runtime::clock::unix_seconds();
+            .filter(|_| !headers.contains_key(TARGET_PROVIDER_HEADER));
+        let prefer_verified = tier.is_some() && crate::routing::service_tier::enabled(&snapshot);
+        let providers = if let Some(tier) = tier {
+            if prefer_verified {
                 providers
                     .into_iter()
-                    .filter_map(|p| {
-                        crate::routing::service_tier::restrict(
-                            &snapshot,
-                            &facts.model,
-                            p,
-                            tier,
-                            now,
-                        )
-                    })
+                    .map(crate::routing::service_tier::standard)
                     .collect()
             } else {
+                // Preserve explicit opt-out of verified routing for existing
+                // configurations, including individual channel tier opt-outs.
                 providers
                     .into_iter()
                     .filter(|p| !crate::routing::service_tier::disabled(p, tier))
                     .collect()
-            };
-            if eligible.is_empty() {
-                return Err(reject(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    crate::routing::service_tier::UNAVAILABLE,
-                ));
             }
-            eligible
         } else {
             providers
         };
@@ -188,13 +175,37 @@ impl GatewayRuntime {
         } else {
             providers
         };
-        let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) {
+        let mut providers = providers;
+        let mut preferred = Vec::new();
+        if let Some(tier) = tier.filter(|_| prefer_verified) {
+            let now = crate::runtime::clock::unix_seconds();
+            let mut seen = BTreeSet::new();
+            for provider in &providers {
+                if seen.insert(provider.name.as_ref()) {
+                    preferred.extend(crate::routing::service_tier::restrict(
+                        &snapshot,
+                        &facts.model,
+                        provider.clone(),
+                        tier,
+                        now,
+                    ));
+                }
+            }
+        }
+        let preferred_count = preferred.len();
+        if preferred_count != 0 {
+            preferred.append(&mut providers);
+            providers = preferred;
+        }
+        // A speculative ordinary attempt must not outrun a verified one.
+        let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) || preferred_count != 0 {
             HedgingConfig::default()
         } else {
             parse_hedging(&snapshot.preferences)
         };
         let route = ResolvedRoute {
             providers,
+            preferred_count,
             hedging,
             unknown_400_retries: crate::routing::unknown_400::configured(&snapshot.preferences),
         };

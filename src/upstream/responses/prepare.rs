@@ -9,7 +9,6 @@ use crate::runtime::state::GatewayRuntime;
 use crate::storage::database::Persistence;
 use crate::transport::spool::SpoolObservation;
 use crate::transport::spool::StoredBody;
-use crate::upstream::hedging::parse_hedging;
 use crate::upstream::hedging::HedgingConfig;
 use crate::upstream::responses::route::event_severity;
 use crate::upstream::responses::route::native_rejection_origin;
@@ -286,8 +285,7 @@ pub async fn prepare_request(
         Err(error) => {
             return ResponsesPreparation::Response(json_response(
                 error.status,
-                crate::routing::service_tier::rejection(&error)
-                    .unwrap_or_else(|| json!({"error":error.message})),
+                json!({"error":error.message}),
             ))
         }
     };
@@ -303,6 +301,11 @@ pub async fn prepare_request(
     let targeted = parts.headers.contains_key(TARGET_PROVIDER_HEADER);
     let retry_policy = RetryPolicy::from_value(api_key.preferences.get("AUTO_RETRY"));
     let max_attempts = retry_policy.max_attempts(&providers, targeted);
+    let hedging = if max_attempts == 1 {
+        HedgingConfig::default()
+    } else {
+        context.route.hedging
+    };
     ResponsesPreparation::Ready(ResponsesRoute {
         context,
         unknown_400: crate::routing::unknown_400::Budget::new(
@@ -326,11 +329,7 @@ pub async fn prepare_request(
         request_body_bytes: observation.body_bytes,
         cursor: 0,
         max_attempts,
-        hedging: if targeted || max_attempts == 1 {
-            HedgingConfig::default()
-        } else {
-            parse_hedging(&snapshot.preferences)
-        },
+        hedging,
         attempt_contexts: HashMap::new(),
         history_repair_attempted: false,
         pending_history_repair: None,

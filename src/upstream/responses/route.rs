@@ -32,6 +32,7 @@ pub(crate) struct NativeAttemptObservation {
     pub(crate) request_id: String,
     pub(crate) attempt_id: String,
     pub(crate) attempt_index: usize,
+    pub(crate) provider_index: usize,
     pub(crate) provider: String,
     pub(crate) request_model: String,
     pub(crate) actual_model: String,
@@ -137,10 +138,14 @@ impl ResponsesRoute {
         let Some(provider_name) = plan.provider_name.as_deref() else {
             return;
         };
-        let Some(provider) = self
-            .providers
-            .iter()
-            .find(|provider| provider.name.as_ref() == provider_name)
+        let observation = self.attempt_contexts.get(&plan.attempt_id);
+        let Some(provider) = observation
+            .and_then(|attempt| self.providers.get(attempt.provider_index))
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.name.as_ref() == provider_name)
+            })
             .cloned()
         else {
             return;
@@ -148,7 +153,7 @@ impl ResponsesRoute {
         self.last_provider = Some(provider);
         self.last_provider_key = plan.provider_key.clone();
         self.last_original_model = plan.original_model.clone();
-        if let Some(observation) = self.attempt_contexts.get(&plan.attempt_id).cloned() {
+        if let Some(observation) = observation.cloned() {
             self.last_attempt = Some(observation);
         }
     }
@@ -168,6 +173,22 @@ impl ResponsesRoute {
         self.set_current_plan(&plan);
         let retryable = self.record_failure(outcome).await;
         if crate::routing::unknown_400::upstream_outcome(outcome) {
+            if self
+                .last_provider
+                .as_ref()
+                .zip(
+                    outcome["detail"]
+                        .as_str()
+                        .or_else(|| outcome["body"].as_str()),
+                )
+                .is_some_and(|(provider, detail)| {
+                    crate::routing::service_tier::rejected(provider, detail)
+                })
+            {
+                return self
+                    .unknown_400
+                    .failure(self.auto_retry() && self.has_attempts_remaining(), false);
+            }
             self.unknown_400.set_cause(
                 outcome_status_from(outcome, "upstream_status_code", 400),
                 plan.attempt_id,
@@ -287,9 +308,10 @@ impl ResponsesRoute {
     pub fn has_attempts_remaining(&self) -> bool {
         self.upstream_attempts < 100
             && self.cursor
-                < self
-                    .unknown_400
-                    .scan_limit(self.max_attempts, self.providers.len())
+                < self.context.route.scan_limit(
+                    self.unknown_400
+                        .scan_limit(self.max_attempts, self.providers.len()),
+                )
             && (self.upstream_attempts < self.max_attempts || self.unknown_400.pending())
     }
 
@@ -307,7 +329,11 @@ impl ResponsesRoute {
         }
         while self.has_attempts_remaining() {
             let attempt_number = self.routing_attempts;
-            let provider = self.providers[self.cursor % self.providers.len()].clone();
+            let provider_index = self
+                .context
+                .route
+                .candidate_index(self.cursor, self.providers.len());
+            let provider = self.providers[provider_index].clone();
             self.cursor += 1;
             if !self
                 .store
@@ -443,6 +469,7 @@ impl ResponsesRoute {
                 .dispatch(provider.name.as_ref(), &self.request_id, &attempt_id);
             self.upstream_attempts = self.upstream_attempts.saturating_add(1);
             let observation = NativeAttemptObservation {
+                provider_index,
                 request_id: self.request_id.clone(),
                 attempt_id: attempt_id.clone(),
                 attempt_index: attempt_number.saturating_add(1),
@@ -582,7 +609,11 @@ impl ResponsesRoute {
                         provider,
                         key,
                         original_model,
-                        has_alternative: self.providers.len() > 1,
+                        has_alternative: if self.context.route.preferred_count > 0 {
+                            self.context.route.has_alternative(provider)
+                        } else {
+                            self.providers.len() > 1
+                        },
                         status,
                         detail,
                         provider_model_unavailable: policy.provider_model_unavailable,

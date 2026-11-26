@@ -43,7 +43,7 @@ pub(crate) fn default_value(key: &str) -> Option<Value> {
             json!({"enabled":false,"max_inflight_attempts":1,"winner_policy":"first_valid_success"})
         }
         "unknown_upstream_400_retries" => json!(0),
-        crate::routing::service_tier::SWITCH => json!(false),
+        crate::routing::service_tier::SWITCH => json!(true),
         _ => return None,
     })
 }
@@ -176,7 +176,7 @@ pub(crate) fn note(key: &str) -> &'static str {
     match key {
         "model_timeout" => "支持统一秒数或按模型设置；条件超时策略优先，具体请求值可在预览中核对。",
         "timeout_policy" => "全局规则先匹配，渠道规则再覆盖；未填写的超时项继续继承。",
-        "unknown_upstream_400_retries" => "所有上游400的额外换渠道次数（0–3，默认0关闭），HTTP400与尚未提交实质输出的SSE语义400统一计数，不区分错误内容或请求类型。此400预算独立于调用API key的AUTO_RETRY；不改正文、不全局冷却，成功即停，耗尽保留400。定向请求及本地校验不重试；无其他可用渠道时结束。重试可能增加费用与延迟。",
+        "unknown_upstream_400_retries" => "上游400的额外换渠道次数（0–3，默认0关闭），HTTP400与尚未提交实质输出的SSE语义400统一计数。此400预算独立于调用API key的AUTO_RETRY；明确的加速档位拒绝按档位回退处理。定向请求及本地校验不重试；无其他可用渠道时结束。",
         "keepalive_interval" => "0 或大于当前模型超时的间隔不发送心跳。",
         "api_key_rate_limit_cooldown_period" => {
             "配置为 0 时实际使用 1800 秒；站点 Retry-After 可延长冷却。"

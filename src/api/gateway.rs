@@ -182,12 +182,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             .await
         {
             Ok(route) => route,
-            Err(error) => {
-                return match crate::routing::service_tier::rejection(&error) {
-                    Some(value) => crate::api::platform::json_response(error.status, value),
-                    None => json_error(error.status, &error.message),
-                }
-            }
+            Err(error) => return json_error(error.status, &error.message),
         }
     };
     let mut resolved = context.route.clone();

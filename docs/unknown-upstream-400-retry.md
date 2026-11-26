@@ -31,7 +31,11 @@ The console exposes this setting only when the gateway advertises
 older gateway. Existing persisted settings are preserved. The bootstrap header
 `X-Uni-All-Upstream-400-Retries: 1` signals that capability during restore.
 
-All former content-, provider-, and message-specific 400 retries and request
-repairs are retired. Non-400 fallback policy and the independent 404 persisted
-item recovery are unchanged. Regression coverage uses loopback providers only;
-it does not replay customer traffic or call paid model providers.
+Fast and Ultrafast Responses routing is a separate policy enabled by default.
+It tries verified channels for the requested tier first, then uses the ordinary
+channel order without forwarding the tier. A structured rejection of
+`service_tier` on an accelerated attempt can advance that route before any
+substantive output, within the normal `AUTO_RETRY` budget. Other 400s retain the
+policy above. Setting `preferences.service_tier_routing: false` retains legacy
+tier forwarding. Targeted probes and ordinary requests keep their existing
+behavior. Regression coverage uses loopback providers only.

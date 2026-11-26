@@ -881,7 +881,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         &path,
     ) == Some("compaction");
     let mut compaction_visited = HashSet::new();
-    let mut scan_limit = unknown_400.scan_limit(max_attempts, providers.len());
+    let mut scan_limit = context
+        .route
+        .scan_limit(unknown_400.scan_limit(max_attempts, providers.len()));
     let mut cache_fallback = None;
     let mut dispatched = 0usize;
     let routing_trace = RoutingTrace {
@@ -905,7 +907,10 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         let provider = if cache_last_resort {
             cache_fallback.take().unwrap()
         } else {
-            providers[attempt_index % providers.len()].clone()
+            providers[context
+                .route
+                .candidate_index(attempt_index, providers.len())]
+            .clone()
         };
         cursor += 1;
         if !state
@@ -1212,7 +1217,11 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     let outcome_api_key = api_key.clone();
                     let outcome_path = path.clone();
                     let outcome_method = method.clone();
-                    let has_alternative = providers.len() > 1;
+                    let has_alternative = if context.route.preferred_count > 0 {
+                        context.route.has_alternative(&provider)
+                    } else {
+                        providers.len() > 1
+                    };
                     tokio::spawn(async move {
                         let outcome = stream_outcome.await.unwrap_or_else(|_| {
                             provider_stream::StreamOutcome {
@@ -1512,7 +1521,11 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             provider: &provider,
                             key: &provider_key_raw,
                             original_model: &original_model,
-                            has_alternative: providers.len() > 1,
+                            has_alternative: if context.route.preferred_count > 0 {
+                                context.route.has_alternative(&provider)
+                            } else {
+                                providers.len() > 1
+                            },
                             status: failure.status.as_u16(),
                             detail: &failure.detail,
                             provider_model_unavailable: policy.provider_model_unavailable,
@@ -1541,13 +1554,19 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     "failed",
                     Some(failure.observed_status()),
                 );
-                if failure.unknown_400() {
+                let upstream_400 = failure.unknown_400();
+                let tier_rejected = upstream_400
+                    && crate::routing::service_tier::rejected(&provider, &failure.detail);
+                if upstream_400 && !tier_rejected {
                     unknown_400.set_cause(
                         failure.observed_status(),
                         format!("{request_id}-r{}", attempt_index + 1),
                     );
                 }
-                let retryable = unknown_400.failure(policy.retryable, failure.unknown_400());
+                let retryable = unknown_400.failure(
+                    policy.retryable || (tier_rejected && auto_retry),
+                    upstream_400 && !tier_rejected,
+                );
                 if !retryable || failure.failure_reason == "stream_collection_after_output" {
                     break;
                 }

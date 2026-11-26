@@ -27,8 +27,40 @@ pub(crate) struct ProviderFailurePolicy {
 #[derive(Clone)]
 pub(crate) struct ResolvedRoute {
     pub(crate) providers: Vec<Arc<Provider>>,
+    // An optional one-pass tier-specific prefix followed by the unchanged ordinary schedule.
+    pub(crate) preferred_count: usize,
     pub(crate) hedging: HedgingConfig,
     pub(crate) unknown_400_retries: u8,
+}
+
+impl ResolvedRoute {
+    pub(crate) fn scan_limit(&self, original: usize) -> usize {
+        if self.preferred_count != 0
+            || self
+                .providers
+                .first()
+                .is_some_and(|provider| super::service_tier::is_standard(provider))
+        {
+            original.max(self.providers.len())
+        } else {
+            original
+        }
+    }
+
+    pub(crate) fn candidate_index(&self, cursor: usize, provider_count: usize) -> usize {
+        if cursor < self.preferred_count {
+            cursor
+        } else {
+            self.preferred_count
+                + (cursor - self.preferred_count) % (provider_count - self.preferred_count)
+        }
+    }
+
+    pub(crate) fn has_alternative(&self, provider: &Provider) -> bool {
+        self.providers
+            .iter()
+            .any(|other| other.name != provider.name)
+    }
 }
 
 pub(crate) struct RouteResolutionError {

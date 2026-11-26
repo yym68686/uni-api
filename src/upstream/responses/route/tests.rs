@@ -111,6 +111,7 @@ async fn native_route_for_test(provider: Arc<Provider>, max_attempts: usize) -> 
             ),
             admission: crate::routing::context::AdmissionReceipt::Request,
             route: crate::routing::types::ResolvedRoute {
+                preferred_count: 0,
                 providers: vec![provider.clone()],
                 hedging: HedgingConfig::default(),
                 unknown_400_retries: 0,

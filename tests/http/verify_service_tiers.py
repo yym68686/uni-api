@@ -21,6 +21,17 @@ class Upstream(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         tier = body.get("service_tier")
         self.server.hits.append((self.path, self.headers["Authorization"], body))
+        name = self.path.split("/")[1]
+        fault = self.server.faults.get((name, tier))
+        if fault and body.get("input") != "Reply OK.":
+            status, error = fault
+            raw = json.dumps({"error": error}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         response = {"id": "resp_test", "status": "completed", "object": "response",
                     "model": body["model"], "output": [{"id": "msg", "type": "message", "role": "assistant",
                     "status": "completed", "content": [{"type": "output_text", "text": "OK"}]}],
@@ -28,15 +39,24 @@ class Upstream(BaseHTTPRequestHandler):
                     "service_tier": {"fast": "priority", "ultrafast": (
                         "ultrafast" if self.path.startswith("/verified/") else "default"
                     )}.get(tier, tier)}
+        if name == "compat":
+            response = {"id": "chatcmpl_1", "object": "chat.completion", "model": body["model"],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"},
+                                     "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
         kind = "application/json"
         raw = json.dumps(response).encode()
         if body.get("stream"):
             kind = "text/event-stream"
             events = [{"type": "response.created", "response": dict(response, status="in_progress", service_tier=tier)}]
-            if self.path.startswith("/full/"):
+            if name != "early":
                 events.append({"type": "response.output_text.delta", "delta": "OK", "item_id": "msg",
                                "output_index": 0, "content_index": 0})
-                events.append({"type": "response.completed", "response": response})
+                if (name, tier) in self.server.fail_after_output:
+                    events.append({"type": "response.failed", "response": dict(
+                        response, status="failed", error={"code": "server_error", "message": "Upstream unavailable"})})
+                else:
+                    events.append({"type": "response.completed", "response": response})
             raw = "".join("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n" for e in events).encode()
         self.send_response(200)
         self.send_header("Content-Type", kind)
@@ -49,6 +69,8 @@ def main():
     binary = Path(sys.argv[1]).resolve()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     upstream.hits = []
+    upstream.faults = {}
+    upstream.fail_after_output = set()
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     probe_path = "/v1/channel-settings/service-tier-probe"
     global_scope = "__uni_console_global_preferences__"
@@ -63,12 +85,20 @@ def main():
              )}}
             for name in ("peer", "verified", "early", "full", "portable")
         ]
+        providers.append({
+            "provider": "compat", "engine": "gpt",
+            "base_url": f"http://127.0.0.1:{upstream.server_port}/compat/v1/chat/completions",
+            "api": "compat-key", "model": [{"wire": "public"}],
+        })
         config = {"providers": providers, "api_keys": [
             {"api": "admin", "role": "admin", "model": ["all"]},
             {"api": "caller", "role": "user", "model": ["peer/*", "verified/*"],
              "preferences": {"SCHEDULING_ALGORITHM": "fixed_priority"}},
             {"api": "peer-only", "role": "user", "model": ["peer/*"]},
             {"api": "verified-only", "role": "user", "model": ["verified/*"]},
+            {"api": "mixed", "role": "user", "model": ["compat/*", "verified/*"]},
+            {"api": "no-retry", "role": "user", "model": ["peer/*", "verified/*"],
+             "preferences": {"AUTO_RETRY": False}},
         ]}
         (root / "config.json").write_text(json.dumps(config))
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "TMPDIR", "LANG", "DYLD_LIBRARY_PATH")}
@@ -101,9 +131,18 @@ def main():
             })
             assert code == 200, (code, applied)
 
-        def request(tier=None, key="caller"):
+        def request(tier=None, key="caller", **options):
             return call("POST", "/v1/responses", {"model": "public", "input": "test",
-                                                 **({"service_tier": tier} if tier else {})}, key)
+                                                 **({"service_tier": tier} if tier else {}), **options}, key)
+
+        def check_route(tier, expected, key="caller", status=200, **options):
+            before = len(upstream.hits)
+            code, body = request(tier, key, **options)
+            assert code == status, (code, body, expected)
+            attempts = [(path.split("/")[1], sent.get("service_tier"))
+                        for path, _, sent in upstream.hits[before:]]
+            assert attempts == expected, (attempts, expected, body)
+            return body
 
         def assert_catalog(tiers, key="caller"):
             before = len(upstream.hits)
@@ -138,7 +177,8 @@ def main():
                 assert code == 200 and pre["status"] == "ready" and not upstream.hits, pre
                 code, portable = call("POST", probe_path, dict(req, provider="portable", verify_only=True))
                 assert code == 200 and portable["status"] == "ready" and portable["compatibility"]
-                candidate = {"base_url": providers[-1]["base_url"], "api_key": "first-portable",
+                candidate = {"base_url": next(p["base_url"] for p in providers if p["provider"] == "portable"),
+                             "api_key": "first-portable",
                              "models": {"new-alias": "wire"}}
                 preview = dict(req, provider="candidate", verify_only=True, candidate=candidate)
                 assert call("POST", probe_path, dict(preview, verify_only=False))[0] == 400
@@ -163,16 +203,11 @@ def main():
                     code, streamed = call("POST", probe_path, dict(req, provider=provider))
                     assert code == 200 and streamed["status"] == status, (provider, streamed)
                 assert len(upstream.hits) == 4
-                code, response = request("ultrafast")
-                assert code == 200 and upstream.hits[-1][0] == "/peer/v1/responses", response
-                setting(global_scope, {"/preferences/service_tier_routing": True}, "enable")
-                before = len(upstream.hits)
-                code, denied = request("fast")
-                assert code == 503 and denied["error"]["code"] == "service_tier_unavailable", denied
-                assert len(upstream.hits) == before
+                check_route("ultrafast", [("peer", None)])
+                check_route("fast", [("peer", None)])
                 path = "/preferences/service_tier_evidence/" + result["binding"] + "/fast"
                 setting("verified", {path: result["checked_at"] - 7 * 86400}, "expired")
-                assert request("fast")[0] == 503 and len(upstream.hits) == before
+                check_route("fast", [("peer", None)])
                 assert_catalog([])
                 setting("verified", {path: result["checked_at"]}, "publish")
                 assert_catalog(["priority"])
@@ -182,9 +217,27 @@ def main():
                     assert code == 200 and served["service_tier"] == "priority", served
                     assert upstream.hits[-1][:2] == ("/verified/v1/responses", "Bearer first-verified")
                     assert upstream.hits[-1][2]["service_tier"] == "fast"
-                assert request("fast", "peer-only")[0] == 503
-                assert request("ultrafast")[0] == 503
-                assert len(upstream.hits) == before + 2
+                check_route("fast", [("peer", None)], "peer-only")
+                check_route("ultrafast", [("peer", None)])
+                check_route("fast", [("verified", "fast")], "mixed")
+                rejection = (400, {"code": "unsupported_service_tier", "param": "service_tier"})
+                upstream.faults["verified", "fast"] = rejection
+                check_route("fast", [("verified", "fast"), ("peer", None)])
+                check_route("fast", [("verified", "fast"), ("compat", None)], "mixed")
+                streamed = check_route("fast", [("verified", "fast"), ("peer", None)], stream=True)
+                assert "response.completed" in streamed, streamed
+                upstream.faults.clear()
+                upstream.fail_after_output.add(("verified", "fast"))
+                streamed = check_route("fast", [("verified", "fast")], stream=True)
+                assert "response.output_text.delta" in streamed and '"delta": "OK"' in streamed, streamed
+                assert "response.completed" not in streamed, streamed
+                upstream.fail_after_output.clear()
+                upstream.faults["verified", "fast"] = rejection
+                check_route("fast", [("verified", "fast"), ("verified", None)], "verified-only")
+                upstream.faults["verified", "fast"] = (400, {"code": "bad_input", "param": "input"})
+                check_route("fast", [("verified", "fast")], status=400)
+                check_route("fast", [("verified", "fast")], "mixed", status=400)
+                upstream.faults.clear()
                 code, ultra = call("POST", probe_path, dict(req, tier="ultrafast"))
                 assert code == 200 and ultra["status"] == "supported", ultra
                 ultra_path = "/preferences/service_tier_evidence/" + ultra["binding"] + "/ultrafast"
@@ -199,30 +252,42 @@ def main():
                 assert_catalog(["priority", "ultrafast"])
                 assert_catalog(["priority"], "peer-only")
                 assert_catalog(["ultrafast"], "verified-only")
-                assert request("fast", "verified-only")[0] == 503
+                check_route("fast", [("verified", None)], "verified-only")
                 assert request("ultrafast", "verified-only")[0] == 200
                 assert upstream.hits[-1][0] == "/verified/v1/responses"
                 assert request(key="verified-only")[0] == 200
                 assert upstream.hits[-1][0] == "/verified/v1/responses"
                 # Renewing detection evidence must not undo an explicit routing preference.
                 setting("verified", {path: result["checked_at"]}, "renew-fast-evidence")
-                assert request("fast", "verified-only")[0] == 503
+                check_route("fast", [("verified", None)], "verified-only")
                 setting(global_scope, {"/preferences/service_tier_routing": False}, "disable-global-filter")
                 assert_catalog(["priority", "ultrafast"])
                 assert request("fast", "verified-only")[0] == 503
                 assert request("ultrafast", "verified-only")[0] == 200
+                check_route("ultrafast", [("peer", "ultrafast")])
                 assert request(key="verified-only")[0] == 200
                 setting(global_scope, {"/preferences/service_tier_routing": True}, "restore-global-filter")
                 setting("verified", {disabled_path: False}, "reenable-fast")
                 assert request("fast", "verified-only")[0] == 200
                 assert request("ultrafast", "verified-only")[0] == 200
+                upstream.faults["peer", "fast"] = rejection
+                upstream.faults["verified", "fast"] = rejection
+                check_route("fast", [("peer", "fast"), ("verified", "fast"), ("peer", None)])
+                upstream.faults.clear()
                 code, response = request("default")
                 assert code == 200 and upstream.hits[-1][0] == "/peer/v1/responses", response
                 setting("verified", {}, "withdraw", [path])
                 setting("peer", {}, "withdraw-peer-fast", [peer_path])
                 assert_catalog(["ultrafast"])
-                assert request("fast")[0] == 503
+                check_route("fast", [("peer", None)])
                 assert request()[0] == 200 and upstream.hits[-1][0] == "/peer/v1/responses"
+                # An unavailable accelerated route must not take up a send
+                # on the next request, even when AUTO_RETRY disables replays.
+                setting("verified", {"/preferences/cooldown_period": 30}, "cool-after-failure")
+                upstream.faults["verified", "ultrafast"] = (503, {"message": "Upstream unavailable"})
+                check_route("ultrafast", [("verified", "ultrafast"), ("peer", None)])
+                check_route("ultrafast", [("peer", None)], "no-retry")
+                check_route("ultrafast", [("compat", None)], "mixed")
             except Exception:
                 print((root / "process.log").read_text()[-8000:])
                 raise
@@ -235,7 +300,7 @@ def main():
                     proc.wait()
                 upstream.shutdown()
                 upstream.server_close()
-    print("PASS service tier preflight, exact credential, terminal receipts, expiry, ACL, rollback, and live Codex catalogs")
+    print("PASS verified tier priority, cooldown/error fallback, native/compat streaming, safety policies and catalogs")
 
 
 if __name__ == "__main__":

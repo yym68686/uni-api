@@ -227,6 +227,11 @@ pub(crate) fn build_attempt(
     }
 
     let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
+    if path == "/v1/responses" {
+        if let Some(root) = payload.as_object_mut() {
+            crate::routing::service_tier::strip_for_standard(root, provider);
+        }
+    }
     if downstream_protocol == DownstreamProtocol::ResponsesCompat {
         payload = if matches!(engine.as_str(), "gemini" | "vertex" | "vertex-gemini") {
             crate::protocols::conversion::responses_to_gemini_chat_request(

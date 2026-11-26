@@ -12,8 +12,6 @@ pub(crate) const EVIDENCE: &str = "service_tier_evidence";
 pub(crate) const DISABLED: &str = "service_tier_disabled";
 pub(crate) const ROUTED: &str = "__verified_service_tier";
 pub(crate) const TTL: i64 = 7 * 24 * 60 * 60;
-pub(crate) const UNAVAILABLE: &str =
-    "No eligible channel has verified support for the requested service_tier";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,7 +47,71 @@ impl Tier {
 }
 
 pub(crate) fn enabled(snapshot: &Snapshot) -> bool {
-    snapshot.preferences.get(SWITCH).and_then(Value::as_bool) == Some(true)
+    snapshot.preferences.get(SWITCH).and_then(Value::as_bool) != Some(false)
+}
+
+pub(crate) fn standard(mut provider: Arc<Provider>) -> Arc<Provider> {
+    Arc::make_mut(&mut Arc::make_mut(&mut provider).preferences).insert(ROUTED.into(), Value::Null);
+    provider
+}
+
+pub(crate) fn is_accelerated(provider: &Provider) -> bool {
+    provider
+        .preferences
+        .get(ROUTED)
+        .is_some_and(Value::is_string)
+}
+
+pub(crate) fn is_standard(provider: &Provider) -> bool {
+    provider.preferences.get(ROUTED).is_some_and(Value::is_null)
+}
+
+pub(crate) fn strip_for_standard(
+    payload: &mut serde_json::Map<String, Value>,
+    provider: &Provider,
+) {
+    if is_standard(provider) {
+        payload.remove("service_tier");
+    }
+}
+
+// A known tier rejection is specific to the accelerated attempt. Leave other
+// 400s to the existing shared 400 retry budget (including malformed inputs).
+pub(crate) fn rejected(provider: &Provider, detail: &str) -> bool {
+    if !is_accelerated(provider) {
+        return false;
+    }
+    let mut parsed = match serde_json::from_str::<Value>(detail) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    for _ in 0..3 {
+        let error = parsed
+            .get("error")
+            .or_else(|| parsed.get("detail"))
+            .unwrap_or(&parsed);
+        if error["param"] == "service_tier"
+            || matches!(
+                error["code"].as_str(),
+                Some(
+                    "unsupported_service_tier"
+                        | "invalid_service_tier"
+                        | "service_tier_unavailable"
+                )
+            )
+        {
+            return true;
+        }
+        let Some(nested) = error
+            .as_str()
+            .or_else(|| error["message"].as_str())
+            .and_then(|value| serde_json::from_str(value).ok())
+        else {
+            break;
+        };
+        parsed = nested;
+    }
+    false
 }
 
 pub(crate) fn endpoint(provider: &Provider, model: &str) -> Option<String> {
@@ -344,9 +406,4 @@ pub(crate) fn compatibility(
     hash.update([0]);
     hash.update(key.as_bytes());
     Some(format!("{:x}", hash.finalize()))
-}
-
-pub(crate) fn rejection(error: &super::types::RouteResolutionError) -> Option<Value> {
-    (error.status == axum::http::StatusCode::SERVICE_UNAVAILABLE && error.message == UNAVAILABLE)
-        .then(|| json!({"error":{"message":error.message,"type":"server_error","param":"service_tier","code":"service_tier_unavailable"}}))
 }

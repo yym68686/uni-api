@@ -32,9 +32,11 @@ pub(crate) fn compile_payload(
     }
     apply_overrides(root, provider, request_model);
     if !wants_compact {
+        crate::routing::service_tier::strip_for_standard(root, provider);
         if let Some(tier) = provider
             .preferences
             .get(crate::routing::service_tier::ROUTED)
+            .filter(|tier| tier.is_string())
         {
             root.insert("service_tier".into(), tier.clone());
             root.insert("model".into(), Value::String(original_model.to_owned()));
