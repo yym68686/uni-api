@@ -1,13 +1,14 @@
 use crate::config::snapshot::ApiKey;
 use crate::config::snapshot::Provider;
 use crate::routing::filters::provider_accepts_endpoint;
+use crate::routing::service_tier::{self, Tier};
 use crate::routing::types::AuthContext;
 use crate::routing::types::RouteResolutionError;
 use crate::runtime::state::GatewayRuntime;
 use crate::storage::database::Persistence;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,33 +22,44 @@ impl GatewayRuntime {
     pub(crate) async fn codex_models_for_headers(
         &self,
         headers: &HeaderMap,
-    ) -> Result<Vec<String>, u16> {
+    ) -> Result<BTreeMap<String, BTreeSet<Tier>>, u16> {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let base = self.base_snapshot().await.ok_or(503u16)?;
         let controls = self.channel_controls.read().await;
         let snapshot = controls.overlay(base);
         let key = snapshot.api_keys.get(&token).ok_or(403u16)?;
         let key_id = crate::routing::catalog::key_id(&token);
-        let models = crate::routing::catalog::ordered_entries(&snapshot, key)
-            .into_iter()
-            .filter(|(provider, model)| {
-                let provider = &crate::config::model_protocol::effective(provider.clone(), model);
-                crate::control::channels::temporary_allowed(provider, key)
-                    && provider_accepts_endpoint(provider, "/v1/responses")
-                    && !provider.excluded_endpoints.iter().any(|endpoint| {
-                        endpoint
-                            .trim_end_matches('/')
-                            .eq_ignore_ascii_case("/v1/responses")
-                    })
-                    && !controls.disabled(&key_id, model, &provider.name)
-                    && crate::providers::codex::models::is_conversational_model(model)
-                    && provider.models.get(model).is_some_and(|upstream| {
-                        crate::providers::codex::models::is_conversational_model(upstream)
-                    })
-            })
-            .map(|(_, model)| model)
-            .collect::<BTreeSet<_>>();
-        Ok(models.into_iter().collect())
+        let now = crate::runtime::clock::unix_seconds();
+        let mut models = BTreeMap::<_, BTreeSet<_>>::new();
+        for (provider, model) in crate::routing::catalog::ordered_entries(&snapshot, key) {
+            let provider = crate::config::model_protocol::effective(provider, &model);
+            if !crate::control::channels::temporary_allowed(&provider, key)
+                || !provider_accepts_endpoint(&provider, service_tier::ENDPOINT)
+                || provider.excluded_endpoints.iter().any(|endpoint| {
+                    endpoint
+                        .trim_end_matches('/')
+                        .eq_ignore_ascii_case(service_tier::ENDPOINT)
+                })
+                || controls.disabled(&key_id, &model, &provider.name)
+                || !crate::providers::codex::models::is_conversational_model(&model)
+                || !provider.models.get(&model).is_some_and(|upstream| {
+                    crate::providers::codex::models::is_conversational_model(upstream)
+                })
+            {
+                continue;
+            }
+            let tiers = models.entry(model.clone()).or_default();
+            // The global switch selects a routing policy; it does not change
+            // what the configured channels have been verified to support.
+            for tier in Tier::ALL {
+                if !tiers.contains(&tier)
+                    && service_tier::supports(&snapshot, &provider, &model, tier, now)
+                {
+                    tiers.insert(tier);
+                }
+            }
+        }
+        Ok(models)
     }
 
     pub(crate) async fn models_for_endpoint(

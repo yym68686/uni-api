@@ -105,6 +105,19 @@ def main():
             return call("POST", "/v1/responses", {"model": "public", "input": "test",
                                                  **({"service_tier": tier} if tier else {})}, key)
 
+        def assert_catalog(tiers, key="caller"):
+            before = len(upstream.hits)
+            for path in ("/v1/codex/models", "/v1/models?client_version="):
+                status, catalog = call("GET", path, key=key)
+                assert status == 200, (path, status, catalog)
+                card, = catalog["models"]
+                assert card["slug"] == "public"
+                assert [tier["id"] for tier in card.get("service_tiers", [])] == tiers, card
+                assert all(tier["name"] and tier["description"] for tier in card.get("service_tiers", []))
+                assert card.get("additional_speed_tiers", []) == (["fast"] if "priority" in tiers else [])
+                assert "default_service_tier" not in card
+            assert len(upstream.hits) == before
+
         with (root / "process.log").open("w+") as log:
             proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
             try:
@@ -118,6 +131,7 @@ def main():
                         pass
                     time.sleep(.05)
                 assert call("GET", "/v1/observability/runtime")[1]["service_tier_probe_version"] == 1
+                assert_catalog([])
                 req = {"provider": "verified", "model": "public", "tier": "fast"}
                 assert call("POST", probe_path, req, "caller")[0] == 403
                 code, pre = call("POST", probe_path, dict(req, verify_only=True))
@@ -159,7 +173,10 @@ def main():
                 path = "/preferences/service_tier_evidence/" + result["binding"] + "/fast"
                 setting("verified", {path: result["checked_at"] - 7 * 86400}, "expired")
                 assert request("fast")[0] == 503 and len(upstream.hits) == before
+                assert_catalog([])
                 setting("verified", {path: result["checked_at"]}, "publish")
+                assert_catalog(["priority"])
+                assert_catalog([], "peer-only")
                 for tier in ("fast", "priority"):
                     code, served = request(tier)
                     assert code == 200 and served["service_tier"] == "priority", served
@@ -173,6 +190,15 @@ def main():
                 ultra_path = "/preferences/service_tier_evidence/" + ultra["binding"] + "/ultrafast"
                 disabled_path = "/preferences/service_tier_disabled/fast"
                 setting("verified", {ultra_path: ultra["checked_at"], disabled_path: True}, "enable-ultra-disable-fast")
+                assert_catalog(["ultrafast"])
+                assert_catalog(["ultrafast"], "verified-only")
+                code, peer_fast = call("POST", probe_path, dict(req, provider="peer"))
+                assert code == 200 and peer_fast["status"] == "supported", peer_fast
+                peer_path = "/preferences/service_tier_evidence/" + peer_fast["binding"] + "/fast"
+                setting("peer", {peer_path: peer_fast["checked_at"]}, "enable-fast-on-peer")
+                assert_catalog(["priority", "ultrafast"])
+                assert_catalog(["priority"], "peer-only")
+                assert_catalog(["ultrafast"], "verified-only")
                 assert request("fast", "verified-only")[0] == 503
                 assert request("ultrafast", "verified-only")[0] == 200
                 assert upstream.hits[-1][0] == "/verified/v1/responses"
@@ -182,6 +208,7 @@ def main():
                 setting("verified", {path: result["checked_at"]}, "renew-fast-evidence")
                 assert request("fast", "verified-only")[0] == 503
                 setting(global_scope, {"/preferences/service_tier_routing": False}, "disable-global-filter")
+                assert_catalog(["priority", "ultrafast"])
                 assert request("fast", "verified-only")[0] == 503
                 assert request("ultrafast", "verified-only")[0] == 200
                 assert request(key="verified-only")[0] == 200
@@ -192,6 +219,8 @@ def main():
                 code, response = request("default")
                 assert code == 200 and upstream.hits[-1][0] == "/peer/v1/responses", response
                 setting("verified", {}, "withdraw", [path])
+                setting("peer", {}, "withdraw-peer-fast", [peer_path])
+                assert_catalog(["ultrafast"])
                 assert request("fast")[0] == 503
                 assert request()[0] == 200 and upstream.hits[-1][0] == "/peer/v1/responses"
             except Exception:
@@ -206,7 +235,7 @@ def main():
                     proc.wait()
                 upstream.shutdown()
                 upstream.server_close()
-    print("PASS service tier preflight, exact credential, terminal receipts, expiry, ACL and rollback")
+    print("PASS service tier preflight, exact credential, terminal receipts, expiry, ACL, rollback, and live Codex catalogs")
 
 
 if __name__ == "__main__":

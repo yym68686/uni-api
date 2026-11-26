@@ -15,7 +15,7 @@ pub(crate) const TTL: i64 = 7 * 24 * 60 * 60;
 pub(crate) const UNAVAILABLE: &str =
     "No eligible channel has verified support for the requested service_tier";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Tier {
     Fast,
@@ -23,6 +23,8 @@ pub(crate) enum Tier {
 }
 
 impl Tier {
+    pub(crate) const ALL: [Self; 2] = [Self::Fast, Self::Ultrafast];
+
     pub(crate) fn requested(endpoint: &str, payload: Option<&Value>) -> Option<Self> {
         if endpoint.trim_end_matches('/') != ENDPOINT {
             return None;
@@ -217,37 +219,57 @@ pub(crate) fn restrict(
     if disabled(&provider, tier) {
         return None;
     }
-    let keys = qualified_keys(snapshot, &provider, model, tier, now)?;
+    let keys: Vec<_> = qualified_keys(snapshot, &provider, model, tier, now)?
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
     let selected = Arc::make_mut(&mut provider);
     selected.api_keys = Arc::new(keys);
     Arc::make_mut(&mut selected.preferences).insert(ROUTED.into(), json!(tier.wire()));
     Some(provider)
 }
 
-fn qualified_keys(
+pub(crate) fn supports(
     snapshot: &Snapshot,
     provider: &Provider,
     model: &str,
     tier: Tier,
     now: i64,
-) -> Option<Vec<String>> {
+) -> bool {
+    !disabled(provider, tier) && has_qualified_key(snapshot, provider, model, tier, now)
+}
+
+fn has_qualified_key(
+    snapshot: &Snapshot,
+    provider: &Provider,
+    model: &str,
+    tier: Tier,
+    now: i64,
+) -> bool {
+    qualified_keys(snapshot, provider, model, tier, now)
+        .is_some_and(|mut keys| keys.next().is_some())
+}
+
+fn qualified_keys<'a>(
+    snapshot: &'a Snapshot,
+    provider: &'a Provider,
+    model: &'a str,
+    tier: Tier,
+    now: i64,
+) -> Option<impl Iterator<Item = &'a String> + 'a> {
     let evidence = provider.preferences.get(EVIDENCE)?;
     let url = endpoint(provider, model)?;
-    let keys: Vec<_> = provider
-        .api_keys
-        .iter()
-        .filter(|key| {
-            !key.is_empty()
-                && !key.contains(',')
-                && evidence
-                    .get(binding(snapshot, provider, model, &url, key))
-                    .and_then(|v| v.get(tier.wire()))
-                    .and_then(Value::as_i64)
-                    .is_some_and(|time| fresh(time, now))
-        })
-        .cloned()
-        .collect();
-    (!keys.is_empty()).then_some(keys)
+    Some(provider.api_keys.iter().filter(move |key| {
+        !key.is_empty()
+            && !key.contains(',')
+            && evidence
+                .get(binding(snapshot, provider, model, &url, key))
+                .and_then(|v| v.get(tier.wire()))
+                .and_then(Value::as_i64)
+                .is_some_and(|time| fresh(time, now))
+    }))
 }
 
 // Return only route state, not bindings or raw credentials. This describes
@@ -255,7 +277,7 @@ fn qualified_keys(
 pub(crate) fn routing_state(snapshot: &Snapshot, provider: &Arc<Provider>, now: i64) -> Value {
     let mut result = serde_json::Map::new();
     let evidence = provider.preferences.get(EVIDENCE);
-    for tier in [Tier::Fast, Tier::Ultrafast] {
+    for tier in Tier::ALL {
         let has_evidence = evidence.is_some_and(|e| {
             e.as_object().is_some_and(|o| {
                 o.values().any(|v| {
@@ -265,14 +287,13 @@ pub(crate) fn routing_state(snapshot: &Snapshot, provider: &Arc<Provider>, now: 
                 })
             })
         }) && provider.models.keys().any(|model| {
-            qualified_keys(
+            has_qualified_key(
                 snapshot,
                 &crate::config::model_protocol::effective(provider.clone(), model),
                 model,
                 tier,
                 now,
             )
-            .is_some()
         });
         let state = match (disabled(provider, tier), has_evidence) {
             (true, true) => "disabled_verified",

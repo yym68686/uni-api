@@ -127,6 +127,10 @@ def verify(binary):
                 cards = {model["slug"]: model for model in json.loads(baseline)["models"]}
                 assert set(cards) == expected, (set(cards), expected)
                 assert len(baseline) < 1024 * 1024, len(baseline)
+                # Even known GPT cards and their aliases must not inherit
+                # advertised speeds from their prompt/metadata templates.
+                assert all(not card.get("service_tiers") and not card.get("additional_speed_tiers")
+                           and "default_service_tier" not in card for card in cards.values())
                 for slug in expected & known.keys():
                     before, after = known[slug], cards[slug]
                     messages = before.get("model_messages") or {}

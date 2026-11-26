@@ -1,10 +1,11 @@
 //! Version-independent Codex model cards derived from the caller's routes.
 
+use crate::routing::service_tier::Tier;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 fn templates() -> &'static [Value] {
@@ -102,7 +103,6 @@ fn compact_codex_card(mut card: Value) -> Value {
         "guardian",
         "description",
         "default_reasoning_level",
-        "default_service_tier",
         "available_access_programs",
         "availability_nux",
         "upgrade",
@@ -147,8 +147,6 @@ fn compact_codex_card(mut card: Value) -> Value {
         }
     }
     for (field, default) in [
-        ("additional_speed_tiers", json!([])),
-        ("service_tiers", json!([])),
         ("default_reasoning_summary", json!("auto")),
         ("web_search_tool_type", json!("text")),
         ("effective_context_window_percent", json!(95)),
@@ -165,6 +163,14 @@ fn compact_codex_card(mut card: Value) -> Value {
         "minimal_client_version",
         "prefer_websockets",
         "requires_sandboxed_review",
+    ] {
+        fields.remove(field);
+    }
+    // Template metadata is not evidence about this gateway's routes.
+    for field in [
+        "additional_speed_tiers",
+        "service_tiers",
+        "default_service_tier",
     ] {
         fields.remove(field);
     }
@@ -203,8 +209,8 @@ fn generic_card(name: &str, priority: u64) -> Value {
     })
 }
 
-fn catalog(models: &[String]) -> Value {
-    let mut remaining: BTreeSet<&str> = models.iter().map(String::as_str).collect();
+fn catalog(models: &BTreeMap<String, BTreeSet<Tier>>) -> Value {
+    let mut remaining: BTreeSet<&str> = models.keys().map(String::as_str).collect();
     let templates = templates();
     let mut cards = Vec::with_capacity(remaining.len());
     for template in templates {
@@ -239,10 +245,33 @@ fn catalog(models: &[String]) -> Value {
         };
         cards.push(card);
     }
+    for card in &mut cards {
+        let tiers = &models[card["slug"].as_str().expect("model card slug")];
+        if !tiers.is_empty() {
+            card["service_tiers"] = json!(tiers
+                .iter()
+                .map(|tier| match tier {
+                    Tier::Fast => json!({
+                        "id": "priority", "name": "Fast", "description": "Priority processing."
+                    }),
+                    Tier::Ultrafast => json!({
+                        "id": "ultrafast", "name": "Ultra Fast", "description": "Ultra Fast processing."
+                    }),
+                })
+                .collect::<Vec<_>>());
+        }
+        if tiers.contains(&Tier::Fast) {
+            // Legacy Codex clients only recognize Fast in this array.
+            card["additional_speed_tiers"] = json!(["fast"]);
+        }
+    }
     json!({"models": cards})
 }
 
-pub(crate) fn response(models: &[String], headers: &HeaderMap) -> Response<Body> {
+pub(crate) fn response(
+    models: &BTreeMap<String, BTreeSet<Tier>>,
+    headers: &HeaderMap,
+) -> Response<Body> {
     let body = serde_json::to_vec(&catalog(models)).expect("serializable model catalog");
     let etag = format!("\"{:x}\"", Sha256::digest(&body));
     let unchanged = headers.get_all("if-none-match").iter().any(|value| {
@@ -280,6 +309,16 @@ pub(crate) fn response(models: &[String], headers: &HeaderMap) -> Response<Body>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog(models: &[String]) -> Value {
+        super::catalog(
+            &models
+                .iter()
+                .cloned()
+                .map(|name| (name, BTreeSet::new()))
+                .collect(),
+        )
+    }
 
     #[test]
     fn modality_filter_keeps_conversation_and_rejects_generation_and_embeddings() {
@@ -525,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn etag_tracks_the_authorized_body_and_never_uses_upstream_etag() {
-        let models = vec!["gpt-6-sol".to_owned()];
+        let mut models = BTreeMap::from([("gpt-6-sol".to_owned(), BTreeSet::new())]);
         let response = response(&models, &HeaderMap::new());
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "private, no-cache");
@@ -547,6 +586,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(super::response(&[], &headers).status(), StatusCode::OK);
+        models.get_mut("gpt-6-sol").unwrap().insert(Tier::Fast);
+        assert_eq!(super::response(&models, &headers).status(), StatusCode::OK);
     }
 }
