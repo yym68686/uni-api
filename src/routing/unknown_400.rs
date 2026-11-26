@@ -4,15 +4,17 @@ use serde_json::{Map, Value};
 use std::collections::HashSet;
 
 pub(crate) const KEY: &str = "unknown_upstream_400_retries";
+pub(crate) const MAX_UPSTREAM_ATTEMPTS: usize = 100;
+pub(crate) const MAX_RETRIES: u8 = (MAX_UPSTREAM_ATTEMPTS - 1) as u8;
 
 pub(crate) fn validate(value: Option<&Value>) -> Result<u8, String> {
     match value {
         None => Ok(0),
         Some(value) => value
             .as_u64()
-            .filter(|n| *n <= 3)
+            .filter(|n| *n <= u64::from(MAX_RETRIES))
             .map(|n| n as u8)
-            .ok_or_else(|| format!("{KEY} must be an integer from 0 to 3")),
+            .ok_or_else(|| format!("{KEY} must be an integer from 0 to {MAX_RETRIES}")),
     }
 }
 pub(crate) fn configured(preferences: &Map<String, Value>) -> u8 {
@@ -73,7 +75,9 @@ impl Budget {
     }
 
     pub(crate) fn can_attempt(&self, ordinary_limit: usize) -> bool {
-        self.sent < 100 && self.can_plan() && (self.sent < ordinary_limit || self.pending)
+        self.sent < MAX_UPSTREAM_ATTEMPTS
+            && self.can_plan()
+            && (self.sent < ordinary_limit || self.pending)
     }
     pub(crate) fn set_cause(&mut self, raw_status: u16, attempt_id: String) {
         self.cause = Some((raw_status, attempt_id));
@@ -121,11 +125,11 @@ mod tests {
     #[test]
     fn settings_keep_the_existing_storage_contract() {
         assert_eq!(validate(None), Ok(0));
-        for n in 0..=3 {
+        for n in 0..=MAX_RETRIES {
             assert_eq!(validate(Some(&json!(n))), Ok(n));
         }
         for bad in [
-            json!(4),
+            json!(MAX_UPSTREAM_ATTEMPTS),
             json!(-1),
             json!(1.0),
             json!(null),
@@ -135,6 +139,22 @@ mod tests {
             assert!(validate(Some(&bad)).is_err());
         }
     }
+    #[test]
+    fn extra_retries_can_exceed_three_but_keep_the_total_attempt_cap() {
+        let mut budget = Budget::new(MAX_RETRIES, true);
+        budget.dispatch("original", "r", "first");
+        for n in 1..=MAX_RETRIES {
+            assert!(budget.failure(false, true));
+            assert!(budget.can_attempt(1));
+            assert!(!budget.may_dispatch("original"));
+            budget.dispatch(&format!("alternative-{n}"), "r", &n.to_string());
+        }
+        assert_eq!(budget.used(), MAX_RETRIES);
+        assert_eq!(budget.sent(), MAX_UPSTREAM_ATTEMPTS);
+        assert!(!budget.failure(true, true));
+        assert!(!budget.can_attempt(usize::MAX));
+    }
+
     #[test]
     fn every_upstream_400_uses_status_and_commit_only() {
         for (kind, raw) in [

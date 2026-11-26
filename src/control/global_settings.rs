@@ -21,9 +21,10 @@ pub(crate) fn document(preferences: &Map<String, Value>) -> Value {
     json!({"preferences":preferences.iter().filter(|(k,_)|KEYS.contains(&k.as_str())).map(|(k,v)|(k.clone(),v.clone())).collect::<Map<_,_>>()})
 }
 pub(crate) fn schema() -> Value {
-    json!({"version":1,"global_settings":true,"unknown_upstream_400_retries":true,"all_upstream_400_retries":true,"fields":KEYS.iter().map(|k| {
+    let retry_max = crate::routing::unknown_400::MAX_RETRIES;
+    json!({"version":1,"global_settings":true,"unknown_upstream_400_retries":true,"all_upstream_400_retries":true,"all_upstream_400_retries_max":retry_max,"fields":KEYS.iter().map(|k| {
         if *k == crate::routing::unknown_400::KEY {
-            json!({"path":format!("/preferences/{k}"),"group":"重试保护","type":"integer","minimum":0,"maximum":3,"note":note(k)})
+            json!({"path":format!("/preferences/{k}"),"group":"重试保护","type":"integer","minimum":0,"maximum":retry_max,"note":note(k)})
         } else if *k == crate::routing::service_tier::SWITCH {
             json!({"path":format!("/preferences/{k}"),"group":"路由","type":"boolean"})
         } else {
@@ -176,7 +177,7 @@ pub(crate) fn note(key: &str) -> &'static str {
     match key {
         "model_timeout" => "支持统一秒数或按模型设置；条件超时策略优先，具体请求值可在预览中核对。",
         "timeout_policy" => "全局规则先匹配，渠道规则再覆盖；未填写的超时项继续继承。",
-        "unknown_upstream_400_retries" => "上游400的额外换渠道次数（0–3，默认0关闭），HTTP400与尚未提交实质输出的SSE语义400统一计数。此400预算独立于调用API key的AUTO_RETRY；明确的加速档位拒绝按档位回退处理。定向请求及本地校验不重试；无其他可用渠道时结束。",
+        "unknown_upstream_400_retries" => "上游400的额外换渠道次数（默认0关闭），HTTP400与尚未提交实质输出的SSE语义400统一计数。此400预算独立于调用API key的AUTO_RETRY，但仍受总尝试次数限制；明确的加速档位拒绝按档位回退处理。定向请求及本地校验不重试；无其他可用渠道时结束。",
         "keepalive_interval" => "0 或大于当前模型超时的间隔不发送心跳。",
         "api_key_rate_limit_cooldown_period" => {
             "配置为 0 时实际使用 1800 秒；站点 Retry-After 可延长冷却。"
@@ -222,11 +223,12 @@ mod tests {
             default_value("unknown_upstream_400_retries"),
             Some(json!(0))
         );
-        for n in 0..=3 {
+        let max_retries = crate::routing::unknown_400::MAX_RETRIES;
+        for n in [0, 3, 4, 17, max_retries] {
             assert!(validate(&json!({"preferences":{"unknown_upstream_400_retries":n}})).is_ok());
         }
         for bad in [
-            json!(4),
+            json!(max_retries + 1),
             json!(-1),
             json!(1.0),
             json!("1"),
@@ -241,7 +243,11 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v["path"] == path && v["type"] == "integer" && v["maximum"] == 3));
+            .any(|v| v["path"] == path && v["type"] == "integer" && v["maximum"] == max_retries));
+        assert_eq!(
+            super::super::settings::schema()["all_upstream_400_retries_max"],
+            max_retries
+        );
         assert!(field_values(&json!({}), &Map::new()).get(path).is_none());
     }
 

@@ -181,9 +181,9 @@ def verify(binary, native=True, semantic=False, hedging=False, collect=False, er
                 check(key='one')
                 shared['mode']='hold'; check(flip=True) # policy snapshot captured before request starts
                 shared['mode']='reject'; check(400,('first',)) # following request sees zero
-                for credits in [1,2,3]:
+                for credits in [1,2,3,4,17]:
                     limit(credits); shared['mode']='exhausted'
-                    check(400,tuple(['first','second','third','fourth'][:credits+1]))
+                    check(400,tuple(['first','second','third','fourth','fifth'][:credits+1]))
                 if hedging:
                     limit(2); shared['mode']='hedge_probe'
                     check(200,('first','second','third')) # a rescue's hedge trigger cannot burn the route cursor

@@ -306,7 +306,7 @@ impl ResponsesRoute {
     }
 
     pub fn has_attempts_remaining(&self) -> bool {
-        self.upstream_attempts < 100
+        self.upstream_attempts < crate::routing::unknown_400::MAX_UPSTREAM_ATTEMPTS
             && self.cursor
                 < self.context.route.scan_limit(
                     self.unknown_400

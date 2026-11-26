@@ -1085,6 +1085,10 @@ impl GatewayRuntime {
                     .header("X-Uni-Upstream-Stream-Mode", "1")
                     .header("X-Uni-Unknown-Upstream-400-Retries", "1")
                     .header("X-Uni-All-Upstream-400-Retries", "1")
+                    .header(
+                        "X-Uni-All-Upstream-400-Retries-Max",
+                        crate::routing::unknown_400::MAX_RETRIES.to_string(),
+                    )
                     .bearer_auth(&token)
                     .send()
                     .await
