@@ -431,12 +431,27 @@ pub(crate) async fn prepare_input(
         }
         RequestBodySpoolError::Spool(failure) => json_error(failure.status, &failure.message),
     })?;
-    if normalized_content_type.starts_with("application/json") {
-        let (payload, reservation) = spool
-            .storage
-            .parse_json_governed(&state.resource_governor)
-            .await
-            .map_err(|error| error.response(StatusCode::BAD_REQUEST))?;
+    let interactions = crate::protocols::interactions::is_route(path);
+    let json_media_type = normalized_content_type.split(';').next().map(str::trim);
+    if interactions && json_media_type != Some("application/json") {
+        return Err(json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Interactions requires application/json",
+        ));
+    }
+    if interactions || normalized_content_type.starts_with("application/json") {
+        let (payload, reservation) = if interactions {
+            spool
+                .storage
+                .parse_unique_json_object_governed(&state.resource_governor)
+                .await
+        } else {
+            spool
+                .storage
+                .parse_json_governed(&state.resource_governor)
+                .await
+        }
+        .map_err(|error| error.response(StatusCode::BAD_REQUEST))?;
         if !payload.is_object() {
             return Err(json_error(
                 StatusCode::BAD_REQUEST,
@@ -446,7 +461,7 @@ pub(crate) async fn prepare_input(
         return Ok(PreparedInput {
             _memory_reservations: vec![std::sync::Arc::new(reservation)],
             payload: Some(payload),
-            replay: None,
+            replay: interactions.then(|| (spool.storage, spool.observation.clone())),
             observation: spool.observation,
             default_model: String::new(),
             content_type,

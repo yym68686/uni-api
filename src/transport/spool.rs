@@ -8,6 +8,8 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use futures_util::Stream;
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -272,6 +274,34 @@ pub struct MultipartFile {
     pub bytes: u64,
 }
 
+// When the original body is forwarded, the gateway and provider must not
+// disagree on which occurrence of a routing or policy field is authoritative.
+struct UniqueJsonObject(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonObject {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct UniqueObjectVisitor;
+        impl<'de> Visitor<'de> for UniqueObjectVisitor {
+            type Value = UniqueJsonObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with unique top-level fields")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<Self::Value, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some((key, value)) = fields.next_entry::<String, serde_json::Value>()? {
+                    if object.insert(key, value).is_some() {
+                        return Err(A::Error::custom("duplicate top-level JSON field"));
+                    }
+                }
+                Ok(UniqueJsonObject(object.into()))
+            }
+        }
+        deserializer.deserialize_map(UniqueObjectVisitor)
+    }
+}
+
 impl StoredBody {
     fn local(path: PathBuf) -> Self {
         Self {
@@ -303,6 +333,38 @@ impl StoredBody {
         ),
         JsonReadFailure,
     > {
+        self.parse_governed(governor, serde_json::from_reader).await
+    }
+
+    pub(crate) async fn parse_unique_json_object_governed(
+        &self,
+        governor: &ResourceGovernor,
+    ) -> Result<
+        (
+            serde_json::Value,
+            crate::runtime::resources::MemoryReservation,
+        ),
+        JsonReadFailure,
+    > {
+        self.parse_governed(governor, |reader| {
+            serde_json::from_reader(reader).map(|UniqueJsonObject(value)| value)
+        })
+        .await
+    }
+
+    async fn parse_governed(
+        &self,
+        governor: &ResourceGovernor,
+        parse: impl FnOnce(std::io::BufReader<std::fs::File>) -> serde_json::Result<serde_json::Value>
+            + Send
+            + 'static,
+    ) -> Result<
+        (
+            serde_json::Value,
+            crate::runtime::resources::MemoryReservation,
+        ),
+        JsonReadFailure,
+    > {
         let storage = self.clone();
         let estimate = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&storage.path)?;
@@ -327,10 +389,9 @@ impl StoredBody {
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&storage.path)
                 .map_err(|error| JsonReadFailure::Invalid(error.to_string()))?;
-            let payload =
-                serde_json::from_reader(std::io::BufReader::new(file)).map_err(|error| {
-                    JsonReadFailure::Invalid(format!("invalid JSON request body: {error}"))
-                })?;
+            let payload = parse(std::io::BufReader::new(file)).map_err(|error| {
+                JsonReadFailure::Invalid(format!("invalid JSON request body: {error}"))
+            })?;
             reservation.materialize();
             Ok((payload, reservation))
         })

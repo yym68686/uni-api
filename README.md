@@ -333,16 +333,20 @@ yym68686/uni-api:latest
 
 ### Gemini Interactions (`POST /v1/interactions`)
 
-This native route accepts stateless text requests, for example
-`{"model":"your-gemini-alias","input":"Hello","stream":false}`.
-`input` can also be an array of text parts or native `user_input` and
-`model_output` steps whose `content` contains only text parts, e.g.
-`[{"type":"user_input","content":[{"type":"text","text":"Hello"}]}]`.
+This route forwards the original JSON body from the caller to a native
+Gemini Interactions provider. Use a configured upstream model name and
+explicitly opt out of storage, for example
+`{"model":"gemini-3.1-flash-lite","input":"Hello","stream":false,"store":false}`.
+The gateway does not add defaults, rewrite model aliases, or apply channel
+body overrides. It preserves native `input` steps, `tools`, and
+`generation_config.tool_choice`. For stateless function calling, send the
+upstream steps and the client's `function_result` in the next request.
 Use a uni-api key with `x-goog-api-key` or `Authorization: Bearer …`.
 `"stream":true` returns native SSE; normal responses return native JSON.
-Only one upstream attempt is made, with `store:false`. Interaction
-lookup/continuation/deletion, background execution, agents, tools, non-text
-input/output, and custom service tiers are not supported.
+Only one upstream attempt is made. The gateway rejects omitted or enabled
+`store` instead of inserting a default. Stored interaction operations,
+background execution, agents, non-text response formats, and custom service
+tiers remain outside this gateway's contract.
 
 For Google's HTTPS Developer API origin, `engine: gemini` uses upstream
 `/v1/interactions` without changing existing `/v1beta/models` routes. An
@@ -356,8 +360,9 @@ preferences:
   gemini_interactions_version: v1
 ```
 
-This sends Interactions to `/prefix/v1/interactions`. The model is mapped
-using the provider's existing aliases. To test locally, build with
+This sends Interactions to `/prefix/v1/interactions`. Configure literal
+upstream model names for this endpoint; alias mappings remain available on
+other gateway endpoints. To test locally, build with
 `cargo build --locked` and run
 `python3 tests/http/verify_gemini_interactions.py target/debug/uni-api-front`.
 

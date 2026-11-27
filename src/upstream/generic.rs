@@ -605,9 +605,8 @@ pub(crate) async fn run_hedged_attempt_loop(
                     response_completed: collected_outcome
                         .as_ref()
                         .map(|v| v["kind"] == "completed"),
-                    is_flagged: collected_outcome
-                        .as_ref()
-                        .is_some_and(|v| v["kind"] != "completed"),
+                    is_flagged: collected_outcome.is_some()
+                        && !final_facts.terminal.successful_turn(),
                     stream: context.downstream_stream,
                     status: status.as_u16(),
                     request_id: execution.request_id.clone(),
@@ -1440,9 +1439,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     upstream_model: original_model.clone(),
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
-                    success: collected_outcome
-                        .as_ref()
-                        .is_none_or(|v| v["kind"] == "completed"),
+                    success: collected_outcome.is_none() || final_facts.terminal.successful_turn(),
                     endpoint: path.clone(),
                     stream: downstream_stream,
                 });
@@ -1805,18 +1802,9 @@ pub(crate) async fn send_attempt(
         request = request.timeout(timeout);
     }
     request = match std::mem::replace(&mut prepared.body, AttemptBody::Empty) {
-        // With this reqwest version a streaming body is not replayable even
-        // by transport-level retries (e.g. HTTP/2 REFUSED_STREAM).
-        AttemptBody::Json(body) if interactions => {
-            let length = body.len();
-            request
-                .header("content-length", length)
-                .body(reqwest::Body::wrap_stream(futures_util::stream::once(
-                    async move { Ok::<_, std::io::Error>(Bytes::from(body)) },
-                )))
-        }
         AttemptBody::Json(body) => request.body(Bytes::from(body)),
         AttemptBody::Replay(storage, observation) => {
+            let wire_bytes = observation.body_bytes;
             let body = storage
                 .into_body(&observation)
                 .await
@@ -1827,6 +1815,11 @@ pub(crate) async fn send_attempt(
                     upstream_url: prepared.url.clone(),
                     response: None,
                 })?;
+            // Keep the original length but use a non-replayable stream so
+            // transport-level retries cannot repeat an Interactions POST.
+            if interactions {
+                request = request.header("content-length", wire_bytes);
+            }
             request.body(reqwest::Body::wrap_stream(body.into_data_stream()))
         }
         AttemptBody::MultipartRewrite {

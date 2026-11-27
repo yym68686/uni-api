@@ -10,12 +10,11 @@ const GOOGLE_HOST: &str = "generativelanguage.googleapis.com";
 pub(crate) const VERSION: &str = "gemini_interactions_version";
 
 pub(crate) fn supports_model(provider: &Provider, model: &str) -> bool {
-    let conversational = crate::providers::codex::models::is_conversational_model;
-    conversational(model)
+    crate::providers::codex::models::is_conversational_model(model)
         && provider
             .models
             .get(model)
-            .is_some_and(|upstream| conversational(upstream))
+            .is_some_and(|upstream| upstream == model)
 }
 
 pub(crate) fn upstream_url(provider: &Provider) -> Option<Url> {
@@ -64,23 +63,26 @@ pub(crate) fn upstream_url(provider: &Provider) -> Option<Url> {
     Some(url)
 }
 
+pub(crate) struct RequestEntity<'a> {
+    pub(crate) metadata: &'a Value,
+    pub(crate) body: AttemptBody,
+    pub(crate) content_type: &'a str,
+}
+
 pub(crate) fn prepare(
     provider: &Provider,
     key: &str,
     model: &str,
     upstream_model: &str,
-    payload: Option<&Value>,
+    entity: RequestEntity<'_>,
     request_id: &str,
 ) -> Result<PreparedAttempt, String> {
     let url = upstream_url(provider).ok_or("Provider does not support Interactions")?;
-    if !supports_model(provider, model) {
-        return Err("Interactions requires a text generation model".into());
+    if upstream_model != model || !supports_model(provider, model) {
+        return Err("Interactions passthrough requires the configured upstream model name".into());
     }
-    let mut payload = payload.cloned().ok_or("Interactions requires JSON")?;
-    interactions::validate(&payload)?;
-    let stream = payload["stream"].as_bool().unwrap_or(false);
-    super::request::set_model(&mut payload, upstream_model)?;
-    payload["store"] = Value::Bool(false);
+    interactions::validate(entity.metadata)?;
+    let stream = entity.metadata["stream"].as_bool().unwrap_or(false);
     // Provider header settings may supply proxy-specific headers, but no caller
     // credentials, cookies, settlement metadata or arbitrary header forwarding.
     let mut headers = provider_headers(
@@ -101,7 +103,11 @@ pub(crate) fn prepare(
     ] {
         headers.remove(name);
     }
-    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "content-type",
+        HeaderValue::from_str(entity.content_type)
+            .map_err(|_| "Invalid Interactions Content-Type")?,
+    );
     headers.insert(
         "accept",
         HeaderValue::from_static(if stream {
@@ -119,9 +125,7 @@ pub(crate) fn prepare(
         method: Method::POST,
         url: url.into(),
         headers,
-        body: AttemptBody::Json(
-            serde_json::to_vec(&payload).map_err(|_| "Invalid Interactions JSON")?,
-        ),
+        body: entity.body,
         adapter: ResponseAdapter::Passthrough,
         downstream_stream: stream,
         upstream_stream: stream,

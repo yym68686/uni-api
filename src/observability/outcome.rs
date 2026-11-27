@@ -6,6 +6,7 @@ use serde_json::Value;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TerminalKind {
     Completed,
+    RequiresAction,
     Incomplete,
     SemanticFailure,
     ProtocolError,
@@ -20,6 +21,7 @@ impl TerminalKind {
     pub fn parse(kind: &str) -> Self {
         match kind {
             "completed" => Self::Completed,
+            "requires_action" => Self::RequiresAction,
             "incomplete" => Self::Incomplete,
             "semantic_error" | "semantic_failure" | "failed" => Self::SemanticFailure,
             "protocol_error" => Self::ProtocolError,
@@ -33,6 +35,7 @@ impl TerminalKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::RequiresAction => "requires_action",
             Self::Incomplete => "incomplete",
             Self::SemanticFailure => "semantic_failure",
             Self::ProtocolError => "protocol_error",
@@ -42,6 +45,10 @@ impl TerminalKind {
             Self::Rejected => "rejected",
             Self::Unknown => "unknown",
         }
+    }
+
+    pub fn successful_turn(self) -> bool {
+        matches!(self, Self::Completed | Self::RequiresAction)
     }
 }
 

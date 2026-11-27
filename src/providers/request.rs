@@ -69,18 +69,36 @@ pub(crate) fn preview_channel_request(
         default_model: String::new(),
         content_type: "application/json".into(),
     };
-    let attempt = build_attempt(
-        provider,
-        "preview-key",
-        model,
-        upstream,
-        &Method::POST,
-        &uri,
-        endpoint,
-        &HeaderMap::new(),
-        &input,
-        "preview",
-    )?;
+    let attempt = if crate::protocols::interactions::is_route(endpoint) {
+        // This administrative preview has already parsed its nested sample.
+        // Live requests must take the raw request spool path in build_attempt.
+        let payload = input.payload.as_ref().ok_or("Interactions requires JSON")?;
+        super::interactions::prepare(
+            provider,
+            "preview-key",
+            model,
+            upstream,
+            super::interactions::RequestEntity {
+                metadata: payload,
+                body: AttemptBody::Json(serde_json::to_vec(payload).map_err(|e| e.to_string())?),
+                content_type: "application/json",
+            },
+            "preview",
+        )?
+    } else {
+        build_attempt(
+            provider,
+            "preview-key",
+            model,
+            upstream,
+            &Method::POST,
+            &uri,
+            endpoint,
+            &HeaderMap::new(),
+            &input,
+            "preview",
+        )?
+    };
     let body = match attempt.body {
         AttemptBody::Json(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
         _ => Value::Null,
@@ -123,12 +141,20 @@ pub(crate) fn build_attempt(
         return Err("Provider does not support this endpoint".into());
     }
     if crate::protocols::interactions::is_route(path) {
+        let (storage, observation) = input
+            .replay
+            .as_ref()
+            .ok_or("Missing original Interactions request body")?;
         return super::interactions::prepare(
             provider,
             provider_key,
             request_model,
             original_model,
-            input.payload.as_ref(),
+            super::interactions::RequestEntity {
+                metadata: input.payload.as_ref().ok_or("Interactions requires JSON")?,
+                body: AttemptBody::Replay(storage.clone_for_replay(), observation.clone()),
+                content_type: &input.content_type,
+            },
             request_id,
         );
     }
