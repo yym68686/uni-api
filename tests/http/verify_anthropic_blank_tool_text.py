@@ -135,7 +135,8 @@ def main(binary):
                                 "messages": [{"role": "assistant", "content": content}]}
                         server.hits = []
                         status, raw = request('/v1/messages', body)
-                        assert status == 400 and b'ValidationException' in raw, (status, raw)
+                        assert status == 400 and json.loads(raw)['error']['code'] == 'upstream_invalid_request', (status, raw)
+                        assert b'ValidationException' not in raw, raw
                         assert len(server.hits) == 1 and server.hits[0][1]['messages'] == body['messages']
                         count += 1
                 # Converted OpenAI tool turns are cleaned only at the Claude wire boundary.

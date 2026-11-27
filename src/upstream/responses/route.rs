@@ -19,13 +19,10 @@ use crate::upstream::hedging::HedgingConfig;
 use crate::upstream::responses::Plan;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Response};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use url::Url;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeAttemptObservation {
@@ -37,7 +34,6 @@ pub(crate) struct NativeAttemptObservation {
     pub(crate) request_model: String,
     pub(crate) actual_model: String,
     pub(crate) wire_model: Option<String>,
-    pub(crate) upstream_host: String,
     pub(crate) stream: bool,
     pub(crate) snapshot_revision: String,
     pub(crate) started_at: tokio::time::Instant,
@@ -294,17 +290,6 @@ impl ResponsesRoute {
         self.last_status
     }
 
-    pub fn response_detail(&self) -> String {
-        if self.last_provider_model_unavailable {
-            format!(
-                "All configured providers failed for model {}",
-                self.request_model
-            )
-        } else {
-            self.last_detail.clone()
-        }
-    }
-
     pub fn has_attempts_remaining(&self) -> bool {
         self.upstream_attempts < crate::routing::unknown_400::MAX_UPSTREAM_ATTEMPTS
             && self.cursor
@@ -480,7 +465,6 @@ impl ResponsesRoute {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                upstream_host: upstream_host(&provider.base_url),
                 stream: self.stream,
                 snapshot_revision: self.snapshot.revision.to_string(),
                 started_at: tokio::time::Instant::now(),
@@ -702,11 +686,6 @@ impl ResponsesRoute {
     }
 
     pub fn final_message(&mut self) -> Value {
-        let detail = if self.last_detail.is_empty() {
-            format!("All {} providers failed", self.request_model)
-        } else {
-            self.response_detail()
-        };
         let status = if self.last_status == 0 {
             502
         } else {
@@ -716,7 +695,6 @@ impl ResponsesRoute {
         json!({
             "kind": "final",
             "status_code": status,
-            "body_b64": BASE64.encode(detail.as_bytes()),
         })
     }
 
@@ -841,7 +819,6 @@ impl ResponsesRoute {
                 "attempt_index": attempt.attempt_index,
                 "provider": attempt.provider,
                 "actual_model": attempt.actual_model,
-                "upstream_host": attempt.upstream_host,
             "downstream_stream": attempt.stream,
             "upstream_stream": outcome.get("upstream_stream").and_then(Value::as_bool).unwrap_or(attempt.stream),
                 "status_code": status,
@@ -884,13 +861,11 @@ impl ResponsesRoute {
             "failure_reason": if success { None } else { metric_failure_reason(attempt_outcome, outcome) },
             "provider_model_unavailable": provider_model_unavailable,
             "status_origin": failure_origin(outcome),
-            "error": crate::observability::request_trace::error_fields(detail.as_bytes(), &[self.last_provider_key.as_deref().unwrap_or_default(), self.api_key.token.as_ref()]),
             "error_sha256": error_sha256,
             "duration_ms": duration_ms,
             "transport_timing": outcome.get("transport_timing"),
             "response_created_ms": outcome.get("response_created_ms"),
             "first_text_ms": outcome.get("first_text_ms"),
-            "upstream_host": attempt.upstream_host,
             "downstream_stream": attempt.stream,
             "upstream_stream": outcome.get("upstream_stream").and_then(Value::as_bool).unwrap_or(attempt.stream),
             "streaming": attempt.stream,
@@ -1004,7 +979,16 @@ impl ResponsesRoute {
             model: self.request_model.clone(),
             api_key: self.api_key.token.to_string(),
             is_flagged: !success || status >= 400,
-            text: detail.chars().take(4096).collect(),
+            text: if success {
+                String::new()
+            } else {
+                crate::transport::upstream_error::PublicError::new(
+                    axum::http::StatusCode::from_u16(status)
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                )
+                .message()
+                .into()
+            },
             prompt_tokens,
             completion_tokens,
             total_tokens,
@@ -1154,13 +1138,6 @@ pub(crate) fn client_ip(headers: &HeaderMap) -> String {
 pub(crate) use crate::providers::responses::{
     build_headers, compile_payload, normalize_upstream_url, provider_stream_override,
 };
-
-pub(crate) fn upstream_host(base_url: &str) -> String {
-    Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default()
-}
 
 pub(crate) fn outcome_status(outcome: &Value, fallback: u16) -> u16 {
     outcome_status_from(

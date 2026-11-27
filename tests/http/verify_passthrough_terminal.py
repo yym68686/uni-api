@@ -98,12 +98,14 @@ def verify(binary):
                         assert response.status == 200, (case, response.status)
                         wire = b''
                         if case.endswith(('close', 'cancel')):
-                            marker = b'OK' if case.endswith('cancel') else b'fixture failure' if '-error-' in case else b'message_stop' if kind == 'claude' else b'[DONE]'
+                            marker = b'OK' if case.endswith('cancel') else b'"error"' if '-error-' in case else b'message_stop' if kind == 'claude' else b'[DONE]'
                             while marker not in wire or not wire.endswith(b'\n\n'):
                                 part = response.read(1)
                                 if not part: break
                                 wire += part
                             assert marker in wire, (case, wire)
+                            if '-error-' in case:
+                                assert b'fixture failure' not in wire, (case, wire)
                         else: wire = response.read()
                         response.close(); conn.close()
                     deadline = time.monotonic() + 8

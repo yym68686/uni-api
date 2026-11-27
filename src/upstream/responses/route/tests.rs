@@ -1795,12 +1795,13 @@ async fn local_cooldown_skip_does_not_overwrite_last_upstream_failure() {
     assert!(route.next_plan().await.unwrap().is_none());
 
     assert_eq!(route.last_status(), 503);
-    assert_eq!(route.response_detail(), "no available token");
+    assert_eq!(route.last_detail, "no available token");
     assert_eq!(route.routing_attempts, 2);
     assert_eq!(route.routing_skips, 1);
     assert_eq!(route.upstream_attempts, 1);
     let final_message = route.final_message();
     assert_eq!(final_message["status_code"], 503);
+    assert!(final_message.get("body_b64").is_none());
     assert!(route.final_emitted);
 }
 

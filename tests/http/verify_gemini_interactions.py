@@ -19,7 +19,8 @@ SSE_BODY = (
     b'event: step.delta\r\ndata: {"event_type":"step.delta","delta":{"type":"text","text":"hello"}}\r\n\r\n'
     b'event: interaction.completed\r\ndata: {"interaction":' + JSON_BODY + b'}\r\n\r\n'
 )
-GOOGLE_ERROR = b'{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "fixture"}}'
+FAKE_URL = "https://private-fixture.invalid/model?key=opaque%2Ffixture%2Bkey"
+FAKE_KEY = "opaque/fixture+key"
 TEXT_STEPS = [
     {"type": "user_input", "content": [{"type": "text", "text": "你好"}]},
     {"type": "model_output", "content": [{"type": "text", "text": "Hello"}]},
@@ -38,19 +39,31 @@ class Upstream(BaseHTTPRequestHandler):
         if urlsplit(self.path).path.endswith(":generateContent"):
             body = b'{"candidates":[{"content":{"role":"model","parts":[{"text":"legacy"}]},"finishReason":"STOP"}]}'
         elif payload["input"] == "quota":
-            status, body = 429, GOOGLE_ERROR
+            status, body = 429, json.dumps({"error": {"code":429, "message": FAKE_URL},
+                                           "debug": FAKE_KEY}).encode()
         elif payload["input"] == "redirect":
             status, body = 307, b""
         elif payload["input"] == "invalid":
             body = b"null"
         elif payload["input"] == "wrong-content-type":
             pass
+        elif payload["input"] == "stream-error":
+            media = "text/event-stream"
+            body = SSE_BODY.split(b"event: interaction.completed", 1)[0] + (
+                b"event: error\r\ndata: " + json.dumps({"event_type":"error",
+                    "error":{"code":503, "message": FAKE_URL}, "debug": FAKE_KEY}).encode()
+                + b"\r\n\r\n")
         elif payload.get("stream"):
             media, body = "text/event-stream; charset=utf-8", SSE_BODY
         self.send_response(status)
         self.send_header("Content-Type", media)
         if status == 307:
-            self.send_header("Location", "/do-not-follow")
+            self.send_header("Location", FAKE_URL)
+        if status >= 300 or payload.get("input") == "stream-error":
+            self.send_header("Set-Cookie", FAKE_KEY)
+            self.send_header("X-Upstream-Debug", FAKE_URL)
+        if status == 429:
+            self.send_header("Retry-After", "17")
         self.end_headers()
         for offset in range(0, len(body), 13):
             self.wfile.write(body[offset:offset + 13])
@@ -74,6 +87,9 @@ def verify(binary):
               for name in ("primary", "fallback")],
             {"provider": "legacy", "engine": "gemini", "base_url": base + "/legacy/v1beta",
              "api": "fixture-provider", "model": ["legacy-model", {"wire-model": "alias"}]},
+            {"provider": "closed-fixture", "engine": "gemini",
+             "base_url": f"http://127.0.0.1:{free_port()}/private-fixture/v1beta",
+             "api": FAKE_KEY, "model": ["closed-fixture"]},
         ]}
         (root / "config.json").write_text(json.dumps(config))
         env = {k: v for k, v in os.environ.items() if not k.startswith(("FACTS_", "UNI_API_CONTROL_RESTORE_", "OTEL_", "FUGUE_OTEL_")) and k != "CONFIG_URL"}
@@ -126,7 +142,8 @@ def verify(binary):
                 catalog_status, _, catalog = call("/v1/model-channels?endpoint=%2Fv1%2Finteractions", bearer=True)
                 assert catalog_status == 200
                 assert {(row["model"], row["interactions_mode"]) for row in json.loads(catalog)["data"]} == {
-                    ("alias", "native"), ("alias", "translated"), ("legacy-model", "translated")
+                    ("alias", "native"), ("alias", "translated"), ("legacy-model", "translated"),
+                    ("closed-fixture", "translated"),
                 }, catalog
                 assert not upstream.hits
                 for changes, status, expected in [
@@ -137,13 +154,19 @@ def verify(binary):
                                           "schema": {"type": "object"}}}, 200, JSON_BODY),
                     ({"response_format": [{"type": "text", "mime_type": "application/json",
                                            "schema": {"type": "object"}}]}, 200, JSON_BODY),
-                    ({"input": "quota"}, 429, GOOGLE_ERROR), ({"input": "invalid"}, 502, None),
+                    ({"input": "quota"}, 429, None), ({"input": "invalid"}, 502, None),
                     ({"input": "wrong-content-type", "stream": True}, 502, None),
                     ({"input": "redirect"}, 307, None),
                 ]:
                     upstream.hits.clear()
                     result, headers, raw = call(path + "?key=fixture-client", {**request, **changes}, key=False)
                     assert result == status and (expected is None or raw == expected), (result, raw)
+                    if status == 429:
+                        assert json.loads(raw)["error"] == {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                            "message": "The upstream service rate limit was reached"}, raw
+                        assert {k.lower(): v for k, v in headers.items()}["retry-after"] == "17"
+                    surface = raw.decode() + repr(headers)
+                    assert not any(secret in surface for secret in ["private-fixture", "opaque%2F", FAKE_KEY]), surface
                     assert "location" not in {k.lower() for k in headers}
                     assert len(upstream.hits) == 1, upstream.hits
                     route, body, wire = upstream.hits[0]
@@ -151,6 +174,19 @@ def verify(binary):
                     assert body == {**request, **changes, "model": "wire-model", "store": False}, body
                     assert wire["x-goog-api-key"] == "fixture-provider"
                     assert not set(wire) & {"authorization", "cookie", "idempotency-key"}
+                upstream.hits.clear()
+                status, headers, raw = call(path, {**request, "input": "stream-error", "stream": True})
+                assert status == 200 and b"hello" in raw and b"UNAVAILABLE" in raw, (status, raw)
+                assert b"interaction.completed" not in raw
+                assert not any(secret in raw.decode() + repr(headers)
+                               for secret in ["private-fixture", "opaque%2F", FAKE_KEY])
+                status, headers, raw = call(path, {"model": "closed-fixture", "input": "hello", "stream": True})
+                assert status == 502 and json.loads(raw)["error"]["code"] == 502, (status, raw)
+                assert not any(secret in raw.decode() + repr(headers)
+                               for secret in ["private-fixture", "opaque%2F", FAKE_KEY, "key="])
+                log.flush()
+                assert not any(secret in (root / "gateway.log").read_text()
+                               for secret in ["private-fixture", "opaque%2F", FAKE_KEY])
                 upstream.hits.clear()
                 status, headers, raw = call(path, {**request, "stream": "not-a-boolean",
                     "tools": [{"type": "function", "name": "optional"}]})

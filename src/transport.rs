@@ -4,3 +4,4 @@ pub(crate) mod http;
 mod json_memory;
 pub(crate) mod multipart;
 pub(crate) mod spool;
+pub(crate) mod upstream_error;

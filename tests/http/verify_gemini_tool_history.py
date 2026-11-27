@@ -191,12 +191,14 @@ def verify(binary):
                             cases += 1
                         server.mode = 'error'
                         status, raw = call(endpoint, {collection: [{'role': 'user', 'content': 'start'}]})
-                        assert status == 400 and json.loads(raw)['error']['param'] == 'contents[1]', raw
+                        assert status == 400 and json.loads(raw)['error']['code'] == 'upstream_invalid_request', raw
+                        assert b'contents[1]' not in raw and b'fixture rejection' not in raw, raw
                         cases += 1
                         server.mode = 'postcommit'
                         before = len(server.hits)
                         status, raw = call(endpoint, {'stream': True, collection: [{'role': 'user', 'content': 'start'}]})
-                        assert status == 200 and b'partial text' in raw and b'specific_fixture_code' in raw and b'contents[1]' in raw, raw
+                        assert status == 200 and b'partial text' in raw and b'"error"' in raw, raw
+                        assert b'specific_fixture_code' not in raw and b'contents[1]' not in raw, raw
                         assert len(server.hits) == before + 1
                         if collection == 'input': assert b'response.failed' in raw and b'response.completed' not in raw
                         cases += 1

@@ -570,14 +570,15 @@ pub(crate) fn chat_prompt_block(value: &Value) -> Option<ChatResponseError> {
         return None;
     }
     // Preserve the reason enum, not the upstream's free-form feedback.
-    let reason = if reason.len() <= 64
-        && reason
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-    {
-        reason
-    } else {
-        "UNKNOWN"
+    let reason = match reason {
+        "SAFETY" => "SAFETY",
+        "OTHER" => "OTHER",
+        "BLOCKLIST" => "BLOCKLIST",
+        "PROHIBITED_CONTENT" => "PROHIBITED_CONTENT",
+        "IMAGE_SAFETY" => "IMAGE_SAFETY",
+        "MODEL_ARMOR" => "MODEL_ARMOR",
+        "JAILBREAK" => "JAILBREAK",
+        _ => "UNKNOWN",
     };
     Some(ChatResponseError {
         status: 400,

@@ -542,7 +542,7 @@ pub(crate) async fn run_moderation_preflight(
                 return Ok(());
             }
             Err(failure) => {
-                last_error = json_error(failure.status, &failure.detail);
+                last_error = crate::transport::upstream_error::response(failure.status);
             }
         }
     }

@@ -67,7 +67,11 @@ impl SseDecoder {
         observed_bytes > self.max_event_bytes
     }
 
-    pub(crate) fn feed(&mut self, mut chunk: &[u8]) -> Result<Vec<SseFrame>, String> {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, String> {
+        self.feed_inner(chunk, false)
+    }
+
+    fn feed_inner(&mut self, mut chunk: &[u8], eof: bool) -> Result<Vec<SseFrame>, String> {
         let mut frames = Vec::new();
         loop {
             // Do not copy an arbitrarily large transport chunk before checking the
@@ -80,7 +84,7 @@ impl SseDecoder {
             self.buffer.extend_from_slice(&chunk[..consumed]);
             chunk = &chunk[consumed..];
             while let Some((end, delimiter_len)) =
-                find_event_delimiter_from(&self.buffer, self.scan_from)
+                find_event_delimiter_from(&self.buffer, self.scan_from, eof)
             {
                 if self.exceeds_event_limit(end) {
                     return Err("Responses upstream SSE event exceeds the configured limit".into());
@@ -109,7 +113,7 @@ impl SseDecoder {
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<SseFrame>, String> {
-        let mut frames = self.feed(&[])?;
+        let mut frames = self.feed_inner(&[], true)?;
         if !self.buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
             if self.exceeds_event_limit(self.buffer.len()) {
                 return Err("Responses upstream SSE event exceeds the configured limit".into());
@@ -127,18 +131,28 @@ impl SseDecoder {
     }
 }
 
-pub(crate) fn find_event_delimiter_from(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+fn find_event_delimiter_from(bytes: &[u8], start: usize, eof: bool) -> Option<(usize, usize)> {
     let mut index = start.min(bytes.len());
     while index < bytes.len() {
         let relative = memchr2(b'\r', b'\n', &bytes[index..])?;
         index += relative;
-        if bytes[index..].starts_with(b"\r\n\r\n") {
-            return Some((index, 4));
+        let first = if bytes[index..].starts_with(b"\r\n") {
+            2
+        } else {
+            1
+        };
+        let tail = &bytes[index + first..];
+        match tail.first() {
+            Some(b'\n') => return Some((index, first + 1)),
+            Some(b'\r') if tail.len() > 1 => {
+                return Some((index, first + if tail[1] == b'\n' { 2 } else { 1 }));
+            }
+            Some(b'\r') if eof => return Some((index, first + 1)),
+            // The next chunk may complete the second CRLF.
+            Some(b'\r') | None => return None,
+            _ => {}
         }
-        if bytes[index..].starts_with(b"\n\n") || bytes[index..].starts_with(b"\r\r") {
-            return Some((index, 2));
-        }
-        index += 1;
+        index += first;
     }
     None
 }
@@ -146,6 +160,7 @@ pub(crate) fn find_event_delimiter_from(bytes: &[u8], start: usize) -> Option<(u
 pub(crate) fn parse_sse_frame(frame: &SseFrame) -> Result<ParsedSseFrame, String> {
     let text = std::str::from_utf8(frame.raw())
         .map_err(|_| "Responses upstream SSE event is not valid UTF-8".to_owned())?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let normalized = if text.as_bytes().contains(&b'\r') {
         text.replace("\r\n", "\n").replace('\r', "\n")
     } else {

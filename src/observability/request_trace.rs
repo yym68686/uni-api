@@ -104,9 +104,9 @@ fn emit(mut value: Value) {
     }
 }
 
-// Error fields are kept separate from arbitrary echoed body fields. Known
-// credentials are removed before token redaction; unstructured bodies stay out.
-pub(crate) fn error_fields(body: &[u8], secrets: &[&str]) -> Value {
+// Only known enum values may reach exported trace records. Never log an
+// upstream message, even if it does not look like a URL or credential.
+pub(crate) fn error_fields(body: &[u8]) -> Value {
     let Ok(root) = serde_json::from_slice::<Value>(body) else {
         return json!({});
     };
@@ -114,50 +114,25 @@ pub(crate) fn error_fields(body: &[u8], secrets: &[&str]) -> Value {
         .pointer("/response/error")
         .or_else(|| root.get("error"))
         .unwrap_or(&root);
-    let mut out = json!({});
-    for name in ["code", "type", "message"] {
-        if let Some(text) = error.get(name).and_then(Value::as_str) {
-            let mut clean = text.to_owned();
-            for secret in secrets.iter().filter(|s| !s.is_empty()) {
-                clean = clean.replace(secret, "[redacted]");
-            }
-            // Strip URLs (including credential query strings), email addresses,
-            // key/token-shaped words and long opaque identifiers.
-            let mut redact_next = false;
-            clean = clean
-                .split_whitespace()
-                .map(|word| {
-                    let lower = word.to_ascii_lowercase();
-                    let previous = redact_next;
-                    redact_next = matches!(
-                        lower.trim_matches([':', '"', '\'']),
-                        "bearer" | "authorization" | "api_key" | "token" | "password"
-                    );
-                    if previous
-                        || redact_next
-                        || word.contains("sk-")
-                        || lower.contains("api_key=")
-                        || lower.contains("token=")
-                        || lower.contains("password=")
-                        || word.contains("://")
-                        || word.contains('@')
-                        || word.len() > 96
-                    {
-                        "[redacted]"
-                    } else {
-                        word
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            out[format!("error_{name}")] = json!(clean
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(1024)
-                .collect::<String>());
+    match error.get("code").and_then(Value::as_str) {
+        Some(
+            code @ ("INSUFFICIENT_BALANCE"
+            | "gemini_tool_history"
+            | "gemini_part"
+            | "upstream_redirect"
+            | "upstream_invalid_request"
+            | "upstream_authentication_failed"
+            | "upstream_billing_error"
+            | "upstream_not_found"
+            | "upstream_timeout"
+            | "upstream_rate_limited"
+            | "upstream_unavailable"
+            | "upstream_error"),
+        ) => {
+            json!({"error_code":code})
         }
+        _ => json!({}),
     }
-    out
 }
 
 pub(crate) struct RequestTrace {
@@ -165,7 +140,6 @@ pub(crate) struct RequestTrace {
     trace_id: String,
     endpoint: String,
     key_id: String,
-    caller_secret: String,
     started: Instant,
     status: u16,
     done: bool,
@@ -185,7 +159,6 @@ impl RequestTrace {
                 crate::routing::catalog::key_id(&key)
             },
             started: Instant::now(),
-            caller_secret: key,
             status: 0,
             done: false,
         };
@@ -250,7 +223,7 @@ impl HttpBody for ObservedBody {
             if matches!(&result, Poll::Ready(None))
                 || (matches!(&result, Poll::Ready(Some(_))) && self.inner.is_end_stream())
             {
-                let detail = error_fields(&self.error_body, &[&self.trace.caller_secret]);
+                let detail = error_fields(&self.error_body);
                 if detail.as_object().is_some_and(|v| !v.is_empty()) {
                     self.trace.record("gateway_error", detail);
                 }
@@ -279,7 +252,7 @@ mod tests {
     use super::*;
     #[test]
     fn errors_exclude_body_fields_and_credentials() {
-        let error = error_fields(br#"{"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance secret-value sk-secret https://test/?token=secret Bearer opaque-secret"},"input":"private prompt","api_key":"secret-value"}"#, &["secret-value"]);
+        let error = error_fields(br#"{"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance secret-value sk-secret https://test/?token=secret Bearer opaque-secret"},"input":"private prompt","api_key":"secret-value"}"#);
         let text = error.to_string();
         assert_eq!(error["error_code"], "INSUFFICIENT_BALANCE");
         for forbidden in [
@@ -291,7 +264,7 @@ mod tests {
         ] {
             assert!(!text.contains(forbidden));
         }
-        assert!(error_fields(b"not json with secrets", &[])
+        assert!(error_fields(b"not json with secrets")
             .as_object()
             .unwrap()
             .is_empty());

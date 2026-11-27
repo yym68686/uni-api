@@ -309,7 +309,8 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(response.headers()["x-test"], "same");
+        assert!(!response.headers().contains_key("x-test"));
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
         assert!(matches!(
             outcome.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)

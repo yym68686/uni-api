@@ -109,7 +109,7 @@ fn upstream_body_error(error: reqwest::Error) -> io::Error {
             "upstream body total timeout exceeded",
         )
     } else {
-        io::Error::other(error)
+        io::Error::other(super::upstream_error::transport_reason(&error))
     }
 }
 

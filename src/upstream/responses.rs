@@ -21,6 +21,7 @@ use crate::runtime::context::AppState;
 use crate::runtime::idempotency;
 use crate::transport::http::filtered_response_headers;
 use crate::transport::http::json_error;
+use crate::transport::upstream_error::{self, PublicError};
 use crate::upstream::hedging::HedgeEvent;
 use crate::upstream::hedging::HedgeScheduler;
 use crate::upstream::hedging::HedgeTrigger;
@@ -359,12 +360,12 @@ pub async fn serve_native(
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
                 route.emit_final_response(status.as_u16(), "native_hedge_exhausted");
                 release_owner(&mut idempotency_owner).await;
-                return json_error(status, &route.response_detail());
+                return upstream_error::response(status);
             }
             Err(error) => {
                 route.emit_internal_failure(502, "native_hedge_error", &error);
                 release_owner(&mut idempotency_owner).await;
-                return json_error(StatusCode::BAD_GATEWAY, &error);
+                return upstream_error::response(StatusCode::BAD_GATEWAY);
             }
         }
     }
@@ -376,7 +377,7 @@ pub async fn serve_native(
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
                 route.emit_final_response(status.as_u16(), "native_route_exhausted");
                 release_owner(&mut idempotency_owner).await;
-                return json_error(status, &route.response_detail());
+                return upstream_error::response(status);
             }
             Err(error) if error == "native-codex-oauth-fallback" => {
                 route.emit_internal_failure(502, "native_codex_oauth_fallback", &error);
@@ -389,7 +390,7 @@ pub async fn serve_native(
             Err(error) => {
                 route.emit_internal_failure(400, "native_plan_error", &error);
                 release_owner(&mut idempotency_owner).await;
-                return json_error(StatusCode::BAD_REQUEST, &error);
+                return upstream_error::response(StatusCode::BAD_REQUEST);
             }
         };
         match preflight_attempt(&state, plan.clone(), false).await {
@@ -413,7 +414,7 @@ pub async fn serve_native(
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(status, &route.response_detail());
+                    return upstream_error::response(status);
                 }
             }
             Ok(PreflightResult::HttpError(plan, outcome)) => {
@@ -422,7 +423,7 @@ pub async fn serve_native(
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(status, &route.response_detail());
+                    return upstream_error::response(status);
                 }
             }
             Err(error) => {
@@ -435,7 +436,7 @@ pub async fn serve_native(
                 if !route.record_plan_failure(plan, &outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
+                    return upstream_error::response(StatusCode::BAD_GATEWAY);
                 }
             }
         }
@@ -455,12 +456,12 @@ async fn serve_native_nonstream(
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
                 route.emit_final_response(status.as_u16(), "native_route_exhausted");
                 release_owner(&mut idempotency_owner).await;
-                return json_error(status, &route.response_detail());
+                return upstream_error::response(status);
             }
             Err(error) => {
                 route.emit_internal_failure(400, "native_plan_error", &error);
                 release_owner(&mut idempotency_owner).await;
-                return json_error(StatusCode::BAD_REQUEST, &error);
+                return upstream_error::response(StatusCode::BAD_REQUEST);
             }
         };
         match send_native_nonstream_attempt(&state, &plan).await {
@@ -481,10 +482,24 @@ async fn serve_native_nonstream(
                         }
                         route.emit_final_response(502, "failed_before_commit");
                         release_owner(&mut idempotency_owner).await;
-                        return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
+                        return upstream_error::response(StatusCode::BAD_GATEWAY);
                     }
                 }
                 if let Some(payload) = payload.as_mut() {
+                    if upstream_error::is_error(payload) {
+                        let semantic = upstream_error::semantic_status(payload);
+                        let outcome = json!({"kind":"semantic_error", "status_code":semantic.as_u16(),
+                            "upstream_status_code":status.as_u16(), "detail":payload.to_string(),
+                            "committed":false});
+                        if route.record_plan_failure(plan, &outcome).await {
+                            continue;
+                        }
+                        let final_status =
+                            StatusCode::from_u16(route.last_status()).unwrap_or(semantic);
+                        route.emit_final_response(final_status.as_u16(), "failed_before_commit");
+                        release_owner(&mut idempotency_owner).await;
+                        return upstream_error::response(final_status);
+                    }
                     let mut changed =
                         crate::protocols::responses::usage::normalize_payload(payload);
                     if plan.normalize_custom_tool_call_ids {
@@ -583,7 +598,7 @@ async fn serve_native_nonstream(
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(final_status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(final_status, &route.response_detail());
+                    return upstream_error::response(final_status);
                 }
             }
             Err(error) => {
@@ -598,7 +613,7 @@ async fn serve_native_nonstream(
                 if !route.record_plan_failure(plan, &outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
+                    return upstream_error::response(StatusCode::BAD_GATEWAY);
                 }
             }
         }
@@ -736,12 +751,9 @@ pub async fn serve_session(
 
     let mut message = match control_get_plan(&state, &session_id).await {
         Ok(message) => message,
-        Err(error) => {
+        Err(_) => {
             release_owner(&mut idempotency_owner).await;
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("Rust Responses control plan failed: {error}"),
-            );
+            return upstream_error::response(StatusCode::BAD_GATEWAY);
         }
     };
 
@@ -774,12 +786,9 @@ pub async fn serve_session(
                 );
                 message = match control_advance(&state, &session_id, &outcome).await {
                     Ok(next) => next,
-                    Err(error) => {
+                    Err(_) => {
                         release_owner(&mut idempotency_owner).await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Rust Responses retry coordination failed: {error}"),
-                        );
+                        return upstream_error::response(StatusCode::BAD_GATEWAY);
                     }
                 };
             }
@@ -792,12 +801,12 @@ pub async fn serve_session(
                     "precommit_events": active.stats.event_count,
                     "precommit_bytes": active.buffered_bytes(),
                 });
-                if let Err(error) = control_commit(&state, &session_id, &observation).await {
+                if control_commit(&state, &session_id, &observation)
+                    .await
+                    .is_err()
+                {
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("Rust Responses commit coordination failed: {error}"),
-                    );
+                    return upstream_error::response(StatusCode::BAD_GATEWAY);
                 }
                 let control_drain = control_response.take().map(|response| {
                     tokio::spawn(async move {
@@ -828,12 +837,9 @@ pub async fn serve_session(
                 });
                 message = match control_advance(&state, &session_id, &outcome).await {
                     Ok(next) => next,
-                    Err(control_error) => {
+                    Err(_) => {
                         release_owner(&mut idempotency_owner).await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Rust Responses preflight failed: {control_error}"),
-                        );
+                        return upstream_error::response(StatusCode::BAD_GATEWAY);
                     }
                 };
             }
@@ -2295,27 +2301,16 @@ async fn retry_after_public_start_python(
 }
 
 async fn send_final_inband(output: &mut OutputSink, message: &Value) -> Result<(), ()> {
-    if let Some(encoded) = message
-        .get("stream_failure_terminal_b64")
-        .and_then(Value::as_str)
-    {
-        if let Ok(wire) = BASE64.decode(encoded) {
-            return output.send_wire(Bytes::from(wire)).await;
-        }
-    }
     let status = message
         .get("status_code")
         .and_then(Value::as_u64)
-        .unwrap_or(502);
-    let detail = message
-        .get("body_b64")
-        .and_then(Value::as_str)
-        .and_then(|value| BASE64.decode(value).ok())
-        .map(|value| String::from_utf8_lossy(&value).chars().take(2048).collect())
-        .unwrap_or_else(|| "All Responses providers failed".to_owned());
+        .and_then(|n| u16::try_from(n).ok())
+        .and_then(|n| StatusCode::from_u16(n).ok())
+        .filter(|s| !s.is_success())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
     let error = json!({
         "type": "error",
-        "error": {"message": detail, "status_code": status},
+        "error": PublicError::new(status).object(),
     });
     let wire = encode_event("error", &error).map_err(|_| ())?;
     output.send_wire(wire).await?;
@@ -2697,15 +2692,24 @@ async fn response_from_final(
     let status = message
         .get("status_code")
         .and_then(Value::as_u64)
-        .and_then(|value| StatusCode::from_u16(value as u16).ok())
+        .and_then(|value| u16::try_from(value).ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
         .unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = Bytes::from(
+    if !status.is_success() {
+        if let Some(owner) = owner {
+            owner.release().await;
+        }
+        let mut response = upstream_error::response(status);
+        response.headers_mut().extend(control_headers.clone());
+        return response;
+    }
+    let body = upstream_error::clean_json_body(Bytes::from(
         message
             .get("body_b64")
             .and_then(Value::as_str)
             .and_then(|value| BASE64.decode(value).ok())
             .unwrap_or_default(),
-    );
+    ));
     let mut headers = HeaderMap::new();
     if let Some(values) = message.get("headers").and_then(Value::as_object) {
         for (name, value) in values {
@@ -2723,6 +2727,7 @@ async fn response_from_final(
             headers.append(name, value);
         }
     }
+    let mut headers = filtered_response_headers(&headers);
     for (name, value) in control_headers {
         headers.insert(name.clone(), value.clone());
     }

@@ -19,7 +19,6 @@ struct Receipt {
     status: u16,
     error_sha256: String,
     error_fields: Value,
-    secret: String,
     headers_ms: Option<i64>,
 }
 
@@ -66,7 +65,6 @@ impl BillingAttempt {
             r.base = billing_base(url);
             if !secret.is_empty() {
                 r.key_hash = hex::encode(Sha256::digest(secret.as_bytes()));
-                r.secret = secret.to_owned();
             }
         }
     }
@@ -92,8 +90,7 @@ impl BillingAttempt {
             if let Ok(mut r) = self.receipt.lock() {
                 if r.status == status {
                     r.error_sha256 = hex::encode(Sha256::digest(body));
-                    r.error_fields =
-                        crate::observability::request_trace::error_fields(body, &[&r.secret]);
+                    r.error_fields = crate::observability::request_trace::error_fields(body);
                 }
             }
         }

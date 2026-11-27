@@ -139,7 +139,8 @@ def verify(binary):
                         assert "stream" not in sent and "messages" not in sent
                 for error in (422, 429, 529):
                     status, headers, result = call("POST", "/v1/systemone", {"model": "jev-1.13.0", "state": {"error": error}, "questions": QUESTIONS})
-                    assert status == error and result == {"detail": "Fixture upstream failure"}, (status, result)
+                    assert status == error and result["error"]["status_code"] == error, (status, result)
+                    assert "Fixture upstream failure" not in json.dumps(result), result
                     if error in (429, 529):
                         assert next(v for k, v in headers.items() if k.lower() == "retry-after") == "17"
                 hits = len(upstream.hits)

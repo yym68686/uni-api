@@ -12,6 +12,7 @@ use crate::transport::http::CONTROL_HEADER;
 use crate::transport::spool::RequestSpool;
 use crate::transport::spool::SpoolFailure;
 use crate::transport::spool::SpoolObservation;
+use crate::transport::upstream_error::{self, PublicError};
 use crate::upstream::responses;
 use crate::upstream::responses::prepare::prepare_request;
 use crate::upstream::responses::route::ResponsesPreparation;
@@ -56,7 +57,11 @@ pub async fn handler(State(state): State<AppState>, mut request: Request) -> Res
     } else {
         None
     };
-    let mut response = handler_inner(state, request).await;
+    let mut response = upstream_error::sanitize_stream(
+        handler_inner(state, request).await,
+        interactions,
+        gemini.is_some(),
+    );
     if interactions {
         response = crate::protocols::gemini::wire_interactions_response(response).await;
     } else if gemini.is_some() || gemini_catalog {
@@ -261,7 +266,12 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
             let request = Request::from_parts(parts, body);
             let response = crate::api::gateway::handle(state, request, resource_wait).await;
             if let Some(owner) = owner {
-                return relay_idempotent_axum_response(response, owner).await;
+                return relay_idempotent_axum_response(
+                    response,
+                    owner,
+                    crate::protocols::gemini::route(&path).is_some(),
+                )
+                .await;
             }
             return response;
         }
@@ -353,7 +363,7 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
         if matches!(path.as_str(), "/v1/responses" | "/v1/responses/compact") {
             let response = crate::api::gateway::handle(state, request, resource_wait).await;
             if let Some(owner) = owner {
-                return relay_idempotent_axum_response(response, owner).await;
+                return relay_idempotent_axum_response(response, owner, false).await;
             }
             return response;
         }
@@ -371,17 +381,11 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
             }
             (Ok((response, None)), Some(owner)) => relay_idempotent_response(response, owner).await,
             (Ok((response, None)), None) => relay_response(response),
-            (Err(error), Some(owner)) => {
+            (Err(_), Some(owner)) => {
                 owner.release().await;
-                json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("Python control plane unavailable: {error}"),
-                )
+                upstream_error::response(StatusCode::BAD_GATEWAY)
             }
-            (Err(error), None) => json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("Python control plane unavailable: {error}"),
-            ),
+            (Err(_), None) => upstream_error::response(StatusCode::BAD_GATEWAY),
         };
     }
     if crate::api::gateway::supports(request.method(), &path) {
@@ -404,10 +408,7 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
                 relay_response(response)
             }
         }
-        Err(error) => json_error(
-            StatusCode::BAD_GATEWAY,
-            &format!("Python control plane unavailable: {error}"),
-        ),
+        Err(_) => upstream_error::response(StatusCode::BAD_GATEWAY),
     }
 }
 
@@ -458,15 +459,16 @@ async fn relay_idempotent_response(
     owner: idempotency::Owner,
 ) -> Response<Body> {
     let status = response.status();
+    if !status.is_success() {
+        owner.release().await;
+        return PublicError::new(status).response(response.headers());
+    }
     let headers = filtered_response_headers(response.headers());
     let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(error) => {
+        Ok(body) => upstream_error::clean_json_body(body),
+        Err(_) => {
             owner.release().await;
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("Python control response read failed: {error}"),
-            );
+            return upstream_error::response(StatusCode::BAD_GATEWAY);
         }
     };
     if body.len() > owner.max_response_bytes() {
@@ -482,14 +484,23 @@ async fn relay_idempotent_response(
 async fn relay_idempotent_axum_response(
     response: Response<Body>,
     owner: idempotency::Owner,
+    gemini: bool,
 ) -> Response<Body> {
+    if !response.status().is_success() {
+        owner.release().await;
+        return response;
+    }
     if response
         .headers()
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"))
     {
-        return crate::runtime::replay::capture_stream(response, owner).await;
+        return crate::runtime::replay::capture_stream(
+            upstream_error::sanitize_stream(response, false, gemini),
+            owner,
+        )
+        .await;
     }
     let (parts, body) = response.into_parts();
     let maximum = std::env::var("RUST_GENERIC_UPSTREAM_RESPONSE_MAX_BYTES")
@@ -499,14 +510,11 @@ async fn relay_idempotent_axum_response(
         .unwrap_or(64 * 1024 * 1024);
     let body = match to_bytes(body, maximum.saturating_add(1)).await {
         Ok(body) => body,
-        Err(error) => {
+        Err(_) => {
             owner
                 .nonreplayable("response_read_failed_after_execution")
                 .await;
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("Rust compatibility response read failed: {error}"),
-            );
+            return upstream_error::response(StatusCode::BAD_GATEWAY);
         }
     };
     if body.len() > owner.max_response_bytes() {

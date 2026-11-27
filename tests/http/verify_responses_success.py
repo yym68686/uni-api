@@ -113,7 +113,7 @@ def main():
                         assert status == expected_status, (provider, case, status, raw)
                         if case == "blank-incomplete":
                             assert b"response.incomplete" not in raw and b"resp_fixture" not in raw, raw
-                            assert b"substantive output" in raw, raw
+                            assert b'"code":"upstream_error"' in raw, raw
                         if case == "partial-incomplete":
                             assert b"response.incomplete" in raw and b"response.completed" not in raw
                         if provider == "gpt" and case in ("completed", "tool", "partial-incomplete"):

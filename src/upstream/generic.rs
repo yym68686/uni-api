@@ -39,6 +39,7 @@ use crate::transport::http::filtered_response_headers;
 use crate::transport::http::json_error;
 use crate::transport::multipart::multipart_rewrite_body;
 use crate::transport::multipart::prepare_dashscope_transcription;
+use crate::transport::upstream_error::{self, PublicError};
 use crate::upstream::hedging::await_with_hedge;
 use crate::upstream::hedging::deadline as hedge_deadline;
 use crate::upstream::hedging::HedgeEvent;
@@ -53,7 +54,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use url::Url;
 
 pub(crate) struct AttemptLoop {
     pub(crate) context: Arc<crate::routing::context::RequestContext>,
@@ -176,7 +176,7 @@ pub(crate) async fn next_generic_hedge_plan(
             ProviderKeySelection::Selected(key) => key,
             ProviderKeySelection::NoProviderKey => {
                 *last_status = StatusCode::BAD_GATEWAY;
-                *last_detail = format!("Provider {} has no API key", provider.name);
+                *last_detail = "No upstream channel is available".into();
                 emit_routing_skip(
                     execution,
                     attempt_index,
@@ -231,9 +231,9 @@ pub(crate) async fn next_generic_hedge_plan(
                     provider_key = auth.bearer;
                     codex_account_id = auth.account_id;
                 }
-                Err(error) => {
+                Err(_) => {
                     *last_status = StatusCode::UNAUTHORIZED;
-                    *last_detail = error;
+                    *last_detail = PublicError::new(*last_status).message().into();
                     emit_routing_skip(
                         execution,
                         attempt_index,
@@ -260,7 +260,7 @@ pub(crate) async fn next_generic_hedge_plan(
             Ok(attempt) => attempt,
             Err(error) => {
                 *last_status = StatusCode::BAD_REQUEST;
-                *last_detail = error;
+                *last_detail = public_build_detail(&error);
                 RoutingTrace::from_execution(execution).skipped(
                     attempt_index,
                     &provider,
@@ -435,11 +435,10 @@ impl<'a> RoutingTrace<'a> {
         "streaming": self.stream,
         "rust_generic_data_plane": true,
         });
-        if let Some((message, (code, field))) = error.and_then(|message| {
-            crate::transport::http::conversion_error_location(message)
-                .map(|location| (message, location))
-        }) {
-            event["error"] = json!({"error_code":code,"error_param":field,"error_message":message.chars().take(1024).collect::<String>()});
+        if let Some((code, field)) =
+            error.and_then(crate::transport::http::conversion_error_location)
+        {
+            event["error"] = json!({"error_code":code,"error_param":field});
         }
         crate::observability::telemetry::emit(event);
     }
@@ -673,7 +672,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                 failure.status =
                     StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 if let Some(response) = failure.response.as_mut() {
-                    *response.status_mut() = failure.status;
+                    *response = upstream_failure_response(failure.status, response.headers());
                 }
                 last_status = failure.status;
                 if policy.provider_model_unavailable {
@@ -684,7 +683,7 @@ pub(crate) async fn run_hedged_attempt_loop(
                     last_upstream_response = None;
                     last_response_route = None;
                 } else {
-                    last_detail = failure.detail.clone();
+                    last_detail = public_attempt_detail(&failure);
                     last_response_route = failure.response.as_ref().map(|_| {
                         (
                             context.provider.name.to_string(),
@@ -785,7 +784,8 @@ pub(crate) async fn run_hedged_attempt_loop(
         }
     }
 
-    let response = last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail));
+    let response =
+        last_upstream_response.unwrap_or_else(|| public_final_error(last_status, &last_detail));
     let mut final_facts =
         crate::observability::outcome::FinalFacts::exhausted(response.status().as_u16());
     final_facts.upstream_http_status = last_response_route.as_ref().map(|route| route.2);
@@ -965,7 +965,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             ProviderKeySelection::Selected(key) => key,
             ProviderKeySelection::NoProviderKey => {
                 last_status = StatusCode::BAD_GATEWAY;
-                last_detail = format!("Provider {} has no API key", provider.name);
+                last_detail = "No upstream channel is available".into();
                 routing_trace.skipped(
                     attempt_index,
                     &provider,
@@ -1014,9 +1014,9 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     provider_key = auth.bearer;
                     codex_account_id = auth.account_id;
                 }
-                Err(error) => {
+                Err(_) => {
                     last_status = StatusCode::UNAUTHORIZED;
-                    last_detail = error;
+                    last_detail = PublicError::new(last_status).message().into();
                     routing_trace.skipped(
                         attempt_index,
                         &provider,
@@ -1053,7 +1053,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     }
                 } else {
                     last_status = StatusCode::BAD_REQUEST;
-                    last_detail.clone_from(&error);
+                    last_detail = public_build_detail(&error);
                 }
                 routing_trace.skipped(
                     attempt_index,
@@ -1506,7 +1506,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 }
                 if let Some(response) = failure.response.as_mut() {
-                    *response.status_mut() = failure.status;
+                    *response = upstream_failure_response(failure.status, response.headers());
                 }
                 last_status = failure.status;
                 if policy.provider_model_unavailable && !interactions {
@@ -1515,7 +1515,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     last_upstream_response = None;
                     last_response_route = None;
                 } else {
-                    last_detail = failure.detail.clone();
+                    last_detail = public_attempt_detail(&failure);
                     last_response_route = failure.response.as_ref().map(|_| {
                         (
                             provider.name.to_string(),
@@ -1611,7 +1611,8 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         }
     }
 
-    let response = last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail));
+    let response =
+        last_upstream_response.unwrap_or_else(|| public_final_error(last_status, &last_detail));
     let mut final_facts =
         crate::observability::outcome::FinalFacts::exhausted(response.status().as_u16());
     final_facts.upstream_http_status = last_response_route.as_ref().map(|route| route.2);
@@ -1643,6 +1644,43 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     response
 }
 
+fn public_build_detail(error: &str) -> String {
+    if let Some((code, field)) = crate::transport::http::conversion_error_location(error) {
+        format!("{code}: {field}: Unable to convert request field")
+    } else {
+        "Could not prepare an upstream request".into()
+    }
+}
+
+fn public_attempt_detail(failure: &AttemptFailure) -> String {
+    if failure.failure_reason == "gemini_prompt_blocked" {
+        "Gemini blocked the prompt (SAFETY)".into()
+    } else {
+        PublicError::new(failure.status).message().into()
+    }
+}
+
+fn public_final_error(status: StatusCode, detail: &str) -> Response<Body> {
+    if status == StatusCode::UNPROCESSABLE_ENTITY
+        && crate::protocols::interactions::capability_unavailable(detail)
+        || status == StatusCode::BAD_REQUEST
+            && (crate::transport::http::conversion_error_location(detail).is_some()
+                || detail == "Gemini blocked the prompt (SAFETY)")
+    {
+        json_error(status, detail)
+    } else {
+        upstream_error::response(status)
+    }
+}
+
+fn upstream_failure_response(status: StatusCode, headers: &HeaderMap) -> Response<Body> {
+    let mut output = PublicError::new(status).response(headers);
+    output
+        .headers_mut()
+        .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+    output
+}
+
 pub(crate) struct AttemptSuccess {
     pub(crate) cache_completed: bool,
     pub(crate) response: Response<Body>,
@@ -1659,8 +1697,8 @@ pub(crate) struct AttemptSuccess {
 // type/length or other representation headers would describe the wrong body.
 pub(crate) fn copy_oaix_headers(source: &HeaderMap, target: &mut HeaderMap) {
     for (name, value) in source {
-        if name.as_str().starts_with("x-oaix-") {
-            target.append(name.clone(), value.clone());
+        if let Some(value) = crate::transport::http::oaix_header(name.as_str(), value) {
+            target.append(name.clone(), value);
         }
     }
 }
@@ -1942,7 +1980,7 @@ pub(crate) async fn send_attempt(
     .map_err(|error| AttemptFailure {
         failure_reason: "transport_error".into(),
         status: StatusCode::BAD_GATEWAY,
-        detail: format!("Upstream transport error: {error}"),
+        detail: upstream_error::transport_reason(&error).into(),
         upstream_url: prepared.url.clone(),
         response: None,
     })?;
@@ -1956,7 +1994,7 @@ pub(crate) async fn send_attempt(
     let status = response.status();
     let attribution_headers = response.headers().clone();
     if !status.is_success() {
-        let headers = filtered_response_headers(response.headers());
+        let headers = response.headers().clone();
         let body = read_limited_upstream_body_with_idle(
             response,
             UPSTREAM_ERROR_MAX_BYTES,
@@ -1979,12 +2017,7 @@ pub(crate) async fn send_attempt(
                 response: None,
             });
         }
-        let mut output = Response::new(Body::from(body));
-        *output.status_mut() = status;
-        *output.headers_mut() = headers;
-        output
-            .headers_mut()
-            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        let output = upstream_failure_response(status, &headers);
         return Err(AttemptFailure {
             failure_reason: format!("upstream_http_{}", status.as_u16()),
             status,
@@ -2472,6 +2505,12 @@ pub(crate) async fn send_attempt(
             response: None,
         })?;
         let parsed = serde_json::from_slice::<Value>(&body).ok();
+        let body = parsed
+            .as_ref()
+            .filter(|value| upstream_error::is_error(value))
+            .map_or(body, |value| {
+                Bytes::from(upstream_error::safe_json(value).to_string())
+            });
         let cache_completed = status.is_success()
             && endpoint == "/v1/messages"
             && parsed.as_ref().is_some_and(|p| {
@@ -2566,6 +2605,15 @@ pub(crate) async fn send_attempt(
             response: None,
         })?
     };
+    if upstream_error::is_error(&upstream) {
+        return Err(AttemptFailure {
+            failure_reason: "protocol_error".into(),
+            status: upstream_error::semantic_status(&upstream),
+            detail: truncate_detail(&upstream.to_string()),
+            upstream_url: prepared.url,
+            response: None,
+        });
+    }
     if prepared.adapter == ResponseAdapter::ResponsesToChat {
         crate::protocols::responses::usage::normalize_payload(&mut upstream);
     }
@@ -3116,7 +3164,7 @@ pub(crate) fn emit_attempt_with_first_output(
     endpoint: &str,
     downstream_stream: bool,
     method: &Method,
-    url: &str,
+    _url: &str,
     outcome: &str,
     status: Option<u16>,
     first_output_ms: Option<f64>,
@@ -3144,10 +3192,6 @@ pub(crate) fn emit_attempt_with_first_output(
             first_output_ms,
         );
     }
-    let upstream_host = Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
     let event = if outcome == "started" {
         "routing_attempt"
     } else {
@@ -3181,7 +3225,6 @@ pub(crate) fn emit_attempt_with_first_output(
             "model": request_model,
             "request_model": request_model,
             "actual_model": original_model,
-            "upstream_host": upstream_host,
             "attempt_outcome": outcome,
             "attempt_status_code": status,
             "attempt_success": attempt_success,

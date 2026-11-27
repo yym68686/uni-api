@@ -138,7 +138,7 @@ def verify(binary):
                     client.close()
 
                     status, body = call(port, "/v1/responses", {**native, "stream": True}, target="native")
-                    assert status == 502 and b"configured limit" in body, (status, body)
+                    assert status == 502 and json.loads(body)["error"]["code"] == "upstream_error", (status, body)
                     assert get_json(port, "/healthz")["status"] == "ok"
                     for _ in range(100):
                         totals = struct.unpack("<7Q", (root / "ledger").read_bytes())
