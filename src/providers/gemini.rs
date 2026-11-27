@@ -103,10 +103,11 @@ pub(crate) fn chat_to_gemini(
     if let Some(value) = root.get("top_p") {
         generation.insert("topP".into(), value.clone());
     }
-    generation.insert(
-        "maxOutputTokens".into(),
-        root.get("max_tokens").cloned().unwrap_or(json!(8192)),
-    );
+    // Use the provider/model default unless the caller specified a budget.
+    // Responses' max_output_tokens is already mapped to max_tokens.
+    if let Some(value) = root.get("max_tokens").filter(|value| !value.is_null()) {
+        generation.insert("maxOutputTokens".into(), value.clone());
+    }
     let mut output = json!({
         "contents": contents,
         "generationConfig": generation,

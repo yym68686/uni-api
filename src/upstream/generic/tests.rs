@@ -692,6 +692,10 @@ fn gemini_4_responses_map_named_levels_on_each_configured_wire() {
             "{engine} {model}"
         );
         if engine == "gemini" {
+            assert!(
+                body.pointer("/generationConfig/maxOutputTokens").is_none(),
+                "{model} must use the upstream default without an explicit cap"
+            );
             assert_eq!(
                 body.pointer("/generationConfig/thinkingConfig/includeThoughts"),
                 Some(&json!(true))
@@ -727,6 +731,60 @@ fn gemini_4_responses_map_named_levels_on_each_configured_wire() {
                 matches!(result, Err(error) if error.contains("does not support reasoning effort xhigh"))
             );
         }
+    }
+}
+
+#[test]
+fn responses_to_gemini_only_sends_a_caller_supplied_output_cap() {
+    let provider = test_provider("gemini", "https://relay.example/v1beta");
+    let uri = Uri::from_static("/v1/responses");
+    for (cap, expected) in [
+        (None, None),
+        (Some(Value::Null), None),
+        (Some(json!(997)), Some(json!(997))),
+    ] {
+        let mut payload = json!({
+            "model": "gemini-4-neon",
+            "input": "test",
+            "reasoning": {"effort":"xhigh"},
+            "stream": true
+        });
+        if let Some(cap) = cap {
+            payload["max_output_tokens"] = cap;
+        }
+        let input = PreparedInput {
+            _memory_reservations: Vec::new(),
+            payload: Some(payload),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        };
+        let prepared = build_attempt(
+            &provider,
+            "fixture",
+            "gemini-4-neon",
+            "gemini-4-neon",
+            &Method::POST,
+            &uri,
+            "/v1/responses",
+            &HeaderMap::new(),
+            &input,
+            "request-gemini-output-cap",
+        )
+        .unwrap();
+        let AttemptBody::Json(body) = prepared.body else {
+            panic!("expected JSON");
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body.pointer("/generationConfig/maxOutputTokens"),
+            expected.as_ref()
+        );
+        assert_eq!(
+            body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&json!("XHIGH"))
+        );
     }
 }
 
