@@ -1216,6 +1216,9 @@ impl GatewayRuntime {
                 .get("endpoint")
                 .and_then(Value::as_str)
                 .unwrap_or("/v1/responses");
+            let effective = crate::protocols::interactions::is_route(endpoint)
+                .then(|| crate::config::model_protocol::effective(compiled.clone(), request_model));
+            let compiled = effective.as_deref().unwrap_or(&compiled);
             let stream = input
                 .sample
                 .get("stream")
@@ -1228,16 +1231,16 @@ impl GatewayRuntime {
                 .request_type
                 .or_else(|| input.sample.get("request_type").and_then(Value::as_str));
             let excluded_type =
-                !crate::routing::filters::provider_accepts_request_type(&compiled, request_type)
+                !crate::routing::filters::provider_accepts_request_type(compiled, request_type)
                     || !crate::routing::filters::provider_accepts_compaction_tier(
-                        &compiled,
+                        compiled,
                         request_type,
                         facts.requested_service_tier,
                     );
             let preview_snapshot = candidate.overlay(base.clone());
             let timeout = crate::routing::timeouts::resolve_timeouts(
                 &preview_snapshot,
-                &compiled,
+                compiled,
                 request_model,
                 upstream,
                 &compiled.engine,
@@ -1254,7 +1257,7 @@ impl GatewayRuntime {
                 }
             }
             let prepared = crate::providers::request::preview_channel_request(
-                &compiled,
+                compiled,
                 request_model,
                 upstream,
                 endpoint,
@@ -1273,11 +1276,11 @@ impl GatewayRuntime {
             };
             if let Some(o) = body.as_object_mut() {
                 o.insert("model".into(), json!(upstream));
-                crate::providers::overrides::apply_overrides(o, &compiled, request_model);
+                crate::providers::overrides::apply_overrides(o, compiled, request_model);
             }
             // Payload may contain configured secrets. Only the field names leave
             // the gateway preview; unredacted headers/body never enter logs.
-            previews.push(json!({"provider":c.provider,"created":!original_change.copy_to_key.is_empty() || !original_change.create_to_key.is_empty(),"before":redact_at(&current,""),"after":redact_at(&merged,""),"sample":{"model":request_model,"upstream_model":upstream,"endpoint":endpoint,"timeouts":timeout,"excluded_endpoint":compiled.excluded_endpoints.iter().any(|e|e==endpoint),"excluded_request_type":excluded_type,"engine":compiled.engine.as_ref(),"base_url":compiled.base_url.as_ref(),"wire_request":wire,"excluded_rule":!crate::routing::filters::provider_accepts_request_rules(&compiled,endpoint,request_model,input.sample.get("reasoning_effort").and_then(Value::as_str),request_type),"body":redact_at(&json!({"preferences":{"post_body_parameter_overrides":body}}),"")["preferences"]["post_body_parameter_overrides"]}}));
+            previews.push(json!({"provider":c.provider,"created":!original_change.copy_to_key.is_empty() || !original_change.create_to_key.is_empty(),"before":redact_at(&current,""),"after":redact_at(&merged,""),"sample":{"model":request_model,"upstream_model":upstream,"endpoint":endpoint,"timeouts":timeout,"excluded_endpoint":compiled.excluded_endpoints.iter().any(|e|e==endpoint),"excluded_request_type":excluded_type,"engine":compiled.engine.as_ref(),"base_url":compiled.base_url.as_ref(),"wire_request":wire,"excluded_rule":!crate::routing::filters::provider_accepts_request_rules(compiled,endpoint,request_model,input.sample.get("reasoning_effort").and_then(Value::as_str),request_type),"body":redact_at(&json!({"preferences":{"post_body_parameter_overrides":body}}),"")["preferences"]["post_body_parameter_overrides"]}}));
         }
         let effective = candidate.overlay(base.clone());
         for p in &mut previews {
@@ -2027,6 +2030,41 @@ mod tests {
         )
         .is_ok());
     }
+    #[tokio::test]
+    async fn interactions_preview_uses_per_model_wire_protocol() {
+        let store = fixture().await;
+        {
+            let raw = json!({"provider":"one","api":"fixture-provider",
+                "engine":"typesafe","base_url":"https://openrouter.ai/api/v1/systemone",
+                "model":[{"upstream":"alias"}],
+                "model_upstream_protocols":{"upstream":"responses"},
+                "preferences":{"interactions_thinking_summaries":true}});
+            let mut current = store.current.write().await;
+            let base = Arc::make_mut(current.as_mut().unwrap());
+            let provider = compile(&raw, &base.providers[0]).unwrap();
+            base.providers = Arc::new(vec![provider.clone()]);
+            base.providers_by_name = Arc::new(HashMap::from([("one".into(), provider)]));
+            base.api_config = Arc::new(json!({"providers":[raw]}));
+        }
+        let view = store.settings_view("one").await.unwrap();
+        let revision = view["revision"].as_str().unwrap();
+        let mut preview = change(revision, "interactions-wire-protocol", json!({}));
+        preview.sample = json!({"model":"alias","endpoint":"/v1/interactions","stream":false,
+            "body":{"input":"hello","generation_config":{"thinking_summaries":"auto","future":true}}});
+        let result = store.settings_change(preview, false).await.unwrap();
+        let sample = &result["previews"][0]["sample"];
+        let wire = &sample["wire_request"];
+        assert_eq!(sample["engine"], "codex");
+        assert_eq!(wire["url"], "https://openrouter.ai/api/v1/responses");
+        assert_eq!(wire["body"]["model"], "upstream");
+        assert_eq!(wire["body"]["reasoning"]["summary"], "auto");
+        assert_eq!(wire["interactions_omitted"], "generation_config");
+        assert_eq!(
+            store.settings_view("one").await.unwrap()["revision"],
+            revision
+        );
+    }
+
     #[tokio::test]
     async fn protocols_preview_inherit_models_and_delete_copy_atomically() {
         let store = fixture().await;
