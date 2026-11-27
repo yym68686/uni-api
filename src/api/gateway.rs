@@ -1,4 +1,5 @@
 use crate::observability::context::request_id;
+use crate::protocols::interactions;
 use crate::providers::request::build_attempt;
 use crate::providers::request::ALPHA_SEARCH_ENDPOINT;
 use crate::providers::types::PreparedInput;
@@ -27,6 +28,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 pub(crate) const PUBLIC_JSON_ROUTES: &[&str] = &[
+    interactions::PATH,
     "/v1/systemone",
     "/v1/chat/completions",
     "/v1/messages",
@@ -123,6 +125,13 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             }
         }
     }
+    let native_interactions = interactions::is_route(&path);
+    if native_interactions {
+        if let Err(detail) = interactions::validate(input.payload.as_ref().unwrap_or(&Value::Null))
+        {
+            return json_error(StatusCode::BAD_REQUEST, detail);
+        }
+    }
     if method != Method::GET {
         if let Some(payload) = input.payload.as_ref() {
             if let Some(field) = missing_required_field(&path, payload) {
@@ -163,7 +172,14 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             .await
             .unwrap_or(false)
     {
-        if let Some(text) = input.payload.as_ref().and_then(moderation_text) {
+        let text = input.payload.as_ref().and_then(|payload| {
+            if native_interactions {
+                interactions::moderation_text(payload)
+            } else {
+                moderation_text(payload)
+            }
+        });
+        if let Some(text) = text {
             if let Err(response) = run_moderation_preflight(&state, &headers, &text).await {
                 return response;
             }
@@ -209,17 +225,25 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let retry_policy = crate::routing::retry::RetryPolicy::from_value(
         context.caller.preferences.get("AUTO_RETRY"),
     );
-    let max_attempts = retry_policy.max_attempts(
-        &resolved.providers,
-        headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
-    );
+    let max_attempts = if native_interactions {
+        1
+    } else {
+        retry_policy.max_attempts(
+            &resolved.providers,
+            headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
+        )
+    };
     let hedging = if max_attempts > 1 {
         resolved.hedging
     } else {
         Default::default()
     };
-    let auto_retry = retry_policy.enabled();
-    let (input, image_reservations) = match prepare_image_inputs(&state, input).await {
+    let auto_retry = !native_interactions && retry_policy.enabled();
+    let (input, image_reservations) = match if native_interactions {
+        Ok((input, Vec::new()))
+    } else {
+        prepare_image_inputs(&state, input).await
+    } {
         Ok(prepared) => prepared,
         Err((status, detail)) => return json_error(status, &detail),
     };
@@ -236,7 +260,8 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         context,
         unknown_400: crate::routing::unknown_400::Budget::new(
             resolved.unknown_400_retries,
-            !headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
+            !native_interactions
+                && !headers.contains_key(crate::routing::planner::TARGET_PROVIDER_HEADER),
         ),
         state,
         started,

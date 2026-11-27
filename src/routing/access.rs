@@ -89,9 +89,13 @@ impl GatewayRuntime {
         let snapshot = self.snapshot().await.ok_or(503u16)?;
         let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
         let allowed = |p: &Arc<Provider>, model: &str| {
-            let p = &crate::config::model_protocol::effective(p.clone(), model);
-            crate::control::channels::temporary_allowed(p, api_key)
-                && provider_accepts_endpoint(p, endpoint)
+            let p = if crate::protocols::interactions::is_route(endpoint) {
+                p.clone()
+            } else {
+                crate::config::model_protocol::effective(p.clone(), model)
+            };
+            crate::control::channels::temporary_allowed(&p, api_key)
+                && provider_accepts_endpoint(&p, endpoint)
         };
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {

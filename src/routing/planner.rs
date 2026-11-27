@@ -693,10 +693,11 @@ pub(crate) fn matching_providers(
             {
                 crate::config::model_protocol::diagnostic(provider, request_model, protocol)
             } else {
-                Some(crate::config::model_protocol::effective(
-                    provider,
-                    request_model,
-                ))
+                Some(if crate::protocols::interactions::is_route(endpoint) {
+                    provider
+                } else {
+                    crate::config::model_protocol::effective(provider, request_model)
+                })
             }
         })
         .collect();

@@ -331,6 +331,33 @@ docker run --user root -p 8001:8000 --name uni-api -dit \
 yym68686/uni-api:latest
 ```
 
+### Gemini Interactions (`POST /v1/interactions`)
+
+This native route accepts stateless text requests, for example
+`{"model":"your-gemini-alias","input":"Hello","stream":false}`.
+Use a uni-api key with `x-goog-api-key` or `Authorization: Bearer …`.
+`"stream":true` returns native SSE; normal responses return native JSON.
+Only one upstream attempt is made, with `store:false`. Interaction
+lookup/continuation/deletion, background execution, agents, tools, non-text
+input/output, and custom service tiers are not supported.
+
+For Google's HTTPS Developer API origin, `engine: gemini` uses upstream
+`/v1/interactions` without changing existing `/v1beta/models` routes. An
+operator who has verified a different Gemini provider supports this contract
+can explicitly set its upstream version:
+
+```yaml
+engine: gemini
+base_url: https://gemini.example.com/prefix/v1beta
+preferences:
+  gemini_interactions_version: v1
+```
+
+This sends Interactions to `/prefix/v1/interactions`. The model is mapped
+using the provider's existing aliases. To test locally, build with
+`cargo build --locked` and run
+`python3 tests/http/verify_gemini_interactions.py target/debug/uni-api-front`.
+
 ### Codex (`/v1/responses` + `engine: codex`)
 
 When `engine` is omitted, uni-api infers it only from `base_url`, never from model names. A URL path ending in `/v1/responses` (including a deployment prefix, trailing slash, or query string) selects `codex`. Existing special URL rules such as Messages, Gemini, Vertex, AWS, Azure, and Cloudflare keep their priority; unmatched URLs select `gpt`. An explicitly configured `engine` always overrides inference. Console clients can omit `engine` to reuse the same inference during validation, creation, and restoration.

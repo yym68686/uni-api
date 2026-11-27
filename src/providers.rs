@@ -6,6 +6,7 @@ pub(crate) mod endpoints;
 pub(crate) mod gemini;
 pub(crate) mod gemini_effort;
 pub(crate) mod gemini_tools;
+pub(crate) mod interactions;
 pub(crate) mod overrides;
 pub(crate) mod request;
 pub(crate) mod responses;

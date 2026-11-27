@@ -68,7 +68,18 @@ impl AppState {
         connect_timeout: Option<Duration>,
     ) -> Result<reqwest::Client, String> {
         self.upstream_clients
-            .get(proxy, http1_only, connect_timeout)
+            .get(proxy, http1_only, connect_timeout, false)
+            .await
+    }
+
+    pub(crate) async fn interactions_client(
+        &self,
+        proxy: Option<&str>,
+        http1_only: bool,
+        connect_timeout: Option<Duration>,
+    ) -> Result<reqwest::Client, String> {
+        self.upstream_clients
+            .get(proxy, http1_only, connect_timeout, true)
             .await
     }
 

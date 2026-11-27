@@ -13,6 +13,7 @@ struct ClientKey {
     proxy: Option<String>,
     http1_only: bool,
     connect_timeout_ms: Option<u64>,
+    single_dispatch: bool,
 }
 
 impl ClientPool {
@@ -21,12 +22,14 @@ impl ClientPool {
         proxy: Option<&str>,
         http1_only: bool,
         connect_timeout: Option<Duration>,
+        single_dispatch: bool,
     ) -> Result<reqwest::Client, String> {
         let key = ClientKey {
             proxy: proxy.map(str::to_owned),
             http1_only,
             connect_timeout_ms: connect_timeout
                 .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64),
+            single_dispatch,
         };
         if let Some(client) = self.clients.lock().await.get(&key).cloned() {
             return Ok(client);
@@ -35,6 +38,9 @@ impl ClientPool {
         let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(256)
             .tcp_keepalive(std::time::Duration::from_secs(30));
+        if single_dispatch {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
         if http1_only {
             builder = builder.http1_only();
         }

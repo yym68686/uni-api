@@ -885,6 +885,10 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let mut scan_limit = context
         .route
         .scan_limit(unknown_400.scan_limit(max_attempts, providers.len()));
+    if crate::protocols::interactions::is_route(&path) {
+        // Skip ineligible/local candidates without consuming the one wire attempt.
+        scan_limit = scan_limit.max(providers.len());
+    }
     let mut cache_fallback = None;
     let mut dispatched = 0usize;
     let routing_trace = RoutingTrace {
@@ -1468,15 +1472,18 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
             Err(mut failure) => {
                 upstream_failed = true;
+                let interactions = crate::protocols::interactions::is_route(&path);
                 let policy =
                     failure.policy(Some(&provider), &path, auto_retry, wire_model.as_deref());
-                failure.status =
-                    StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                if !interactions {
+                    failure.status =
+                        StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                }
                 if let Some(response) = failure.response.as_mut() {
                     *response.status_mut() = failure.status;
                 }
                 last_status = failure.status;
-                if policy.provider_model_unavailable {
+                if policy.provider_model_unavailable && !interactions {
                     last_detail =
                         format!("All configured providers failed for model {request_model}");
                     last_upstream_response = None;
@@ -1568,7 +1575,10 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     policy.retryable || (tier_rejected && auto_retry),
                     upstream_400 && !tier_rejected,
                 );
-                if !retryable || failure.failure_reason == "stream_collection_after_output" {
+                if interactions
+                    || !retryable
+                    || failure.failure_reason == "stream_collection_after_output"
+                {
                     break;
                 }
             }
@@ -1692,6 +1702,7 @@ pub(crate) async fn send_attempt(
     keepalive_updates: Option<&crate::protocols::chat::stream::KeepaliveUpdates>,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
+    let interactions = crate::protocols::interactions::is_route(endpoint);
     let compaction = prepared.request_type == Some("compaction");
     let snapshot = state
         .runtime
@@ -1742,16 +1753,22 @@ pub(crate) async fn send_attempt(
     let proxy = policy.proxy.as_deref();
     let http1_only = policy.http1_only;
     let connect_timeout = positive_duration(timeouts.connect);
-    let client = state
-        .upstream_client(proxy, http1_only, connect_timeout)
-        .await
-        .map_err(|error| AttemptFailure {
-            failure_reason: "other".into(),
-            status: StatusCode::BAD_GATEWAY,
-            detail: error,
-            upstream_url: prepared.url.clone(),
-            response: None,
-        })?;
+    let client = if interactions {
+        state
+            .interactions_client(proxy, http1_only, connect_timeout)
+            .await
+    } else {
+        state
+            .upstream_client(proxy, http1_only, connect_timeout)
+            .await
+    }
+    .map_err(|error| AttemptFailure {
+        failure_reason: "other".into(),
+        status: StatusCode::BAD_GATEWAY,
+        detail: error,
+        upstream_url: prepared.url.clone(),
+        response: None,
+    })?;
     // The resolved policy is also returned by the control-plane preview. Never
     // infer a second, hidden total timeout from model_timeout or the endpoint.
     let request_timeout = positive_duration(timeouts.total);
@@ -1788,6 +1805,16 @@ pub(crate) async fn send_attempt(
         request = request.timeout(timeout);
     }
     request = match std::mem::replace(&mut prepared.body, AttemptBody::Empty) {
+        // With this reqwest version a streaming body is not replayable even
+        // by transport-level retries (e.g. HTTP/2 REFUSED_STREAM).
+        AttemptBody::Json(body) if interactions => {
+            let length = body.len();
+            request
+                .header("content-length", length)
+                .body(reqwest::Body::wrap_stream(futures_util::stream::once(
+                    async move { Ok::<_, std::io::Error>(Bytes::from(body)) },
+                )))
+        }
         AttemptBody::Json(body) => request.body(Bytes::from(body)),
         AttemptBody::Replay(storage, observation) => {
             let body = storage
@@ -2027,6 +2054,45 @@ pub(crate) async fn send_attempt(
             fact_usage,
             collected_outcome,
             stream_outcome: None,
+            upstream_url: prepared.url,
+        });
+    }
+    if interactions && prepared.upstream_stream {
+        if !response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+            })
+        {
+            return Err(AttemptFailure {
+                failure_reason: "protocol_error".into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail: "Interactions upstream did not return an event stream".into(),
+                upstream_url: prepared.url,
+                response: None,
+            });
+        }
+        let mut translation = crate::protocols::interactions::observe_stream(
+            response,
+            send_started,
+            positive_duration(timeouts.idle),
+        );
+        translation
+            .response
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            cache_completed: false,
+            response: translation.response,
+            status,
+            usage: (0, 0, 0),
+            fact_usage: Default::default(),
+            collected_outcome: None,
+            stream_outcome: Some(translation.outcome),
             upstream_url: prepared.url,
         });
     }
@@ -2310,10 +2376,26 @@ pub(crate) async fn send_attempt(
                         .contains(&r)
                     })
             });
-        let fact_usage = crate::observability::usage::FactUsage::from_usage(
-            parsed.as_ref().and_then(|v| v.get("usage")),
-        );
-        let usage = parsed.as_ref().map(usage).unwrap_or((0, 0, 0));
+        let (usage, fact_usage, collected_outcome) = if interactions {
+            let Some(value) = parsed.as_ref().filter(|value| value.is_object()) else {
+                return Err(AttemptFailure {
+                    failure_reason: "protocol_error".into(),
+                    status: StatusCode::BAD_GATEWAY,
+                    detail: "Interactions upstream did not return a JSON object".into(),
+                    upstream_url: prepared.url,
+                    response: None,
+                });
+            };
+            let usage = crate::protocols::interactions::Usage::read(value.get("usage"));
+            let kind =
+                crate::protocols::interactions::status_kind(value["status"].as_str().unwrap_or(""));
+            (usage.counters(), usage.fact, Some(json!({"kind": kind})))
+        } else {
+            let facts = crate::observability::usage::FactUsage::from_usage(
+                parsed.as_ref().and_then(|v| v.get("usage")),
+            );
+            (parsed.as_ref().map(usage).unwrap_or((0, 0, 0)), facts, None)
+        };
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
@@ -2326,7 +2408,7 @@ pub(crate) async fn send_attempt(
             status,
             usage,
             fact_usage,
-            collected_outcome: None,
+            collected_outcome,
             stream_outcome: None,
             upstream_url: prepared.url,
         });

@@ -26,9 +26,11 @@ const INTERNAL_PREFIX: &str = "/_internal/rust-responses";
 pub async fn handler(State(state): State<AppState>, mut request: Request) -> Response<Body> {
     let gemini = crate::protocols::gemini::route(request.uri().path()).map(|(_, a)| a.to_owned());
     let gemini_catalog = request.uri().path().starts_with("/v1beta/models");
+    let interactions = crate::protocols::interactions::is_route(request.uri().path())
+        || crate::protocols::interactions::is_resource(request.uri().path());
     let gemini_array = gemini.as_deref() == Some("streamGenerateContent")
         && crate::upstream::generic::query_value(request.uri(), "alt").as_deref() != Some("sse");
-    if gemini.is_some() || gemini_catalog {
+    if gemini.is_some() || gemini_catalog || interactions {
         crate::protocols::gemini::normalize_auth(&mut request);
     }
     request
@@ -55,7 +57,9 @@ pub async fn handler(State(state): State<AppState>, mut request: Request) -> Res
         None
     };
     let mut response = handler_inner(state, request).await;
-    if gemini.is_some() || gemini_catalog {
+    if interactions {
+        response = crate::protocols::gemini::wire_interactions_response(response).await;
+    } else if gemini.is_some() || gemini_catalog {
         response = crate::protocols::gemini::wire_response(response, gemini_array).await;
     }
     cors.apply(&mut response);
@@ -74,6 +78,15 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
     let path = if path.is_empty() { "/" } else { path }.to_owned();
     if path.starts_with(INTERNAL_PREFIX) {
         return json_error(StatusCode::NOT_FOUND, "Not found");
+    }
+    if crate::protocols::interactions::is_resource(&path) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "Stored Interactions are not supported",
+        );
+    }
+    if crate::protocols::interactions::is_route(&path) && request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
     }
     let native_method = request.method().clone();
     let native_path = path.clone();

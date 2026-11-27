@@ -25,6 +25,9 @@ pub(crate) fn provider_accepts_endpoint(provider: &Provider, endpoint: &str) -> 
     if endpoint == "all" {
         return true;
     }
+    if crate::protocols::interactions::is_route(endpoint) {
+        return crate::providers::interactions::upstream_url(provider).is_some();
+    }
     if crate::protocols::gemini::route(endpoint).is_some_and(|(_, a)| a == "countTokens") {
         return matches!(
             provider.engine.trim().to_ascii_lowercase().as_str(),

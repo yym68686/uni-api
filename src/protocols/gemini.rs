@@ -84,14 +84,40 @@ pub(crate) fn error(status: u16, message: &str) -> Value {
 }
 
 pub(crate) async fn wire_response(response: Response<Body>, array: bool) -> Response<Body> {
+    wire_response_impl(response, array, false).await
+}
+
+pub(crate) async fn wire_interactions_response(response: Response<Body>) -> Response<Body> {
+    wire_response_impl(response, false, true).await
+}
+
+async fn wire_response_impl(
+    response: Response<Body>,
+    array: bool,
+    preserve_native_error: bool,
+) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     if !parts.status.is_success() {
+        if preserve_native_error && parts.status.is_redirection() {
+            parts.headers.remove("location");
+        }
         let bytes = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
         let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        if preserve_native_error
+            && value.pointer("/error").is_some_and(Value::is_object)
+            && value
+                .pointer("/error/message")
+                .is_some_and(Value::is_string)
+            && (value.pointer("/error/status").is_some_and(Value::is_string)
+                || value.pointer("/error/code").is_some_and(Value::is_number))
+        {
+            return Response::from_parts(parts, Body::from(bytes));
+        }
         let message = value
             .pointer("/error/message")
             .or_else(|| value.get("detail"))
             .and_then(Value::as_str)
+            .or_else(|| value.get("error").and_then(Value::as_str))
             .unwrap_or("Gemini request failed");
         parts.headers.remove("content-length");
         parts.headers.remove("content-encoding");

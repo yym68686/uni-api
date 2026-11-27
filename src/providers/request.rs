@@ -122,6 +122,16 @@ pub(crate) fn build_attempt(
     if !crate::routing::filters::provider_accepts_endpoint(provider, path) {
         return Err("Provider does not support this endpoint".into());
     }
+    if crate::protocols::interactions::is_route(path) {
+        return super::interactions::prepare(
+            provider,
+            provider_key,
+            request_model,
+            original_model,
+            input.payload.as_ref(),
+            request_id,
+        );
+    }
     let native_responses_wire = compaction::responses_endpoint(path)
         && ((matches!(engine.as_str(), "gpt" | "codex") || request_type == Some("compaction"))
             && super::stream_mode::responses_wire(&engine, &provider.base_url));

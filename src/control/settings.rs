@@ -315,6 +315,11 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         ("base_url", "基本与模型", "string"),
         ("engine", "基本与模型", "engine"),
+        (
+            "preferences/gemini_interactions_version",
+            "基本与模型",
+            "string",
+        ),
         ("model", "基本与模型", "models"),
         ("api", "密钥", "keys"),
         ("api_key_schedule_algorithm", "密钥", "algorithm"),
@@ -497,6 +502,11 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
         }
         if let Some(mode) = p.get(crate::providers::responses::COMPACTION_MODE) {
             crate::providers::responses::validate_compaction_mode(mode)?;
+        }
+        if p.get(crate::providers::interactions::VERSION)
+            .is_some_and(|v| !matches!(v.as_str(), Some("v1" | "v1beta")))
+        {
+            return Err(field_error("/preferences/gemini_interactions_version"));
         }
         if p.get(crate::routing::service_tier::EVIDENCE)
             .is_some_and(|v| !crate::routing::service_tier::valid_evidence(v))

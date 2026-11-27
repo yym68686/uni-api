@@ -917,6 +917,7 @@ fn openapi_document() -> Value {
     for (method, path) in [
         ("post", "/v1/chat/completions"),
         ("post", "/v1/responses"),
+        ("post", "/v1/interactions"),
         ("post", "/v1/responses/compact"),
         ("post", "/v1/messages"),
         ("post", "/v1/systemone"),
