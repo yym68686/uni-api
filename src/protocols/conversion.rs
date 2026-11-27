@@ -603,16 +603,31 @@ pub(crate) fn normalize_jina_embedding(
     Ok(())
 }
 
-pub(crate) fn chat_to_cloudflare(input: &Value) -> Result<Value, String> {
+pub(crate) fn chat_to_cloudflare(input: &Value, include_history: bool) -> Result<Value, String> {
     let root = input
         .as_object()
         .ok_or_else(|| "chat request body must be an object".to_owned())?;
-    let prompt = root
+    let messages = root
         .get("messages")
         .and_then(Value::as_array)
-        .and_then(|messages| messages.last())
-        .and_then(|message| content_text(message.get("content")))
         .ok_or_else(|| "Cloudflare chat request requires a text message".to_owned())?;
+    let prompt = if include_history {
+        // The Cloudflare prompt-only adapter otherwise keeps just the latest
+        // turn, dropping both the summary instruction and restored history.
+        messages
+            .iter()
+            .filter_map(|message| {
+                let role = message["role"].as_str().unwrap_or("user");
+                content_text(message.get("content")).map(|text| format!("[{role}]\n{text}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        messages
+            .last()
+            .and_then(|message| content_text(message.get("content")))
+            .ok_or_else(|| "Cloudflare chat request requires a text message".to_owned())?
+    };
     let mut output = json!({"prompt":prompt});
     if let Some(root) = output.as_object_mut() {
         for name in ["temperature", "top_p", "max_tokens", "seed"] {

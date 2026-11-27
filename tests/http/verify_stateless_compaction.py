@@ -41,13 +41,26 @@ class Upstream(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(value).encode())
         else:
             for item in events:
-                self.wfile.write(f"data: {json.dumps(item)}\n\n".encode())
+                data = item if isinstance(item, str) else json.dumps(item)
+                self.wfile.write(f"data: {data}\n\n".encode())
 
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.hits.append((self.path, payload))
         source = self.path.split("/")[1]
         stream = payload.get("stream", False) or ":streamGenerateContent" in self.path
+        if source == "client":  # Cloudflare builds its own account/ai/run path.
+            events = [{"response": SUMMARY}]
+            if self.path.endswith("/cloudflare-text"):
+                events.append("[DONE]")
+            return self.write_result({"result": {"response": SUMMARY}}, events if stream else None)
+        if source in ("cohere", "cohere-truncated"):
+            finish = "COMPLETE" if source == "cohere" else "MAX_TOKENS"
+            value = {"text": SUMMARY, "finish_reason": finish,
+                     "meta": {"billed_units": {"input_tokens": 21, "output_tokens": 8}}}
+            events = [{"event_type": "text-generation", "text": SUMMARY},
+                      {"event_type": "stream-end", "finish_reason": finish, "response": value}]
+            return self.write_result(value, events if stream else None)
         if source in ("gemini", "broken"):
             usage = {"promptTokenCount": 21, "candidatesTokenCount": 8, "cachedContentTokenCount": 4}
             parts = [{"thought": True, "text": "Never send internal thoughts"}, {"text": SUMMARY}]
@@ -118,6 +131,10 @@ def verify(binary, native):
                 provider("claude", "/v1/messages", "claude-test", "claude"),
                 provider("claude-truncated", "/v1/messages", "claude-truncated", "claude"),
                 provider("chat", "/v1/chat/completions", "arbitrary-chat", "gpt"),
+                provider("cohere", "/v1/chat", "cohere-text", "cohere"),
+                provider("cohere-truncated", "/v1/chat", "cohere-truncated", "cohere"),
+                {**provider("cloudflare", "", ["cloudflare-text", "cloudflare-truncated"], "cloudflare"),
+                 "cf_account_id": "fixture"},
                 provider("response", "/v1/responses", [{"vendor/arbitrary-text": "public-text"}], "codex",
                          {"upstream_stream_mode": "stream_only"}),
                 provider("gpt", "/v1/responses", [{"gpt-6-example": "native-alias"}], "gpt"),
@@ -195,19 +212,22 @@ def verify(binary, native):
                     prefix, encoded = value.split(":", 1)
                     assert prefix == "compact-v1"
                     assert base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode() == SUMMARY
-                    if model == "no-usage":
+                    if model in ("no-usage", "cloudflare-text"):
                         assert "usage" not in result, result
                     else:
                         assert result["usage"]["output_tokens"] == 8, result
                 return checkpoint
 
             with process("first"):
-                checkpoints = {model: compact(model) for model in [*GEMINI, "arbitrary-chat", "claude-test", "public-text", "no-usage"]}
+                checkpoints = {model: compact(model) for model in [
+                    *GEMINI, "arbitrary-chat", "claude-test", "cohere-text", "cloudflare-text", "public-text", "no-usage",
+                ]}
                 assert any(path.startswith("/broken/") for path, _ in server.hits)
                 for path, body in server.hits:
                     text = json.dumps(body, ensure_ascii=False)
                     assert "compaction_trigger" not in text and "pending diff" in text, (path, body)
                     assert "tools" not in body and "toolConfig" not in body and "text" not in body, body
+                    assert "Summarize the supplied conversation" in text, (path, body)
                 for model in ["native-alias", "vendor-native"]:
                     compact(model)
                     assert TRIGGER in server.hits[-1][1]["input"]
@@ -215,7 +235,7 @@ def verify(binary, native):
                 assert ":generateContent" in server.hits[-1][0]
                 compact("public-text", stream=False, path="/v1/responses/compact")
                 assert server.hits[-1][0].endswith("/v1/responses") and server.hits[-1][1]["stream"]
-                for model in ("blank", "short", "false-tool", "claude-truncated"):
+                for model in ("blank", "short", "false-tool", "claude-truncated", "cohere-truncated", "cloudflare-truncated"):
                     status, raw = call("/v1/responses", {"model": model, "stream": True, "input": [message("test"), TRIGGER]})
                     assert "response.completed" not in raw and "compact-v1:" not in raw, (model, status, raw)
                     assert status == 502 or '"type":"error"' in raw, (status, raw)

@@ -484,7 +484,10 @@ pub(crate) fn build_attempt(
             )
         }
         "cloudflare" if wire_path == "/v1/chat/completions" => {
-            payload = chat_to_cloudflare(&payload)?;
+            payload = chat_to_cloudflare(
+                &payload,
+                downstream_protocol == DownstreamProtocol::ResponsesCompat,
+            )?;
             (
                 cloudflare_url(provider, original_model)?,
                 ResponseAdapter::CloudflareToChat,

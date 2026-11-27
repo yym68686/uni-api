@@ -931,7 +931,16 @@ async fn process_sse_event(
             data.push_str(value.trim_start());
         }
     }
-    if data.trim().is_empty() || data.trim() == "[DONE]" {
+    if data.trim() == "[DONE]" {
+        // Workers AI can use an SSE sentinel without a final JSON frame.
+        if state.strict_summary && protocol == Protocol::Cloudflare {
+            for chunk in state.finish_chunks_with_usage("stop", false) {
+                send_wire(tx, &chunk, state.output_protocol).await?;
+            }
+        }
+        return Ok(());
+    }
+    if data.trim().is_empty() {
         return Ok(());
     }
     process_json_bytes(data.as_bytes(), protocol, state, tx).await
@@ -1738,6 +1747,21 @@ impl StreamState {
                 .map(|text| vec![self.chunk(json!({"content":text}), None, None)])
                 .unwrap_or_default();
         }
+        if self.strict_summary {
+            let ended = value["event_type"] == "stream-end" || value["is_finished"] == true;
+            if !ended {
+                return Vec::new();
+            }
+            if value["finish_reason"] != "COMPLETE" {
+                return self.finish_chunks_with_usage("length", false);
+            }
+            self.chat_usage = value
+                .pointer("/response/meta/billed_units")
+                .or_else(|| value.pointer("/meta/billed_units"))
+                .filter(|usage| usage.is_object())
+                .cloned();
+            return self.finish_chunks_with_usage("stop", false);
+        }
         if value.get("is_finished").and_then(Value::as_bool) == Some(true) {
             self.prompt_tokens = number(value.pointer("/meta/billed_units/input_tokens"));
             self.completion_tokens = number(value.pointer("/meta/billed_units/output_tokens"));
@@ -1756,6 +1780,23 @@ impl StreamState {
     }
 
     fn cloudflare(&mut self, value: &Value) -> Vec<Value> {
+        if self.strict_summary {
+            if value["success"] == false
+                || !value["error"].is_null()
+                || value["errors"].as_array().is_some_and(|v| !v.is_empty())
+            {
+                return vec![json!({"error":{"message":"Summary generation failed"}})];
+            }
+            if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                self.chat_usage = Some(usage.clone());
+            }
+            if value["finish_reason"]
+                .as_str()
+                .is_some_and(|reason| reason != "stop")
+            {
+                return self.finish_chunks_with_usage("length", false);
+            }
+        }
         let text = value
             .get("response")
             .or_else(|| value.pointer("/result/response"))
@@ -1769,7 +1810,7 @@ impl StreamState {
                 Some("done" | "completed")
             )
         {
-            output.extend(self.finish_chunks("stop"));
+            output.extend(self.finish_chunks_with_usage("stop", !self.strict_summary));
         }
         output
     }

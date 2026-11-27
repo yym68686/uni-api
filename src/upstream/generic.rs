@@ -2644,16 +2644,20 @@ async fn collect_prompt_compaction(
                 return Err(FAILED);
             }
             let has_reported_usage = match prepared.adapter {
-                ResponseAdapter::CloudflareToChat => false,
+                ResponseAdapter::CohereToChat | ResponseAdapter::CloudflareToChat => false,
                 ResponseAdapter::ClaudeToChat | ResponseAdapter::AwsToChat => raw
                     .get("usage")
                     .and_then(Value::as_object)
                     .is_some_and(|usage| !usage.is_empty()),
-                ResponseAdapter::CohereToChat => raw
-                    .pointer("/meta/billed_units")
-                    .is_some_and(Value::is_object),
                 _ => true,
             };
+            let wire_usage = compaction::chat_usage(match prepared.adapter {
+                ResponseAdapter::CohereToChat => raw.pointer("/meta/billed_units"),
+                ResponseAdapter::CloudflareToChat => {
+                    raw.pointer("/result/usage").or_else(|| raw.get("usage"))
+                }
+                _ => None,
+            });
             let normalized = match prepared.adapter {
                 ResponseAdapter::GeminiToChat
                     if raw
@@ -2685,7 +2689,9 @@ async fn collect_prompt_compaction(
                 {
                     cohere_to_chat(&raw, &prepared.original_model)
                 }
-                ResponseAdapter::CloudflareToChat => {
+                ResponseAdapter::CloudflareToChat
+                    if raw["finish_reason"].is_null() || raw["finish_reason"] == "stop" =>
+                {
                     cloudflare_to_chat(&raw, &prepared.original_model)
                 }
                 ResponseAdapter::Passthrough => raw,
@@ -2693,7 +2699,8 @@ async fn collect_prompt_compaction(
             };
             let usage = has_reported_usage
                 .then(|| compaction::chat_usage(normalized.get("usage")))
-                .flatten();
+                .flatten()
+                .or(wire_usage);
             (compaction::chat_summary(&normalized)?.to_owned(), usage)
         };
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
