@@ -41,6 +41,12 @@ pub(crate) fn compile_config_document(
         .flatten()
     {
         compile_model_protocols(provider)?;
+        if let Some(mode) = provider
+            .get("preferences")
+            .and_then(|p| p.get(crate::providers::responses::COMPACTION_MODE))
+        {
+            crate::providers::responses::validate_compaction_mode(mode)?;
+        }
     }
 
     let mut providers = root

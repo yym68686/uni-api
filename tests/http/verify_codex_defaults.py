@@ -73,7 +73,7 @@ def verify(binary):
             "providers": [{"provider": name, "engine": "gpt" if name == "gpt" else "codex",
                            "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
                            "api": "upstream-fixture", "model": [{"upstream-model": "public-model"}],
-                           "preferences": preferences} for name, preferences in variants.items()],
+                           "preferences": {"compaction_mode": "native", **preferences}} for name, preferences in variants.items()],
             "api_keys": [{"api": "admin-fixture", "model": ["all"]}]
                         + [{"api": f"{name}-fixture", "model": [f"{name}/*"]} for name in variants],
             "preferences": {"AUTO_RETRY": False},

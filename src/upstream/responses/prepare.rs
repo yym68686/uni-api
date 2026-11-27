@@ -190,6 +190,12 @@ pub async fn prepare_request(
             ));
         }
     };
+    if let Err(detail) = crate::protocols::responses::compaction::restore_history(&mut payload) {
+        return ResponsesPreparation::Response(json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":detail}),
+        ));
+    }
     let object = payload.as_object().expect("checked JSON object");
     let Some(request_model) = object
         .get("model")
@@ -295,6 +301,14 @@ pub async fn prepare_request(
             || provider.api_keys.is_empty()
             || (provider.engine.as_ref() == "gpt" && !provider.base_url.contains("v1/responses"))
             || provider_stream_override(provider).is_some_and(|value| value != stream)
+            || (request_type == Some("compaction")
+                && provider.models.get(&request_model).is_some_and(|upstream| {
+                    crate::providers::responses::prompt_compaction(
+                        provider,
+                        &request_model,
+                        upstream,
+                    )
+                }))
     }) {
         return ResponsesPreparation::PreparedFallback(context, payload, memory_reservation);
     }

@@ -9,6 +9,7 @@ use crate::protocols::conversion::synthetic_responses_stream;
 use crate::protocols::provider_stream;
 use crate::protocols::provider_stream::OutputProtocol as StreamOutputProtocol;
 use crate::protocols::provider_stream::Protocol as StreamProtocol;
+use crate::protocols::responses::compaction;
 use crate::providers::anthropic::claude_to_chat;
 use crate::providers::gemini::gemini_to_chat;
 use crate::providers::request::build_attempt;
@@ -1786,7 +1787,7 @@ pub(crate) async fn send_attempt(
     if let Some(timeout) = request_timeout {
         request = request.timeout(timeout);
     }
-    request = match prepared.body {
+    request = match std::mem::replace(&mut prepared.body, AttemptBody::Empty) {
         AttemptBody::Json(body) => request.body(Bytes::from(body)),
         AttemptBody::Replay(storage, observation) => {
             let body = storage
@@ -1934,7 +1935,26 @@ pub(crate) async fn send_attempt(
         // The generic compatibility path has no resumable streaming coordinator.
         // Collect only the authoritative object under the existing response cap;
         // expose a single validated response, never an invalid attempt's state.
-        let (payload, collected_outcome) = if prepared.upstream_stream {
+        let (payload, collected_outcome) = if prepared.prompt_compaction {
+            let (payload, outcome) = collect_prompt_compaction(
+                response,
+                &prepared,
+                provider,
+                endpoint,
+                started,
+                timeouts.idle,
+                remaining_timeout(timeouts.total, send_started.elapsed()),
+            )
+            .await
+            .map_err(|detail| AttemptFailure {
+                failure_reason: compaction::failure_reason(detail).into(),
+                status: StatusCode::BAD_GATEWAY,
+                detail: detail.into(),
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+            (payload, Some(outcome))
+        } else if prepared.upstream_stream {
             let done = crate::protocols::responses::collect::collect(
                 response,
                 started,
@@ -2161,22 +2181,7 @@ pub(crate) async fn send_attempt(
         });
     }
     if prepared.upstream_stream && !collect_responses {
-        let protocol = match prepared.adapter {
-            ResponseAdapter::ResponsesToChat => StreamProtocol::Responses,
-            ResponseAdapter::GeminiToChat => StreamProtocol::Gemini,
-            ResponseAdapter::ClaudeToChat
-                if provider.engine.eq_ignore_ascii_case("vertex-claude") =>
-            {
-                StreamProtocol::VertexClaude
-            }
-            ResponseAdapter::ClaudeToChat => StreamProtocol::Claude,
-            ResponseAdapter::CohereToChat => StreamProtocol::Cohere,
-            ResponseAdapter::CloudflareToChat => StreamProtocol::Cloudflare,
-            ResponseAdapter::AwsToChat => StreamProtocol::AwsBedrock,
-            ResponseAdapter::LingjingVideo | ResponseAdapter::CallxyqVideo => unreachable!(),
-            ResponseAdapter::Passthrough => StreamProtocol::Chat,
-            ResponseAdapter::Search => unreachable!(),
-        };
+        let protocol = stream_protocol(prepared.adapter, provider).expect("streaming adapter");
         let output_protocol = match prepared.downstream_protocol {
             DownstreamProtocol::ResponsesCompat => StreamOutputProtocol::Responses,
             DownstreamProtocol::Gemini => StreamOutputProtocol::Gemini,
@@ -2499,6 +2504,218 @@ pub(crate) async fn send_attempt(
         stream_outcome: None,
         upstream_url: prepared.url,
     })
+}
+
+fn stream_protocol(adapter: ResponseAdapter, provider: &Provider) -> Option<StreamProtocol> {
+    Some(match adapter {
+        ResponseAdapter::ResponsesToChat => StreamProtocol::Responses,
+        ResponseAdapter::GeminiToChat => StreamProtocol::Gemini,
+        ResponseAdapter::ClaudeToChat if provider.engine.eq_ignore_ascii_case("vertex-claude") => {
+            StreamProtocol::VertexClaude
+        }
+        ResponseAdapter::ClaudeToChat => StreamProtocol::Claude,
+        ResponseAdapter::CohereToChat => StreamProtocol::Cohere,
+        ResponseAdapter::CloudflareToChat => StreamProtocol::Cloudflare,
+        ResponseAdapter::AwsToChat => StreamProtocol::AwsBedrock,
+        ResponseAdapter::Passthrough => StreamProtocol::Chat,
+        _ => return None,
+    })
+}
+
+async fn collect_prompt_compaction(
+    response: reqwest::Response,
+    prepared: &PreparedAttempt,
+    provider: &Provider,
+    endpoint: &str,
+    started: tokio::time::Instant,
+    idle: Option<f64>,
+    total: Option<f64>,
+) -> Result<(Value, Value), &'static str> {
+    const FAILED: &str = "compaction_stream_failed: upstream summary did not complete";
+    const INVALID: &str = "compaction_invalid_output: expected a plain-text summary";
+    let wire_responses =
+        crate::providers::stream_mode::responses_wire(&provider.engine, &prepared.url);
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .unwrap_or_default()
+        .trim();
+    let is_stream = content_type.eq_ignore_ascii_case("text/event-stream")
+        || (prepared.upstream_stream && !content_type.eq_ignore_ascii_case("application/json"));
+    let (summary, usage, timing) = if wire_responses && is_stream {
+        let collected = crate::protocols::responses::collect::collect(
+            response,
+            started,
+            positive_duration(idle),
+            false,
+            false,
+        )
+        .await
+        .map_err(|_| FAILED)?;
+        (
+            compaction::responses_summary(&collected.payload)?,
+            collected.payload.get("usage").cloned(),
+            collected.outcome,
+        )
+    } else if is_stream {
+        let protocol = stream_protocol(prepared.adapter, provider).ok_or(INVALID)?;
+        let translation =
+            provider_stream::translate_compaction(response, started, protocol, idle, total);
+        let mut stream = translation.response.into_body().into_data_stream();
+        let mut decoder = crate::protocols::sse::SseDecoder::new(1024 * 1024);
+        let mut summary = String::new();
+        let mut reported_usage = None;
+        let mut finished = false;
+        let mut received = 0usize;
+        while let Some(bytes) = futures_util::StreamExt::next(&mut stream).await {
+            let bytes = bytes.map_err(|_| FAILED)?;
+            received = received.saturating_add(bytes.len());
+            if received > upstream_response_max_bytes() {
+                return Err(INVALID);
+            }
+            for frame in decoder.feed(&bytes).map_err(|_| FAILED)? {
+                let frame = crate::protocols::sse::parse_sse_frame(&frame).map_err(|_| FAILED)?;
+                let Some(data) = frame
+                    .data
+                    .filter(|data| !data.trim().is_empty() && data.trim() != "[DONE]")
+                else {
+                    continue;
+                };
+                let payload: Value = serde_json::from_str(&data).map_err(|_| FAILED)?;
+                if !payload["error"].is_null() {
+                    return Err(FAILED);
+                }
+                let choice = &payload["choices"][0];
+                let delta = &choice["delta"];
+                if !delta["refusal"].is_null()
+                    || !delta["function_call"].is_null()
+                    || !(delta["tool_calls"].is_null()
+                        || delta["tool_calls"].as_array().is_some_and(Vec::is_empty))
+                {
+                    return Err(INVALID);
+                }
+                if let Some(text) = delta["content"].as_str() {
+                    if finished && !text.is_empty() {
+                        return Err(INVALID);
+                    }
+                    compaction::append_summary(&mut summary, text)?;
+                }
+                if let Some(reason) = choice["finish_reason"].as_str() {
+                    if reason != "stop" {
+                        return Err(FAILED);
+                    }
+                    finished = true;
+                }
+                if let Some(value) = payload.get("usage").filter(|v| v.is_object()) {
+                    reported_usage = Some(value.clone());
+                }
+            }
+        }
+        let outcome = translation.outcome.await.map_err(|_| FAILED)?;
+        if !finished || !outcome.success {
+            return Err(FAILED);
+        }
+        (
+            summary,
+            compaction::chat_usage(reported_usage.as_ref()),
+            json!({
+                "first_output_ms":outcome.first_output_ms, "first_text_ms":outcome.first_text_ms,
+                "response_created_ms":outcome.response_created_ms,
+            }),
+        )
+    } else {
+        let body = read_limited_upstream_body_with_idle(
+            response,
+            upstream_response_max_bytes(),
+            positive_duration(idle),
+        )
+        .await
+        .map_err(|_| FAILED)?;
+        let raw: Value = serde_json::from_slice(&body).map_err(|_| INVALID)?;
+        let (summary, usage) = if wire_responses {
+            (
+                compaction::responses_summary(&raw)?,
+                raw.get("usage").cloned(),
+            )
+        } else {
+            if !raw["error"].is_null() || raw["success"] == false {
+                return Err(FAILED);
+            }
+            let has_reported_usage = match prepared.adapter {
+                ResponseAdapter::CloudflareToChat => false,
+                ResponseAdapter::ClaudeToChat | ResponseAdapter::AwsToChat => raw
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .is_some_and(|usage| !usage.is_empty()),
+                ResponseAdapter::CohereToChat => raw
+                    .pointer("/meta/billed_units")
+                    .is_some_and(Value::is_object),
+                _ => true,
+            };
+            let normalized = match prepared.adapter {
+                ResponseAdapter::GeminiToChat
+                    if raw
+                        .pointer("/candidates/0/finishReason")
+                        .and_then(Value::as_str)
+                        == Some("STOP")
+                        && raw
+                            .pointer("/candidates/0/content/parts")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .all(|part| {
+                                part.get("inlineData").is_none()
+                                    && part.get("functionCall").is_none()
+                            }) =>
+                {
+                    gemini_to_chat(&raw, &prepared.original_model).map_err(|_| INVALID)?
+                }
+                ResponseAdapter::ClaudeToChat | ResponseAdapter::AwsToChat
+                    if matches!(
+                        raw["stop_reason"].as_str(),
+                        Some("end_turn" | "stop_sequence")
+                    ) =>
+                {
+                    claude_to_chat(&raw, &prepared.original_model)
+                }
+                ResponseAdapter::CohereToChat
+                    if raw["finish_reason"].is_null() || raw["finish_reason"] == "COMPLETE" =>
+                {
+                    cohere_to_chat(&raw, &prepared.original_model)
+                }
+                ResponseAdapter::CloudflareToChat => {
+                    cloudflare_to_chat(&raw, &prepared.original_model)
+                }
+                ResponseAdapter::Passthrough => raw,
+                _ => return Err(INVALID),
+            };
+            let usage = has_reported_usage
+                .then(|| compaction::chat_usage(normalized.get("usage")))
+                .flatten();
+            (compaction::chat_summary(&normalized)?.to_owned(), usage)
+        };
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        (
+            summary,
+            usage,
+            json!({"first_output_ms":elapsed,"first_text_ms":elapsed}),
+        )
+    };
+    let payload = compaction::summary_response(
+        &summary,
+        usage.as_ref(),
+        &prepared.request_model,
+        endpoint == "/v1/responses/compact",
+    )?;
+    let mut outcome = timing;
+    outcome["kind"] = "completed".into();
+    outcome["upstream_status_code"] = 200.into();
+    outcome["upstream_stream"] = is_stream.into();
+    outcome["downstream_stream"] = prepared.downstream_stream.into();
+    outcome["usage"] = usage.unwrap_or(Value::Null);
+    Ok((payload, outcome))
 }
 
 pub(crate) fn usage(value: &Value) -> (i64, i64, i64) {

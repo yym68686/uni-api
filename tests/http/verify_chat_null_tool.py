@@ -27,11 +27,12 @@ def verify(binary):
         providers = []
         for name in ("auto", "gpt", "codex", "override"):
             provider = {"provider": name, "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
-                        "api": "fixture", "model": [{"upstream-model": "public-model"}]}
+                        "api": "fixture", "model": [{"upstream-model": "public-model"}],
+                        "preferences": {"compaction_mode": "native"}}
             if name in ("gpt", "codex"):
                 provider["engine"] = name
             if name == "override":
-                provider["preferences"] = {"post_body_parameter_overrides": {"input": forced_input}}
+                provider["preferences"]["post_body_parameter_overrides"] = {"input": forced_input}
             providers.append(provider)
         config = {"providers": providers, "preferences": {"AUTO_RETRY": False},
                   "api_keys": [{"api": f"{name}-fixture", "model": [f"{name}/*"]}

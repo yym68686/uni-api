@@ -7,6 +7,7 @@ use crate::protocols::conversion::extract_translation_text;
 use crate::protocols::conversion::normalize_jina_embedding;
 use crate::protocols::conversion::openai_tts_to_minimax;
 use crate::protocols::conversion::responses_to_chat_request;
+use crate::protocols::responses::compaction;
 use crate::providers::anthropic::chat_to_claude;
 use crate::providers::cloud::aws_bedrock_url;
 use crate::providers::cloud::azure_chat_url;
@@ -52,11 +53,14 @@ pub(crate) fn preview_channel_request(
     model: &str,
     upstream: &str,
     endpoint: &str,
-    payload: Value,
+    mut payload: Value,
 ) -> Result<Value, String> {
     let uri: Uri = endpoint
         .parse()
         .map_err(|_| "invalid preview endpoint".to_owned())?;
+    if compaction::responses_endpoint(endpoint) {
+        compaction::restore_history(&mut payload)?;
+    }
     let input = PreparedInput {
         _memory_reservations: Vec::new(),
         payload: Some(payload),
@@ -104,38 +108,46 @@ pub(crate) fn build_attempt(
     let is_alpha_search = path == ALPHA_SEARCH_ENDPOINT;
     let is_systemone = path == "/v1/systemone";
     let engine = provider.engine.trim().to_ascii_lowercase();
+    let request_type = crate::routing::filters::request_type_for_endpoint(
+        input.payload.as_ref().and_then(Value::as_object),
+        path,
+    );
+    let prompt_compaction = request_type == Some("compaction")
+        && super::responses::prompt_compaction(provider, request_model, original_model);
+    let generation_path = if prompt_compaction {
+        "/v1/responses"
+    } else {
+        path
+    };
     if !crate::routing::filters::provider_accepts_endpoint(provider, path) {
         return Err("Provider does not support this endpoint".into());
     }
-    let native_responses_wire = matches!(path, "/v1/responses" | "/v1/responses/compact")
-        && (engine == "codex"
-            || (engine == "gpt"
-                && provider
-                    .base_url
-                    .to_ascii_lowercase()
-                    .contains("/responses")));
+    let native_responses_wire = compaction::responses_endpoint(path)
+        && ((matches!(engine.as_str(), "gpt" | "codex") || request_type == Some("compaction"))
+            && super::stream_mode::responses_wire(&engine, &provider.base_url));
     let gemini = crate::protocols::gemini::route(path);
     let native_gemini =
         gemini.is_some() && matches!(engine.as_str(), "gemini" | "vertex" | "vertex-gemini");
     let downstream_protocol = if gemini.is_some_and(|(_, a)| a != "countTokens") {
         DownstreamProtocol::Gemini
-    } else if path == "/v1/responses" && !native_responses_wire {
+    } else if generation_path == "/v1/responses" && !native_responses_wire {
         DownstreamProtocol::ResponsesCompat
     } else {
         DownstreamProtocol::Native
     };
-    let downstream_stream = gemini
-        .map(|(_, a)| a == "streamGenerateContent")
-        .unwrap_or_else(|| {
-            !is_alpha_search
-                && !is_systemone
-                && input
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("stream"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-        });
+    let downstream_stream = !(prompt_compaction && path == "/v1/responses/compact")
+        && gemini
+            .map(|(_, a)| a == "streamGenerateContent")
+            .unwrap_or_else(|| {
+                !is_alpha_search
+                    && !is_systemone
+                    && input
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("stream"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            });
     let provider_stream = downstream_stream;
     let chat_stream_include_usage = path == "/v1/chat/completions"
         && input
@@ -214,10 +226,8 @@ pub(crate) fn build_attempt(
             upstream_stream: false,
             request_model: request_model.to_owned(),
             original_model: original_model.to_owned(),
-            request_type: crate::routing::filters::request_type_for_endpoint(
-                input.payload.as_ref().and_then(Value::as_object),
-                path,
-            ),
+            request_type,
+            prompt_compaction,
             wire_model: None,
             downstream_protocol,
             chat_stream_include_usage,
@@ -227,7 +237,18 @@ pub(crate) fn build_attempt(
     }
 
     let mut payload = input.payload.clone().unwrap_or_else(|| json!({}));
-    let gemini_effort = if matches!(path, "/v1/responses" | "/v1/chat/completions") {
+    if prompt_compaction {
+        compaction::restore_history(&mut payload)?;
+        compaction::summary_request(&mut payload)?;
+    } else if downstream_protocol == DownstreamProtocol::ResponsesCompat {
+        if compaction::has_opaque_history(&payload) {
+            return Err("This route cannot read the native compaction item".into());
+        }
+        if compaction::references_stored_history(&payload) {
+            return Err("This route requires full input history without previous_response_id or conversation".into());
+        }
+    }
+    let gemini_effort = if matches!(generation_path, "/v1/responses" | "/v1/chat/completions") {
         if let Some((preset, wire)) = super::gemini_effort::route(provider, original_model) {
             super::gemini_effort::selected(preset, original_model, &payload)?
                 .map(|effort| (wire, effort))
@@ -246,7 +267,7 @@ pub(crate) fn build_attempt(
             super::gemini_effort::remove_openai_effort(root);
         }
     }
-    if path == "/v1/responses" {
+    if generation_path == "/v1/responses" {
         if let Some(root) = payload.as_object_mut() {
             crate::routing::service_tier::strip_for_standard(root, provider);
         }
@@ -309,7 +330,7 @@ pub(crate) fn build_attempt(
         if downstream_protocol == DownstreamProtocol::ResponsesCompat || gemini.is_some() {
             "/v1/chat/completions"
         } else {
-            path
+            generation_path
         };
     let estimated_video_tokens = (path == "/v1/video/tasks")
         .then(|| estimate_video_tokens(&payload))
@@ -624,7 +645,7 @@ pub(crate) fn build_attempt(
         && !is_systemone
         && matches!(engine.as_str(), "gpt" | "codex")
         && crate::providers::stream_mode::responses_wire(&engine, &url)
-        && matches!(path, "/v1/responses" | "/v1/responses/compact");
+        && compaction::responses_endpoint(generation_path);
     if shared_responses_wire {
         crate::providers::responses::compile_payload(
             &mut payload,
@@ -632,7 +653,7 @@ pub(crate) fn build_attempt(
             request_model,
             original_model,
             &engine,
-            path == "/v1/responses/compact",
+            generation_path == "/v1/responses/compact",
         )?;
     }
     if let Some(root) = payload.as_object_mut() {
@@ -657,6 +678,55 @@ pub(crate) fn build_attempt(
             }
             if engine == "doubao-translation" {
                 root.remove("translation_options");
+            }
+        }
+    }
+    if prompt_compaction {
+        // Channel overrides may normally turn on tools or a response schema.
+        // A summary is plain text and may never cause a tool invocation.
+        if let Some(root) = payload.as_object_mut() {
+            for field in [
+                "tools",
+                "tool_choice",
+                "tools_choice",
+                "toolConfig",
+                "tool_config",
+                "parallel_tool_calls",
+                "functions",
+                "function_call",
+                "plugins",
+                "response_format",
+                "output_format",
+                "text",
+                "modalities",
+                "audio",
+                "include",
+                "stop",
+                "stop_sequences",
+                "store",
+            ] {
+                root.remove(field);
+            }
+            if let Some(config) = root
+                .get_mut("generationConfig")
+                .and_then(Value::as_object_mut)
+            {
+                for field in [
+                    "responseMimeType",
+                    "responseSchema",
+                    "responseJsonSchema",
+                    "stopSequences",
+                    "responseModalities",
+                    "candidateCount",
+                ] {
+                    config.remove(field);
+                }
+            }
+            if let Some(config) = root.get_mut("output_config").and_then(Value::as_object_mut) {
+                config.remove("format");
+            }
+            if super::stream_mode::responses_wire(&engine, &url) {
+                root.insert("store".into(), Value::Bool(false));
             }
         }
     }
@@ -697,7 +767,7 @@ pub(crate) fn build_attempt(
     // Capability applies only to the Responses generation wire endpoint (never compact/search).
     if !is_alpha_search
         && !is_systemone
-        && (path == "/v1/responses" || adapter == ResponseAdapter::ResponsesToChat)
+        && (generation_path == "/v1/responses" || adapter == ResponseAdapter::ResponsesToChat)
         && crate::providers::stream_mode::responses_wire(&engine, &url)
         && crate::providers::stream_mode::stream_only(provider, request_model, original_model)
     {
@@ -716,6 +786,13 @@ pub(crate) fn build_attempt(
     } else {
         upstream_stream
     };
+    if prompt_compaction
+        && upstream_stream
+        && adapter == ResponseAdapter::Passthrough
+        && !super::stream_mode::responses_wire(&engine, &url)
+    {
+        payload["stream_options"] = json!({"include_usage":true});
+    }
     let mut headers = if shared_responses_wire {
         let headers = crate::providers::responses::build_headers(
             incoming_headers,
@@ -796,10 +873,8 @@ pub(crate) fn build_attempt(
         upstream_stream,
         request_model: request_model.to_owned(),
         original_model: original_model.to_owned(),
-        request_type: crate::routing::filters::request_type_for_endpoint(
-            input.payload.as_ref().and_then(Value::as_object),
-            path,
-        ),
+        request_type,
+        prompt_compaction,
         wire_model: payload
             .get("model")
             .and_then(Value::as_str)

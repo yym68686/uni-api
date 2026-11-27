@@ -74,6 +74,7 @@ struct StreamTimeouts {
 #[derive(Clone, Copy)]
 struct TranslationOptions {
     include_usage: bool,
+    require_terminal: bool,
     timeouts: StreamTimeouts,
     timing: StreamTiming,
 }
@@ -177,6 +178,36 @@ pub fn translate(
         idle_timeout_seconds,
         total_timeout_seconds,
         false,
+        false,
+        StreamTiming::new(observed_from),
+    )
+}
+
+pub(crate) fn translate_compaction(
+    response: reqwest::Response,
+    observed_from: tokio::time::Instant,
+    protocol: Protocol,
+    idle_timeout_seconds: Option<f64>,
+    total_timeout_seconds: Option<f64>,
+) -> Translation {
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    spawn_translation(
+        response.status(),
+        content_type,
+        Box::pin(response.bytes_stream()),
+        protocol,
+        OutputProtocol::Chat,
+        String::new(),
+        false,
+        idle_timeout_seconds,
+        total_timeout_seconds,
+        false,
+        true,
         StreamTiming::new(observed_from),
     )
 }
@@ -256,6 +287,7 @@ pub async fn translate_responses_to_chat(
                             started.elapsed(),
                         ),
                         emit_precommit_comment,
+                        false,
                         timing,
                     ));
                 }
@@ -306,6 +338,7 @@ pub async fn translate_responses_to_chat(
                                     started.elapsed(),
                                 ),
                                 emit_precommit_comment,
+                                false,
                                 timing,
                             ));
                         }
@@ -336,6 +369,7 @@ fn spawn_translation(
     idle_timeout_seconds: Option<f64>,
     total_timeout_seconds: Option<f64>,
     emit_precommit_comment: bool,
+    require_terminal: bool,
     timing: StreamTiming,
 ) -> Translation {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
@@ -348,6 +382,7 @@ fn spawn_translation(
         }
         let options = TranslationOptions {
             include_usage,
+            require_terminal,
             timing,
             timeouts: StreamTimeouts {
                 idle: positive_duration(idle_timeout_seconds),
@@ -480,6 +515,8 @@ async fn run_translation_inner(
     options: TranslationOptions,
 ) -> Result<StreamOutcome, String> {
     let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
+    state.require_terminal |= options.require_terminal;
+    state.strict_summary = options.require_terminal;
     state.source_protocol = Some(protocol);
     state.timing = options.timing;
     let timeouts = options.timeouts;
@@ -1173,6 +1210,8 @@ struct StreamState {
     fact_usage: crate::observability::usage::FactUsage,
     terminal: bool,
     require_terminal: bool,
+    strict_summary: bool,
+    claude_message_stop: bool,
     failure: Option<PrecommitFailure>,
     output_protocol: OutputProtocol,
     include_usage: bool,
@@ -1203,6 +1242,8 @@ impl StreamState {
             fact_usage: Default::default(),
             terminal: false,
             require_terminal: output_protocol == OutputProtocol::Gemini,
+            strict_summary: false,
+            claude_message_stop: false,
             failure: None,
             output_protocol,
             include_usage,
@@ -1222,6 +1263,25 @@ impl StreamState {
 
     fn convert(&mut self, protocol: Protocol, value: &Value) -> Vec<Value> {
         self.require_terminal |= protocol == Protocol::Gemini;
+        if self.strict_summary
+            && protocol == Protocol::Gemini
+            && (value
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason != "STOP")
+                || value
+                    .pointer("/candidates/0/content/parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|part| {
+                        part.get("inlineData").is_some() || part.get("functionCall").is_some()
+                    }))
+        {
+            return self.gemini_failure(crate::protocols::gemini::ChatResponseError::invalid(
+                "Expected a complete text summary",
+            ));
+        }
         if (protocol == Protocol::Gemini || self.output_protocol == OutputProtocol::Gemini)
             && value.get("error").is_some_and(|error| !error.is_null())
         {
@@ -1559,6 +1619,18 @@ impl StreamState {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if self.strict_summary {
+            if event == "message_stop" {
+                self.claude_message_stop = true;
+            }
+            if value
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !matches!(reason, "end_turn" | "stop_sequence"))
+            {
+                return vec![json!({"error":{"message":"Expected a complete text summary"}})];
+            }
+        }
         match event {
             "message_start" => {
                 if let Some(id) = value.pointer("/message/id").and_then(Value::as_str) {
@@ -1880,6 +1952,15 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        if self.strict_summary
+            && matches!(
+                self.source_protocol,
+                Some(Protocol::Claude | Protocol::AwsBedrock)
+            )
+            && !self.claude_message_stop
+        {
+            return Err("upstream stream ended without message_stop".into());
+        }
         if self.require_terminal && !self.terminal {
             return Err("upstream stream ended without a terminal event".into());
         }
@@ -2640,6 +2721,7 @@ mod tests {
             Some(1.0),
             Some(0.01),
             true,
+            false,
             StreamTiming::new(tokio::time::Instant::now()),
         );
         // Retain the HTTP body without polling it. This also tests that error
@@ -3045,6 +3127,7 @@ mod tests {
             None,
             None,
             true,
+            false,
             StreamTiming::new(tokio::time::Instant::now()),
         );
         let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)

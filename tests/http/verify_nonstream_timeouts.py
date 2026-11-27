@@ -102,7 +102,7 @@ def verify(binary):
             "providers": [{"provider": name, "engine": "gpt",
                            "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
                            "api": "fixture-upstream", "model": list(cases),
-                           "preferences": {"cooldown_period": 0}}
+                           "preferences": {"compaction_mode": "native", "cooldown_period": 0}}
                           for name in ["first", "fallback"]],
             "api_keys": [{"api": "fixture-key", "model": ["first/*", "fallback/*"],
                           "preferences": {"AUTO_RETRY": True}}],

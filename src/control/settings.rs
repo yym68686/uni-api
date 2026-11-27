@@ -367,6 +367,7 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
             "json",
         ),
         ("preferences/upstream_stream_mode", "网络与适配", "json"),
+        ("preferences/compaction_mode", "网络与适配", "json"),
         ("preferences/explicit_cache_guard", "请求规则", "boolean"),
         ("tools", "网络与适配", "boolean"),
         ("image", "网络与适配", "boolean"),
@@ -493,6 +494,9 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
         }
         if let Some(mode) = p.get("upstream_stream_mode") {
             crate::providers::stream_mode::validate(mode)?;
+        }
+        if let Some(mode) = p.get(crate::providers::responses::COMPACTION_MODE) {
+            crate::providers::responses::validate_compaction_mode(mode)?;
         }
         if p.get(crate::routing::service_tier::EVIDENCE)
             .is_some_and(|v| !crate::routing::service_tier::valid_evidence(v))

@@ -82,7 +82,7 @@ def verify(binary, mode):
         root, port = Path(directory), free_port()
         config = {"providers": [{"provider": p, "engine": "gpt", "api": "fixture",
                     "base_url": f"http://127.0.0.1:{upstream.server_port}/{p}/v1/responses",
-                    "model": ["model-a"]} for p in ("bad", "good")],
+                    "model": ["model-a"], "preferences": {"compaction_mode": "native"}} for p in ("bad", "good")],
                   "api_keys": [{"api": "fixture-admin", "role": "admin", "model": ["all"]},
                                {"api":"fixture-disabled", "model":["all"], "preferences":{"AUTO_RETRY":False}},
                                {"api":"fixture-weighted", "model":["all"],

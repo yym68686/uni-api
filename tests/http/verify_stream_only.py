@@ -91,7 +91,7 @@ def verify(binary):
         root = Path(directory); port = free_port()
         mode = {'default':'stream_only', 'models':{'follow':'follow_client'}}
         config = {'providers':[{'provider':n,'engine':'gpt', 'base_url':f'http://127.0.0.1:{upstream.server_port}/{n}/v1/'+('chat/completions' if n=='chat' else 'responses'),
-                               'api':'fixture','model':models,'preferences':{'upstream_stream_mode':mode, 'cooldown_period':0,
+                               'api':'fixture','model':models,'preferences':{'compaction_mode':'native','upstream_stream_mode':mode, 'cooldown_period':0,
                                'timeout_policy':{'default':{'total':2,'idle':1},'rules':[
                                    {'match':{'model':'idle','stream':False},'timeout':{'idle':.05}},
                                    {'match':{'model':'total','stream':False},'timeout':{'total':.15}}]}}}

@@ -61,7 +61,7 @@ def verify(binary, hedging):
                 return {"provider": name, "engine": "gpt",
                         "base_url": f"http://127.0.0.1:{server.server_port}/{name}/v1/responses",
                         "api": [f"fixture-upstream-{i}" for i in range(keys)], "model": [model],
-                        "preferences": {"cooldown_period": 0, "api_key_cooldown_period": 0}}
+                        "preferences": {"compaction_mode": "native", "cooldown_period": 0, "api_key_cooldown_period": 0}}
             values = {"three": 3, "string-three": " 3 ", "one": 1, "false": False,
                       "zero": 0, "string-false": "false", "off": " OFF ",
                       "invalid": "invalid", "negative": -1, "fractional": 1.5,

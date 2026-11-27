@@ -65,14 +65,14 @@ def verify(binary, mode):
             providers = [
                 {"provider": name, "engine": "gpt", "api": "fixture-upstream",
                  "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
-                 "model": ["model-a"], **policy}
+                 "model": ["model-a"], "preferences": {"compaction_mode": "native"}, **policy}
                 for name, policy in [
                     ("regular", {}), ("compact", {"only_request_types": ["compaction"]})]
             ]
-            providers[1]["preferences"] = {"timeout_policy": {
+            providers[1]["preferences"]["timeout_policy"] = {
                 "default": {"first_byte": .2},
                 "rules": [{"match": {"request_type": "compaction"}, "timeout": {"first_byte": 3}}],
-            }}
+            }
             if mode == "fallback":
                 # A compatible fallback candidate makes native preparation hand
                 # the request back to generic routing after its first filtering.

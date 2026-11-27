@@ -85,7 +85,7 @@ def main():
             {"provider": name, **({} if name == "portable" else {"engine": "gpt"}),
              "base_url": f"http://127.0.0.1:{upstream.server_port}/{name}/v1/responses",
              "api": ["first-" + name, "second-" + name], "model": [{"wire": "public"}],
-             "preferences": {"api_key_schedule_algorithm": "fixed_priority", **(
+             "preferences": {"compaction_mode": "native", "api_key_schedule_algorithm": "fixed_priority", **(
                  {"upstream_stream_mode": "stream_only"} if name in ("early", "full") else {}
              )}}
             for name in ("peer", "verified", "early", "full", "portable")

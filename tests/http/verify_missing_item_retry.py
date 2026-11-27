@@ -116,7 +116,7 @@ def verify(binary, hedging):
         config = {"providers": [{"provider": name, "engine": "gpt",
             "base_url": f"http://127.0.0.1:{server.server_port}/{name}/v1/responses",
             "api": ["fixture-key-1", "fixture-key-2"], "model": [{"upstream-model": "test-model"}],
-            "preferences": {"cooldown_period": 0, "oaix_routing_attempt_id": True,
+            "preferences": {"compaction_mode": "native", "cooldown_period": 0, "oaix_routing_attempt_id": True,
                             "model_timeout": {"default": 0.05}}}
             for name in ("first", "fallback", "third")],
             "api_keys": [

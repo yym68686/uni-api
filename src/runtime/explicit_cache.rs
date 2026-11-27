@@ -353,7 +353,7 @@ mod tests {
                 "system":[{"type":"text","text":"reference ".repeat(1000),"cache_control":{"type":"ephemeral","ttl":"5m"}}],
                 "messages":[{"role":"user","content":question}]})).unwrap()),
             adapter:ResponseAdapter::Passthrough,downstream_stream:true,upstream_stream:true,
-            request_model:"claude".into(),original_model:"claude".into(),request_type:None,wire_model:None,
+            request_model:"claude".into(),original_model:"claude".into(),request_type:None,prompt_compaction:false,wire_model:None,
             downstream_protocol:DownstreamProtocol::Native,chat_stream_include_usage:false,
             provider_key:"private-upstream-key".into(),estimated_video_tokens:None };
         (provider, p)

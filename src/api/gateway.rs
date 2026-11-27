@@ -110,10 +110,19 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .map(|auth| auth.api_key.role.to_string())
         .unwrap_or_default();
 
-    let input = match prepare_input(&state, request, &method, &uri, &path, resource_wait).await {
+    let mut input = match prepare_input(&state, request, &method, &uri, &path, resource_wait).await
+    {
         Ok(input) => input,
         Err(response) => return response,
     };
+    if method == Method::POST && crate::protocols::responses::compaction::responses_endpoint(&path)
+    {
+        if let Some(payload) = input.payload.as_mut() {
+            if let Err(detail) = crate::protocols::responses::compaction::restore_history(payload) {
+                return json_error(StatusCode::BAD_REQUEST, detail);
+            }
+        }
+    }
     if method != Method::GET {
         if let Some(payload) = input.payload.as_ref() {
             if let Some(field) = missing_required_field(&path, payload) {
@@ -352,6 +361,11 @@ pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
                 }
             }
             for item in items.iter().rev() {
+                if let Ok(Some(summary)) =
+                    crate::protocols::responses::compaction::checkpoint_summary(item)
+                {
+                    return Some(summary);
+                }
                 if item
                     .get("role")
                     .and_then(Value::as_str)

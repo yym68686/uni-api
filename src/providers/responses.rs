@@ -7,6 +7,68 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+pub(crate) const COMPACTION_MODE: &str = "compaction_mode";
+
+pub(crate) fn validate_compaction_mode(value: &Value) -> Result<(), String> {
+    let valid = |v: &Value| matches!(v.as_str(), Some("auto" | "native" | "prompt"));
+    if valid(value)
+        || value.as_object().is_some_and(|scope| {
+            scope
+                .keys()
+                .all(|key| matches!(key.as_str(), "default" | "models"))
+                && scope.get("default").is_none_or(valid)
+                && scope.get("models").is_none_or(|v| {
+                    v.as_object().is_some_and(|models| {
+                        models
+                            .iter()
+                            .all(|(model, mode)| !model.trim().is_empty() && valid(mode))
+                    })
+                })
+        })
+    {
+        Ok(())
+    } else {
+        Err("Invalid channel setting: /preferences/compaction_mode".into())
+    }
+}
+
+pub(crate) fn prompt_compaction(provider: &Provider, model: &str, upstream: &str) -> bool {
+    if !super::stream_mode::responses_wire(&provider.engine, &provider.base_url) {
+        return true;
+    }
+    let preference = provider.preferences.get(COMPACTION_MODE).and_then(|value| {
+        value
+            .get("models")
+            .and_then(|m| m.get(model).or_else(|| m.get(upstream)))
+            .or_else(|| value.get("default"))
+            .unwrap_or(value)
+            .as_str()
+    });
+    match preference {
+        Some("native") => false,
+        Some("prompt") => true,
+        // A Responses URL describes the wire, not the model's ability to create
+        // OpenAI compaction. Resolve the actual channel model, not the public alias.
+        _ => {
+            let leaf = upstream
+                .rsplit('/')
+                .next()
+                .unwrap_or(upstream)
+                .to_ascii_lowercase();
+            let leaf = leaf.strip_prefix("openai.").unwrap_or(&leaf);
+            !["gpt-", "codex-", "chatgpt-"]
+                .iter()
+                .any(|prefix| leaf.starts_with(prefix))
+                && !["o1", "o3", "o4"].iter().any(|model| {
+                    leaf == *model
+                        || leaf
+                            .strip_prefix(model)
+                            .is_some_and(|suffix| suffix.starts_with('-'))
+                })
+        }
+    }
+}
+
 pub(crate) fn compile_payload(
     payload: &mut Value,
     provider: &Provider,
