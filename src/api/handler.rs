@@ -86,7 +86,11 @@ async fn handler_inner(mut state: AppState, request: Request) -> Response<Body> 
         );
     }
     if crate::protocols::interactions::is_route(&path) && request.method() != Method::POST {
-        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
+        let mut response = json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
+        response
+            .headers_mut()
+            .insert("allow", HeaderValue::from_static("POST"));
+        return response;
     }
     let native_method = request.method().clone();
     let native_path = path.clone();

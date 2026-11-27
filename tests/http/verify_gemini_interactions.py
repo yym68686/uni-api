@@ -102,7 +102,8 @@ def verify(binary):
                     raise AssertionError("Gateway was not ready")
                 path, request = "/v1/interactions", {"model": "alias", "input": "hello"}
                 assert call(path, request, key=False)[0] == 403
-                assert call(path)[0] == 405
+                method_status, method_headers, _ = call(path)
+                assert method_status == 405 and method_headers.get("allow") == "POST"
                 assert call(path + "/fixture")[0] == 404
                 assert call(path, {**request, "store": True})[0] == 400
                 assert call(path, {**request, "previous_interaction_id": "fixture"})[0] == 400

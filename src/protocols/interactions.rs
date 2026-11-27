@@ -24,10 +24,7 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
     let object = value
         .as_object()
         .ok_or("Interactions requires a JSON object")?;
-    if value["model"]
-        .as_str()
-        .is_none_or(|s| s.trim().is_empty())
-    {
+    if value["model"].as_str().is_none_or(|s| s.trim().is_empty()) {
         return Err("Interactions requires a model");
     }
     let nonempty = |v: &Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
