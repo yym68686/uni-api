@@ -33,6 +33,7 @@ pub enum OutputProtocol {
     Chat,
     Responses,
     Gemini,
+    Interactions,
 }
 
 pub struct Translation {
@@ -414,6 +415,10 @@ fn spawn_translation(
                 let payload = match output_protocol {
                     OutputProtocol::Chat => json!({"error":{"message":error}}),
                     OutputProtocol::Gemini => crate::protocols::gemini::error(502, &error),
+                    OutputProtocol::Interactions => crate::protocols::interactions::stream_error(
+                        502,
+                        "Upstream stream did not complete successfully",
+                    ),
                     OutputProtocol::Responses => json!({
                         "type":"response.failed",
                         "response":{
@@ -560,7 +565,7 @@ async fn run_translation_inner(
                 &chunk.map_err(|error| format!("upstream transport error: {error}"))?,
             );
             drain_sse_events(&mut buffer, protocol, &mut state, tx).await?;
-            if protocol == Protocol::Responses && state.terminal {
+            if state.stop_reading(protocol) {
                 break;
             }
             if buffer.len() > MAX_STREAM_FRAME_BYTES {
@@ -641,7 +646,7 @@ async fn drain_sse_events(
         let event = buffer.drain(..end).collect::<Vec<_>>();
         buffer.drain(..separator);
         process_sse_event(&event, protocol, state, tx).await?;
-        if protocol == Protocol::Responses && state.terminal {
+        if state.stop_reading(protocol) {
             break;
         }
     }
@@ -932,6 +937,9 @@ async fn process_sse_event(
         }
     }
     if data.trim() == "[DONE]" {
+        if let Some(output) = &mut state.interactions_output {
+            output.input_done = true;
+        }
         // Workers AI can use an SSE sentinel without a final JSON frame.
         if state.strict_summary && protocol == Protocol::Cloudflare {
             for chunk in state.finish_chunks_with_usage("stop", false) {
@@ -942,6 +950,16 @@ async fn process_sse_event(
     }
     if data.trim().is_empty() {
         return Ok(());
+    }
+    if state.interactions_output.is_some() && protocol == Protocol::Responses {
+        let payload: Value = serde_json::from_str(&data)
+            .map_err(|error| format!("decode upstream Responses stream event: {error}"))?;
+        if let Some(declared) = text.lines().find_map(|line| line.strip_prefix("event:")) {
+            if payload["type"].as_str() != Some(declared.trim()) {
+                return Err("upstream Responses event does not match payload type".into());
+            }
+        }
+        return process_json_value(protocol, state, tx, payload).await;
     }
     process_json_bytes(data.as_bytes(), protocol, state, tx).await
 }
@@ -958,6 +976,15 @@ async fn process_json_bytes(
     }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
+    process_json_value(protocol, state, tx, value).await
+}
+
+async fn process_json_value(
+    protocol: Protocol,
+    state: &mut StreamState,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    value: Value,
+) -> Result<(), String> {
     state.timing.observe(protocol, &value);
     let chunks = state.convert(protocol, &value);
     for chunk in chunks {
@@ -1175,6 +1202,11 @@ async fn send_wire_until(
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(), String> {
     let mut wire = Vec::new();
+    if output_protocol == OutputProtocol::Interactions {
+        crate::protocols::interactions::sse_frame(&mut wire, value)
+            .map_err(|error| error.to_string())?;
+        return send_downstream(tx, Bytes::from(wire), deadline).await;
+    }
     if output_protocol == OutputProtocol::Responses {
         if let Some(event_type) = value.get("type").and_then(Value::as_str) {
             wire.extend_from_slice(b"event: ");
@@ -1226,10 +1258,19 @@ struct StreamState {
     include_usage: bool,
     responses: ResponsesOutputState,
     gemini_output: crate::protocols::gemini::OutputState,
+    interactions_output: Option<crate::protocols::interactions::TextOutput>,
     timing: StreamTiming,
 }
 
 impl StreamState {
+    fn stop_reading(&self, protocol: Protocol) -> bool {
+        (protocol == Protocol::Responses && self.terminal)
+            || self
+                .interactions_output
+                .as_ref()
+                .is_some_and(|output| output.input_done || self.failure.is_some())
+    }
+
     fn new_with_options(model: &str, output_protocol: OutputProtocol, include_usage: bool) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1250,7 +1291,10 @@ impl StreamState {
             chat_usage: None,
             fact_usage: Default::default(),
             terminal: false,
-            require_terminal: output_protocol == OutputProtocol::Gemini,
+            require_terminal: matches!(
+                output_protocol,
+                OutputProtocol::Gemini | OutputProtocol::Interactions
+            ),
             strict_summary: false,
             claude_message_stop: false,
             failure: None,
@@ -1258,12 +1302,16 @@ impl StreamState {
             include_usage,
             responses: ResponsesOutputState::new(model, created),
             gemini_output: Default::default(),
+            interactions_output: (output_protocol == OutputProtocol::Interactions)
+                .then(|| crate::protocols::interactions::TextOutput::new(model)),
             timing: StreamTiming::new(tokio::time::Instant::now()),
         }
     }
 
     fn start_chunks(&mut self) -> Vec<Value> {
-        if self.output_protocol == OutputProtocol::Responses {
+        if let Some(output) = &self.interactions_output {
+            vec![output.created()]
+        } else if self.output_protocol == OutputProtocol::Responses {
             self.responses.start_chunks()
         } else {
             Vec::new()
@@ -1272,6 +1320,26 @@ impl StreamState {
 
     fn convert(&mut self, protocol: Protocol, value: &Value) -> Vec<Value> {
         self.require_terminal |= protocol == Protocol::Gemini;
+        if let Some(output) = &mut self.interactions_output {
+            let usage = match protocol {
+                Protocol::Responses => value.pointer("/response/usage"),
+                Protocol::Gemini => value.get("usageMetadata"),
+                _ => value.get("usage"),
+            };
+            output
+                .usage
+                .extend(crate::protocols::interactions::from_wire_usage(usage));
+            self.fact_usage
+                .merge(crate::observability::usage::FactUsage::from_usage(usage));
+            if self.failure.is_some() {
+                return Vec::new();
+            }
+            if protocol == Protocol::Gemini
+                && crate::protocols::interactions::gemini_non_text(value)
+            {
+                return self.interactions_failure(502, "Upstream returned non-text content");
+            }
+        }
         if self.strict_summary
             && protocol == Protocol::Gemini
             && (value
@@ -1291,7 +1359,11 @@ impl StreamState {
                 "Expected a complete text summary",
             ));
         }
-        if (protocol == Protocol::Gemini || self.output_protocol == OutputProtocol::Gemini)
+        if (protocol == Protocol::Gemini
+            || matches!(
+                self.output_protocol,
+                OutputProtocol::Gemini | OutputProtocol::Interactions
+            ))
             && value.get("error").is_some_and(|error| !error.is_null())
         {
             let error = &value["error"];
@@ -1361,6 +1433,46 @@ impl StreamState {
     }
 
     fn encode_chunks(&mut self, chunks: Vec<Value>) -> Vec<Value> {
+        if let Some(output) = &mut self.interactions_output {
+            let mut events = Vec::new();
+            for chunk in chunks {
+                if !chunk["error"].is_null() {
+                    let code = chunk["error"]["status_code"]
+                        .as_u64()
+                        .or_else(|| chunk["error"]["code"].as_u64())
+                        .filter(|code| (400..600).contains(code))
+                        .unwrap_or(502) as u16;
+                    events.push(crate::protocols::interactions::stream_error(
+                        code,
+                        "Upstream stream failed",
+                    ));
+                    break;
+                }
+                let delta = &chunk["choices"][0]["delta"];
+                if crate::protocols::interactions::chat_non_text(delta) {
+                    events.extend(
+                        self.interactions_failure(502, "Upstream returned non-text content"),
+                    );
+                    break;
+                }
+                if let Some(text) = delta["content"].as_str() {
+                    events.extend(output.delta(text));
+                }
+                if let Some(reason) = chunk
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                {
+                    match crate::protocols::interactions::output_status(reason) {
+                        Ok(status) => output.terminal = Some(status),
+                        Err(detail) => {
+                            events.extend(self.interactions_failure(502, detail));
+                            break;
+                        }
+                    }
+                }
+            }
+            return events;
+        }
         if self.output_protocol == OutputProtocol::Gemini {
             let mut output = Vec::new();
             for chunk in chunks {
@@ -1390,12 +1502,57 @@ impl StreamState {
         }
     }
 
+    fn interactions_failure(&mut self, status: u16, detail: &str) -> Vec<Value> {
+        self.terminal = true;
+        self.failure = Some(PrecommitFailure {
+            status_code: status,
+            detail: detail.into(),
+            failure_reason: Some("protocol_error"),
+        });
+        vec![crate::protocols::interactions::stream_error(status, detail)]
+    }
+
     fn responses(&mut self, value: &Value) -> Vec<Value> {
         let event = value
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
         match event {
+            "response.completed" | "response.incomplete"
+                if self.interactions_output.is_some()
+                    && crate::protocols::interactions::responses_reason(&value["response"])
+                        .is_ok() =>
+            {
+                let response = &value["response"];
+                let reason =
+                    crate::protocols::interactions::responses_reason(response).expect("checked");
+                let normalized =
+                    crate::protocols::conversion::responses_to_chat(response, &self.model);
+                let mut chunks = Vec::new();
+                if self
+                    .interactions_output
+                    .as_ref()
+                    .is_some_and(|o| !o.emitted_text)
+                {
+                    if let Some(text) = normalized
+                        .pointer("/choices/0/message/content")
+                        .and_then(Value::as_str)
+                    {
+                        chunks.push(self.chunk(json!({"content":text}), None, None));
+                    }
+                }
+                if let Some(usage) = response.get("usage").filter(|u| u.is_object()) {
+                    let mapped = responses_usage_to_chat(Some(usage));
+                    self.prompt_tokens = number(mapped.get("prompt_tokens"));
+                    self.completion_tokens = number(mapped.get("completion_tokens"));
+                    self.chat_usage = Some(mapped);
+                }
+                chunks.extend(self.finish_chunks_with_usage(reason, false));
+                chunks
+            }
+            "response.completed" | "response.incomplete" if self.interactions_output.is_some() => {
+                self.responses_failure(value, event)
+            }
             "response.output_text.delta" => value
                 .get("delta")
                 .and_then(Value::as_str)
@@ -1948,6 +2105,11 @@ impl StreamState {
     }
 
     fn outcome(&self) -> StreamOutcome {
+        let status = self
+            .interactions_output
+            .as_ref()
+            .and_then(|output| output.terminal);
+        let complete = status.is_none_or(|s| s == "completed");
         match &self.failure {
             Some(failure) => StreamOutcome {
                 observational_only: false,
@@ -1974,14 +2136,19 @@ impl StreamState {
                 observational_only: false,
                 usage: self.usage(),
                 fact_usage: self.fact_usage.clone(),
-                success: true,
+                success: complete,
                 status_code: 200,
                 detail: String::new(),
                 failure_reason: None,
-                terminal_kind: self.terminal.then_some("completed"),
+                terminal_kind: match status {
+                    Some("failed") => Some("semantic_failure"),
+                    Some(kind) => Some(kind),
+                    None => self.terminal.then_some("completed"),
+                },
                 response_completed: (self.source_protocol == Some(Protocol::Responses)
                     || self.output_protocol == OutputProtocol::Responses)
-                    .then_some(self.terminal),
+                    .then_some(self.terminal && complete)
+                    .or_else(|| self.interactions_output.as_ref().map(|_| complete)),
                 first_output_ms: self.timing.first_output_ms,
                 response_created_ms: self.timing.response_created_ms,
                 first_text_ms: self.timing.first_text_ms,
@@ -1993,6 +2160,18 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        if let Some(output) = &self.interactions_output {
+            if self.failure.is_some() {
+                return Ok(());
+            }
+            let status = output
+                .terminal
+                .ok_or("upstream stream ended without a valid terminal event")?;
+            for event in output.finish(status) {
+                send_wire(tx, &event, self.output_protocol).await?;
+            }
+            return Ok(());
+        }
         if self.strict_summary
             && matches!(
                 self.source_protocol,

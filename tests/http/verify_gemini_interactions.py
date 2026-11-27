@@ -68,12 +68,12 @@ def verify(binary):
         config = {"api_keys": [{"api": "fixture-client", "model": ["all"], "preferences": {
             "AUTO_RETRY": 3, "SCHEDULING_ALGORITHM": "fixed_priority"
         }}], "providers": [
-            {"provider": "legacy", "engine": "gemini", "base_url": base + "/legacy/v1beta",
-             "api": "fixture-provider", "model": ["legacy-model", {"wire-model": "alias"}]},
             *[{"provider": name, "engine": "gemini", "base_url": base + f"/{name}/v1beta",
                "api": "fixture-provider", "model": [{"wire-model": "alias"}, {"gemini-embedding-001": "embedding-alias"}, {"gemini-flash-preview-tts": "audio-alias"}],
                "preferences": {"gemini_interactions_version": "v1", "cooldown_period": 0}}
               for name in ("primary", "fallback")],
+            {"provider": "legacy", "engine": "gemini", "base_url": base + "/legacy/v1beta",
+             "api": "fixture-provider", "model": ["legacy-model", {"wire-model": "alias"}]},
         ]}
         (root / "config.json").write_text(json.dumps(config))
         env = {k: v for k, v in os.environ.items() if not k.startswith(("FACTS_", "UNI_API_CONTROL_RESTORE_", "OTEL_", "FUGUE_OTEL_")) and k != "CONFIG_URL"}
@@ -108,7 +108,8 @@ def verify(binary):
                 else:
                     raise AssertionError("Gateway was not ready")
                 path, request = "/v1/interactions", {"model": "alias", "input": "hello"}
-                assert call(path, request, key=False)[0] == 403
+                missing_key = call(path, request, key=False)
+                assert missing_key[0] == 403, missing_key
                 method_status, method_headers, _ = call(path)
                 assert method_status == 405 and method_headers.get("allow") == "POST"
                 assert call(path + "/fixture")[0] == 404
@@ -121,11 +122,13 @@ def verify(binary):
                 ]:
                     result, _, raw = call(path, {**request, **changes})
                     assert result == 400 and message in json.loads(raw)["error"]["message"], (result, raw)
-                assert call(path, {**request, "model": "legacy-model"})[0] >= 400
                 assert call(path, {**request, "model": "embedding-alias"})[0] >= 400
                 assert call(path, {**request, "model": "audio-alias"})[0] >= 400
                 catalog_status, _, catalog = call("/v1/model-channels?endpoint=%2Fv1%2Finteractions", bearer=True)
-                assert catalog_status == 200 and {row["model"] for row in json.loads(catalog)["data"]} == {"alias"}, (catalog_status, catalog)
+                assert catalog_status == 200
+                assert {(row["model"], row["interactions_mode"]) for row in json.loads(catalog)["data"]} == {
+                    ("alias", "native"), ("alias", "translated"), ("legacy-model", "translated")
+                }, catalog
                 assert not upstream.hits
                 for changes, status, expected in [
                     ({}, 200, JSON_BODY), ({"stream": True}, 200, SSE_BODY),

@@ -1703,6 +1703,10 @@ pub(crate) async fn send_attempt(
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let interactions = crate::protocols::interactions::is_route(endpoint);
+    let native_interactions =
+        prepared.downstream_protocol == DownstreamProtocol::InteractionsNative;
+    let translated_interactions =
+        prepared.downstream_protocol == DownstreamProtocol::InteractionsCompat;
     let compaction = prepared.request_type == Some("compaction");
     let snapshot = state
         .runtime
@@ -1722,6 +1726,7 @@ pub(crate) async fn send_attempt(
     let facts = crate::routing::context::RequestFacts {
         service_tier: None,
         requested_service_tier: None,
+        interactions_compat_error: None,
         model: prepared.request_model.clone(),
         endpoint: endpoint.into(),
         body_bytes: 0,
@@ -2057,7 +2062,7 @@ pub(crate) async fn send_attempt(
             upstream_url: prepared.url,
         });
     }
-    if interactions && prepared.upstream_stream {
+    if native_interactions && prepared.upstream_stream {
         if !response
             .headers()
             .get(CONTENT_TYPE)
@@ -2252,40 +2257,43 @@ pub(crate) async fn send_attempt(
             DownstreamProtocol::ResponsesCompat => StreamOutputProtocol::Responses,
             DownstreamProtocol::Gemini => StreamOutputProtocol::Gemini,
             DownstreamProtocol::Native => StreamOutputProtocol::Chat,
+            DownstreamProtocol::InteractionsCompat => StreamOutputProtocol::Interactions,
+            DownstreamProtocol::InteractionsNative => unreachable!("handled native Interactions"),
         };
-        let mut translation = if prepared.adapter == ResponseAdapter::ResponsesToChat {
-            provider_stream::translate_responses_to_chat(
-                response.take().unwrap(),
-                started,
-                output_protocol,
-                prepared.request_model.clone(),
-                prepared.chat_stream_include_usage,
-                remaining_timeout(timeouts.first_byte, send_started.elapsed()),
-                timeouts.idle,
-                remaining_timeout(timeouts.total, send_started.elapsed()),
-                false,
-            )
-            .await
-            .map_err(|failure| AttemptFailure {
-                failure_reason: precommit_reason(failure.failure_reason),
-                status: StatusCode::from_u16(failure.status_code)
-                    .unwrap_or(StatusCode::BAD_GATEWAY),
-                detail: failure.detail,
-                upstream_url: prepared.url.clone(),
-                response: None,
-            })?
-        } else {
-            provider_stream::translate(
-                response.take().unwrap(),
-                started,
-                protocol,
-                output_protocol,
-                prepared.request_model.clone(),
-                prepared.chat_stream_include_usage,
-                timeouts.idle,
-                remaining_timeout(timeouts.total, send_started.elapsed()),
-            )
-        };
+        let mut translation =
+            if prepared.adapter == ResponseAdapter::ResponsesToChat && !translated_interactions {
+                provider_stream::translate_responses_to_chat(
+                    response.take().unwrap(),
+                    started,
+                    output_protocol,
+                    prepared.request_model.clone(),
+                    prepared.chat_stream_include_usage,
+                    remaining_timeout(timeouts.first_byte, send_started.elapsed()),
+                    timeouts.idle,
+                    remaining_timeout(timeouts.total, send_started.elapsed()),
+                    false,
+                )
+                .await
+                .map_err(|failure| AttemptFailure {
+                    failure_reason: precommit_reason(failure.failure_reason),
+                    status: StatusCode::from_u16(failure.status_code)
+                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    detail: failure.detail,
+                    upstream_url: prepared.url.clone(),
+                    response: None,
+                })?
+            } else {
+                provider_stream::translate(
+                    response.take().unwrap(),
+                    started,
+                    protocol,
+                    output_protocol,
+                    prepared.request_model.clone(),
+                    prepared.chat_stream_include_usage,
+                    timeouts.idle,
+                    remaining_timeout(timeouts.total, send_started.elapsed()),
+                )
+            };
         if endpoint == "/v1/responses"
             && prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat
         {
@@ -2341,7 +2349,7 @@ pub(crate) async fn send_attempt(
         });
     }
     if prepared.adapter == ResponseAdapter::Passthrough
-        && prepared.downstream_protocol == DownstreamProtocol::Native
+        && (prepared.downstream_protocol == DownstreamProtocol::Native || native_interactions)
         && !collect_responses
     {
         let headers = filtered_response_headers(response.as_ref().unwrap().headers());
@@ -2376,7 +2384,7 @@ pub(crate) async fn send_attempt(
                         .contains(&r)
                     })
             });
-        let (usage, fact_usage, collected_outcome) = if interactions {
+        let (usage, fact_usage, collected_outcome) = if native_interactions {
             let Some(value) = parsed.as_ref().filter(|value| value.is_object()) else {
                 return Err(AttemptFailure {
                     failure_reason: "protocol_error".into(),
@@ -2456,6 +2464,34 @@ pub(crate) async fn send_attempt(
     if prepared.adapter == ResponseAdapter::ResponsesToChat {
         crate::protocols::responses::usage::normalize_payload(&mut upstream);
     }
+    let wire_usage = upstream
+        .get("usage")
+        .or_else(|| upstream.get("usageMetadata"));
+    let translated_usage = translated_interactions
+        .then(|| crate::protocols::interactions::from_wire_usage(wire_usage));
+    let invalid_interactions = |detail: &str| AttemptFailure {
+        failure_reason: "protocol_error".into(),
+        status: StatusCode::BAD_GATEWAY,
+        detail: detail.into(),
+        upstream_url: prepared.url.clone(),
+        response: None,
+    };
+    let mut translated_reason = None;
+    if translated_interactions {
+        if upstream.get("error").is_some_and(|e| !e.is_null()) {
+            return Err(invalid_interactions("Upstream returned an error"));
+        }
+        if prepared.adapter == ResponseAdapter::ResponsesToChat {
+            translated_reason = Some(
+                crate::protocols::interactions::responses_reason(&upstream)
+                    .map_err(invalid_interactions)?,
+            );
+        } else if prepared.adapter == ResponseAdapter::GeminiToChat
+            && crate::protocols::interactions::gemini_non_text(&upstream)
+        {
+            return Err(invalid_interactions("Upstream returned non-text content"));
+        }
+    }
     if (prepared.downstream_protocol == DownstreamProtocol::Gemini
         || prepared.adapter == ResponseAdapter::GeminiToChat)
         && (upstream.get("error").is_some_and(|error| !error.is_null())
@@ -2520,6 +2556,53 @@ pub(crate) async fn send_attempt(
     } else {
         usage(&normalized)
     };
+    if let Some(wire_usage) = translated_usage {
+        use crate::protocols::interactions::{self, TextOutput};
+        let choice = &normalized["choices"][0];
+        let message = &choice["message"];
+        if interactions::chat_non_text(message) {
+            return Err(invalid_interactions("Upstream returned non-text content"));
+        }
+        let reason = translated_reason
+            .or_else(|| choice["finish_reason"].as_str())
+            .ok_or_else(|| {
+                invalid_interactions("Upstream response has no Interactions finish reason")
+            })?;
+        let result = interactions::output_status(reason).map_err(invalid_interactions)?;
+        let text = message["content"].as_str().unwrap_or_default();
+        let mut encoder = TextOutput::new(&prepared.request_model);
+        encoder.usage = wire_usage;
+        let mut output = if prepared.downstream_stream {
+            let mut frames = vec![encoder.created()];
+            frames.extend(encoder.delta(text));
+            frames.extend(encoder.finish(result));
+            let mut bytes = Vec::new();
+            for event in frames {
+                interactions::sse_frame(&mut bytes, &event)
+                    .map_err(|_| invalid_interactions("Could not encode Interactions stream"))?;
+            }
+            let mut res = Response::new(Body::from(bytes));
+            res.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            res
+        } else {
+            json_response(StatusCode::OK, encoder.json(result, text))
+        };
+        copy_oaix_headers(&attribution_headers, output.headers_mut());
+        output
+            .headers_mut()
+            .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        return Ok(AttemptSuccess {
+            cache_completed: false,
+            response: output,
+            status,
+            usage: measured_usage,
+            fact_usage,
+            collected_outcome: Some(json!({"kind":interactions::status_kind(result)})),
+            stream_outcome: None,
+            upstream_url: prepared.url,
+        });
+    }
     let normalized = if prepared.downstream_protocol == DownstreamProtocol::Gemini {
         preserved_gemini.unwrap_or_else(|| {
             crate::protocols::gemini::response_from_chat(&normalized, &prepared.request_model)

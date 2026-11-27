@@ -3,7 +3,7 @@ use super::types::{AttemptBody, DownstreamProtocol, PreparedAttempt, ResponseAda
 use crate::config::snapshot::Provider;
 use crate::protocols::interactions;
 use axum::http::{HeaderMap, HeaderValue, Method};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 const GOOGLE_HOST: &str = "generativelanguage.googleapis.com";
@@ -16,6 +16,130 @@ pub(crate) fn supports_model(provider: &Provider, model: &str) -> bool {
             .models
             .get(model)
             .is_some_and(|upstream| conversational(upstream))
+}
+
+pub(crate) fn native(provider: &Provider, model: &str) -> bool {
+    crate::config::model_protocol::selected(provider, model).is_none()
+        && upstream_url(provider).is_some()
+}
+
+pub(crate) fn supports_provider(provider: &Provider) -> bool {
+    upstream_url(provider).is_some()
+        || matches!(
+            provider.engine.trim().to_ascii_lowercase().as_str(),
+            "gpt"
+                | "codex"
+                | "openrouter"
+                | "azure"
+                | "azure-databricks"
+                | "gemini"
+                | "vertex"
+                | "vertex-gemini"
+        )
+}
+
+pub(crate) fn finalize_translation(
+    provider: &Provider,
+    attempt: &mut PreparedAttempt,
+) -> Result<(), String> {
+    let AttemptBody::Json(bytes) = &mut attempt.body else {
+        return Err("Invalid translated Interactions body".into());
+    };
+    let mut value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let body = value
+        .as_object_mut()
+        .ok_or("Invalid translated Interactions object")?;
+    // Existing channel overrides are applied by the wire builder. They must
+    // not re-enable state or execution features excluded by this contract.
+    for field in [
+        "background",
+        "previous_response_id",
+        "previous_interaction_id",
+        "conversation",
+        "continuation_token",
+        "tools",
+        "tool_choice",
+        "tool_config",
+        "toolConfig",
+        "functions",
+        "function_call",
+        "cachedContent",
+        "modalities",
+        "audio",
+        "response_format",
+    ] {
+        if body.get(field).is_some_and(|value| {
+            !value.is_null()
+                && value != &Value::Bool(false)
+                && !value.as_array().is_some_and(Vec::is_empty)
+        }) {
+            return Err(format!(
+                "Incompatible channel setting for Interactions: {field}"
+            ));
+        }
+        body.remove(field);
+    }
+    if let Some(config) = body.get("generationConfig") {
+        if [
+            "responseModalities",
+            "responseSchema",
+            "responseJsonSchema",
+            "candidateCount",
+        ]
+        .iter()
+        .any(|field| config.get(field).is_some())
+            || config
+                .get("responseMimeType")
+                .is_some_and(|v| v != "text/plain")
+        {
+            return Err("Incompatible Gemini output settings for Interactions".into());
+        }
+    }
+    let responses = attempt.adapter == ResponseAdapter::ResponsesToChat;
+    if !responses && attempt.upstream_stream && !attempt.downstream_stream {
+        return Err("This Interactions channel cannot return non-streaming output".into());
+    }
+    if body.get("n").is_some_and(|n| n != 1) {
+        return Err("Interactions requires a single output candidate".into());
+    }
+    if responses {
+        body.insert("store".into(), Value::Bool(false));
+        if body.get("text").is_some_and(|text| {
+            text.pointer("/format/type")
+                .is_some_and(|kind| kind != "text")
+        }) {
+            return Err("Incompatible Responses output format for Interactions".into());
+        }
+    } else {
+        body.remove("store");
+        if attempt.adapter == ResponseAdapter::Passthrough && attempt.upstream_stream {
+            body.insert("stream_options".into(), json!({"include_usage":true}));
+        }
+    }
+    if attempt.adapter == ResponseAdapter::GeminiToChat
+        && provider.engine.eq_ignore_ascii_case("gemini")
+        && Url::parse(&attempt.url).is_ok_and(|url| url.host_str() == Some(GOOGLE_HOST))
+    {
+        let mut url = Url::parse(&attempt.url).map_err(|_| "Invalid Gemini upstream URL")?;
+        let safe_query: Vec<_> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "key")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !safe_query.is_empty() {
+            url.query_pairs_mut().extend_pairs(safe_query);
+        }
+        attempt.url = url.into();
+        attempt.headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_str(&attempt.provider_key)
+                .map_err(|_| "Invalid Gemini provider key")?,
+        );
+    }
+    *bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    attempt.downstream_protocol = DownstreamProtocol::InteractionsCompat;
+    Ok(())
 }
 
 pub(crate) fn upstream_url(provider: &Provider) -> Option<Url> {
@@ -129,7 +253,7 @@ pub(crate) fn prepare(
         original_model: upstream_model.to_owned(),
         request_type: None,
         wire_model: Some(upstream_model.to_owned()),
-        downstream_protocol: DownstreamProtocol::Native,
+        downstream_protocol: DownstreamProtocol::InteractionsNative,
         chat_stream_include_usage: false,
         prompt_compaction: false,
         provider_key: key.to_owned(),

@@ -130,10 +130,25 @@ impl GatewayRuntime {
                 )
             })
             .collect();
+        if !providers.is_empty() {
+            if let Some(error) = &facts.interactions_compat_error {
+                providers.retain(|p| crate::providers::interactions::native(p, &facts.model));
+                if providers.is_empty() {
+                    return Err(reject(StatusCode::BAD_REQUEST, error));
+                }
+            }
+        }
         if providers.is_empty() {
             return Err(RouteResolutionError {
                 status: StatusCode::NOT_FOUND,
-                message: format!("No available providers at the moment: {}", facts.model),
+                message: if crate::protocols::interactions::is_route(&facts.endpoint) {
+                    format!(
+                        "No available channel for model {} on /v1/interactions",
+                        facts.model
+                    )
+                } else {
+                    format!("No available providers at the moment: {}", facts.model)
+                },
             });
         }
         if matches!(
@@ -693,11 +708,10 @@ pub(crate) fn matching_providers(
             {
                 crate::config::model_protocol::diagnostic(provider, request_model, protocol)
             } else {
-                Some(if crate::protocols::interactions::is_route(endpoint) {
-                    provider
-                } else {
-                    crate::config::model_protocol::effective(provider, request_model)
-                })
+                Some(crate::config::model_protocol::effective(
+                    provider,
+                    request_model,
+                ))
             }
         })
         .collect();

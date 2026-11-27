@@ -333,14 +333,24 @@ yym68686/uni-api:latest
 
 ### Gemini Interactions (`POST /v1/interactions`)
 
-This native route accepts stateless text requests, for example
+This route accepts stateless text requests, for example
 `{"model":"your-gemini-alias","input":"Hello","stream":false}`.
 `input` can also be an array of text parts or native `user_input` and
 `model_output` steps whose `content` contains only text parts, e.g.
 `[{"type":"user_input","content":[{"type":"text","text":"Hello"}]}]`.
 Use a uni-api key with `x-goog-api-key` or `Authorization: Bearer …`.
-`"stream":true` returns native SSE; normal responses return native JSON.
-Only one upstream attempt is made, with `store:false`. Interaction
+`"stream":true` returns Interactions SSE; normal responses return Interactions
+JSON. A text model can use its existing Chat Completions, Responses, or Gemini
+GenerateContent channel without enabling native Interactions on that channel.
+The model's configured alias, upstream protocol, and channel ordering still
+apply. The channel directory for this endpoint reports `interactions_mode` as
+`native` or `translated`.
+
+Only one upstream attempt is made. Interactions are not stored by uni-api.
+Translated channels accept text, `system_instruction`, and the common
+`generation_config` fields `temperature`, `top_p`, and `max_output_tokens`.
+Other settings that passed stateless validation require a native channel.
+Interaction
 lookup/continuation/deletion, background execution, agents, tools, non-text
 input/output, and custom service tiers are not supported.
 
@@ -356,10 +366,11 @@ preferences:
   gemini_interactions_version: v1
 ```
 
-This sends Interactions to `/prefix/v1/interactions`. The model is mapped
-using the provider's existing aliases. To test locally, build with
-`cargo build --locked` and run
-`python3 tests/http/verify_gemini_interactions.py target/debug/uni-api-front`.
+This enables native Interactions at `/prefix/v1/interactions` on that channel;
+it is not required for translated text requests. Native Interactions and
+Responses requests sent by this route explicitly use `store:false`.
+To test locally, build with `cargo build --locked` and run
+`python3 scripts/verify-http.py`.
 
 ### Codex (`/v1/responses` + `engine: codex`)
 

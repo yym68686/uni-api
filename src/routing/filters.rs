@@ -26,7 +26,7 @@ pub(crate) fn provider_accepts_endpoint(provider: &Provider, endpoint: &str) -> 
         return true;
     }
     if crate::protocols::interactions::is_route(endpoint) {
-        return crate::providers::interactions::upstream_url(provider).is_some();
+        return crate::providers::interactions::supports_provider(provider);
     }
     if crate::protocols::gemini::route(endpoint).is_some_and(|(_, a)| a == "countTokens") {
         return matches!(

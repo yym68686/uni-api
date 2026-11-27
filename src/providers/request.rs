@@ -123,14 +123,44 @@ pub(crate) fn build_attempt(
         return Err("Provider does not support this endpoint".into());
     }
     if crate::protocols::interactions::is_route(path) {
-        return super::interactions::prepare(
+        if !super::interactions::supports_model(provider, request_model) {
+            return Err("Interactions requires a text generation model".into());
+        }
+        if super::interactions::native(provider, request_model) {
+            return super::interactions::prepare(
+                provider,
+                provider_key,
+                request_model,
+                original_model,
+                input.payload.as_ref(),
+                request_id,
+            );
+        }
+        let chat = crate::protocols::interactions::to_chat(
+            input.payload.as_ref().ok_or("Interactions requires JSON")?,
+        )?;
+        let bridge = PreparedInput {
+            _memory_reservations: input._memory_reservations.clone(),
+            payload: Some(chat),
+            replay: None,
+            observation: input.observation.clone(),
+            default_model: request_model.into(),
+            content_type: "application/json".into(),
+        };
+        let mut attempt = build_attempt(
             provider,
             provider_key,
             request_model,
             original_model,
-            input.payload.as_ref(),
+            method,
+            &Uri::from_static("/v1/chat/completions"),
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            &bridge,
             request_id,
-        );
+        )?;
+        super::interactions::finalize_translation(provider, &mut attempt)?;
+        return Ok(attempt);
     }
     let native_responses_wire = compaction::responses_endpoint(path)
         && ((matches!(engine.as_str(), "gpt" | "codex") || request_type == Some("compaction"))

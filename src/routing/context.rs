@@ -14,6 +14,7 @@ pub(crate) struct RequestFacts {
     pub stream: bool,
     pub service_tier: Option<crate::routing::service_tier::Tier>,
     pub requested_service_tier: Option<&'static str>,
+    pub interactions_compat_error: Option<String>,
 }
 
 impl RequestFacts {
@@ -39,6 +40,9 @@ impl RequestFacts {
             reasoning_effort: object.and_then(crate::routing::filters::request_reasoning_effort),
             service_tier: crate::routing::service_tier::Tier::requested(endpoint, payload),
             requested_service_tier: requested_log_tier(endpoint, payload),
+            interactions_compat_error: payload
+                .filter(|_| crate::protocols::interactions::is_route(endpoint))
+                .and_then(|body| crate::protocols::interactions::compatibility(body).err()),
             stream: payload
                 .and_then(|p| p.get("stream"))
                 .and_then(Value::as_bool)

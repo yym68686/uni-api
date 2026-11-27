@@ -3,7 +3,7 @@ use crate::protocols::provider_stream::{StreamOutcome, Translation};
 use crate::protocols::sse::{parse_sse_frame, SseDecoder};
 use axum::{body::Body, http::Response};
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -105,6 +105,342 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn compatibility(value: &Value) -> Result<(), String> {
+    let Some(root) = value.as_object() else {
+        return Err("Interactions requires a JSON object".into());
+    };
+    for (key, _) in root.iter().filter(|(_, value)| !value.is_null()) {
+        match key.as_str() {
+            "model" | "input" | "store" | "background" | "stream" => {}
+            "system_instruction" if root[key].is_string() => {}
+            "response_format" if text_format(&root[key]) => {}
+            "generation_config" => {
+                if let Some(config) = root[key].as_object() {
+                    for (field, setting) in config.iter().filter(|(_, value)| !value.is_null()) {
+                        match field.as_str() {
+                            "temperature" | "top_p" if setting.is_number() => {}
+                            "max_output_tokens" if setting.as_u64().is_some_and(|n| n > 0) => {}
+                            _ => {
+                                return Err(native_required(&format!("generation_config.{field}")))
+                            }
+                        }
+                    }
+                } else {
+                    return Err(native_required(key));
+                }
+            }
+            _ => return Err(native_required(key)),
+        }
+    }
+    if let Some(items) = value["input"].as_array() {
+        for item in items {
+            let (allowed, parts): (&[&str], _) = if item["type"] == "text" {
+                (&["type", "text"], None)
+            } else {
+                (&["type", "content"], item["content"].as_array())
+            };
+            let allowed_fields = |item: &Value, allowed: &[&str]| {
+                item.as_object()
+                    .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+            };
+            if !allowed_fields(item, allowed)
+                || parts.is_some_and(|parts| {
+                    !parts.iter().all(|p| allowed_fields(p, &["type", "text"]))
+                })
+            {
+                return Err(native_required("input"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn text_format(value: &Value) -> bool {
+    let text = |v: &Value| v["type"] == "text" && v.as_object().is_some_and(|o| o.len() == 1);
+    text(value)
+        || value
+            .as_array()
+            .is_some_and(|v| v.len() == 1 && text(&v[0]))
+}
+
+fn native_required(field: &str) -> String {
+    format!("Interactions field {field} requires a native Interactions channel for this model")
+}
+
+pub(crate) fn from_wire_usage(usage: Option<&Value>) -> serde_json::Map<String, Value> {
+    let mut result = serde_json::Map::new();
+    let Some(usage) = usage.filter(|u| u.is_object()) else {
+        return result;
+    };
+    let usage = usage
+        .get("uniApiUsage")
+        .filter(|v| v.is_object())
+        .unwrap_or(usage);
+    let facts = crate::observability::usage::FactUsage::from_usage(Some(usage));
+    let read = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            usage
+                .pointer(key)
+                .and_then(Value::as_i64)
+                .filter(|n| *n >= 0)
+        })
+    };
+    let thought = read(&[
+        "/thoughtsTokenCount",
+        "/completion_tokens_details/reasoning_tokens",
+        "/output_tokens_details/reasoning_tokens",
+    ]);
+    let text = if usage.get("candidatesTokenCount").is_some() {
+        read(&["/candidatesTokenCount"])
+    } else {
+        facts
+            .output
+            .and_then(|n| n.checked_sub(thought.unwrap_or(0)).filter(|n| *n >= 0))
+    };
+    for (name, count) in [
+        ("total_input_tokens", facts.input),
+        ("total_output_tokens", text),
+        ("total_thought_tokens", thought),
+        ("total_cached_tokens", facts.cache_read),
+        ("total_tokens", read(&["/total_tokens", "/totalTokenCount"])),
+    ] {
+        if let Some(count) = count {
+            result.insert(name.into(), json!(count));
+        }
+    }
+    result
+}
+
+pub(crate) fn stream_error(code: u16, message: &str) -> Value {
+    let error = crate::protocols::gemini::error(code, message);
+    json!({"event_type":"error","error":error["error"]})
+}
+
+fn text_step(text: &str) -> Value {
+    json!({"type":"model_output","content":[{"type":"text","text":text}]})
+}
+
+pub(crate) fn output_status(reason: &str) -> Result<&'static str, &'static str> {
+    match reason {
+        "stop" => Ok("completed"),
+        "length" => Ok("incomplete"),
+        "content_filter" => Ok("failed"),
+        _ => Err("Upstream returned an unsupported Interactions finish reason"),
+    }
+}
+
+pub(crate) fn chat_non_text(message: &Value) -> bool {
+    ["tool_calls", "function_call", "audio", "refusal", "images"]
+        .iter()
+        .any(|field| {
+            message.get(field).is_some_and(|value| {
+                !value.is_null()
+                    && !value.as_array().is_some_and(Vec::is_empty)
+                    && value.as_str() != Some("")
+            })
+        })
+        || message
+            .get("content")
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+}
+
+pub(crate) fn gemini_non_text(value: &Value) -> bool {
+    value
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                !part["text"].is_string()
+                    && !part.as_object().is_some_and(|fields| {
+                        fields.keys().all(|key| {
+                            matches!(
+                                key.as_str(),
+                                "thought" | "thoughtSignature" | "thought_signature"
+                            )
+                        })
+                    })
+            })
+        })
+}
+
+pub(crate) fn responses_reason(value: &Value) -> Result<&'static str, &'static str> {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("Upstream Responses returned an error");
+    }
+    if value
+        .get("output")
+        .and_then(Value::as_array)
+        .is_none_or(|items| {
+            items.iter().any(|item| match item["type"].as_str() {
+                Some("reasoning") => false,
+                Some("message") => item["content"].as_array().is_none_or(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| !matches!(part["type"].as_str(), Some("output_text" | "text")))
+                }),
+                _ => true,
+            })
+        })
+    {
+        return Err("Upstream Responses returned unsupported output");
+    }
+    match value["status"].as_str() {
+        Some("completed") => Ok("stop"),
+        Some("incomplete") => match value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens" | "length") => Ok("length"),
+            Some("content_filter") => Ok("content_filter"),
+            _ => Err("Upstream Responses returned an unknown incomplete reason"),
+        },
+        _ => Err("Upstream Responses did not return a completed or incomplete response"),
+    }
+}
+
+pub(crate) struct TextOutput {
+    id: String,
+    model: String,
+    created: String,
+    pub(crate) emitted_text: bool,
+    pub(crate) terminal: Option<&'static str>,
+    pub(crate) input_done: bool,
+    pub(crate) usage: serde_json::Map<String, Value>,
+}
+
+impl TextOutput {
+    pub(crate) fn new(model: &str) -> Self {
+        Self {
+            id: format!(
+                "int_{}",
+                crate::observability::context::request_id(&Default::default())
+            ),
+            model: model.into(),
+            created: timestamp(),
+            emitted_text: false,
+            terminal: None,
+            input_done: false,
+            usage: Default::default(),
+        }
+    }
+
+    fn interaction(&self, status: &str, steps: Option<Value>) -> Value {
+        let updated = if status == "in_progress" {
+            self.created.clone()
+        } else {
+            timestamp()
+        };
+        let mut result = json!({
+            "id":self.id,"model":self.model,"status":status,"store":false,
+            "created":self.created,"updated":updated,
+        });
+        if !self.usage.is_empty() && status != "in_progress" {
+            result["usage"] = Value::Object(self.usage.clone());
+        }
+        if let Some(steps) = steps {
+            result["steps"] = steps;
+        }
+        result
+    }
+
+    pub(crate) fn created(&self) -> Value {
+        json!({"event_type":"interaction.created","interaction":self.interaction("in_progress", None)})
+    }
+
+    pub(crate) fn delta(&mut self, text: &str) -> Vec<Value> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if !self.emitted_text {
+            self.emitted_text = true;
+            events.push(json!({"event_type":"step.start","index":0,"step":{"type":"model_output","content":[]}}));
+        }
+        events
+            .push(json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":text}}));
+        events
+    }
+
+    pub(crate) fn finish(&self, status: &str) -> Vec<Value> {
+        let mut events = Vec::new();
+        if self.emitted_text {
+            events.push(json!({"event_type":"step.stop","index":0}));
+        }
+        events.push(json!({"event_type":"interaction.completed","interaction":self.interaction(status, None)}));
+        events
+    }
+
+    pub(crate) fn json(&self, status: &str, text: &str) -> Value {
+        let steps = if text.is_empty() {
+            json!([])
+        } else {
+            json!([text_step(text)])
+        };
+        self.interaction(status, Some(steps))
+    }
+}
+
+fn timestamp() -> String {
+    let now = crate::runtime::clock::unix_seconds();
+    let (year, month, day) = crate::providers::cloud::civil_from_days(now / 86_400);
+    let (hour, minute, second) = (now / 3_600 % 24, now / 60 % 60, now % 60);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+pub(crate) fn sse_frame(output: &mut Vec<u8>, event: &Value) -> Result<(), serde_json::Error> {
+    if let Some(kind) = event["event_type"].as_str() {
+        output.extend_from_slice(b"event: ");
+        output.extend_from_slice(kind.as_bytes());
+        output.push(b'\n');
+    }
+    output.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut *output, event)?;
+    output.extend_from_slice(b"\n\n");
+    Ok(())
+}
+
+pub(crate) fn to_chat(value: &Value) -> Result<Value, String> {
+    validate(value)?;
+    compatibility(value)?;
+    let mut messages = Vec::new();
+    if let Some(instruction) = value["system_instruction"].as_str() {
+        messages.push(json!({"role":"system","content":instruction}));
+    }
+    let input = &value["input"];
+    if let Some(text) = input.as_str() {
+        messages.push(json!({"role":"user","content":text}));
+    } else if input[0]["type"] == "text" {
+        messages.push(json!({"role":"user","content":input}));
+    } else if let Some(steps) = input.as_array() {
+        messages.extend(steps.iter().map(|step| {
+            let role = if step["type"] == "model_output" {
+                "assistant"
+            } else {
+                "user"
+            };
+            json!({"role":role,"content":step["content"]})
+        }));
+    }
+    let stream = value["stream"].as_bool().unwrap_or(false);
+    let mut request = json!({"model":value["model"],"messages":messages,"stream":stream});
+    for (source, target) in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("max_output_tokens", "max_tokens"),
+    ] {
+        if let Some(setting) = value["generation_config"]
+            .get(source)
+            .filter(|v| !v.is_null())
+        {
+            request[target] = setting.clone();
+        }
+    }
+    if stream {
+        request["stream_options"] = json!({"include_usage":true});
+    }
+    Ok(request)
 }
 
 pub(crate) fn status_kind(status: &str) -> &'static str {

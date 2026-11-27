@@ -89,15 +89,15 @@ impl GatewayRuntime {
         let snapshot = self.snapshot().await.ok_or(503u16)?;
         let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
         let allowed = |p: &Arc<Provider>, model: &str| {
-            let p = if crate::protocols::interactions::is_route(endpoint) {
-                p.clone()
-            } else {
-                crate::config::model_protocol::effective(p.clone(), model)
-            };
+            let p = crate::config::model_protocol::effective(p.clone(), model);
             crate::control::channels::temporary_allowed(&p, api_key)
                 && provider_accepts_endpoint(&p, endpoint)
                 && (!crate::protocols::interactions::is_route(endpoint)
-                    || crate::providers::interactions::supports_model(&p, model))
+                    || (crate::providers::interactions::supports_model(&p, model)
+                        && !p
+                            .excluded_endpoints
+                            .iter()
+                            .any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint))))
         };
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {
@@ -210,7 +210,7 @@ impl GatewayRuntime {
         let mut options_by_provider = std::collections::HashMap::new();
         let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
             let protocol_options = (endpoint == "all").then(|| options_by_provider.entry(provider.name.clone()).or_insert_with(|| json!(crate::config::model_protocol::options(&provider))).clone());
-            let provider = if crate::protocols::interactions::is_route(endpoint) {provider} else {crate::config::model_protocol::effective(provider, &model)};
+            let provider = crate::config::model_protocol::effective(provider, &model);
             if crate::protocols::interactions::is_route(endpoint) && !crate::providers::interactions::supports_model(&provider, &model) {return None;}
             if !provider_accepts_endpoint(&provider, endpoint) || (provider.engine.eq_ignore_ascii_case("typesafe") && stream) || provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
@@ -223,6 +223,9 @@ impl GatewayRuntime {
                 (false, "no_provider_key")
             } else if route_cooling { (false, "channel_cooldown") } else { (true, "eligible") };
             let mut row = json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"engine_mode":provider.engine_mode.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason});
+            if crate::protocols::interactions::is_route(endpoint) {
+                row["interactions_mode"] = json!(if crate::providers::interactions::native(&provider, &model) {"native"} else {"translated"});
+            }
             if let Some(protocol) = crate::config::model_protocol::selected(&provider, &model) {
                 row["upstream_protocol"] = json!(protocol);
             }

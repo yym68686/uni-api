@@ -22,6 +22,8 @@ pub(crate) enum DownstreamProtocol {
     Native,
     ResponsesCompat,
     Gemini,
+    InteractionsNative,
+    InteractionsCompat,
 }
 
 pub(crate) struct PreparedAttempt {
