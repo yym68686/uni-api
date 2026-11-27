@@ -9,6 +9,15 @@ use url::Url;
 const GOOGLE_HOST: &str = "generativelanguage.googleapis.com";
 pub(crate) const VERSION: &str = "gemini_interactions_version";
 
+pub(crate) fn supports_model(provider: &Provider, model: &str) -> bool {
+    let conversational = crate::providers::codex::models::is_conversational_model;
+    conversational(model)
+        && provider
+            .models
+            .get(model)
+            .is_some_and(|upstream| conversational(upstream))
+}
+
 pub(crate) fn upstream_url(provider: &Provider) -> Option<Url> {
     if !provider.engine.eq_ignore_ascii_case("gemini") {
         return None;
@@ -64,6 +73,9 @@ pub(crate) fn prepare(
     request_id: &str,
 ) -> Result<PreparedAttempt, String> {
     let url = upstream_url(provider).ok_or("Provider does not support Interactions")?;
+    if !supports_model(provider, model) {
+        return Err("Interactions requires a text generation model".into());
+    }
     let mut payload = payload.cloned().ok_or("Interactions requires JSON")?;
     interactions::validate(&payload)?;
     let stream = payload["stream"].as_bool().unwrap_or(false);

@@ -96,6 +96,8 @@ impl GatewayRuntime {
             };
             crate::control::channels::temporary_allowed(&p, api_key)
                 && provider_accepts_endpoint(&p, endpoint)
+                && (!crate::protocols::interactions::is_route(endpoint)
+                    || crate::providers::interactions::supports_model(&p, model))
         };
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {
@@ -208,7 +210,8 @@ impl GatewayRuntime {
         let mut options_by_provider = std::collections::HashMap::new();
         let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
             let protocol_options = (endpoint == "all").then(|| options_by_provider.entry(provider.name.clone()).or_insert_with(|| json!(crate::config::model_protocol::options(&provider))).clone());
-            let provider = crate::config::model_protocol::effective(provider, &model);
+            let provider = if crate::protocols::interactions::is_route(endpoint) {provider} else {crate::config::model_protocol::effective(provider, &model)};
+            if crate::protocols::interactions::is_route(endpoint) && !crate::providers::interactions::supports_model(&provider, &model) {return None;}
             if !provider_accepts_endpoint(&provider, endpoint) || (provider.engine.eq_ignore_ascii_case("typesafe") && stream) || provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
                 return None;
             }

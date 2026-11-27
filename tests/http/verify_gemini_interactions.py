@@ -64,7 +64,7 @@ def verify(binary):
             {"provider": "legacy", "engine": "gemini", "base_url": base + "/legacy/v1beta",
              "api": "fixture-provider", "model": ["legacy-model", {"wire-model": "alias"}]},
             *[{"provider": name, "engine": "gemini", "base_url": base + f"/{name}/v1beta",
-               "api": "fixture-provider", "model": [{"wire-model": "alias"}],
+               "api": "fixture-provider", "model": [{"wire-model": "alias"}, {"gemini-embedding-001": "embedding-alias"}, {"gemini-flash-preview-tts": "audio-alias"}],
                "preferences": {"gemini_interactions_version": "v1", "cooldown_period": 0}}
               for name in ("primary", "fallback")],
         ]}
@@ -76,11 +76,11 @@ def verify(binary):
                    RUST_REQUEST_SPOOL_DIRECTORY=str(root / "spool"), RUST_REQUEST_SPOOL_DISK_RESERVE_BPS="0",
                    RUST_REQUEST_SPOOL_INODE_RESERVE_BPS="0", NO_PROXY="127.0.0.1,localhost")
 
-        def call(path, payload=None, key=True):
+        def call(path, payload=None, key=True, bearer=False):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
             headers = {"content-type": "application/json", "cookie": "caller=secret", "idempotency-key": "caller"}
             if key:
-                headers["x-goog-api-key"] = "fixture-client"
+                headers["Authorization" if bearer else "x-goog-api-key"] = "Bearer fixture-client" if bearer else "fixture-client"
             try:
                 conn.request("GET" if payload is None else "POST", path, None if payload is None else json.dumps(payload), headers)
                 res = conn.getresponse()
@@ -108,6 +108,10 @@ def verify(binary):
                 assert call(path, {**request, "store": True})[0] == 400
                 assert call(path, {**request, "previous_interaction_id": "fixture"})[0] == 400
                 assert call(path, {**request, "model": "legacy-model"})[0] >= 400
+                assert call(path, {**request, "model": "embedding-alias"})[0] >= 400
+                assert call(path, {**request, "model": "audio-alias"})[0] >= 400
+                catalog_status, _, catalog = call("/v1/model-channels?endpoint=%2Fv1%2Finteractions", bearer=True)
+                assert catalog_status == 200 and {row["model"] for row in json.loads(catalog)["data"]} == {"alias"}, (catalog_status, catalog)
                 assert not upstream.hits
                 for changes, status, expected in [
                     ({}, 200, JSON_BODY), ({"stream": True}, 200, SSE_BODY),

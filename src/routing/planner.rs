@@ -704,6 +704,8 @@ pub(crate) fn matching_providers(
     matches.retain(|provider| {
         crate::control::channels::temporary_allowed(provider, api_key)
             && provider_accepts_endpoint(provider, endpoint)
+            && (!crate::protocols::interactions::is_route(endpoint)
+                || crate::providers::interactions::supports_model(provider, request_model))
             && !provider.excluded_endpoints.iter().any(|excluded| {
                 excluded
                     .trim_end_matches('/')
