@@ -42,6 +42,12 @@ structured output and streamed/non-streamed results use the existing conversion
 pipeline. Cached and reasoning token details survive the return conversion.
 Truncation and safety stops return an incomplete Responses result.
 
+For Chat and converted Responses image data URLs, the gateway uses the detected
+raster type when a supported image is mislabeled (for example, PNG bytes labeled
+as JPEG). It forwards the original image bytes with the canonical MIME type and
+base64 padding. Unrecognized image bytes, invalid base64, animated GIFs, and
+oversize inputs still fail locally without using a channel retry.
+
 For converted Chat/Responses requests ending in ordinary assistant text, the
 Gemini adapter preserves that text and appends a user turn containing `Continue.`.
 This supports Gemini providers that reject a final `model` turn. It is an explicit

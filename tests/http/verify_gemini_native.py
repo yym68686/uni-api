@@ -19,6 +19,8 @@ def candidate(reason, parts=()):
 
 TOOL_PART = {'functionCall': {'id': 'native-lookup', 'name': 'lookup', 'args': {'term': 'fixture'}},
              'thoughtSignature': 'opaque-fixture-signature'}
+PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aGx0AAAAASUVORK5CYII='
+ANIMATED_GIF = 'R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQACgAAACwAAAAAAgACAIEAAP8AAAAAAAAAAAAIBgABCAQQEAA7'
 GEMINI_CHAT_CASES = {
     'empty-object': ({}, 502, None),
     'empty-candidates': ({'candidates': [], 'usageMetadata': USAGE}, 502, None),
@@ -34,6 +36,58 @@ GEMINI_CHAT_CASES = {
     'text-without-usage': (candidate('STOP', [{'text': 'hello without usage'}]), 200, 'stop'),
     'image-without-text': (candidate('STOP', [{'inlineData': {'mimeType': 'image/png', 'data': 'iVBORw0KGgo='}}]), 200, 'stop'),
 }
+
+def verify_image_data_urls(call, upstream):
+    chat = '/v1/chat/completions'
+    responses = '/v1/responses'
+    canonical = f'data:image/png;base64,{PNG}'
+
+    def send(endpoint, model, url):
+        if endpoint == chat:
+            fields = {'messages': [{'role': 'user', 'content': [
+                {'type': 'text', 'text': 'describe the image'},
+                {'type': 'image_url', 'image_url': {'url': url, 'detail': 'low'}},
+            ]}]}
+        else:
+            fields = {'input': [{'role': 'user', 'content': [
+                {'type': 'input_text', 'text': 'describe the image'},
+                {'type': 'input_image', 'image_url': url, 'detail': 'low'},
+            ]}]}
+        upstream.hits.clear()
+        status, _, raw = call(endpoint, {'model': model, 'stream': True, **fields}, 'bearer')
+        return status, raw
+
+    for endpoint in (chat, responses):
+        for url in (canonical, f'data:image/jpeg;base64,{PNG}',
+                    f'DATA:IMAGE/JPG;BASE64,{PNG.rstrip("=")}'):
+            status, raw = send(endpoint, 'gemini', url)
+            assert status == 200 and b'hello' in raw, (endpoint, status, raw)
+            assert (b'[DONE]' if endpoint == chat else b'response.completed') in raw, raw
+            assert len(upstream.hits) == 1, upstream.hits
+            path, wire, _ = upstream.hits[0]
+            assert '/models/gemini:streamGenerateContent' in path, path
+            assert wire['contents'][0]['parts'][1] == {'inlineData': {
+                'mimeType': 'image/png', 'data': PNG,
+            }}, wire
+
+        for url, expected_status, message in (
+            ('data:image/png;base64,!!!', 400, 'Invalid image base64'),
+            ('data:image/png;base64,', 400, 'not a recognized PNG'),
+            ('data:image/png;base64,dGV4dA==', 400, 'not a recognized PNG'),
+            ('data:image/png;base64,R0lGODlh', 400, 'Invalid GIF image input'),
+            (f'data:image/png;base64,{ANIMATED_GIF}', 415, 'Animated GIF'),
+            (f'data:application/octet-stream;base64,{PNG}', 415, 'Unsupported image media type'),
+        ):
+            status, raw = send(endpoint, 'gemini', url)
+            assert status == expected_status and message.encode() in raw, (endpoint, status, raw)
+            assert not upstream.hits, upstream.hits
+
+    status, raw = send(chat, 'chat', f'data:image/jpeg;base64,{PNG}')
+    assert status == 200 and b'hello' in raw, (status, raw)
+    assert len(upstream.hits) == 1, upstream.hits
+    _, wire, _ = upstream.hits[0]
+    assert wire['messages'][0]['content'][1]['image_url'] == {'url': canonical, 'detail': 'low'}, wire
+    print('Inline image URL normalization passed: Chat and Responses → Gemini, Chat passthrough, local rejections')
 
 class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -146,6 +200,7 @@ def verify(binary):
                     except OSError: pass
                     time.sleep(.05)
                 body={'contents':[{'role':'user','parts':[{'text':'hello'}]}]}
+                verify_image_data_urls(call, upstream)
                 for stream in (False, True):
                     for mode, (_, expected_status, finish) in GEMINI_CHAT_CASES.items():
                         payload = {'model': 'gemini', 'messages': [{'role': 'user', 'content': mode}], 'stream': stream}

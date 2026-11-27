@@ -37,17 +37,10 @@ pub(crate) async fn prepare_image_inputs(
                 if part.get("type").and_then(Value::as_str) != Some("image_url") {
                     continue;
                 }
-                let Some(url) = part
-                    .pointer("/image_url/url")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                else {
+                let Some(Value::String(url)) = part.pointer_mut("/image_url/url") else {
                     continue;
                 };
-                let normalized = normalize_image_url(state, &url, &mut reservations).await?;
-                if let Some(root) = part.get_mut("image_url").and_then(Value::as_object_mut) {
-                    root.insert("url".into(), Value::String(normalized));
-                }
+                *url = normalize_image_url(state, std::mem::take(url), &mut reservations).await?;
             }
         }
     }
@@ -60,34 +53,29 @@ pub(crate) async fn prepare_image_inputs(
                 if part.get("type").and_then(Value::as_str) != Some("input_image") {
                     continue;
                 }
-                let Some(url) = part
-                    .get("image_url")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                else {
+                let Some(Value::String(url)) = part.get_mut("image_url") else {
                     continue;
                 };
-                let normalized = normalize_image_url(state, &url, &mut reservations).await?;
-                part.as_object_mut()
-                    .expect("responses input image object")
-                    .insert("image_url".into(), Value::String(normalized));
+                *url = normalize_image_url(state, std::mem::take(url), &mut reservations).await?;
             }
         }
     }
     Ok((input, reservations))
 }
 
-pub(crate) async fn normalize_image_url(
+async fn normalize_image_url(
     state: &AppState,
-    value: &str,
+    value: String,
     reservations: &mut Vec<MemoryReservation>,
 ) -> Result<String, (StatusCode, String)> {
-    if value.starts_with("data:") {
-        validate_image_data_url(state, value, reservations).await?;
-        return Ok(value.to_owned());
+    if value
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+    {
+        return normalize_image_data_url(state, value).await;
     }
     let parsed =
-        Url::parse(value).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image URL".into()))?;
+        Url::parse(&value).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image URL".into()))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err((StatusCode::BAD_REQUEST, "Invalid image URL".into()));
     }
@@ -184,11 +172,10 @@ pub(crate) async fn normalize_image_url(
     Ok(normalized)
 }
 
-pub(crate) async fn validate_image_data_url(
+async fn normalize_image_data_url(
     state: &AppState,
-    value: &str,
-    _reservations: &mut [MemoryReservation],
-) -> Result<(), (StatusCode, String)> {
+    mut value: String,
+) -> Result<String, (StatusCode, String)> {
     let (header, encoded) = value
         .split_once(',')
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid image data URL".into()))?;
@@ -202,21 +189,18 @@ pub(crate) async fn validate_image_data_url(
         ));
     }
     let declared = header[5..header.len().saturating_sub(7)].to_ascii_lowercase();
-    let declared = if declared == "image/jpg" {
-        "image/jpeg"
-    } else {
-        declared.as_str()
-    };
     if !matches!(
-        declared,
-        "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+        declared.as_str(),
+        "image/gif" | "image/jpeg" | "image/jpg" | "image/png" | "image/webp"
     ) {
         return Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Unsupported image media type".into(),
         ));
     }
-    let predicted = encoded.len().saturating_add(3) / 4 * 3;
+    let header_len = header.len();
+    let encoded_len = encoded.len();
+    let predicted = encoded_len.saturating_add(3) / 4 * 3;
     if predicted > image_max_bytes() {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -225,7 +209,7 @@ pub(crate) async fn validate_image_data_url(
     }
     let (_, mut reservation) = state
         .resource_governor
-        .reserve_memory_capacity(predicted.saturating_add(encoded.len()).saturating_add(4) as u64)
+        .reserve_memory_capacity(predicted.saturating_add(encoded_len).saturating_add(4) as u64)
         .await
         .map_err(|_| {
             (
@@ -233,9 +217,11 @@ pub(crate) async fn validate_image_data_url(
                 "Insufficient memory capacity for image input".into(),
             )
         })?;
-    let padded = format!("{encoded}{}", "=".repeat((4 - encoded.len() % 4) % 4));
+    // Carry canonical padding into the outbound URL as well; a strict downstream
+    // decoder should see the same base64 that was validated here.
+    value.push_str(&"==="[..(4 - encoded_len % 4) % 4]);
     let decoded = BASE64
-        .decode(padded.as_bytes())
+        .decode(&value.as_bytes()[header_len + 1..])
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image base64".into()))?;
     reservation.materialize();
     let detected = match inspect_image_media_type(&decoded) {
@@ -252,17 +238,17 @@ pub(crate) async fn validate_image_data_url(
         ImageMediaTypeInspection::Unsupported => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "Image bytes do not match the declared media type".into(),
+                "Image bytes are not a recognized PNG, JPEG, WebP, or GIF".into(),
             ));
         }
     };
-    if detected != declared {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Image bytes do not match the declared media type".into(),
-        ));
+    // Clients sometimes label every attachment as JPEG or PNG. Use the
+    // detected, supported raster type before protocol adapters consume it.
+    let canonical = format!("data:{detected};base64");
+    if &value[..header_len] != canonical.as_str() {
+        value.replace_range(..header_len, &canonical);
     }
-    Ok(())
+    Ok(value)
 }
 
 pub(crate) fn image_max_bytes() -> usize {
