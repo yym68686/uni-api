@@ -60,6 +60,8 @@ pub(crate) fn preview_channel_request(
         .map_err(|_| "invalid preview endpoint".to_owned())?;
     if compaction::responses_endpoint(endpoint) {
         compaction::restore_history(&mut payload)?;
+    } else if crate::protocols::interactions::is_route(endpoint) {
+        crate::protocols::interactions::validate(&payload)?;
     }
     let input = PreparedInput {
         _memory_reservations: Vec::new(),
@@ -87,9 +89,15 @@ pub(crate) fn preview_channel_request(
     };
     let mut url = Url::parse(&attempt.url).map_err(|_| "invalid prepared endpoint".to_owned())?;
     url.set_query(None);
-    Ok(
-        json!({"url":url.to_string(),"method":attempt.method.as_str(),"header_names":attempt.headers.keys().map(|h|h.as_str()).collect::<Vec<_>>(),"body":body,"stream":attempt.upstream_stream,"upstream_stream":attempt.upstream_stream,"downstream_stream":attempt.downstream_stream}),
-    )
+    let mut preview = json!({"url":url.to_string(),"method":attempt.method.as_str(),"header_names":attempt.headers.keys().map(|h|h.as_str()).collect::<Vec<_>>(),"body":body,"stream":attempt.upstream_stream,"upstream_stream":attempt.upstream_stream,"downstream_stream":attempt.downstream_stream});
+    if let DownstreamProtocol::InteractionsCompat(options)
+    | DownstreamProtocol::InteractionsNative(options) = attempt.downstream_protocol
+    {
+        if let Some(warning) = options.warning() {
+            preview["interactions_omitted"] = json!(warning);
+        }
+    }
+    Ok(preview)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,9 +144,22 @@ pub(crate) fn build_attempt(
                 request_id,
             );
         }
-        let chat = crate::protocols::interactions::to_chat(
-            input.payload.as_ref().ok_or("Interactions requires JSON")?,
-        )?;
+        let payload = input.payload.as_ref().ok_or("Interactions requires JSON")?;
+        if crate::protocols::interactions::structured_text_requested(payload) {
+            return Err(
+                "Interactions capability unavailable: structured output on this upstream channel"
+                    .into(),
+            );
+        }
+        let mut compat = crate::protocols::interactions::Compat::default();
+        let mut chat = crate::protocols::interactions::to_chat(payload, &mut compat);
+        super::interactions::translate_thinking_level(
+            provider,
+            original_model,
+            payload,
+            &mut chat,
+            &mut compat,
+        );
         let bridge = PreparedInput {
             _memory_reservations: input._memory_reservations.clone(),
             payload: Some(chat),
@@ -159,7 +180,7 @@ pub(crate) fn build_attempt(
             &bridge,
             request_id,
         )?;
-        super::interactions::finalize_translation(provider, &mut attempt)?;
+        super::interactions::finalize_translation(provider, payload, compat, &mut attempt)?;
         return Ok(attempt);
     }
     let native_responses_wire = compaction::responses_endpoint(path)

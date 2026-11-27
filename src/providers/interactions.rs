@@ -2,12 +2,14 @@ use super::request::provider_headers;
 use super::types::{AttemptBody, DownstreamProtocol, PreparedAttempt, ResponseAdapter};
 use crate::config::snapshot::Provider;
 use crate::protocols::interactions;
+use crate::protocols::interactions::{Compat, Omitted};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use serde_json::{json, Value};
 use url::Url;
 
 const GOOGLE_HOST: &str = "generativelanguage.googleapis.com";
 pub(crate) const VERSION: &str = "gemini_interactions_version";
+pub(crate) const THINKING_SUMMARIES: &str = "interactions_thinking_summaries";
 
 pub(crate) fn supports_model(provider: &Provider, model: &str) -> bool {
     let conversational = crate::providers::codex::models::is_conversational_model;
@@ -35,13 +37,109 @@ pub(crate) fn supports_provider(provider: &Provider) -> bool {
                 | "gemini"
                 | "vertex"
                 | "vertex-gemini"
+                | "claude"
+                | "vertex-claude"
+                | "aws"
         )
+}
+
+pub(crate) fn translate_thinking_level(
+    provider: &Provider,
+    model: &str,
+    source: &Value,
+    chat: &mut Value,
+    compat: &mut Compat,
+) {
+    let setting = &source["generation_config"]["thinking_level"];
+    if setting.is_null() {
+        return;
+    }
+    let level = setting.as_str().and_then(interactions::thinking_level);
+    if let Some(level) = level.filter(|level| {
+        if let Some((preset, _)) = super::gemini_effort::route(provider, model) {
+            return preset.level(level).is_some();
+        }
+        let model = model.rsplit('/').next().unwrap_or(model);
+        matches!(
+            provider.engine.as_ref(),
+            "gemini" | "vertex" | "vertex-gemini"
+        ) && model.starts_with("gemini-3")
+            && (matches!(*level, "low" | "high")
+                || (model.contains("-flash") && matches!(*level, "minimal" | "medium")))
+    }) {
+        chat["reasoning_effort"] = json!(level);
+    } else {
+        compat.omit(Omitted::ThinkingLevel);
+    }
+}
+
+fn object_at<'a>(
+    object: &'a mut serde_json::Map<String, Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    let value = object.entry(key).or_insert_with(|| json!({}));
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("object normalized above")
+}
+
+fn supports_summaries(provider: &Provider, attempt: &PreparedAttempt) -> bool {
+    if !matches!(
+        attempt.adapter,
+        ResponseAdapter::GeminiToChat | ResponseAdapter::ResponsesToChat
+    ) {
+        return false;
+    }
+    if let Some(enabled) = provider
+        .preferences
+        .get(THINKING_SUMMARIES)
+        .and_then(Value::as_bool)
+    {
+        return enabled;
+    }
+    let model = attempt
+        .wire_model
+        .as_deref()
+        .unwrap_or(&attempt.original_model);
+    let leaf = model.rsplit('/').next().unwrap_or(model);
+    if attempt.adapter == ResponseAdapter::GeminiToChat {
+        return [
+            "gemini-2.5-",
+            "gemini-3-",
+            "gemini-3.1-",
+            "gemini-3.5-",
+            "gemini-3.8-",
+            "gemini-4-",
+        ]
+        .into_iter()
+        .any(|prefix| leaf.starts_with(prefix));
+    }
+    // An OpenAI-shaped HTTP endpoint alone is not evidence that it implements
+    // summary requests. Allow custom gateways to opt in with a channel setting.
+    Url::parse(&attempt.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| matches!(host.as_str(), "api.openai.com" | "chatgpt.com"))
+        && ["gpt-5", "o3", "o4-mini"].into_iter().any(|prefix| {
+            leaf == prefix
+                || leaf
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with(['-', '.']))
+        })
 }
 
 pub(crate) fn finalize_translation(
     provider: &Provider,
+    source: &Value,
+    mut compat: Compat,
     attempt: &mut PreparedAttempt,
 ) -> Result<(), String> {
+    let summary_setting = &source["generation_config"]["thinking_summaries"];
+    compat.summaries = summary_setting == "auto" && supports_summaries(provider, attempt);
+    if !summary_setting.is_null() && summary_setting != "none" && !compat.summaries {
+        compat.omit(Omitted::ThinkingSummaries);
+    }
     let AttemptBody::Json(bytes) = &mut attempt.body else {
         return Err("Invalid translated Interactions body".into());
     };
@@ -61,59 +159,151 @@ pub(crate) fn finalize_translation(
         "tool_choice",
         "tool_config",
         "toolConfig",
+        "parallel_tool_calls",
+        "plugins",
         "functions",
         "function_call",
         "cachedContent",
+        "cached_content",
         "modalities",
         "audio",
         "response_format",
+        "service_tier",
+        "serviceTier",
+        "include",
     ] {
         if body.get(field).is_some_and(|value| {
             !value.is_null()
                 && value != &Value::Bool(false)
                 && !value.as_array().is_some_and(Vec::is_empty)
         }) {
-            return Err(format!(
-                "Incompatible channel setting for Interactions: {field}"
-            ));
+            compat.omit(Omitted::ChannelDefaults);
         }
         body.remove(field);
     }
-    if let Some(config) = body.get("generationConfig") {
-        if [
-            "responseModalities",
-            "responseSchema",
-            "responseJsonSchema",
-            "candidateCount",
-        ]
-        .iter()
-        .any(|field| config.get(field).is_some())
-            || config
-                .get("responseMimeType")
-                .is_some_and(|v| v != "text/plain")
-        {
-            return Err("Incompatible Gemini output settings for Interactions".into());
-        }
-    }
     let responses = attempt.adapter == ResponseAdapter::ResponsesToChat;
-    if !responses && attempt.upstream_stream && !attempt.downstream_stream {
-        return Err("This Interactions channel cannot return non-streaming output".into());
-    }
     if body.get("n").is_some_and(|n| n != 1) {
-        return Err("Interactions requires a single output candidate".into());
+        body.remove("n");
+        compat.omit(Omitted::ChannelDefaults);
     }
     if responses {
         body.insert("store".into(), Value::Bool(false));
-        if body.get("text").is_some_and(|text| {
-            text.pointer("/format/type")
-                .is_some_and(|kind| kind != "text")
-        }) {
-            return Err("Incompatible Responses output format for Interactions".into());
+        if let Some(text) = body.get_mut("text").and_then(Value::as_object_mut) {
+            if text
+                .get("format")
+                .is_some_and(|format| format["type"] != "text")
+            {
+                text.remove("format");
+                compat.omit(Omitted::ChannelDefaults);
+            }
+        }
+        if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+            reasoning.remove("summary");
+            reasoning.remove("generate_summary");
+            if reasoning.is_empty() {
+                body.remove("reasoning");
+            }
+        }
+        if compat.summaries {
+            object_at(body, "reasoning").insert("summary".into(), json!("auto"));
         }
     } else {
-        body.remove("store");
+        if attempt.adapter == ResponseAdapter::Passthrough
+            && Url::parse(&attempt.url)
+                .ok()
+                .is_some_and(|url| url.host_str() == Some("api.openai.com"))
+        {
+            body.insert("store".into(), Value::Bool(false));
+        } else if body.remove("store").is_some_and(|v| v == true) {
+            compat.omit(Omitted::ChannelDefaults);
+        }
         if attempt.adapter == ResponseAdapter::Passthrough && attempt.upstream_stream {
             body.insert("stream_options".into(), json!({"include_usage":true}));
+        }
+    }
+    if attempt.adapter == ResponseAdapter::GeminiToChat {
+        for key in ["generationConfig", "generation_config"] {
+            if let Some(config) = body.get_mut(key).and_then(Value::as_object_mut) {
+                for field in [
+                    "responseModalities",
+                    "response_modalities",
+                    "responseSchema",
+                    "response_schema",
+                    "responseJsonSchema",
+                    "response_json_schema",
+                    "candidateCount",
+                    "candidate_count",
+                    "responseMimeType",
+                    "response_mime_type",
+                ] {
+                    if config.remove(field).is_some() {
+                        compat.omit(Omitted::ChannelDefaults);
+                    }
+                }
+                for key in ["thinkingConfig", "thinking_config"] {
+                    if let Some(thinking) = config.get_mut(key).and_then(Value::as_object_mut) {
+                        thinking.remove("includeThoughts");
+                        thinking.remove("include_thoughts");
+                        if thinking.is_empty() {
+                            config.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        if compat.summaries {
+            let config = object_at(body, "generationConfig");
+            object_at(config, "thinkingConfig").insert("includeThoughts".into(), Value::Bool(true));
+        }
+    }
+    if matches!(
+        attempt.adapter,
+        ResponseAdapter::ClaudeToChat | ResponseAdapter::AwsToChat
+    ) {
+        if let Some(output) = body.get_mut("output_config").and_then(Value::as_object_mut) {
+            if output.remove("format").is_some() {
+                compat.omit(Omitted::ChannelDefaults);
+            }
+        }
+        if body
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .is_some_and(|v| v > 1.0)
+        {
+            body.remove("temperature");
+        }
+    }
+    if let Some(limit) =
+        interactions::max_output_limit(&source["generation_config"]["max_output_tokens"])
+    {
+        let clamp = |root: &mut serde_json::Map<String, Value>, key: &str| {
+            let selected = root.get(key).and_then(interactions::max_output_limit);
+            root.insert(key.into(), json!(selected.unwrap_or(limit).min(limit)));
+        };
+        if attempt.adapter == ResponseAdapter::GeminiToChat {
+            clamp(object_at(body, "generationConfig"), "maxOutputTokens");
+        } else if responses {
+            clamp(body, "max_output_tokens");
+        } else if attempt.adapter == ResponseAdapter::Passthrough
+            && body.contains_key("max_completion_tokens")
+        {
+            body.remove("max_tokens");
+            clamp(body, "max_completion_tokens");
+        } else {
+            clamp(body, "max_tokens");
+        }
+    }
+    for (field, gemini) in [("temperature", "temperature"), ("top_p", "topP")] {
+        let requested = &source["generation_config"][field];
+        if !requested.is_null()
+            && if attempt.adapter == ResponseAdapter::GeminiToChat {
+                body.get("generationConfig")
+                    .is_none_or(|config| &config[gemini] != requested)
+            } else {
+                body.get(field) != Some(requested)
+            }
+        {
+            compat.omit(Omitted::GenerationConfig);
         }
     }
     if attempt.adapter == ResponseAdapter::GeminiToChat
@@ -138,7 +328,7 @@ pub(crate) fn finalize_translation(
         );
     }
     *bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-    attempt.downstream_protocol = DownstreamProtocol::InteractionsCompat;
+    attempt.downstream_protocol = DownstreamProtocol::InteractionsCompat(compat);
     Ok(())
 }
 
@@ -201,10 +391,47 @@ pub(crate) fn prepare(
         return Err("Interactions requires a text generation model".into());
     }
     let mut payload = payload.cloned().ok_or("Interactions requires JSON")?;
-    interactions::validate(&payload)?;
     let stream = payload["stream"].as_bool().unwrap_or(false);
     super::request::set_model(&mut payload, upstream_model)?;
     payload["store"] = Value::Bool(false);
+    let mut compat = Compat::default();
+    if let Some(root) = payload.as_object_mut() {
+        if root
+            .remove("service_tier")
+            .is_some_and(|value| !value.is_null())
+        {
+            compat.omit(Omitted::ServiceTier);
+        }
+        if root
+            .remove("tools")
+            .is_some_and(|v| !v.is_null() && !v.as_array().is_some_and(Vec::is_empty))
+        {
+            compat.omit(Omitted::Tools);
+        }
+        root.remove("tool_choice");
+        if let Some(config) = root
+            .get_mut("generation_config")
+            .and_then(Value::as_object_mut)
+        {
+            config.remove("tool_choice");
+        } else if root
+            .remove("generation_config")
+            .is_some_and(|v| !v.is_null())
+        {
+            compat.omit(Omitted::GenerationConfig);
+        }
+        if root.get("stream").is_some_and(|value| !value.is_boolean()) {
+            root.remove("stream");
+            compat.omit(Omitted::Extensions);
+        }
+        if root
+            .get("background")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            root.remove("background");
+            compat.omit(Omitted::Extensions);
+        }
+    }
     // Provider header settings may supply proxy-specific headers, but no caller
     // credentials, cookies, settlement metadata or arbitrary header forwarding.
     let mut headers = provider_headers(
@@ -253,7 +480,7 @@ pub(crate) fn prepare(
         original_model: upstream_model.to_owned(),
         request_type: None,
         wire_model: Some(upstream_model.to_owned()),
-        downstream_protocol: DownstreamProtocol::InteractionsNative,
+        downstream_protocol: DownstreamProtocol::InteractionsNative(compat),
         chat_stream_include_usage: false,
         prompt_compaction: false,
         provider_key: key.to_owned(),

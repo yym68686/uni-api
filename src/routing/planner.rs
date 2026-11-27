@@ -130,14 +130,6 @@ impl GatewayRuntime {
                 )
             })
             .collect();
-        if !providers.is_empty() {
-            if let Some(error) = &facts.interactions_compat_error {
-                providers.retain(|p| crate::providers::interactions::native(p, &facts.model));
-                if providers.is_empty() {
-                    return Err(reject(StatusCode::BAD_REQUEST, error));
-                }
-            }
-        }
         if providers.is_empty() {
             return Err(RouteResolutionError {
                 status: StatusCode::NOT_FOUND,

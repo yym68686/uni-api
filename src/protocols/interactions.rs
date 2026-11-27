@@ -61,10 +61,8 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
     if !visit_input_text(&value["input"], |_| {}) {
         return Err("Interactions requires nonempty text input (a string, text parts, or text-only user_input/model_output steps)");
     }
-    for field in ["background", "store"] {
-        if object.get(field).is_some_and(|v| v != &Value::Bool(false)) {
-            return Err("Interactions requires store and background to be false when specified");
-        }
+    if value["store"] == true || value["background"] == true {
+        return Err("Interactions capability unavailable: stored or background execution");
     }
     if [
         "previous_interaction_id",
@@ -72,22 +70,37 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
         "agent",
         "agent_config",
         "max_total_tokens",
-        "service_tier",
-        "response_modalities",
     ]
     .iter()
     .any(|field| object.get(*field).is_some_and(|v| !v.is_null()))
     {
-        return Err("Interactions currently supports only stateless text model requests without custom service tiers");
+        return Err(
+            "Interactions capability unavailable: continuation, agents, or total token budgets",
+        );
     }
-    if ["tools", "tool_choice"]
-        .iter()
-        .any(|field| object.get(*field).is_some_and(|v| !v.is_null()))
+    let requires_tool = |v: &Value| {
+        matches!(v.as_str(), Some("required" | "any"))
+            || v.get("type").is_some_and(|v| v == "function")
+            || matches!(
+                v.get("mode").and_then(Value::as_str),
+                Some("any" | "required")
+            )
+    };
+    if requires_tool(&value["tool_choice"])
+        || requires_tool(&value["generation_config"]["tool_choice"])
     {
-        return Err("Interactions currently does not support tools or tool_choice");
+        return Err("Interactions capability unavailable: required tool calls");
     }
-    if object.get("stream").is_some_and(|v| !v.is_boolean()) {
-        return Err("Interactions stream must be a boolean");
+    if object.get("response_modalities").is_some_and(|v| {
+        !v.is_null()
+            && !v.as_array().is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("text"))
+                })
+            })
+    }) {
+        return Err("Interactions capability unavailable: non-text output modalities");
     }
     if let Some(format) = object.get("response_format").filter(|v| !v.is_null()) {
         let text = |v: &Value| v["type"] == "text";
@@ -99,74 +112,77 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
             return Err("Interactions currently supports only text response formats");
         }
     }
-    if let Some(config) = object.get("generation_config").filter(|v| !v.is_null()) {
-        if !config.is_object() || !config["tool_choice"].is_null() {
-            return Err("Interactions currently does not support tool configuration");
-        }
-    }
     Ok(())
 }
 
-pub(crate) fn compatibility(value: &Value) -> Result<(), String> {
-    let Some(root) = value.as_object() else {
-        return Err("Interactions requires a JSON object".into());
-    };
-    for (key, _) in root.iter().filter(|(_, value)| !value.is_null()) {
-        match key.as_str() {
-            "model" | "input" | "store" | "background" | "stream" => {}
-            "system_instruction" if root[key].is_string() => {}
-            "response_format" if text_format(&root[key]) => {}
-            "generation_config" => {
-                if let Some(config) = root[key].as_object() {
-                    for (field, setting) in config.iter().filter(|(_, value)| !value.is_null()) {
-                        match field.as_str() {
-                            "temperature" | "top_p" if setting.is_number() => {}
-                            "max_output_tokens" if setting.as_u64().is_some_and(|n| n > 0) => {}
-                            _ => {
-                                return Err(native_required(&format!("generation_config.{field}")))
-                            }
-                        }
-                    }
-                } else {
-                    return Err(native_required(key));
-                }
-            }
-            _ => return Err(native_required(key)),
-        }
-    }
-    if let Some(items) = value["input"].as_array() {
-        for item in items {
-            let (allowed, parts): (&[&str], _) = if item["type"] == "text" {
-                (&["type", "text"], None)
-            } else {
-                (&["type", "content"], item["content"].as_array())
-            };
-            let allowed_fields = |item: &Value, allowed: &[&str]| {
-                item.as_object()
-                    .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
-            };
-            if !allowed_fields(item, allowed)
-                || parts.is_some_and(|parts| {
-                    !parts.iter().all(|p| allowed_fields(p, &["type", "text"]))
-                })
-            {
-                return Err(native_required("input"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn text_format(value: &Value) -> bool {
-    let text = |v: &Value| v["type"] == "text" && v.as_object().is_some_and(|o| o.len() == 1);
-    text(value)
-        || value
+pub(crate) fn structured_text_requested(value: &Value) -> bool {
+    let format = &value["response_format"];
+    let is_structured = |v: &Value| v["mime_type"] == "application/json" || !v["schema"].is_null();
+    is_structured(format)
+        || format
             .as_array()
-            .is_some_and(|v| v.len() == 1 && text(&v[0]))
+            .is_some_and(|items| items.iter().any(is_structured))
 }
 
-fn native_required(field: &str) -> String {
-    format!("Interactions field {field} requires a native Interactions channel for this model")
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Compat {
+    pub summaries: bool,
+    warnings: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Omitted {
+    Extensions,
+    InputMetadata,
+    GenerationConfig,
+    ThinkingSummaries,
+    ThinkingLevel,
+    ServiceTier,
+    ChannelDefaults,
+    Tools,
+}
+
+impl Compat {
+    pub(crate) fn omit(&mut self, field: Omitted) {
+        self.warnings |= 1 << field as u16;
+    }
+
+    pub(crate) fn warning(self) -> Option<String> {
+        (self.warnings != 0).then(|| {
+            [
+                "extensions",
+                "input_metadata",
+                "generation_config",
+                "thinking_summaries",
+                "thinking_level",
+                "service_tier",
+                "channel_defaults",
+                "tools",
+            ]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, label)| (self.warnings & (1 << i) != 0).then_some(label))
+            .collect::<Vec<_>>()
+            .join(",")
+        })
+    }
+}
+
+pub(crate) fn thinking_level(level: &str) -> Option<&'static str> {
+    match level {
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "extra_high" => Some("xhigh"),
+        _ => None,
+    }
+}
+
+pub(crate) fn max_output_limit(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .filter(|v| *v > 0 && *v <= u64::from(u32::MAX))
 }
 
 pub(crate) fn from_wire_usage(usage: Option<&Value>) -> serde_json::Map<String, Value> {
@@ -220,6 +236,27 @@ pub(crate) fn stream_error(code: u16, message: &str) -> Value {
 
 fn text_step(text: &str) -> Value {
     json!({"type":"model_output","content":[{"type":"text","text":text}]})
+}
+
+pub(crate) fn responses_summaries(value: &Value) -> impl Iterator<Item = &str> {
+    value["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "reasoning")
+        .flat_map(|item| item["summary"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "summary_text")
+        .filter_map(|part| part["text"].as_str().filter(|text| !text.is_empty()))
+}
+
+pub(crate) fn gemini_summaries(value: &Value) -> impl Iterator<Item = &str> {
+    value
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part["thought"] == true)
+        .filter_map(|part| part["text"].as_str().filter(|text| !text.is_empty()))
 }
 
 pub(crate) fn output_status(reason: &str) -> Result<&'static str, &'static str> {
@@ -305,6 +342,9 @@ pub(crate) struct TextOutput {
     model: String,
     created: String,
     pub(crate) emitted_text: bool,
+    pub(crate) emitted_summary: bool,
+    active_step: Option<(usize, bool)>,
+    next_step: usize,
     pub(crate) terminal: Option<&'static str>,
     pub(crate) input_done: bool,
     pub(crate) usage: serde_json::Map<String, Value>,
@@ -320,6 +360,9 @@ impl TextOutput {
             model: model.into(),
             created: timestamp(),
             emitted_text: false,
+            emitted_summary: false,
+            active_step: None,
+            next_step: 0,
             terminal: None,
             input_done: false,
             usage: Default::default(),
@@ -350,35 +393,66 @@ impl TextOutput {
     }
 
     pub(crate) fn delta(&mut self, text: &str) -> Vec<Value> {
+        self.step_delta(text, false)
+    }
+
+    pub(crate) fn summary(&mut self, text: &str) -> Vec<Value> {
+        self.step_delta(text, true)
+    }
+
+    fn step_delta(&mut self, text: &str, summary: bool) -> Vec<Value> {
         if text.is_empty() {
             return Vec::new();
         }
         let mut events = Vec::new();
-        if !self.emitted_text {
-            self.emitted_text = true;
-            events.push(json!({"event_type":"step.start","index":0,"step":{"type":"model_output","content":[]}}));
-        }
-        events
-            .push(json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":text}}));
+        self.emitted_text |= !summary;
+        self.emitted_summary |= summary;
+        let index = match self.active_step {
+            Some((index, kind)) if kind == summary => index,
+            previous => {
+                if let Some((index, _)) = previous {
+                    events.push(json!({"event_type":"step.stop","index":index}));
+                }
+                let index = self.next_step;
+                self.next_step += 1;
+                self.active_step = Some((index, summary));
+                let step = if summary {
+                    json!({"type":"thought","summary":[]})
+                } else {
+                    json!({"type":"model_output","content":[]})
+                };
+                events.push(json!({"event_type":"step.start","index":index,"step":step}));
+                index
+            }
+        };
+        let delta = if summary {
+            json!({"type":"thought_summary","content":{"type":"text","text":text}})
+        } else {
+            json!({"type":"text","text":text})
+        };
+        events.push(json!({"event_type":"step.delta","index":index,"delta":delta}));
         events
     }
 
     pub(crate) fn finish(&self, status: &str) -> Vec<Value> {
         let mut events = Vec::new();
-        if self.emitted_text {
-            events.push(json!({"event_type":"step.stop","index":0}));
+        if let Some((index, _)) = self.active_step {
+            events.push(json!({"event_type":"step.stop","index":index}));
         }
         events.push(json!({"event_type":"interaction.completed","interaction":self.interaction(status, None)}));
         events
     }
 
-    pub(crate) fn json(&self, status: &str, text: &str) -> Value {
-        let steps = if text.is_empty() {
-            json!([])
-        } else {
-            json!([text_step(text)])
-        };
-        self.interaction(status, Some(steps))
+    pub(crate) fn json(&self, status: &str, text: &str, summaries: &[String]) -> Value {
+        let mut steps = Vec::new();
+        if !summaries.is_empty() {
+            steps.push(json!({"type":"thought","summary":summaries.iter()
+                .map(|text| json!({"type":"text","text":text})).collect::<Vec<_>>()}));
+        }
+        if !text.is_empty() {
+            steps.push(text_step(text));
+        }
+        self.interaction(status, Some(json!(steps)))
     }
 }
 
@@ -401,9 +475,120 @@ pub(crate) fn sse_frame(output: &mut Vec<u8>, event: &Value) -> Result<(), serde
     Ok(())
 }
 
-pub(crate) fn to_chat(value: &Value) -> Result<Value, String> {
-    validate(value)?;
-    compatibility(value)?;
+// The input here is the gateway's own bounded translated SSE, not arbitrary
+// provider events. Use the same terminal and usage validation as the SSE path.
+pub(crate) async fn collect_translated(
+    body: Body,
+    limit: usize,
+) -> Result<Option<Value>, &'static str> {
+    const INVALID: &str = "Invalid translated Interactions stream";
+    let mut stream = body.into_data_stream();
+    let mut decoder = SseDecoder::new(limit);
+    let mut received = 0usize;
+    let mut steps: Vec<(bool, String)> = Vec::new();
+    let mut final_payload = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| INVALID)?;
+        received = received.saturating_add(chunk.len());
+        if received > limit {
+            return Err("Translated Interactions stream exceeded the response size limit");
+        }
+        for frame in decoder.feed(&chunk).map_err(|_| INVALID)? {
+            let Some(data) = parse_sse_frame(&frame).map_err(|_| INVALID)?.data else {
+                continue;
+            };
+            let mut event: Value = serde_json::from_str(&data).map_err(|_| INVALID)?;
+            let index = || {
+                event["index"]
+                    .as_u64()
+                    .and_then(|i| usize::try_from(i).ok())
+            };
+            match event["event_type"].as_str() {
+                Some("step.start") if index() == Some(steps.len()) => {
+                    steps.push((event["step"]["type"] == "thought", String::new()));
+                }
+                Some("step.delta") => {
+                    let (is_summary, text) =
+                        index().and_then(|i| steps.get_mut(i)).ok_or(INVALID)?;
+                    let path = if *is_summary {
+                        "/delta/content/text"
+                    } else {
+                        "/delta/text"
+                    };
+                    text.push_str(event.pointer(path).and_then(Value::as_str).ok_or(INVALID)?);
+                }
+                Some("interaction.completed") if final_payload.is_none() => {
+                    final_payload = Some(event["interaction"].take());
+                }
+                Some("error") => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+    if let Some(payload) = &mut final_payload {
+        payload["steps"] = json!(steps
+            .into_iter()
+            .map(|(summary, text)| {
+                if summary {
+                    json!({"type":"thought","summary":[{"type":"text","text":text}]})
+                } else {
+                    text_step(&text)
+                }
+            })
+            .collect::<Vec<_>>());
+    }
+    Ok(final_payload)
+}
+
+pub(crate) fn to_chat(value: &Value, compat: &mut Compat) -> Value {
+    if !value["tools"].is_null() && !value["tools"].as_array().is_some_and(Vec::is_empty) {
+        compat.omit(Omitted::Tools);
+    }
+    if value.as_object().is_some_and(|root| {
+        root.iter().any(|(key, v)| {
+            !v.is_null()
+                && !matches!(
+                    key.as_str(),
+                    "model"
+                        | "input"
+                        | "stream"
+                        | "store"
+                        | "background"
+                        | "system_instruction"
+                        | "generation_config"
+                        | "service_tier"
+                        | "response_format"
+                        | "response_modalities"
+                        | "tools"
+                        | "tool_choice"
+                )
+        })
+    }) || ["stream", "store", "background"]
+        .iter()
+        .any(|key| !value[*key].is_null() && !value[*key].is_boolean())
+        || (!value["system_instruction"].is_null() && !value["system_instruction"].is_string())
+    {
+        compat.omit(Omitted::Extensions);
+    }
+    if !value["service_tier"].is_null() {
+        compat.omit(Omitted::ServiceTier);
+    }
+    let mut parts = |content: &Value| {
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|part| {
+                if part
+                    .as_object()
+                    .is_some_and(|o| o.keys().any(|key| !matches!(key.as_str(), "type" | "text")))
+                {
+                    compat.omit(Omitted::InputMetadata);
+                }
+                json!({"type":"text","text":part["text"]})
+            })
+            .collect::<Vec<_>>()
+    };
     let mut messages = Vec::new();
     if let Some(instruction) = value["system_instruction"].as_str() {
         messages.push(json!({"role":"system","content":instruction}));
@@ -412,35 +597,52 @@ pub(crate) fn to_chat(value: &Value) -> Result<Value, String> {
     if let Some(text) = input.as_str() {
         messages.push(json!({"role":"user","content":text}));
     } else if input[0]["type"] == "text" {
-        messages.push(json!({"role":"user","content":input}));
+        messages.push(json!({"role":"user","content":parts(input)}));
     } else if let Some(steps) = input.as_array() {
-        messages.extend(steps.iter().map(|step| {
+        let mut metadata = false;
+        for step in steps {
             let role = if step["type"] == "model_output" {
                 "assistant"
             } else {
                 "user"
             };
-            json!({"role":role,"content":step["content"]})
-        }));
+            metadata |= step.as_object().is_some_and(|o| {
+                o.keys()
+                    .any(|key| !matches!(key.as_str(), "type" | "content"))
+            });
+            messages.push(json!({"role":role,"content":parts(&step["content"])}));
+        }
+        if metadata {
+            compat.omit(Omitted::InputMetadata);
+        }
     }
     let stream = value["stream"].as_bool().unwrap_or(false);
     let mut request = json!({"model":value["model"],"messages":messages,"stream":stream});
-    for (source, target) in [
-        ("temperature", "temperature"),
-        ("top_p", "top_p"),
-        ("max_output_tokens", "max_tokens"),
-    ] {
-        if let Some(setting) = value["generation_config"]
-            .get(source)
-            .filter(|v| !v.is_null())
-        {
-            request[target] = setting.clone();
+    let config = &value["generation_config"];
+    if let Some(config) = config.as_object() {
+        for (name, v) in config.iter().filter(|(_, v)| !v.is_null()) {
+            match name.as_str() {
+                "temperature" if v.as_f64().is_some_and(|v| (0.0..=2.0).contains(&v)) => {
+                    request[name] = v.clone()
+                }
+                "top_p" if v.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v)) => {
+                    request[name] = v.clone()
+                }
+                "max_output_tokens" if max_output_limit(v).is_some() => {
+                    request["max_tokens"] = v.clone()
+                }
+                "thinking_level" | "thinking_summaries" => {}
+                "tool_choice" if matches!(v.as_str(), Some("auto" | "none")) => {}
+                _ => compat.omit(Omitted::GenerationConfig),
+            }
         }
+    } else if !config.is_null() {
+        compat.omit(Omitted::GenerationConfig);
     }
     if stream {
         request["stream_options"] = json!({"include_usage":true});
     }
-    Ok(request)
+    request
 }
 
 pub(crate) fn status_kind(status: &str) -> &'static str {
@@ -454,6 +656,9 @@ pub(crate) fn status_kind(status: &str) -> &'static str {
 
 pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(system) = payload["system_instruction"].as_str() {
+        parts.push(system);
+    }
     visit_input_text(&payload["input"], |text| parts.push(text)).then(|| parts.join("\n"))
 }
 

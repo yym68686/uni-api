@@ -320,6 +320,11 @@ fn supported_paths() -> Vec<(&'static str, &'static str, &'static str)> {
             "基本与模型",
             "string",
         ),
+        (
+            "preferences/interactions_thinking_summaries",
+            "基本与模型",
+            "boolean",
+        ),
         ("model", "基本与模型", "models"),
         ("api", "密钥", "keys"),
         ("api_key_schedule_algorithm", "密钥", "algorithm"),
@@ -492,6 +497,7 @@ pub(crate) fn compile(raw: &Value, previous: &Arc<Provider>) -> Result<Arc<Provi
         for key in [
             "explicit_cache_guard",
             crate::routing::filters::ULTRAFAST_COMPACTION_ONLY,
+            crate::providers::interactions::THINKING_SUMMARIES,
         ] {
             if p.get(key).is_some_and(|v| !v.is_boolean()) {
                 return Err(field_error(&format!("/preferences/{key}")));

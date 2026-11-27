@@ -14,7 +14,6 @@ pub(crate) struct RequestFacts {
     pub stream: bool,
     pub service_tier: Option<crate::routing::service_tier::Tier>,
     pub requested_service_tier: Option<&'static str>,
-    pub interactions_compat_error: Option<String>,
 }
 
 impl RequestFacts {
@@ -37,12 +36,17 @@ impl RequestFacts {
             endpoint: endpoint.trim_end_matches('/').into(),
             body_bytes,
             request_type: crate::routing::filters::request_type_for_endpoint(object, endpoint),
-            reasoning_effort: object.and_then(crate::routing::filters::request_reasoning_effort),
+            reasoning_effort: if crate::protocols::interactions::is_route(endpoint) {
+                payload
+                    .and_then(|body| body.pointer("/generation_config/thinking_level"))
+                    .and_then(Value::as_str)
+                    .and_then(crate::protocols::interactions::thinking_level)
+                    .map(str::to_owned)
+            } else {
+                object.and_then(crate::routing::filters::request_reasoning_effort)
+            },
             service_tier: crate::routing::service_tier::Tier::requested(endpoint, payload),
             requested_service_tier: requested_log_tier(endpoint, payload),
-            interactions_compat_error: payload
-                .filter(|_| crate::protocols::interactions::is_route(endpoint))
-                .and_then(|body| crate::protocols::interactions::compatibility(body).err()),
             stream: payload
                 .and_then(|p| p.get("stream"))
                 .and_then(Value::as_bool)

@@ -340,19 +340,33 @@ This route accepts stateless text requests, for example
 `[{"type":"user_input","content":[{"type":"text","text":"Hello"}]}]`.
 Use a uni-api key with `x-goog-api-key` or `Authorization: Bearer …`.
 `"stream":true` returns Interactions SSE; normal responses return Interactions
-JSON. A text model can use its existing Chat Completions, Responses, or Gemini
-GenerateContent channel without enabling native Interactions on that channel.
+JSON. A text model can use its existing Chat Completions, Responses, Gemini
+GenerateContent, or Messages channel without enabling native Interactions.
 The model's configured alias, upstream protocol, and channel ordering still
 apply. The channel directory for this endpoint reports `interactions_mode` as
 `native` or `translated`.
 
-Only one upstream attempt is made. Interactions are not stored by uni-api.
-Translated channels accept text, `system_instruction`, and the common
-`generation_config` fields `temperature`, `top_p`, and `max_output_tokens`.
-Other settings that passed stateless validation require a native channel.
-Interaction
-lookup/continuation/deletion, background execution, agents, tools, non-text
-input/output, and custom service tiers are not supported.
+Only one generation request is sent upstream. uni-api does not store
+Interactions. Translated channels map supported options and omit unknown or
+unsupported optional settings rather than refusing to dispatch. A successful
+response with omissions includes `x-uni-api-interactions-omitted` with
+comma-separated categories, not values or request contents.
+
+`generation_config.thinking_summaries: "auto"` requests a public thought
+summary on supported Gemini GenerateContent and OpenAI Responses channels.
+Compatible gateways can declare their capability with channel preference
+`interactions_thinking_summaries: true` (or opt out with `false`). Channels
+without a confirmed mapping still return the generated answer. Summaries are
+separate from the answer and are not returned for `"none"` or when the option
+is omitted on translated channels. Thinking levels are mapped independently
+when the selected upstream model supports them.
+
+Optional tool declarations and custom service-tier hints are omitted. Stored
+Interactions, continuation, background execution, agents, required tools, and
+non-text inputs/outputs remain unavailable. Structured output is not silently
+reduced to plain text on translated channels. A stream-only upstream can serve
+a non-streaming client by collecting its translated stream within the response
+size limit.
 
 For Google's HTTPS Developer API origin, `engine: gemini` uses upstream
 `/v1/interactions` without changing existing `/v1beta/models` routes. An

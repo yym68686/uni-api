@@ -33,7 +33,7 @@ pub enum OutputProtocol {
     Chat,
     Responses,
     Gemini,
-    Interactions,
+    Interactions { summaries: bool },
 }
 
 pub struct Translation {
@@ -415,10 +415,12 @@ fn spawn_translation(
                 let payload = match output_protocol {
                     OutputProtocol::Chat => json!({"error":{"message":error}}),
                     OutputProtocol::Gemini => crate::protocols::gemini::error(502, &error),
-                    OutputProtocol::Interactions => crate::protocols::interactions::stream_error(
-                        502,
-                        "Upstream stream did not complete successfully",
-                    ),
+                    OutputProtocol::Interactions { .. } => {
+                        crate::protocols::interactions::stream_error(
+                            502,
+                            "Upstream stream did not complete successfully",
+                        )
+                    }
                     OutputProtocol::Responses => json!({
                         "type":"response.failed",
                         "response":{
@@ -1202,7 +1204,7 @@ async fn send_wire_until(
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(), String> {
     let mut wire = Vec::new();
-    if output_protocol == OutputProtocol::Interactions {
+    if matches!(output_protocol, OutputProtocol::Interactions { .. }) {
         crate::protocols::interactions::sse_frame(&mut wire, value)
             .map_err(|error| error.to_string())?;
         return send_downstream(tx, Bytes::from(wire), deadline).await;
@@ -1293,7 +1295,7 @@ impl StreamState {
             terminal: false,
             require_terminal: matches!(
                 output_protocol,
-                OutputProtocol::Gemini | OutputProtocol::Interactions
+                OutputProtocol::Gemini | OutputProtocol::Interactions { .. }
             ),
             strict_summary: false,
             claude_message_stop: false,
@@ -1302,7 +1304,7 @@ impl StreamState {
             include_usage,
             responses: ResponsesOutputState::new(model, created),
             gemini_output: Default::default(),
-            interactions_output: (output_protocol == OutputProtocol::Interactions)
+            interactions_output: matches!(output_protocol, OutputProtocol::Interactions { .. })
                 .then(|| crate::protocols::interactions::TextOutput::new(model)),
             timing: StreamTiming::new(tokio::time::Instant::now()),
         }
@@ -1324,6 +1326,9 @@ impl StreamState {
             let usage = match protocol {
                 Protocol::Responses => value.pointer("/response/usage"),
                 Protocol::Gemini => value.get("usageMetadata"),
+                Protocol::Claude | Protocol::VertexClaude | Protocol::AwsBedrock => value
+                    .get("usage")
+                    .or_else(|| value.pointer("/message/usage")),
                 _ => value.get("usage"),
             };
             output
@@ -1362,7 +1367,7 @@ impl StreamState {
         if (protocol == Protocol::Gemini
             || matches!(
                 self.output_protocol,
-                OutputProtocol::Gemini | OutputProtocol::Interactions
+                OutputProtocol::Gemini | OutputProtocol::Interactions { .. }
             ))
             && value.get("error").is_some_and(|error| !error.is_null())
         {
@@ -1458,6 +1463,14 @@ impl StreamState {
                 if let Some(text) = delta["content"].as_str() {
                     events.extend(output.delta(text));
                 }
+                if matches!(
+                    self.output_protocol,
+                    OutputProtocol::Interactions { summaries: true }
+                ) {
+                    if let Some(summary) = delta["interactions_summary"].as_str() {
+                        events.extend(output.summary(summary));
+                    }
+                }
                 if let Some(reason) = chunk
                     .pointer("/choices/0/finish_reason")
                     .and_then(Value::as_str)
@@ -1532,6 +1545,21 @@ impl StreamState {
                 if self
                     .interactions_output
                     .as_ref()
+                    .is_some_and(|o| !o.emitted_summary)
+                    && matches!(
+                        self.output_protocol,
+                        OutputProtocol::Interactions { summaries: true }
+                    )
+                {
+                    chunks.extend(
+                        crate::protocols::interactions::responses_summaries(response).map(|text| {
+                            self.chunk(json!({"interactions_summary":text}), None, None)
+                        }),
+                    );
+                }
+                if self
+                    .interactions_output
+                    .as_ref()
                     .is_some_and(|o| !o.emitted_text)
                 {
                     if let Some(text) = normalized
@@ -1557,6 +1585,11 @@ impl StreamState {
                 .get("delta")
                 .and_then(Value::as_str)
                 .map(|text| vec![self.chunk(json!({"content":text}), None, None)])
+                .unwrap_or_default(),
+            "response.reasoning_summary_text.delta" if self.interactions_output.is_some() => value
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(|text| vec![self.chunk(json!({"interactions_summary":text}), None, None)])
                 .unwrap_or_default(),
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => value
                 .get("delta")
@@ -1658,7 +1691,11 @@ impl StreamState {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 self.gemini_has_output |= !text.trim().is_empty();
                 let field = if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                    "reasoning_content"
+                    if self.interactions_output.is_some() {
+                        "interactions_summary"
+                    } else {
+                        "reasoning_content"
+                    }
                 } else {
                     "content"
                 };
@@ -1785,6 +1822,13 @@ impl StreamState {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if let Some(output) = &mut self.interactions_output {
+            if event == "message_stop" {
+                output.input_done = true;
+                self.claude_message_stop = true;
+                return Vec::new();
+            }
+        }
         if self.strict_summary {
             if event == "message_stop" {
                 self.claude_message_stop = true;
@@ -2163,6 +2207,13 @@ impl StreamState {
         if let Some(output) = &self.interactions_output {
             if self.failure.is_some() {
                 return Ok(());
+            }
+            if matches!(
+                self.source_protocol,
+                Some(Protocol::Claude | Protocol::VertexClaude | Protocol::AwsBedrock)
+            ) && !self.claude_message_stop
+            {
+                return Err("Upstream Messages stream ended before message_stop".into());
             }
             let status = output
                 .terminal

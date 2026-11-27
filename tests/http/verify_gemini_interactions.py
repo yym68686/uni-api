@@ -114,10 +114,9 @@ def verify(binary):
                 assert method_status == 405 and method_headers.get("allow") == "POST"
                 assert call(path + "/fixture")[0] == 404
                 for changes, message in [
-                    ({"input": TEXT_STEPS, "store": True}, "store and background"),
-                    ({"input": TEXT_STEPS, "previous_interaction_id": "fixture"}, "stateless text model"),
-                    ({"input": TEXT_STEPS, "tools": [{"type": "function", "name": "fixture"}]}, "does not support tools"),
-                    ({"input": TEXT_STEPS, "stream": "true"}, "stream must be a boolean"),
+                    ({"input": TEXT_STEPS, "store": True}, "stored or background"),
+                    ({"input": TEXT_STEPS, "previous_interaction_id": "fixture"}, "continuation"),
+                    ({"input": TEXT_STEPS, "tool_choice": {"mode": "any"}}, "required tool calls"),
                     ({"input": [{"type": "user_input", "content": [{"type": "image", "uri": "fixture"}]}]}, "requires nonempty text input"),
                 ]:
                     result, _, raw = call(path, {**request, **changes})
@@ -148,6 +147,12 @@ def verify(binary):
                     assert body == {**request, **changes, "model": "wire-model", "store": False}, body
                     assert wire["x-goog-api-key"] == "fixture-provider"
                     assert not set(wire) & {"authorization", "cookie", "idempotency-key"}
+                upstream.hits.clear()
+                status, headers, raw = call(path, {**request, "stream": "not-a-boolean",
+                    "tools": [{"type": "function", "name": "optional"}]})
+                assert status == 200 and raw == JSON_BODY and len(upstream.hits) == 1, (status, raw)
+                assert set(headers["x-uni-api-interactions-omitted"].split(",")) == {"extensions", "tools"}, headers
+                assert not set(upstream.hits[0][1]) & {"tools", "stream"}, upstream.hits
                 status, _, raw = call("/v1beta/models/legacy-model:generateContent", {"contents": [{"parts": [{"text": "old"}]}]})
                 assert status == 200 and b"legacy" in raw
             except Exception:
