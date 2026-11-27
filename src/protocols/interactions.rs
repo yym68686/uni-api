@@ -20,6 +20,37 @@ pub(crate) fn is_resource(path: &str) -> bool {
         || path.starts_with("/v1beta/interactions/")
 }
 
+// Use the same traversal for admission and moderation; never flatten the
+// actual wire payload. An array is either content parts or explicit steps.
+fn visit_input_text<'a>(input: &'a Value, mut visit: impl FnMut(&'a str)) -> bool {
+    fn nonempty_text(value: &Value) -> Option<&str> {
+        value.as_str().filter(|text| !text.trim().is_empty())
+    }
+    if let Some(text) = nonempty_text(input) {
+        visit(text);
+        return true;
+    }
+    let mut visit_part = |part: &'a Value| match nonempty_text(&part["text"]) {
+        Some(text) if part["type"] == "text" => {
+            visit(text);
+            true
+        }
+        _ => false,
+    };
+    let Some(parts) = input.as_array().filter(|parts| !parts.is_empty()) else {
+        return false;
+    };
+    if parts[0]["type"] == "text" {
+        return parts.iter().all(visit_part);
+    }
+    parts.iter().all(|step| {
+        matches!(step["type"].as_str(), Some("user_input" | "model_output"))
+            && step["content"]
+                .as_array()
+                .is_some_and(|content| !content.is_empty() && content.iter().all(&mut visit_part))
+    })
+}
+
 pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
     let object = value
         .as_object()
@@ -27,16 +58,8 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
     if value["model"].as_str().is_none_or(|s| s.trim().is_empty()) {
         return Err("Interactions requires a model");
     }
-    let nonempty = |v: &Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
-    if !(nonempty(&value["input"])
-        || value["input"].as_array().is_some_and(|parts| {
-            !parts.is_empty()
-                && parts
-                    .iter()
-                    .all(|part| part["type"] == "text" && nonempty(&part["text"]))
-        }))
-    {
-        return Err("Interactions currently requires text input");
+    if !visit_input_text(&value["input"], |_| {}) {
+        return Err("Interactions requires nonempty text input (a string, text parts, or text-only user_input/model_output steps)");
     }
     for field in ["background", "store"] {
         if object.get(field).is_some_and(|v| v != &Value::Bool(false)) {
@@ -49,15 +72,19 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
         "agent",
         "agent_config",
         "max_total_tokens",
-        "tools",
-        "tool_choice",
         "service_tier",
         "response_modalities",
     ]
     .iter()
     .any(|field| object.get(*field).is_some_and(|v| !v.is_null()))
     {
-        return Err("Interactions currently supports only stateless text model requests without tools or custom service tiers");
+        return Err("Interactions currently supports only stateless text model requests without custom service tiers");
+    }
+    if ["tools", "tool_choice"]
+        .iter()
+        .any(|field| object.get(*field).is_some_and(|v| !v.is_null()))
+    {
+        return Err("Interactions currently does not support tools or tool_choice");
     }
     if object.get("stream").is_some_and(|v| !v.is_boolean()) {
         return Err("Interactions stream must be a boolean");
@@ -90,18 +117,8 @@ pub(crate) fn status_kind(status: &str) -> &'static str {
 }
 
 pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
-    let input = &payload["input"];
-    if let Some(text) = input.as_str() {
-        return Some(text.to_owned());
-    }
-    Some(
-        input
-            .as_array()?
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    let mut parts = Vec::new();
+    visit_input_text(&payload["input"], |text| parts.push(text)).then(|| parts.join("\n"))
 }
 
 #[derive(Default)]
@@ -281,6 +298,42 @@ impl Drop for Observation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn admits_and_moderates_each_text_input_shape_without_losing_steps() {
+        for (input, expected) in [
+            (json!("  你好  "), "  你好  "),
+            (
+                json!([{"type":"text", "text":"first"}, {"type":"text", "text":"second"}]),
+                "first\nsecond",
+            ),
+            (
+                json!([
+                    {"type":"user_input", "content":[{"type":"text", "text":"first"}, {"type":"text", "text":"second"}]},
+                    {"type":"model_output", "content":[{"type":"text", "text":"answer"}]},
+                    {"type":"user_input", "content":[{"type":"text", "text":"next"}]}
+                ]),
+                "first\nsecond\nanswer\nnext",
+            ),
+        ] {
+            let payload = json!({"model":"fixture", "input":input});
+            assert_eq!(validate(&payload), Ok(()));
+            assert_eq!(moderation_text(&payload).as_deref(), Some(expected));
+        }
+        for input in [
+            json!("  "),
+            json!([]),
+            json!([{"type":"user_input", "content":[]}]),
+            json!([{"type":"user_input", "content":[{"type":"text", "text":"ok"}, {"type":"image", "uri":"fixture"}]}]),
+            json!([{"type":"model_output", "content":[{"type":"text", "text":" "}]}]),
+            json!([{"type":"function_result", "content":[{"type":"text", "text":"ok"}]}]),
+            json!([{"type":"text", "text":"flat"}, {"type":"user_input", "content":[{"type":"text", "text":"step"}]}]),
+        ] {
+            let payload = json!({"model":"fixture", "input":input});
+            assert!(validate(&payload).is_err(), "{payload}");
+            assert_eq!(moderation_text(&payload), None, "{payload}");
+        }
+    }
 
     #[test]
     fn observes_only_complete_terminal_frames_and_does_not_double_count() {

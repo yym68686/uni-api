@@ -20,6 +20,11 @@ SSE_BODY = (
     b'event: interaction.completed\r\ndata: {"interaction":' + JSON_BODY + b'}\r\n\r\n'
 )
 GOOGLE_ERROR = b'{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "fixture"}}'
+TEXT_STEPS = [
+    {"type": "user_input", "content": [{"type": "text", "text": "你好"}]},
+    {"type": "model_output", "content": [{"type": "text", "text": "Hello"}]},
+    {"type": "user_input", "content": [{"type": "text", "text": "Continue"}]},
+]
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -38,6 +43,8 @@ class Upstream(BaseHTTPRequestHandler):
             status, body = 307, b""
         elif payload["input"] == "invalid":
             body = b"null"
+        elif payload["input"] == "wrong-content-type":
+            pass
         elif payload.get("stream"):
             media, body = "text/event-stream; charset=utf-8", SSE_BODY
         self.send_response(status)
@@ -105,8 +112,15 @@ def verify(binary):
                 method_status, method_headers, _ = call(path)
                 assert method_status == 405 and method_headers.get("allow") == "POST"
                 assert call(path + "/fixture")[0] == 404
-                assert call(path, {**request, "store": True})[0] == 400
-                assert call(path, {**request, "previous_interaction_id": "fixture"})[0] == 400
+                for changes, message in [
+                    ({"input": TEXT_STEPS, "store": True}, "store and background"),
+                    ({"input": TEXT_STEPS, "previous_interaction_id": "fixture"}, "stateless text model"),
+                    ({"input": TEXT_STEPS, "tools": [{"type": "function", "name": "fixture"}]}, "does not support tools"),
+                    ({"input": TEXT_STEPS, "stream": "true"}, "stream must be a boolean"),
+                    ({"input": [{"type": "user_input", "content": [{"type": "image", "uri": "fixture"}]}]}, "requires nonempty text input"),
+                ]:
+                    result, _, raw = call(path, {**request, **changes})
+                    assert result == 400 and message in json.loads(raw)["error"]["message"], (result, raw)
                 assert call(path, {**request, "model": "legacy-model"})[0] >= 400
                 assert call(path, {**request, "model": "embedding-alias"})[0] >= 400
                 assert call(path, {**request, "model": "audio-alias"})[0] >= 400
@@ -115,7 +129,10 @@ def verify(binary):
                 assert not upstream.hits
                 for changes, status, expected in [
                     ({}, 200, JSON_BODY), ({"stream": True}, 200, SSE_BODY),
+                    ({"input": TEXT_STEPS[:1], "store": False, "stream": True, "generation_config": {"thinking_summaries": "auto"}}, 200, SSE_BODY),
+                    ({"input": TEXT_STEPS}, 200, JSON_BODY),
                     ({"input": "quota"}, 429, GOOGLE_ERROR), ({"input": "invalid"}, 502, None),
+                    ({"input": "wrong-content-type", "stream": True}, 502, None),
                     ({"input": "redirect"}, 307, None),
                 ]:
                     upstream.hits.clear()

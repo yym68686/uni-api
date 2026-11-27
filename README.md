@@ -335,6 +335,9 @@ yym68686/uni-api:latest
 
 This native route accepts stateless text requests, for example
 `{"model":"your-gemini-alias","input":"Hello","stream":false}`.
+`input` can also be an array of text parts or native `user_input` and
+`model_output` steps whose `content` contains only text parts, e.g.
+`[{"type":"user_input","content":[{"type":"text","text":"Hello"}]}]`.
 Use a uni-api key with `x-goog-api-key` or `Authorization: Bearer …`.
 `"stream":true` returns native SSE; normal responses return native JSON.
 Only one upstream attempt is made, with `store:false`. Interaction
