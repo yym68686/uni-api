@@ -129,7 +129,12 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     if native_interactions {
         if let Err(detail) = interactions::validate(input.payload.as_ref().unwrap_or(&Value::Null))
         {
-            return json_error(StatusCode::BAD_REQUEST, detail);
+            let status = if interactions::capability_unavailable(detail) {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return json_error(status, detail);
         }
     }
     if method != Method::GET {

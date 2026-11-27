@@ -23,7 +23,7 @@ GOOGLE_ERROR = b'{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "messag
 TEXT_STEPS = [
     {"type": "user_input", "content": [{"type": "text", "text": "你好"}]},
     {"type": "model_output", "content": [{"type": "text", "text": "Hello"}]},
-    {"type": "user_input", "content": [{"type": "text", "text": "Continue"}]},
+    {"type": "user_input", "content": "Continue"},
 ]
 
 
@@ -117,10 +117,10 @@ def verify(binary):
                     ({"input": TEXT_STEPS, "store": True}, "stored or background"),
                     ({"input": TEXT_STEPS, "previous_interaction_id": "fixture"}, "continuation"),
                     ({"input": TEXT_STEPS, "tool_choice": {"mode": "any"}}, "required tool calls"),
-                    ({"input": [{"type": "user_input", "content": [{"type": "image", "uri": "fixture"}]}]}, "requires nonempty text input"),
+                    ({"input": [{"type": "user_input", "content": [{"type": "image", "uri": "fixture"}]}]}, "non-text input"),
                 ]:
                     result, _, raw = call(path, {**request, **changes})
-                    assert result == 400 and message in json.loads(raw)["error"]["message"], (result, raw)
+                    assert result == 422 and message in json.loads(raw)["error"]["message"], (result, raw)
                 assert call(path, {**request, "model": "embedding-alias"})[0] >= 400
                 assert call(path, {**request, "model": "audio-alias"})[0] >= 400
                 catalog_status, _, catalog = call("/v1/model-channels?endpoint=%2Fv1%2Finteractions", bearer=True)
@@ -133,6 +133,10 @@ def verify(binary):
                     ({}, 200, JSON_BODY), ({"stream": True}, 200, SSE_BODY),
                     ({"input": TEXT_STEPS[:1], "store": False, "stream": True, "generation_config": {"thinking_summaries": "auto"}}, 200, SSE_BODY),
                     ({"input": TEXT_STEPS}, 200, JSON_BODY),
+                    ({"response_format": {"type": "text", "mime_type": "application/json",
+                                          "schema": {"type": "object"}}}, 200, JSON_BODY),
+                    ({"response_format": [{"type": "text", "mime_type": "application/json",
+                                           "schema": {"type": "object"}}]}, 200, JSON_BODY),
                     ({"input": "quota"}, 429, GOOGLE_ERROR), ({"input": "invalid"}, 502, None),
                     ({"input": "wrong-content-type", "stream": True}, 502, None),
                     ({"input": "redirect"}, 307, None),

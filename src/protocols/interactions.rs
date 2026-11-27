@@ -22,33 +22,63 @@ pub(crate) fn is_resource(path: &str) -> bool {
 
 // Use the same traversal for admission and moderation; never flatten the
 // actual wire payload. An array is either content parts or explicit steps.
-fn visit_input_text<'a>(input: &'a Value, mut visit: impl FnMut(&'a str)) -> bool {
-    fn nonempty_text(value: &Value) -> Option<&str> {
-        value.as_str().filter(|text| !text.trim().is_empty())
-    }
-    if let Some(text) = nonempty_text(input) {
-        visit(text);
-        return true;
-    }
-    let mut visit_part = |part: &'a Value| match nonempty_text(&part["text"]) {
-        Some(text) if part["type"] == "text" => {
-            visit(text);
-            true
+fn visit_input_text<'a>(
+    input: &'a Value,
+    mut visit: impl FnMut(&'a str),
+) -> Result<(), &'static str> {
+    const EMPTY: &str = "Interactions requires nonempty text input";
+    const INVALID: &str = "Interactions requires a string, text parts, or text-only input steps";
+    const NON_TEXT: &str = "Interactions capability unavailable: non-text input";
+    fn text(value: &Value) -> Result<&str, &'static str> {
+        let text = value.as_str().ok_or(INVALID)?;
+        if text.trim().is_empty() {
+            return Err(EMPTY);
         }
-        _ => false,
-    };
-    let Some(parts) = input.as_array().filter(|parts| !parts.is_empty()) else {
-        return false;
-    };
-    if parts[0]["type"] == "text" {
-        return parts.iter().all(visit_part);
+        Ok(text)
     }
-    parts.iter().all(|step| {
-        matches!(step["type"].as_str(), Some("user_input" | "model_output"))
-            && step["content"]
-                .as_array()
-                .is_some_and(|content| !content.is_empty() && content.iter().all(&mut visit_part))
-    })
+    fn part(value: &Value) -> Result<&str, &'static str> {
+        match value["type"].as_str() {
+            Some("text") => text(&value["text"]),
+            Some("user_input" | "model_output") | None => Err(INVALID),
+            Some(_) => Err(NON_TEXT),
+        }
+    }
+    if input.is_string() {
+        visit(text(input)?);
+        return Ok(());
+    }
+    if input.is_null() {
+        return Err(EMPTY);
+    }
+    let parts = input.as_array().ok_or(INVALID)?;
+    let first = parts.first().ok_or(EMPTY)?;
+    if !matches!(first["type"].as_str(), Some("user_input" | "model_output")) {
+        for value in parts {
+            visit(part(value)?);
+        }
+        return Ok(());
+    }
+    // A step's content may be a string, just like the top-level shorthand.
+    for step in parts {
+        match step["type"].as_str() {
+            Some("user_input" | "model_output") => {}
+            Some("text") | None => return Err(INVALID),
+            Some(_) => return Err(NON_TEXT),
+        }
+        let content = &step["content"];
+        if content.is_string() {
+            visit(text(content)?);
+        } else {
+            let content = content.as_array().ok_or(INVALID)?;
+            if content.is_empty() {
+                return Err(EMPTY);
+            }
+            for value in content {
+                visit(part(value)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
@@ -58,9 +88,16 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
     if value["model"].as_str().is_none_or(|s| s.trim().is_empty()) {
         return Err("Interactions requires a model");
     }
-    if !visit_input_text(&value["input"], |_| {}) {
-        return Err("Interactions requires nonempty text input (a string, text parts, or text-only user_input/model_output steps)");
-    }
+    visit_input_text(&value["input"], |_| {})?;
+    validate_stateless(value, object)
+}
+
+// These are guarantees of the public stateless endpoint regardless of the
+// selected provider. Channel-specific support is checked during compilation.
+fn validate_stateless(
+    value: &Value,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), &'static str> {
     if value["store"] == true || value["background"] == true {
         return Err("Interactions capability unavailable: stored or background execution");
     }
@@ -102,6 +139,21 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
     }) {
         return Err("Interactions capability unavailable: non-text output modalities");
     }
+    let config = &value["generation_config"];
+    if [
+        "response_schema",
+        "responseSchema",
+        "response_json_schema",
+        "responseJsonSchema",
+    ]
+    .into_iter()
+    .any(|key| !config[key].is_null())
+        || ["response_mime_type", "responseMimeType"]
+            .into_iter()
+            .any(|key| config[key] == "application/json")
+    {
+        return Err("Interactions capability unavailable: structured output inside generation_config; use response_format instead");
+    }
     if let Some(format) = object.get("response_format").filter(|v| !v.is_null()) {
         let text = |v: &Value| v["type"] == "text";
         if !(text(format)
@@ -109,10 +161,14 @@ pub(crate) fn validate(value: &Value) -> Result<(), &'static str> {
                 .as_array()
                 .is_some_and(|values| !values.is_empty() && values.iter().all(text)))
         {
-            return Err("Interactions currently supports only text response formats");
+            return Err("Interactions capability unavailable: non-text response format");
         }
     }
     Ok(())
+}
+
+pub(crate) fn capability_unavailable(detail: &str) -> bool {
+    detail.starts_with("Interactions capability unavailable:")
 }
 
 pub(crate) fn structured_text_requested(value: &Value) -> bool {
@@ -610,7 +666,13 @@ pub(crate) fn to_chat(value: &Value, compat: &mut Compat) -> Value {
                 o.keys()
                     .any(|key| !matches!(key.as_str(), "type" | "content"))
             });
-            messages.push(json!({"role":role,"content":parts(&step["content"])}));
+            let content = &step["content"];
+            let content = if content.is_string() {
+                content.clone()
+            } else {
+                json!(parts(content))
+            };
+            messages.push(json!({"role":role,"content":content}));
         }
         if metadata {
             compat.omit(Omitted::InputMetadata);
@@ -659,7 +721,9 @@ pub(crate) fn moderation_text(payload: &Value) -> Option<String> {
     if let Some(system) = payload["system_instruction"].as_str() {
         parts.push(system);
     }
-    visit_input_text(&payload["input"], |text| parts.push(text)).then(|| parts.join("\n"))
+    visit_input_text(&payload["input"], |text| parts.push(text))
+        .ok()
+        .map(|()| parts.join("\n"))
 }
 
 #[derive(Default)]
@@ -850,28 +914,45 @@ mod tests {
             ),
             (
                 json!([
-                    {"type":"user_input", "content":[{"type":"text", "text":"first"}, {"type":"text", "text":"second"}]},
+                    {"type":"user_input", "content":"first"},
                     {"type":"model_output", "content":[{"type":"text", "text":"answer"}]},
-                    {"type":"user_input", "content":[{"type":"text", "text":"next"}]}
+                    {"type":"user_input", "content":"next"}
                 ]),
-                "first\nsecond\nanswer\nnext",
+                "first\nanswer\nnext",
             ),
         ] {
             let payload = json!({"model":"fixture", "input":input});
             assert_eq!(validate(&payload), Ok(()));
             assert_eq!(moderation_text(&payload).as_deref(), Some(expected));
         }
-        for input in [
-            json!("  "),
-            json!([]),
-            json!([{"type":"user_input", "content":[]}]),
-            json!([{"type":"user_input", "content":[{"type":"text", "text":"ok"}, {"type":"image", "uri":"fixture"}]}]),
-            json!([{"type":"model_output", "content":[{"type":"text", "text":" "}]}]),
-            json!([{"type":"function_result", "content":[{"type":"text", "text":"ok"}]}]),
-            json!([{"type":"text", "text":"flat"}, {"type":"user_input", "content":[{"type":"text", "text":"step"}]}]),
+        for (input, unsupported) in [
+            (json!("  "), false),
+            (json!([]), false),
+            (json!(123), false),
+            (json!([{"type":"user_input", "content":[]}]), false),
+            (
+                json!([{"type":"user_input", "content":[{"type":"text", "text":"ok"}, {"type":"image", "uri":"fixture"}]}]),
+                true,
+            ),
+            (
+                json!([{"type":"model_output", "content":[{"type":"text", "text":" "}]}]),
+                false,
+            ),
+            (
+                json!([{"type":"function_result", "content":[{"type":"text", "text":"ok"}]}]),
+                true,
+            ),
+            (
+                json!([{"type":"text", "text":"flat"}, {"type":"user_input", "content":[{"type":"text", "text":"step"}]}]),
+                false,
+            ),
         ] {
             let payload = json!({"model":"fixture", "input":input});
-            assert!(validate(&payload).is_err(), "{payload}");
+            assert_eq!(
+                capability_unavailable(validate(&payload).unwrap_err()),
+                unsupported,
+                "{payload}"
+            );
             assert_eq!(moderation_text(&payload), None, "{payload}");
         }
     }

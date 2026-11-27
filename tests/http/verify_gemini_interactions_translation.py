@@ -266,9 +266,10 @@ def verify(binary):
                             before = len(upstream.hits)
                             payload = {"model": model, "stream": stream, "store": False,
                                        "future_top_level": {"not_wire": True},
-                                       "input": [{"type": "user_input", "future_step": True,
-                                                  "content": [{"type": "text", "text": "summary-trigger",
-                                                               "future_part": True}]}],
+                                       "input": [{"type": "user_input", "future_step": True, "content": "history-user"},
+                                                 {"type": "model_output", "content": [{"type": "text", "text": "history-model",
+                                                                                      "future_part": True}]},
+                                                 {"type": "user_input", "content": "summary-trigger"}],
                                        "service_tier": "priority",
                                        "generation_config": {"future_setting": True, "temperature": "invalid",
                                                              "thinking_summaries": setting,
@@ -276,7 +277,9 @@ def verify(binary):
                             code, headers, raw = call(endpoint, payload)
                             assert code == 200 and len(upstream.hits) == before + 1, (code, raw, upstream.hits)
                             body = upstream.hits[-1][1]
-                            assert not any(word in json.dumps(body) for word in ("future_", "invalid", "priority")), body
+                            wire_json = json.dumps(body)
+                            assert not any(word in wire_json for word in ("future_", "invalid", "priority")), body
+                            assert 0 <= wire_json.find("history-user") < wire_json.find("history-model") < wire_json.find("summary-trigger"), body
                             assert b"private" not in raw and b"unmapped-signature" not in raw, raw
                             emits_summary = (setting == "auto" and engine in ("gemini", "codex"))
                             if engine == "gemini":
@@ -336,14 +339,18 @@ def verify(binary):
                 assert code == 200 and b"event: error" in raw and b"interaction.completed" not in raw, (code, raw)
                 before = len(upstream.hits)
                 for extra, expected in [
-                    ({"store": True}, 400),
-                    ({"previous_interaction_id": "not-a-stateless-call"}, 400),
-                    ({"tool_choice": "required"}, 400),
+                    ({"store": True}, 422),
+                    ({"previous_interaction_id": "not-a-stateless-call"}, 422),
+                    ({"tool_choice": "required"}, 422),
+                    ({"generation_config": {"response_schema": {"type": "object"}}}, 422),
                     ({"response_format": {"type": "text", "mime_type": "application/json",
                                           "schema": {"type": "object"}}}, 422),
                 ]:
                     code, _, raw = call(endpoint, {"model": "forced", "input": "hi", **extra})
                     assert code == expected and b"capability unavailable" in raw, (code, raw)
+                assert len(upstream.hits) == before
+                code, _, raw = call(endpoint, {"model": "forced", "input": ""})
+                assert code == 400 and b"requires nonempty text input" in raw, (code, raw)
                 assert len(upstream.hits) == before
             except Exception:
                 log.seek(0)

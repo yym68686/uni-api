@@ -1043,7 +1043,7 @@ pub(crate) async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             Ok(attempt) => attempt,
             Err(error) => {
                 if crate::protocols::interactions::is_route(&path) {
-                    if error.starts_with("Interactions capability unavailable:") {
+                    if crate::protocols::interactions::capability_unavailable(&error) {
                         last_status = StatusCode::UNPROCESSABLE_ENTITY;
                         last_detail.clone_from(&error);
                     } else {
